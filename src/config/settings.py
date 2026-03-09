@@ -93,6 +93,10 @@ class TradingConfig:
     kelly_fraction: float = 0.75            # INCREASED: More aggressive Kelly multiplier (was 0.5, now 0.75)
     max_single_position: float = 0.05       # INCREASED: Higher position cap (was 0.03, now 5%)
     
+    # Live trading mode control
+    live_trading_enabled: bool = False      # Set to True for live trading (defaults to paper mode for safety)
+    paper_trading_mode: bool = True         # Paper trading for testing
+    
     # Trading frequency - MORE FREQUENT
     market_scan_interval: int = 30          # DECREASED: Scan every 30 seconds (was 60)
     position_check_interval: int = 15       # DECREASED: Check positions every 15 seconds (was 30)
@@ -214,8 +218,6 @@ news_search_volume_threshold: float = 1000.0  # News threshold
 # Overall system behavior settings
 beast_mode_enabled: bool = True         # Enable the unified advanced system
 fallback_to_legacy: bool = True         # Fallback to legacy system if needed
-live_trading_enabled: bool = True       # Set to True for live trading
-paper_trading_mode: bool = False        # Paper trading for testing
 log_level: str = "INFO"                 # Logging level
 performance_monitoring: bool = True     # Enable performance monitoring
 

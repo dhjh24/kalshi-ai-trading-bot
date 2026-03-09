@@ -433,6 +433,89 @@ mypy src/
 
 ---
 
+## Troubleshooting
+
+### Bot Stuck in "Ingestion Mode" or Not Placing Live Trades
+
+**Problem**: Bot shows open positions incrementing in dashboard but no actual trades execute, even with `--live` flag.
+
+**Solution**: This typically indicates the bot is running in paper mode despite the `--live` flag. Check:
+
+1. **Verify command usage**:
+   ```bash
+   python cli.py run --live  # Correct
+   python beast_mode_bot.py --live  # Also correct (direct script)
+   ```
+
+2. **Check logs for mode confirmation**:
+   ```bash
+   # Look for these log messages:
+   # "LIVE TRADING MODE ENABLED - REAL MONEY WILL BE USED"  ← Good (live mode)
+   # "Paper trading mode - orders will be simulated"       ← Problem (paper mode)
+   
+   # Also look for order execution logs:
+   # "LIVE ORDER PLACED for [market]"     ← Good (live mode)  
+   # "PAPER TRADE SIMULATED for [market]" ← Problem (paper mode)
+   ```
+
+3. **Verify API permissions**:
+   - Log into your Kalshi dashboard
+   - Check that your API key has **TRADING** permissions (not just read-only)
+   - Verify your API key hasn't expired
+
+4. **Check rate limiting**:
+   ```bash
+   grep "rate limit\|429" logs/trading_system.log
+   ```
+
+5. **Verify configuration**:
+   - Check `src/config/settings.py` has correct settings
+   - Ensure your `.env` file has valid `KALSHI_API_KEY`
+
+### Dashboard Won't Launch
+
+**Problem**: VS Code/IDE shows import errors like "Import aiosqlite could not be resolved".
+
+**Solution**: These are IDE linter warnings, not runtime errors. To fix:
+
+1. **Install dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+2. **Set correct Python interpreter** in VS Code:
+   - Press `Cmd+Shift+P` (Mac) or `Ctrl+Shift+P` (Windows/Linux)
+   - Type "Python: Select Interpreter"
+   - Choose the interpreter from your virtual environment
+
+3. **Run from project root**:
+   ```bash
+   cd kalshi-ai-trading-bot
+   python beast_mode_dashboard.py
+   ```
+
+### Python 3.14 Compatibility Issues
+
+**Problem**: PyO3 error during `pip install`.
+
+**Solutions**:
+1. **Quick fix** (may be unstable):
+   ```bash
+   export PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
+   pip install -r requirements.txt
+   ```
+
+2. **Recommended** (use supported Python version):
+   ```bash
+   pyenv install 3.13.1
+   pyenv local 3.13.1
+   python -m venv venv
+   source venv/bin/activate
+   pip install -r requirements.txt
+   ```
+
+---
+
 ## Contributing
 
 1. Fork the repository.

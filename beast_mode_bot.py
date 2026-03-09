@@ -69,10 +69,20 @@ class BeastModeBot:
         settings.trading.live_trading_enabled = live_mode
         settings.trading.paper_trading_mode = not live_mode
         
+        # Add detailed logging for debugging
         self.logger.info(
             f"🚀 Beast Mode Bot initialized - "
             f"Mode: {'LIVE TRADING' if live_mode else 'PAPER TRADING'}"
         )
+        self.logger.info(f"📊 CLI live_mode parameter: {live_mode}")
+        self.logger.info(f"⚙️ settings.trading.live_trading_enabled: {settings.trading.live_trading_enabled}")
+        self.logger.info(f"⚙️ settings.trading.paper_trading_mode: {settings.trading.paper_trading_mode}")
+        
+        if live_mode:
+            self.logger.warning("⚠️ LIVE TRADING MODE ENABLED - REAL MONEY WILL BE USED")
+            self.logger.warning("⚠️ All orders will be placed on the Kalshi exchange")
+        else:
+            self.logger.info("📝 Paper trading mode - orders will be simulated")
 
     async def run_dashboard_mode(self):
         """Run in live dashboard mode with real-time updates."""

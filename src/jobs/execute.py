@@ -32,9 +32,11 @@ async def execute_position(
         True if execution was successful, False otherwise.
     """
     logger = get_trading_logger("trade_execution")
-    logger.info(f"Executing position for market: {position.market_id}")
-
+    logger.info(f"🎯 Executing position for market: {position.market_id}")
+    logger.info(f"🎛️ Live mode: {live_mode}")
+    
     if live_mode:
+        logger.warning(f"💰 PLACING LIVE ORDER - Real money will be used for {position.market_id}")
         try:
             # Get current market prices to determine the appropriate price field
             market_data = await kalshi_client.get_market(position.market_id)
@@ -81,16 +83,18 @@ async def execute_position(
             fill_price = position.entry_price
 
             await db_manager.update_position_to_live(position.id, fill_price)
-            logger.info(f"Successfully placed LIVE order for {position.market_id}. Order ID: {order_response.get('order', {}).get('order_id')}")
+            logger.info(f"✅ LIVE ORDER PLACED for {position.market_id}. Order ID: {order_response.get('order', {}).get('order_id')}")
+            logger.info(f"💰 Real money used: ${position.quantity * fill_price:.2f}")
             return True
 
         except KalshiAPIError as e:
-            logger.error(f"Failed to place LIVE order for {position.market_id}: {e}")
+            logger.error(f"❌ FAILED to place LIVE order for {position.market_id}: {e}")
             return False
     else:
         # Simulate the trade
         await db_manager.update_position_to_live(position.id, position.entry_price)
-        logger.info(f"Successfully placed SIMULATED order for {position.market_id}")
+        logger.info(f"📝 PAPER TRADE SIMULATED for {position.market_id} - No real money used")
+        logger.info(f"📊 Would have used: ${position.quantity * position.entry_price:.2f}")
         return True
 
 
