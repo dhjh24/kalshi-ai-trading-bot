@@ -8,6 +8,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -36,7 +37,7 @@ class KalshiClient(TradingLoggerMixin):
     def __init__(
         self, 
         api_key: Optional[str] = None, 
-        private_key_path: str = "kalshi_private_key",
+        private_key_path: str = None,
         max_retries: int = 5,
         backoff_factor: float = 0.5
     ):
@@ -51,7 +52,7 @@ class KalshiClient(TradingLoggerMixin):
         """
         self.api_key = api_key or settings.api.kalshi_api_key
         self.base_url = settings.api.kalshi_base_url
-        self.private_key_path = private_key_path
+        self.private_key_path = private_key_path or os.environ.get("KALSHI_PRIVATE_KEY_PATH", "kalshi_private_key.pem")
         self.private_key = None
         self.max_retries = max_retries
         self.backoff_factor = backoff_factor
