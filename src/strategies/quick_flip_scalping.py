@@ -486,7 +486,7 @@ REASON: [brief explanation]
                 "side": position.side.lower(),
                 "action": "sell",
                 "count": position.quantity,
-                "type": "market"
+                "type_": "market"
             }
             
             live_mode = getattr(settings.trading, 'live_trading_enabled', False)

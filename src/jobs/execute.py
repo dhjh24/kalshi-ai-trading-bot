@@ -53,7 +53,7 @@ async def execute_position(
                 "side": side_lower,
                 "action": "buy",
                 "count": position.quantity,
-                "type": "market"
+                "type_": "market"
             }
             
             # Add the appropriate price field based on side
@@ -136,7 +136,7 @@ async def place_sell_limit_order(
             "side": side,
             "action": "sell",  # We're selling our existing position
             "count": position.quantity,
-            "type": "limit"
+            "type_": "limit"
         }
         
         # Add the appropriate price parameter based on what we're selling

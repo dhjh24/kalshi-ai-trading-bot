@@ -415,7 +415,7 @@ class AdvancedMarketMaker:
                     "side": side,
                     "action": "buy",  # Market making involves buying at our bid prices
                     "count": order.quantity,
-                    "type": "limit"
+                    "type_": "limit"
                 }
                 
                 # Add the appropriate price parameter
