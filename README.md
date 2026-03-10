@@ -116,7 +116,7 @@ A Streamlit web dashboard provides live views of:
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/kalshi-ai-trading-bot.git
+git clone https://github.com/ryanfrigo/kalshi-ai-trading-bot.git
 cd kalshi-ai-trading-bot
 
 # Run the automated setup script
@@ -134,7 +134,7 @@ The setup script will:
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/kalshi-ai-trading-bot.git
+git clone https://github.com/ryanfrigo/kalshi-ai-trading-bot.git
 cd kalshi-ai-trading-bot
 
 # Create and activate a virtual environment
@@ -182,94 +182,6 @@ python -m src.utils.database
 
 > **Note:** Running `python src/utils/database.py` directly may fail with
 > `ModuleNotFoundError: No module named 'src'`. Always use the `-m` flag.
-
-## Troubleshooting
-
-### Dashboard Won't Launch
-
-**Problem**: VS Code/IDE shows import errors or dashboard fails to start.
-
-**Solutions**:
-
-1. **Run the setup script first**:
-   ```bash
-   cd kalshi-ai-trading-bot
-   python setup.py
-   ```
-
-2. **Check you're in the right directory**:
-   ```bash
-   # Make sure you see beast_mode_dashboard.py
-   ls beast_mode_dashboard.py
-   ```
-
-3. **Verify virtual environment is activated**:
-   ```bash
-   # Should show your project venv path
-   which python
-   
-   # Activate if needed
-   source .venv/bin/activate  # macOS/Linux
-   # .venv\Scripts\activate   # Windows
-   ```
-
-4. **Install/reinstall dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-5. **Test the dashboard**:
-   ```bash
-   # Quick test
-   python beast_mode_dashboard.py --summary
-   
-   # If that works, try the full dashboard
-   python beast_mode_dashboard.py
-   ```
-
-6. **Fix VS Code Python interpreter**:
-   - Press `Cmd+Shift+P` (Mac) or `Ctrl+Shift+P` (Windows/Linux)
-   - Type "Python: Select Interpreter"
-   - Choose the interpreter from your `.venv` folder
-
-**Still having issues?** Run `python setup.py` for automated diagnosis.
-
-### Python 3.14 Compatibility Issues
-
-**Problem**: `error: the configured Python interpreter version (3.14) is newer than PyO3's maximum supported version (3.13)`
-
-**Solutions**:
-
-1. **Automatic fix** (use the setup script):
-   ```bash
-   python setup.py
-   ```
-   The setup script automatically handles Python 3.14 compatibility.
-
-2. **Manual fix**:
-   ```bash
-   # Set compatibility flag before installing
-   export PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1  # macOS/Linux
-   set PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1     # Windows
-   
-   pip install -r requirements.txt
-   ```
-
-3. **Recommended** (use supported Python version):
-   ```bash
-   # Install Python 3.13 with pyenv
-   pyenv install 3.13.1
-   pyenv local 3.13.1
-   
-   # Create new virtual environment  
-   python -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
-
-**Note**: Python 3.14 support is experimental. For production use, Python 3.12-3.13 is recommended.
-
----
 
 ### Running
 
