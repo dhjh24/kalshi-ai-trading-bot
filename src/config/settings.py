@@ -94,8 +94,8 @@ class TradingConfig:
     max_single_position: float = 0.05       # INCREASED: Higher position cap (was 0.03, now 5%)
     
     # Live trading mode control
-    live_trading_enabled: bool = False      # Set to True for live trading (defaults to paper mode for safety)
-    paper_trading_mode: bool = True         # Paper trading for testing
+    live_trading_enabled: bool = field(default_factory=lambda: os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true")
+    paper_trading_mode: bool = field(default_factory=lambda: os.getenv("LIVE_TRADING_ENABLED", "false").lower() != "true")
     
     # Trading frequency - MORE FREQUENT
     market_scan_interval: int = 30          # DECREASED: Scan every 30 seconds (was 60)
