@@ -1,178 +1,195 @@
-# Kalshi AI Trading Bot
+# 🤖 Kalshi AI Trading Bot
+
+<div align="center">
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![GitHub Stars](https://img.shields.io/github/stars/ryanfrigo/kalshi-ai-trading-bot?style=flat&color=yellow)](https://github.com/ryanfrigo/kalshi-ai-trading-bot/stargazers)
+[![GitHub Forks](https://img.shields.io/github/forks/ryanfrigo/kalshi-ai-trading-bot?style=flat&color=blue)](https://github.com/ryanfrigo/kalshi-ai-trading-bot/network)
+[![GitHub Issues](https://img.shields.io/github/issues/ryanfrigo/kalshi-ai-trading-bot)](https://github.com/ryanfrigo/kalshi-ai-trading-bot/issues)
+[![Last Commit](https://img.shields.io/github/last-commit/ryanfrigo/kalshi-ai-trading-bot)](https://github.com/ryanfrigo/kalshi-ai-trading-bot/commits/main)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
-**Multi-model AI trading bot for Kalshi prediction markets.**
+**An autonomous trading bot for [Kalshi](https://kalshi.com) prediction markets powered by a five-model AI ensemble.**
 
-An autonomous trading system that combines a five-model AI ensemble, portfolio
-optimization, market making, and dynamic exit strategies to find and exploit
-edges on [Kalshi](https://kalshi.com) event contracts.
+Five frontier LLMs debate every trade. The system only enters when they agree.
 
-> **Disclaimer -- This is experimental software for educational and research
-> purposes only.** Trading involves substantial risk of loss. Only trade with
-> capital you can afford to lose. Past performance does not guarantee future
-> results. This software is not financial advice. Use at your own risk. The
-> authors are not responsible for any financial losses incurred through the use
-> of this software.
+[Quick Start](#-quick-start) · [Features](#-features) · [How It Works](#-how-it-works) · [Configuration](#configuration-reference) · [Contributing](CONTRIBUTING.md) · [Kalshi API Docs](https://trading-api.readme.io/reference/getting-started)
+
+</div>
 
 ---
 
-## Architecture
-
-```
-                           Kalshi AI Trading Bot
-
-  INGEST               DECIDE (Multi-Agent)         EXECUTE          TRACK
- --------             ----------------------        ---------       --------
-                      +--------------------+
-  Kalshi    --------> |  Grok-4            |
-  REST API            |  (Forecaster, 30%) |
-                      +--------------------+
-  WebSocket --------> +--------------------+
-  Stream              |  Claude Sonnet 4   |
-                      |  (News Analyst,20%)|        Kalshi        Portfolio
-  RSS/News  --------> +--------------------+ -----> Order  -----> P&L, Win
-  Feeds               |  GPT-4o            |        Router        Rate,
-                      |  (Bull Case, 20%)  |                      Sharpe,
-  Volume &  --------> +--------------------+        Kelly         Drawdown
-  Price Data          |  Gemini 2.5 Flash  |        Criterion     Tracking
-                      |  (Bear Case, 15%)  |        Sizing
-                      +--------------------+                      Cost &
-                      |  DeepSeek R1       |        Risk          Budget
-                      |  (Risk Mgr, 15%)   |        Parity        Monitor
-                      +--------------------+        Alloc
-
-                        Debate & Consensus
-                        Confidence Calibration
-```
+> ⚠️ **Disclaimer — This is experimental software for educational and research purposes only.** Trading involves substantial risk of loss. Only trade with capital you can afford to lose. Past performance does not guarantee future results. This software is not financial advice. The authors are not responsible for any financial losses incurred through the use of this software.
 
 ---
 
-## Features
+## 🚀 Quick Start
 
-### Multi-Model Ensemble
+**Three steps to get running in paper-trading mode (no real money):**
 
-Five frontier LLMs collaborate on every trading decision. Each model is assigned
-a distinct analytical role and weighted vote. When model opinions diverge beyond
-a configurable threshold the system reduces position size or skips the trade.
+```bash
+# 1. Clone and set up
+git clone https://github.com/ryanfrigo/kalshi-ai-trading-bot.git
+cd kalshi-ai-trading-bot
+python setup.py        # creates .venv, installs deps, checks config
 
-| Model | Provider | Role | Weight |
-|---|---|---|---|
-| Grok-4 | xAI | Lead Forecaster | 30% |
-| Claude Sonnet 4 | OpenRouter | News Analyst | 20% |
-| GPT-4o | OpenRouter | Bull Researcher | 20% |
-| Gemini 2.5 Flash | OpenRouter | Bear Researcher | 15% |
-| DeepSeek R1 | OpenRouter | Risk Manager | 15% |
+# 2. Add your API keys
+cp env.template .env   # then open .env and fill in KALSHI_API_KEY,
+                       # XAI_API_KEY, and OPENROUTER_API_KEY
+
+# 3. Run in paper-trading mode (no real orders)
+python cli.py run --paper
+```
+
+Then open the live dashboard in another terminal:
+
+```bash
+python cli.py dashboard
+```
+
+> **Need API keys?**
+> - Kalshi key + private key → [kalshi.com/account/settings](https://kalshi.com/account/settings) ([API docs](https://trading-api.readme.io/reference/getting-started))
+> - xAI key → [console.x.ai](https://console.x.ai/)
+> - OpenRouter key → [openrouter.ai](https://openrouter.ai/)
+
+---
+
+## ✅ Features
+
+### Multi-Model AI Ensemble
+- ✅ **Five frontier LLMs** collaborate on every decision — Grok-4, Claude Sonnet 4, GPT-4o, Gemini 2.5 Flash, DeepSeek R1
+- ✅ **Role-based specialization** — each model plays a distinct analytical role (forecaster, bull, bear, risk manager, news analyst)
+- ✅ **Consensus gating** — positions are skipped when models diverge beyond a configurable confidence threshold
+- ✅ **Deterministic outputs** — temperature=0 for reproducible AI reasoning
 
 ### Trading Strategies
+- ✅ **Directional trading** (50% of capital) — AI-predicted probability edge with Kelly Criterion sizing
+- ✅ **Market making** (40%) — automated limit orders capturing bid-ask spread
+- ✅ **Arbitrage detection** (10%) — cross-market opportunity scanning
 
-| Strategy | Allocation | Description |
-|---|---|---|
-| Directional Trading | 50% | AI-predicted probability edge with Kelly sizing |
-| Market Making | 40% | Automated limit orders capturing bid-ask spreads |
-| Arbitrage Detection | 10% | Cross-market opportunity scanning |
-
-### Portfolio Optimization
-
-- **Kelly Criterion** position sizing with fractional Kelly (0.75x) for volatility control
-- **Risk parity** allocation across concurrent positions
-- **Dynamic rebalancing** every six hours
-- Hard limits on daily loss (15%), max drawdown (50%), and sector concentration (90%)
+### Risk Management
+- ✅ **Fractional Kelly** position sizing (0.75x Kelly for volatility control)
+- ✅ **Hard daily loss limit** — stops trading at 15% drawdown
+- ✅ **Max drawdown circuit breaker** — halts at 50% portfolio drawdown
+- ✅ **Sector concentration cap** — no more than 90% in any single category
+- ✅ **Daily AI cost budget** — stops spending when API costs hit $50/day
 
 ### Dynamic Exit Strategies
+- ✅ Trailing take-profit at 20% gain
+- ✅ Stop-loss at 15% per position
+- ✅ Confidence-decay exits when AI conviction drops
+- ✅ Time-based exits (10-day max hold)
+- ✅ Volatility-adjusted thresholds
 
-- Trailing take-profit at 20% gain
-- Stop-loss at 15% drawdown per position
-- Confidence-decay exits when AI conviction drops
-- Time-based exits with a 10-day maximum hold
-- Volatility-adjusted thresholds
-
-### Real-Time Dashboard
-
-A Streamlit web dashboard provides live views of:
-
-- Portfolio value and balance
-- Open positions with entry prices and P&L
-- AI decision logs and confidence scores
-- Cost monitoring and daily budget utilization
-- Strategy-level performance breakdown
+### Observability
+- ✅ **Real-time Streamlit dashboard** — portfolio value, positions, P&L, AI decision logs
+- ✅ **Paper trading mode** — simulate trades without real orders; track outcomes on settled markets
+- ✅ **SQLite telemetry** — every trade, AI decision, and cost metric logged locally
+- ✅ **Unified CLI** — `run`, `dashboard`, `status`, `health`, `backtest` commands
 
 ---
 
-## Quick Start
+## 🧠 How It Works
+
+The bot runs a four-stage pipeline on a continuous loop:
+
+```
+  INGEST               DECIDE (5-Model Ensemble)    EXECUTE       TRACK
+ --------             ─────────────────────────    ---------    --------
+                      ┌─────────────────────────┐
+  Kalshi    ────────► │  Grok-4  (Forecaster 30%)│
+  REST API            ├─────────────────────────┤
+                      │  Claude  (News Analyst 20%)│
+  WebSocket ────────► ├─────────────────────────┤
+  Stream              │  GPT-4o  (Bull Case   20%)│  ──► Kalshi  ──► P&L
+                      ├─────────────────────────┤      Order       Win Rate
+  RSS / News ───────► │  Gemini  (Bear Case   15%)│      Router     Sharpe
+  Feeds               ├─────────────────────────┤               Drawdown
+                      │  DeepSeek(Risk Mgr    15%)│      Kelly    Cost
+  Volume &  ────────► └─────────────────────────┘      Sizing   Budget
+  Price Data             Debate → Consensus
+                         Confidence Calibration
+```
+
+### Stage 1 — Ingest
+Market data, order book snapshots, and news feeds are pulled via the Kalshi REST API and WebSocket stream. RSS feeds from financial news sources supplement the signal.
+
+### Stage 2 — Decide (Multi-Model Ensemble)
+Each of the five models analyzes the incoming data from its assigned perspective and returns a probability estimate + confidence score. The ensemble combines weighted votes:
+
+| Model | Role | Weight |
+|---|---|---|
+| Grok-4 (xAI) | Lead Forecaster | 30% |
+| Claude Sonnet 4 (OpenRouter) | News Analyst | 20% |
+| GPT-4o (OpenRouter) | Bull Researcher | 20% |
+| Gemini 2.5 Flash (OpenRouter) | Bear Researcher | 15% |
+| DeepSeek R1 (OpenRouter) | Risk Manager | 15% |
+
+If the weighted confidence falls below `min_confidence_to_trade` (default: 0.50), the opportunity is skipped. If models disagree significantly, position size is automatically reduced.
+
+### Stage 3 — Execute
+Qualifying trades are sized using the **Kelly Criterion** (fractional 0.75x) and routed through Kalshi's order API. Market-making orders are placed symmetrically around the mid-price.
+
+### Stage 4 — Track
+Every decision is written to a local SQLite database. The dashboard and `--stats` commands surface cumulative P&L, win rate, Sharpe ratio, and per-strategy breakdowns in real time.
+
+---
+
+## 📦 Installation
 
 ### Prerequisites
 
 - Python 3.12 or later
-- A [Kalshi](https://kalshi.com) account with API access
+- A [Kalshi](https://kalshi.com) account with API access ([API docs](https://trading-api.readme.io/reference/getting-started))
 - An [xAI](https://console.x.ai/) API key (Grok-4)
-- An [OpenRouter](https://openrouter.ai/) API key (for the remaining four models)
+- An [OpenRouter](https://openrouter.ai/) API key (Claude, GPT-4o, Gemini, DeepSeek)
 
-### Installation
-
-#### Quick Setup (Recommended)
+### Automated Setup (Recommended)
 
 ```bash
-# Clone the repository
 git clone https://github.com/ryanfrigo/kalshi-ai-trading-bot.git
 cd kalshi-ai-trading-bot
-
-# Run the automated setup script
 python setup.py
 ```
 
 The setup script will:
 - ✅ Check Python version compatibility
-- ✅ Create virtual environment if needed  
-- ✅ Install dependencies with Python 3.14 compatibility
+- ✅ Create virtual environment
+- ✅ Install all dependencies (with Python 3.14 compatibility handling)
 - ✅ Test that the dashboard can run
-- ✅ Provide troubleshooting guidance
+- ✅ Print troubleshooting guidance
 
-#### Manual Installation
+### Manual Installation
 
 ```bash
-# Clone the repository
 git clone https://github.com/ryanfrigo/kalshi-ai-trading-bot.git
 cd kalshi-ai-trading-bot
 
-# Create and activate a virtual environment
 python -m venv .venv
 source .venv/bin/activate        # macOS / Linux
 # .venv\Scripts\activate          # Windows
 
-# For Python 3.14 users: Set compatibility flag
-export PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1  # macOS/Linux
-# set PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1   # Windows
+# Python 3.14 users only:
+export PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
 
-# Install dependencies
 pip install -r requirements.txt
-
-# Test the installation
-python beast_mode_dashboard.py --summary
 ```
 
 ### Configuration
 
 ```bash
-# Copy the template and fill in your keys
-cp env.template .env
+cp env.template .env   # fill in your keys
 ```
-
-Required variables in `.env`:
 
 | Variable | Description |
 |---|---|
 | `KALSHI_API_KEY` | Your Kalshi API key ID |
-| `XAI_API_KEY` | xAI API key for Grok-4 |
-| `OPENROUTER_API_KEY` | OpenRouter key for ensemble models |
-| `OPENAI_API_KEY` | OpenAI key (optional fallback) |
+| `XAI_API_KEY` | xAI key for Grok-4 |
+| `OPENROUTER_API_KEY` | OpenRouter key (Claude, GPT-4o, Gemini, DeepSeek) |
+| `OPENAI_API_KEY` | Optional fallback |
 
-You must also place your Kalshi private key file as `kalshi_private_key` (no file
-extension) in the project root. Download it from
-[Kalshi Settings → API](https://kalshi.com/account/settings). This file is
-git-ignored.
+Place your Kalshi private key as `kalshi_private_key` (no extension) in the project root. Download from [Kalshi Settings → API](https://kalshi.com/account/settings). This file is git-ignored.
 
 ### Initialize the Database
 
@@ -180,29 +197,30 @@ git-ignored.
 python -m src.utils.database
 ```
 
-> **Note:** Running `python src/utils/database.py` directly may fail with
-> `ModuleNotFoundError: No module named 'src'`. Always use the `-m` flag.
+> ⚠️ Use `-m` flag — running `python src/utils/database.py` directly will fail with a module import error.
 
-### Running
+---
+
+## 🖥️ Running
 
 ```bash
-# Paper trading (default -- no real orders)
+# Paper trading (no real orders — safe to test)
 python cli.py run --paper
 
 # Live trading (real money)
 python cli.py run --live
 
-# Launch the monitoring dashboard
+# Launch monitoring dashboard
 python cli.py dashboard
 
-# Check portfolio balance and positions
+# Check portfolio balance and open positions
 python cli.py status
 
-# Verify all connections and configuration
+# Verify all API connections
 python cli.py health
 ```
 
-Or run the bot directly:
+Or invoke the bot script directly:
 
 ```bash
 python beast_mode_bot.py              # Paper trading
@@ -212,66 +230,62 @@ python beast_mode_bot.py --dashboard  # Dashboard mode
 
 ---
 
-## Project Structure
+## 📊 Paper Trading Dashboard
 
-```
-kalshi-ai-trading-bot/
-|-- beast_mode_bot.py          # Main bot entry point (BeastModeBot class)
-|-- cli.py                     # Unified CLI: run, dashboard, status, health, backtest
-|-- pyproject.toml             # PEP 621 project metadata and build config
-|-- requirements.txt           # Pinned dependencies
-|-- env.template               # Environment variable template
-|
-|-- src/
-|   |-- agents/                # Multi-agent ensemble (forecaster, bull/bear, risk, trader)
-|   |-- clients/               # API clients (Kalshi, xAI, OpenRouter, WebSocket)
-|   |-- config/                # Settings and trading parameters
-|   |-- data/                  # News aggregation and sentiment analysis
-|   |-- events/                # Async event bus for real-time streaming
-|   |-- jobs/                  # Core pipeline: ingest, decide, execute, track, evaluate
-|   |-- strategies/            # Market making, portfolio optimization, quick flip
-|   +-- utils/                 # Database, logging, prompts, risk helpers
-|
-|-- scripts/                   # Utility and diagnostic scripts (20 scripts)
-|-- docs/                      # Additional documentation
-|-- src/paper/                 # Paper trading signal tracker and dashboard generator
-|
-+-- tests/                     # Pytest test suite
-```
-
----
-
-## Paper Trading Dashboard
-
-Track what the bot *would* trade without risking real money. Every signal is
-logged to SQLite and a static HTML dashboard shows cumulative P&L, win rate, and
-per-signal details.
+Simulate trades without risking real money. Every signal is logged to SQLite and a static HTML dashboard renders cumulative P&L, win rate, and per-signal details after markets settle.
 
 ```bash
-# Scan markets and log signals (no real orders)
+# Scan markets and log signals
 python paper_trader.py
 
 # Continuous scanning every 15 minutes
 python paper_trader.py --loop --interval 900
 
-# Check settled markets and update outcomes
+# Settle markets and update outcomes
 python paper_trader.py --settle
 
-# Regenerate the HTML dashboard
+# Regenerate HTML dashboard
 python paper_trader.py --dashboard
 
 # Print stats to terminal
 python paper_trader.py --stats
 ```
 
-The dashboard is written to `docs/paper_dashboard.html` — open it locally or
-serve via GitHub Pages.
+The dashboard writes to `docs/paper_dashboard.html` — open locally or host via GitHub Pages.
 
 ---
 
-## Configuration Reference
+## 🗂️ Project Structure
 
-All trading parameters live in `src/config/settings.py`. Key defaults:
+```
+kalshi-ai-trading-bot/
+├── beast_mode_bot.py          # Main bot entry point
+├── cli.py                     # Unified CLI: run, dashboard, status, health, backtest
+├── paper_trader.py            # Paper trading signal tracker
+├── pyproject.toml             # PEP 621 project metadata
+├── requirements.txt           # Pinned dependencies
+├── env.template               # Environment variable template
+│
+├── src/
+│   ├── agents/                # Multi-model ensemble (forecaster, bull/bear, risk, trader)
+│   ├── clients/               # API clients (Kalshi, xAI, OpenRouter, WebSocket)
+│   ├── config/                # Settings and trading parameters
+│   ├── data/                  # News aggregation and sentiment analysis
+│   ├── events/                # Async event bus for real-time streaming
+│   ├── jobs/                  # Core pipeline: ingest, decide, execute, track, evaluate
+│   ├── strategies/            # Market making, portfolio optimization, quick flip
+│   └── utils/                 # Database, logging, prompts, risk helpers
+│
+├── scripts/                   # Utility and diagnostic scripts
+├── docs/                      # Additional documentation + paper dashboard HTML
+└── tests/                     # Pytest test suite
+```
+
+---
+
+## ⚙️ Configuration Reference
+
+All trading parameters live in `src/config/settings.py`:
 
 ```python
 # Position sizing
@@ -282,7 +296,7 @@ kelly_fraction         = 0.75    # Fractional Kelly multiplier
 # Market filtering
 min_volume             = 200     # Minimum contract volume
 max_time_to_expiry_days = 30     # Trade contracts up to 30 days out
-min_confidence_to_trade = 0.50   # Minimum ensemble confidence
+min_confidence_to_trade = 0.50   # Minimum ensemble confidence to enter
 
 # AI settings
 primary_model          = "grok-4"
@@ -294,160 +308,134 @@ max_daily_loss_pct     = 15.0    # Hard daily loss limit
 daily_ai_cost_limit    = 50.0    # Max daily AI API spend (USD)
 ```
 
-The ensemble configuration (model roster, weights, debate settings) is in
-`EnsembleConfig` within the same file.
+The ensemble configuration (model roster, weights, debate settings) lives in `EnsembleConfig` in the same file.
 
 ---
 
-## Performance
+## 📈 Performance Tracking
 
-Performance tracking is built in. The bot records every trade, AI decision, and
-cost metric to a local SQLite database (`trading_system.db`). Use the dashboard
-or the scripts in `scripts/` to review:
+Every trade, AI decision, and cost metric is recorded to `trading_system.db` (local SQLite). Use the dashboard or scripts in `scripts/` to review:
 
 - Cumulative P&L and win rate
 - Sharpe ratio and maximum drawdown
-- AI confidence calibration curves
+- AI confidence calibration
 - Cost per trade and daily API budget utilization
 - Per-strategy breakdowns (directional vs. market making)
 
 ---
 
-## Development
+## 🛠️ Development
 
 ### Running Tests
 
 ```bash
-# Run the full test suite
-python run_tests.py
-
-# Or use pytest directly
-pytest tests/
+pytest tests/          # full suite
+pytest tests/ -v       # verbose
+pytest --cov=src       # with coverage
 ```
 
 ### Code Quality
 
 ```bash
-# Format
 black src/ tests/ cli.py beast_mode_bot.py
 isort src/ tests/ cli.py beast_mode_bot.py
-
-# Type check
 mypy src/
 ```
 
 ### Adding a New Strategy
 
-1. Create a module in `src/strategies/`.
-2. Implement the strategy logic and wire it into `src/strategies/unified_trading_system.py`.
-3. Add allocation percentage in `src/config/settings.py`.
-4. Write tests in `tests/`.
+1. Create a module in `src/strategies/`
+2. Wire it into `src/strategies/unified_trading_system.py`
+3. Set allocation percentage in `src/config/settings.py`
+4. Add tests in `tests/`
 
 ---
 
-## Troubleshooting
+## 🔧 Troubleshooting
 
-### Bot Stuck in "Ingestion Mode" or Not Placing Live Trades
+<details>
+<summary><strong>Bot not placing live trades despite --live flag</strong></summary>
 
-**Problem**: Bot shows open positions incrementing in dashboard but no actual trades execute, even with `--live` flag.
+Check logs for the mode confirmation string:
 
-**Solution**: This typically indicates the bot is running in paper mode despite the `--live` flag. Check:
+```bash
+grep -i "live trading\|paper trading\|LIVE ORDER\|PAPER TRADE" logs/trading_system.log | tail -20
+```
 
-1. **Verify command usage**:
-   ```bash
-   python cli.py run --live  # Correct
-   python beast_mode_bot.py --live  # Also correct (direct script)
-   ```
+- `"LIVE TRADING MODE ENABLED"` → correct
+- `"Paper trading mode"` → still in paper mode; verify API key has TRADING permissions in [Kalshi Settings](https://kalshi.com/account/settings)
 
-2. **Check logs for mode confirmation**:
-   ```bash
-   # Look for these log messages:
-   # "LIVE TRADING MODE ENABLED - REAL MONEY WILL BE USED"  ← Good (live mode)
-   # "Paper trading mode - orders will be simulated"       ← Problem (paper mode)
-   
-   # Also look for order execution logs:
-   # "LIVE ORDER PLACED for [market]"     ← Good (live mode)  
-   # "PAPER TRADE SIMULATED for [market]" ← Problem (paper mode)
-   ```
+</details>
 
-3. **Verify API permissions**:
-   - Log into your Kalshi dashboard
-   - Check that your API key has **TRADING** permissions (not just read-only)
-   - Verify your API key hasn't expired
+<details>
+<summary><strong>Dashboard won't launch / import errors</strong></summary>
 
-4. **Check rate limiting**:
-   ```bash
-   grep "rate limit\|429" logs/trading_system.log
-   ```
+Import errors in VS Code are IDE linter warnings, not runtime errors.
 
-5. **Verify configuration**:
-   - Check `src/config/settings.py` has correct settings
-   - Ensure your `.env` file has valid `KALSHI_API_KEY`
+```bash
+# Fix: activate venv, then run from project root
+source .venv/bin/activate
+python beast_mode_dashboard.py
+```
 
-### Dashboard Won't Launch
+Set VS Code Python interpreter to `.venv/bin/python` via `Cmd+Shift+P → Python: Select Interpreter`.
 
-**Problem**: VS Code/IDE shows import errors like "Import aiosqlite could not be resolved".
+</details>
 
-**Solution**: These are IDE linter warnings, not runtime errors. To fix:
+<details>
+<summary><strong>Python 3.14 PyO3 compatibility error</strong></summary>
 
-1. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
+```bash
+# Quick fix
+export PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
+pip install -r requirements.txt
 
-2. **Set correct Python interpreter** in VS Code:
-   - Press `Cmd+Shift+P` (Mac) or `Ctrl+Shift+P` (Windows/Linux)
-   - Type "Python: Select Interpreter"
-   - Choose the interpreter from your virtual environment
+# Recommended: use Python 3.13
+pyenv install 3.13.1 && pyenv local 3.13.1
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-3. **Run from project root**:
-   ```bash
-   cd kalshi-ai-trading-bot
-   python beast_mode_dashboard.py
-   ```
-
-### Python 3.14 Compatibility Issues
-
-**Problem**: PyO3 error during `pip install`.
-
-**Solutions**:
-1. **Quick fix** (may be unstable):
-   ```bash
-   export PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
-   pip install -r requirements.txt
-   ```
-
-2. **Recommended** (use supported Python version):
-   ```bash
-   pyenv install 3.13.1
-   pyenv local 3.13.1
-   python -m venv venv
-   source venv/bin/activate
-   pip install -r requirements.txt
-   ```
+</details>
 
 ---
 
-## Contributing
+## 🤝 Contributing
 
-1. Fork the repository.
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for full guidelines.
+
+**Quick steps:**
+
+1. Fork the repository
 2. Create a feature branch: `git checkout -b feature/your-feature`
-3. Commit your changes with a descriptive message.
-4. Push and open a Pull Request.
+3. Make changes, add tests, run `pytest` and `black`
+4. Commit with [conventional commit](https://www.conventionalcommits.org/) format: `feat: add new model weight config`
+5. Open a Pull Request
 
-Please follow the existing code style (Black, isort) and add tests for new
-functionality.
-
----
-
-## License
-
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for
-details.
+**Good first issues:** look for the [`good first issue`](https://github.com/ryanfrigo/kalshi-ai-trading-bot/issues?q=label%3A%22good+first+issue%22) label.
 
 ---
 
-**Disclaimer**: This software is for educational and research purposes. Trading
-involves risk, and you should only trade with capital you can afford to lose.
-The authors are not responsible for any financial losses incurred through the use
-of this software.
+## 📚 Resources
+
+- [Kalshi Trading API Docs](https://trading-api.readme.io/reference/getting-started)
+- [Kalshi API Authentication](https://trading-api.readme.io/reference/authentication)
+- [Kalshi Markets Overview](https://kalshi.com/markets)
+- [OpenRouter Model Catalog](https://openrouter.ai/models)
+- [xAI API (Grok)](https://console.x.ai/)
+
+---
+
+## 📄 License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+
+---
+
+<div align="center">
+
+**If this project is useful to you, consider giving it a ⭐**
+
+Made with ❤️ for the Kalshi trading community
+
+</div>
