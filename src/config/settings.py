@@ -30,11 +30,11 @@ class EnsembleConfig:
     enabled: bool = True
     # Model roster for ensemble decisions
     models: Dict[str, Dict] = field(default_factory=lambda: {
-        "grok-4-1-fast-reasoning": {"provider": "xai", "role": "forecaster", "weight": 0.30},
-        "anthropic/claude-sonnet-4.5": {"provider": "openrouter", "role": "news_analyst", "weight": 0.20},
-        "openai/o3": {"provider": "openrouter", "role": "bull_researcher", "weight": 0.20},
-        "google/gemini-3-pro-preview": {"provider": "openrouter", "role": "bear_researcher", "weight": 0.15},
-        "deepseek/deepseek-v3.2": {"provider": "openrouter", "role": "risk_manager", "weight": 0.15},
+        "grok-4.20-beta-0309-reasoning": {"provider": "xai", "role": "forecaster", "weight": 0.30},
+        "anthropic/claude-sonnet-4.6": {"provider": "openrouter", "role": "news_analyst", "weight": 0.20},
+        "openai/gpt-5.2": {"provider": "openrouter", "role": "bull_researcher", "weight": 0.20},
+        "google/gemini-3.1-pro-preview": {"provider": "openrouter", "role": "bear_researcher", "weight": 0.15},
+        "deepseek/deepseek-r1-0528": {"provider": "openrouter", "role": "risk_manager", "weight": 0.15},
     })
     min_models_for_consensus: int = 3
     disagreement_threshold: float = 0.25  # Std dev above this = low confidence
@@ -54,7 +54,7 @@ class SentimentConfig:
         "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml",
         "https://feeds.bbci.co.uk/news/business/rss.xml",
     ])
-    sentiment_model: str = "google/gemini-3-flash-preview"  # Fast/cheap for sentiment
+    sentiment_model: str = "google/gemini-3.1-flash-lite-preview"  # Fast/cheap for sentiment ($0.25/M)
     cache_ttl_minutes: int = 30
     max_articles_per_source: int = 10
     relevance_threshold: float = 0.3
@@ -79,8 +79,8 @@ class TradingConfig:
     scan_interval_seconds: int = 30      # DECREASED: Scan more frequently (was 60, now 30)
     
     # AI model configuration
-    primary_model: str = "grok-4-1-fast-reasoning"  # Latest xAI frontier reasoning model
-    fallback_model: str = "grok-4-1-fast-non-reasoning"  # Fallback to non-reasoning variant
+    primary_model: str = "grok-4.20-beta-0309-reasoning"  # Latest xAI frontier reasoning model (March 2026)
+    fallback_model: str = "grok-4-1-fast-non-reasoning"  # Fallback to fast non-reasoning variant
     ai_temperature: float = 0  # Lower temperature for more consistent JSON output
     ai_max_tokens: int = 8000    # Reasonable limit for reasoning models (grok-4 works better with 8000)
     
