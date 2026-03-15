@@ -78,7 +78,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     cfg.max_drawdown = 0.15
     cfg.max_sector_exposure = 0.30
 
-    bot = BeastModeBot(live_mode=live_mode, disciplined=True)
+    bot = BeastModeBot(live_mode=live_mode)
     try:
         asyncio.run(bot.run())
     except KeyboardInterrupt:
@@ -152,44 +152,54 @@ def cmd_status(args: argparse.Namespace) -> None:
             balance_cents = balance_resp.get("balance", 0)
             balance_usd = balance_cents / 100.0
 
-            # Fetch positions
+            # Fetch positions — Kalshi API v2 returns event_positions and market_positions
+            portfolio_value_cents = balance_resp.get("portfolio_value", 0)
+            portfolio_value_usd = portfolio_value_cents / 100.0
+
             positions_resp = await client.get_positions()
-            positions = positions_resp.get("market_positions", [])
+            event_positions = positions_resp.get("event_positions", [])
+            active_positions = [
+                p for p in event_positions
+                if float(p.get("event_exposure_dollars", "0")) > 0
+            ]
 
             # Display
             print("=" * 56)
             print("  PORTFOLIO STATUS")
             print("=" * 56)
-            print(f"  Available Balance:  ${balance_usd:>10,.2f}")
-            print(f"  Open Positions:     {len(positions):>10}")
+            print(f"  Available Cash:     ${balance_usd:>10,.2f}")
+            print(f"  Position Value:     ${portfolio_value_usd:>10,.2f}")
+            print(f"  Total Portfolio:    ${balance_usd + portfolio_value_usd:>10,.2f}")
+            print(f"  Active Positions:   {len(active_positions):>10}")
 
-            total_cost = 0.0
-            total_market_value = 0.0
+            total_exposure = 0.0
+            total_realized_pnl = 0.0
+            total_fees = 0.0
 
-            if positions:
+            if active_positions:
                 print()
-                print(f"  {'Ticker':<20} {'Side':<6} {'Qty':>5} {'Avg':>7} {'Value':>9}")
-                print(f"  {'-'*20} {'-'*6} {'-'*5} {'-'*7} {'-'*9}")
+                print(f"  {'Event':<30} {'Exposure':>10} {'Cost':>10} {'P&L':>10} {'Fees':>8}")
+                print(f"  {'-'*30} {'-'*10} {'-'*10} {'-'*10} {'-'*8}")
 
-                for pos in positions:
-                    ticker = pos.get("ticker", "???")
-                    # Kalshi positions may use different field names
-                    side = "YES" if pos.get("position", 0) > 0 else "NO"
-                    qty = abs(pos.get("position", pos.get("total_traded", 0)))
-                    avg_price = pos.get("average_price", 0)
-                    if isinstance(avg_price, (int, float)) and avg_price > 1:
-                        avg_price = avg_price / 100.0  # convert cents to dollars
-                    market_value = qty * avg_price
-                    total_cost += market_value
-                    total_market_value += market_value
+                for pos in active_positions:
+                    ticker = pos.get("event_ticker", "???")
+                    exposure = float(pos.get("event_exposure_dollars", "0"))
+                    cost = float(pos.get("total_cost_dollars", "0"))
+                    pnl = float(pos.get("realized_pnl_dollars", "0"))
+                    fees = float(pos.get("fees_paid_dollars", "0"))
+                    total_exposure += exposure
+                    total_realized_pnl += pnl
+                    total_fees += fees
                     print(
-                        f"  {ticker:<20} {side:<6} {qty:>5} "
-                        f"${avg_price:>5.2f} ${market_value:>7.2f}"
+                        f"  {ticker:<30} ${exposure:>8.2f} ${cost:>8.2f} "
+                        f"${pnl:>8.2f} ${fees:>6.2f}"
                     )
 
-            print()
-            print(f"  Position Cost:      ${total_cost:>10,.2f}")
-            print(f"  Total Portfolio:    ${balance_usd + total_cost:>10,.2f}")
+                print()
+                print(f"  Total Exposure:     ${total_exposure:>10,.2f}")
+                print(f"  Total Realized P&L: ${total_realized_pnl:>10,.2f}")
+                print(f"  Total Fees Paid:    ${total_fees:>10,.2f}")
+
             print("=" * 56)
         finally:
             await client.close()

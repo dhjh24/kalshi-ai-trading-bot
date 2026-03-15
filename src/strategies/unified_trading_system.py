@@ -163,30 +163,20 @@ class UnifiedAdvancedTradingSystem:
             available_cash = balance_response.get('balance', 0) / 100  # Convert cents to dollars
 
             # Get current positions to calculate total portfolio value
-            positions_response = await self.kalshi_client.get_positions()
-            positions = positions_response.get('positions', []) if isinstance(positions_response, dict) else []
-            total_position_value = 0
+            # Kalshi API v2 returns portfolio_value in balance response (in cents)
+            total_position_value = balance_response.get('portfolio_value', 0) / 100  # Convert cents to dollars
 
-            if positions:
-                for position in positions:
-                    if not isinstance(position, dict):
-                        continue  # Skip non-dict positions
-                    quantity = position.get('quantity', 0)
-                    # Get current market price for this position
-                    market_id = position.get('market_id')
-                    if market_id and quantity != 0:
-                        try:
-                            market_data = await self.kalshi_client.get_market(market_id)
-                            market_info = market_data.get('market', {})
-                            if position.get('side') == 'yes':
-                                current_price = market_info.get('yes_price', 50) / 100
-                            else:
-                                current_price = market_info.get('no_price', 50) / 100
-                            position_value = abs(quantity) * current_price
-                            total_position_value += position_value
-                        except:
-                            # If we can't get market data, estimate at entry price
-                            total_position_value += abs(quantity) * 0.50  # Conservative 50¢ estimate
+            # Also log active positions for visibility
+            positions_response = await self.kalshi_client.get_positions()
+            event_positions = positions_response.get('event_positions', []) if isinstance(positions_response, dict) else []
+            active_positions = [p for p in event_positions if float(p.get('event_exposure_dollars', '0')) > 0]
+            if active_positions:
+                self.logger.info(f"📊 Active positions: {len(active_positions)}")
+                for pos in active_positions:
+                    ticker = pos.get('event_ticker', '?')
+                    exposure = float(pos.get('event_exposure_dollars', '0'))
+                    pnl = float(pos.get('realized_pnl_dollars', '0'))
+                    self.logger.info(f"  📌 {ticker}: exposure=${exposure:.2f}, realized_pnl=${pnl:.2f}")
 
             # Total portfolio value is the basis for all allocations
             total_portfolio_value = available_cash + total_position_value
