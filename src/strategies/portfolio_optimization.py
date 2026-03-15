@@ -1132,7 +1132,7 @@ async def _evaluate_immediate_trade(
             entry_price=entry_price,
             live=False,  # Will be set to True ONLY after successful execution
             timestamp=datetime.now(),
-            rationale=f"IMMEDIATE TRADE: Edge={opportunity.edge:.1%}, Conf={opportunity.confidence:.1%}, Kelly={kelly_fraction:.1%}, Stop={exit_levels['stop_loss_pct']}%",
+            rationale=f"IMMEDIATE TRADE: Edge={opportunity.edge_percentage:.1%} ({opportunity.recommended_side}), Conf={opportunity.confidence:.1%}, Kelly={kelly_fraction:.1%}, Stop={exit_levels['stop_loss_pct']}%",
             strategy="immediate_portfolio_optimization",
             
             # Enhanced exit strategy using Grok4 recommendations
