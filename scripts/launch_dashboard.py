@@ -46,10 +46,14 @@ def launch_dashboard():
     print("🚀 Trading System Dashboard Launcher")
     print("=" * 50)
     
-    # Check if we're in the right directory
-    dashboard_path = Path("trading_dashboard.py")
+    # Look for trading_dashboard.py: first in the same directory as this script,
+    # then in the current working directory (for backwards compatibility).
+    script_dir = Path(__file__).resolve().parent
+    dashboard_path = script_dir / "trading_dashboard.py"
     if not dashboard_path.exists():
-        print("❌ Error: trading_dashboard.py not found in current directory")
+        dashboard_path = Path("trading_dashboard.py")
+    if not dashboard_path.exists():
+        print("❌ Error: trading_dashboard.py not found")
         print("💡 Make sure you're running this from the kalshi project root")
         return False
     
@@ -71,7 +75,7 @@ def launch_dashboard():
             "-m", 
             "streamlit", 
             "run", 
-            "trading_dashboard.py",
+            str(dashboard_path),
             "--server.address", "localhost",
             "--server.port", "8501",
             "--browser.gatherUsageStats", "false"
