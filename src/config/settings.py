@@ -60,23 +60,27 @@ class SentimentConfig:
     relevance_threshold: float = 0.3
 
 
-# Trading strategy configuration - INCREASED AGGRESSIVENESS
+# Trading strategy configuration — DISCIPLINED DEFAULTS (sane risk management)
+# Beast mode is still available via --beast flag, but NOT the default.
+# Discipline defaults based on live prediction market trading experience.
+# NCAAB NO-side: 74% WR, +10% ROI — ONLY profitable category.
+# Economic trades: -70% ROI, 78% of all losses.
 @dataclass
 class TradingConfig:
     """Trading strategy configuration."""
-    # Position sizing and risk management - MADE MORE AGGRESSIVE  
-    max_position_size_pct: float = 5.0  # INCREASED: Back to 5% per position (was 3%)
-    max_daily_loss_pct: float = 15.0    # INCREASED: Allow 15% daily loss (was 10%) 
-    max_positions: int = 15              # INCREASED: Allow 15 concurrent positions (was 10)
-    min_balance: float = 50.0           # REDUCED: Lower minimum to trade more (was 100)
+    # Position sizing and risk management — DISCIPLINED DEFAULTS
+    max_position_size_pct: float = 3.0  # SANE: 3% per position (was 5% "beast mode")
+    max_daily_loss_pct: float = 10.0    # SANE: 10% daily loss limit (was 15%)
+    max_positions: int = 10              # SANE: 10 concurrent positions (was 15)
+    min_balance: float = 100.0          # SANE: $100 minimum balance (was $50)
     
-    # Market filtering criteria - MUCH MORE PERMISSIVE
-    min_volume: float = 200.0            # DECREASED: Much lower volume requirement (was 500, now 200)
-    max_time_to_expiry_days: int = 30    # INCREASED: Allow longer timeframes (was 14, now 30)
+    # Market filtering criteria — DISCIPLINED
+    min_volume: float = 500.0           # SANE: Higher volume requirement (was 200 beast mode)
+    max_time_to_expiry_days: int = 14   # SANE: Shorter timeframes (was 30)
     
-    # AI decision making - MORE AGGRESSIVE THRESHOLDS
-    min_confidence_to_trade: float = 0.50   # DECREASED: Lower confidence barrier (was 0.65, now 0.50)
-    scan_interval_seconds: int = 30      # DECREASED: Scan more frequently (was 60, now 30)
+    # AI decision making — DISCIPLINED THRESHOLDS
+    min_confidence_to_trade: float = 0.65   # SANE: 65% confidence minimum (was 0.50 beast mode)
+    scan_interval_seconds: int = 60      # SANE: 60-second scan interval (was 30)
     
     # AI model configuration
     primary_model: str = "grok-4.20-beta-0309-reasoning"  # Latest xAI frontier reasoning model (March 2026)
@@ -88,10 +92,10 @@ class TradingConfig:
     default_position_size: float = 3.0  # REDUCED: Now using Kelly Criterion as primary method (was 5%, now 3%)
     position_size_multiplier: float = 1.0  # Multiplier for AI confidence
     
-    # Kelly Criterion settings (PRIMARY position sizing method) - MORE AGGRESSIVE
+    # Kelly Criterion settings (PRIMARY position sizing method) — DISCIPLINED
     use_kelly_criterion: bool = True        # Use Kelly Criterion for position sizing (PRIMARY METHOD)
-    kelly_fraction: float = 0.75            # INCREASED: More aggressive Kelly multiplier (was 0.5, now 0.75)
-    max_single_position: float = 0.05       # INCREASED: Higher position cap (was 0.03, now 5%)
+    kelly_fraction: float = 0.25            # SANE: Quarter-Kelly (was 0.75 beast mode — gambling)
+    max_single_position: float = 0.03       # SANE: 3% max position cap (was 0.05 beast mode)
     
     # Live trading mode control
     live_trading_enabled: bool = field(default_factory=lambda: os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true")
@@ -166,11 +170,12 @@ min_position_size: float = 5.0          # Minimum position size ($5 vs $10)
 max_opportunities_per_batch: int = 50   # Limit opportunities to prevent optimization issues
 
 # === RISK MANAGEMENT LIMITS ===
-# Portfolio-level risk constraints (EXTREMELY RELAXED FOR TESTING)
-max_volatility: float = 0.80            # Very high volatility allowed (80%)
-max_correlation: float = 0.95           # Very high correlation allowed (95%)
-max_drawdown: float = 0.50              # High drawdown tolerance (50%)
-max_sector_exposure: float = 0.90       # Very high sector concentration (90%)
+# Portfolio-level risk constraints — DISCIPLINED DEFAULTS
+# Conservative defaults based on live trading experience. Beast mode available via CLI flag.
+max_volatility: float = 0.40            # SANE: 40% volatility max (was 80%)
+max_correlation: float = 0.70           # SANE: 70% correlation max (was 95%)
+max_drawdown: float = 0.15              # SANE: 15% drawdown limit (was 50% — suicidal)
+max_sector_exposure: float = 0.30       # SANE: 30% sector concentration (was 90%)
 
 # === PERFORMANCE TARGETS ===
 # System performance objectives - MORE AGGRESSIVE FOR MORE TRADES

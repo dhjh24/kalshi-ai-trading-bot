@@ -22,6 +22,8 @@ Five frontier LLMs debate every trade. The system only enters when they agree.
 
 > ⚠️ **Disclaimer — This is experimental software for educational and research purposes only.** Trading involves substantial risk of loss. Only trade with capital you can afford to lose. Past performance does not guarantee future results. This software is not financial advice. The authors are not responsible for any financial losses incurred through the use of this software.
 
+> 📊 **Why Discipline Mode Exists** — Through extensive live trading on Kalshi across multiple strategies, we learned that trading without category enforcement and risk guardrails leads to significant losses. The most common mistakes: over-allocating to economic events (CPI, Fed decisions) with no real edge, and using aggressive position sizing. The consistently profitable edge we found was **NCAAB NO-side** trading (74% win rate, +10% ROI). This repo now ships with discipline systems enabled by default — category scoring, portfolio enforcement, and sane risk parameters.
+
 ---
 
 ## 🚀 Quick Start
@@ -38,8 +40,11 @@ python setup.py        # creates .venv, installs deps, checks config
 cp env.template .env   # then open .env and fill in KALSHI_API_KEY,
                        # XAI_API_KEY, and OPENROUTER_API_KEY
 
-# 3. Run in paper-trading mode (no real orders)
+# 3. Run in disciplined mode (default — category scoring + guardrails)
 python cli.py run --paper
+
+# Or run the safe compounder (NO-side edge-based, most conservative)
+python cli.py run --safe-compounder
 ```
 
 Then open the live dashboard in another terminal:
@@ -413,6 +418,169 @@ Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for full guide
 5. Open a Pull Request
 
 **Good first issues:** look for the [`good first issue`](https://github.com/ryanfrigo/kalshi-ai-trading-bot/issues?q=label%3A%22good+first+issue%22) label.
+
+---
+
+---
+
+## 🛡️ Trading Modes
+
+The bot now supports three distinct trading modes. **Disciplined is the default.**
+
+### 1. Disciplined Mode (DEFAULT) — `python cli.py run`
+
+The safe, category-aware mode. Runs the AI ensemble but with guardrails:
+
+```bash
+python cli.py run --paper        # Paper trading (safe, no real money)
+python cli.py run --live         # Live trading with discipline enforced
+python cli.py run --disciplined  # Explicit flag (same as default)
+```
+
+Settings enforced:
+- Max drawdown: **15%** (vs 50% in beast mode)
+- Min confidence: **65%** (vs 50% in beast mode)
+- Max position size: **3%** of portfolio
+- Max sector concentration: **30%**
+- Kelly fraction: **0.25** (quarter-Kelly)
+- Category scoring active — blocks categories with score < 30
+
+### 2. Safe Compounder — `python cli.py run --safe-compounder`
+
+The most conservative and historically validated strategy:
+
+```bash
+python cli.py run --safe-compounder           # Dry run (shows opportunities)
+python cli.py run --safe-compounder --live    # Live execution
+```
+
+Strategy rules:
+- **NO side ONLY** — never buys YES
+- YES last price must be ≤ 20¢ (near-certain NO outcome)
+- NO ask must be > 80¢
+- Edge (EV - price) must be > 5¢
+- Places resting maker orders at `lowest_ask - 1¢` (near-zero fees)
+- Max 10% of portfolio per position (half-Kelly sizing)
+- Skips all sports, entertainment, and "mention" markets
+
+This strategy is the closest thing to a pure edge play on Kalshi.
+
+### 3. Beast Mode — `python cli.py run --beast`
+
+> ⚠️ **Not recommended.** Aggressive settings with no category guardrails have historically led to significant losses in live prediction market trading.
+
+The original aggressive mode with minimal guardrails. Available for comparison/research:
+
+```bash
+python cli.py run --beast --paper  # Only run beast mode in paper trading
+```
+
+Aggressive settings:
+- Max drawdown: 50%
+- Min confidence: 50%
+- Max position: 5%
+- Sector cap: 90%
+- Kelly fraction: 0.75
+
+---
+
+## 📊 Category Scoring System
+
+The category scorer evaluates each Kalshi market category on a 0-100 scale and enforces allocation limits.
+
+### Scoring Formula
+
+| Factor | Weight | Description |
+|--------|--------|-------------|
+| ROI | 40% | Average return on investment across all trades |
+| Recent Trend | 25% | Direction of last 10 trades (recency-weighted) |
+| Sample Size | 20% | More data = more confidence in the score |
+| Win Rate | 15% | Percentage of winning trades |
+
+### Allocation Tiers
+
+| Score Range | Max Position Size | Status |
+|-------------|-------------------|--------|
+| 80-100 | 20% of portfolio | STRONG ✅ |
+| 60-79 | 10% of portfolio | GOOD 🟢 |
+| 40-59 | 5% of portfolio | WEAK 🟡 |
+| 20-39 | 2% of portfolio | POOR 🟠 |
+| 0-19 | 0% (blocked) | BLOCKED 🚫 |
+
+**Categories scoring below 30 are hard-blocked** — the bot will not enter any trade in those categories regardless of AI confidence.
+
+### Check Current Scores
+
+```bash
+python cli.py scores
+```
+
+Example output:
+```
+======================================================================
+  CATEGORY SCORES
+  Category           Score     WR      ROI  Trades   Alloc  Status
+  ------------------ ------ ------ -------- ------- ------ ----------
+  NCAAB               72.3   74%   +10.0%      50    10%   GOOD 🟢
+  NBA                 41.2   52%    +1.5%      28     5%   WEAK 🟡
+  POLITICS            31.0   48%    -8.0%      15     2%   MARGINAL 🔴
+  CPI                  8.4   25%   -65.0%      20     0%   BLOCKED 🚫
+  FED                 12.1   32%   -40.0%      25     0%   BLOCKED 🚫
+  ECON_MACRO          10.5   30%   -55.0%      40     0%   BLOCKED 🚫
+======================================================================
+```
+
+### Real Trading Data (Seeded)
+
+The scorer is pre-seeded with real historical data:
+- **NCAAB**: 74% win rate, +10% ROI → score ~72 → allowed at 10% allocation
+- **ECON/CPI**: 25% win rate, -65% ROI → score ~8 → **blocked**
+- **FED**: 32% win rate, -40% ROI → score ~12 → **blocked**
+
+---
+
+## 📈 Trade History & Analysis
+
+```bash
+python cli.py history           # Last 50 trades with category breakdown
+python cli.py history --limit 100  # Last 100 trades
+```
+
+---
+
+## 🧠 Lessons Learned
+
+After extensive live trading across multiple strategies, here's what the data taught:
+
+### 1. Category discipline > AI confidence
+
+The AI ensemble can be 80% confident on a CPI trade and still be wrong. Market-implied probabilities on economic releases are already efficient — there's no structural edge for a retail bot. The bot was trading these with the same aggression as sports markets where it had actual edge.
+
+**Fix:** Category scoring now hard-blocks economic markets until they prove a positive edge over ≥5 trades.
+
+### 2. Kelly fraction matters enormously
+
+A Kelly fraction of 0.75 sounds reasonable. It's not — it compounds losses catastrophically. At 0.75x Kelly with a 45% win rate, you can lose 80% of capital in a standard drawdown scenario.
+
+**Fix:** Default is now 0.25x Kelly (quarter-Kelly), which is more conservative than most professional traders use.
+
+### 3. Max drawdown must have teeth
+
+A 50% drawdown limit means you can lose half your money before the bot stops. That's not a limit — it's a suggestion. A 15% limit forces the bot to stop while you still have capital to analyze and adjust.
+
+**Fix:** 15% max drawdown, with the circuit breaker actually stopping trades (not just logging a warning).
+
+### 4. Sector concentration = correlated losses
+
+When 90% of capital is in economic categories and there's a Fed meeting, everything moves together. Correlated losses compound faster than diversified losses.
+
+**Fix:** 30% sector cap means no single category can dominate the portfolio.
+
+### 5. Consistency > frequency
+
+The bot was scanning every 30 seconds and trading everything it found. More trades with no edge = faster path to zero.
+
+**Fix:** 60-second scan interval. Trades only when confidence ≥ 65% AND category score ≥ 30.
 
 ---
 

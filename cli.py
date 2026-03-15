@@ -22,18 +22,18 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 def cmd_run(args: argparse.Namespace) -> None:
-    """Start the Beast Mode trading bot."""
+    """Start the trading bot (disciplined mode by default)."""
     from src.utils.logging_setup import setup_logging
-    from beast_mode_bot import BeastModeBot
 
     log_level = getattr(args, "log_level", "INFO")
     setup_logging(log_level=log_level)
 
     live = getattr(args, "live", False)
     paper = getattr(args, "paper", False)
+    beast = getattr(args, "beast", False)
+    disciplined = getattr(args, "disciplined", False)
+    safe_compounder = getattr(args, "safe_compounder", False)
 
-    # --paper explicitly forces paper mode; --live forces live mode.
-    # If neither is given, default is paper trading.
     if live and paper:
         print("Error: --live and --paper are mutually exclusive.")
         sys.exit(1)
@@ -41,14 +41,76 @@ def cmd_run(args: argparse.Namespace) -> None:
     live_mode = live and not paper
 
     if live_mode:
-        print("WARNING: LIVE TRADING MODE ENABLED")
-        print("This will use real money and place actual trades.")
+        print("⚠️  WARNING: LIVE TRADING MODE ENABLED")
+        print("   This will use real money and place actual trades.")
 
-    bot = BeastModeBot(live_mode=live_mode)
+    # --safe-compounder mode: edge-based NO-side only
+    if safe_compounder:
+        _run_safe_compounder(live_mode=live_mode)
+        return
+
+    # --beast mode: original aggressive settings (NOT default)
+    if beast:
+        print("⚠️  BEAST MODE: Aggressive settings enabled.")
+        print("   WARNING: Aggressive settings with no guardrails. Use at your own risk.")
+        from beast_mode_bot import BeastModeBot
+        bot = BeastModeBot(live_mode=live_mode)
+        try:
+            asyncio.run(bot.run())
+        except KeyboardInterrupt:
+            print("\nTrading bot stopped by user.")
+        return
+
+    # DEFAULT: disciplined mode (with or without --disciplined flag)
+    print("🛡️  DISCIPLINED MODE (default)")
+    print("   Category scoring + portfolio enforcement active.")
+    print("   Use --beast to run without guardrails (not recommended).")
+
+    from beast_mode_bot import BeastModeBot
+    from src.strategies.category_scorer import CategoryScorer
+    from src.strategies.portfolio_enforcer import PortfolioEnforcer
+
+    # Apply disciplined settings overrides
+    from src.config import settings as cfg
+    cfg.settings.trading.min_confidence_to_trade = 0.65
+    cfg.settings.trading.max_position_size_pct = 3.0
+    cfg.settings.trading.kelly_fraction = 0.25
+    cfg.max_drawdown = 0.15
+    cfg.max_sector_exposure = 0.30
+
+    bot = BeastModeBot(live_mode=live_mode, disciplined=True)
     try:
         asyncio.run(bot.run())
     except KeyboardInterrupt:
         print("\nTrading bot stopped by user.")
+
+
+def _run_safe_compounder(live_mode: bool = False) -> None:
+    """Run the Safe Compounder strategy."""
+    from src.clients.kalshi_client import KalshiClient
+    from src.strategies.safe_compounder import SafeCompounder
+
+    print("🔒 SAFE COMPOUNDER MODE")
+    print("   NO-side only | Edge-based | Near-certain outcomes")
+    if not live_mode:
+        print("   DRY RUN — no real orders will be placed")
+
+    async def _run():
+        client = KalshiClient()
+        try:
+            compounder = SafeCompounder(
+                client=client,
+                dry_run=not live_mode,
+            )
+            stats = await compounder.run()
+            return stats
+        finally:
+            await client.close()
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        print("\nSafe Compounder stopped by user.")
 
 
 def cmd_dashboard(args: argparse.Namespace) -> None:
@@ -136,6 +198,130 @@ def cmd_status(args: argparse.Namespace) -> None:
         asyncio.run(_status())
     except Exception as exc:
         print(f"Error fetching status: {exc}")
+        sys.exit(1)
+
+
+def cmd_scores(args: argparse.Namespace) -> None:
+    """Show current category scores from the scoring system."""
+
+    async def _scores():
+        from src.strategies.category_scorer import CategoryScorer
+        scorer = CategoryScorer()
+        await scorer.initialize()
+        scores = await scorer.get_all_scores()
+        print(scorer.format_scores_table(scores))
+        print()
+        print("  Key: Score < 30 = BLOCKED | Alloc = max portfolio % allowed")
+        print()
+
+    try:
+        asyncio.run(_scores())
+    except Exception as exc:
+        print(f"Error fetching scores: {exc}")
+        sys.exit(1)
+
+
+def cmd_history(args: argparse.Namespace) -> None:
+    """Show trade history with category breakdown."""
+    limit = getattr(args, "limit", 50)
+
+    async def _history():
+        import aiosqlite
+
+        db_path = Path(__file__).parent / "trading_system.db"
+        if not db_path.exists():
+            print("No trading database found.")
+            return
+
+        async with aiosqlite.connect(str(db_path)) as db:
+            db.row_factory = aiosqlite.Row
+
+            # Overall stats
+            cursor = await db.execute("""
+                SELECT
+                    COUNT(*) as total,
+                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
+                    SUM(pnl) as total_pnl,
+                    AVG(pnl) as avg_pnl
+                FROM trade_logs
+            """)
+            overview = await cursor.fetchone()
+
+            print("=" * 70)
+            print("  TRADE HISTORY")
+            print("=" * 70)
+            if overview and overview["total"]:
+                total = overview["total"]
+                wins = overview["wins"] or 0
+                pnl = overview["total_pnl"] or 0.0
+                print(f"  Total Trades:  {total}")
+                print(f"  Win Rate:      {wins/total*100:.1f}%")
+                print(f"  Total P&L:     ${pnl:.2f}")
+                print(f"  Avg per trade: ${(pnl/total):.2f}")
+            print()
+
+            # Category breakdown
+            cursor = await db.execute("""
+                SELECT
+                    strategy as category,
+                    COUNT(*) as trades,
+                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
+                    SUM(pnl) as total_pnl
+                FROM trade_logs
+                GROUP BY strategy
+                ORDER BY total_pnl DESC
+            """)
+            cats = await cursor.fetchall()
+
+            if cats:
+                print(f"  {'Category':<22} {'Trades':>7} {'WR':>6} {'P&L':>10}")
+                print(f"  {'-'*22} {'-'*7} {'-'*6} {'-'*10}")
+                for row in cats:
+                    cat = row["category"] or "unknown"
+                    t = row["trades"]
+                    w = row["wins"] or 0
+                    p = row["total_pnl"] or 0.0
+                    wr = f"{w/t*100:.0f}%" if t > 0 else "n/a"
+                    print(f"  {cat:<22} {t:>7} {wr:>6} ${p:>9.2f}")
+                print()
+
+            # Recent trades
+            cursor = await db.execute(f"""
+                SELECT market_id, side, entry_price, exit_price, quantity, pnl,
+                       entry_timestamp, strategy
+                FROM trade_logs
+                ORDER BY entry_timestamp DESC
+                LIMIT {limit}
+            """)
+            trades = await cursor.fetchall()
+
+            if trades:
+                print(f"  Recent {limit} trades:")
+                print(f"  {'Market':<28} {'Side':>4} {'Entry':>6} {'Exit':>6} {'Qty':>4} {'P&L':>8} {'Category'}")
+                print(f"  {'-'*28} {'-'*4} {'-'*6} {'-'*6} {'-'*4} {'-'*8} {'-'*12}")
+                for t in trades:
+                    ts = (t["entry_timestamp"] or "")[:10]
+                    cat = t["strategy"] or ""
+                    print(
+                        f"  {t['market_id'][:28]:<28} {t['side']:>4} "
+                        f"{t['entry_price']:>6.2f} {t['exit_price']:>6.2f} "
+                        f"{t['quantity']:>4} ${t['pnl']:>7.2f}  {cat}"
+                    )
+
+            # Blocked trades summary
+            cursor2 = await db.execute("""
+                SELECT COUNT(*) FROM blocked_trades
+            """)
+            r2 = await cursor2.fetchone()
+            if r2 and r2[0]:
+                print(f"\n  ⛔ {r2[0]} trades blocked by portfolio enforcer (use 'python cli.py health' for details)")
+
+            print("=" * 70)
+
+    try:
+        asyncio.run(_history())
+    except Exception as exc:
+        print(f"Error fetching history: {exc}")
         sys.exit(1)
 
 
@@ -261,11 +447,15 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
-            "  python cli.py run --paper        Start in paper-trading mode\n"
-            "  python cli.py run --live          Start in live-trading mode\n"
-            "  python cli.py dashboard           Open the monitoring dashboard\n"
-            "  python cli.py status              Check portfolio balance and positions\n"
-            "  python cli.py health              Verify all connections and config\n"
+            "  python cli.py run                      Start in disciplined mode (default, paper)\n"
+            "  python cli.py run --live               Disciplined mode with real capital\n"
+            "  python cli.py run --disciplined --live Explicit disciplined live trading\n"
+            "  python cli.py run --safe-compounder    NO-side edge-based strategy\n"
+            "  python cli.py run --beast              Beast mode (aggressive, not recommended)\n"
+            "  python cli.py scores                   Show category scores\n"
+            "  python cli.py history                  Show trade history + category breakdown\n"
+            "  python cli.py status                   Check portfolio balance and positions\n"
+            "  python cli.py health                   Verify all connections and config\n"
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -273,19 +463,41 @@ def build_parser() -> argparse.ArgumentParser:
     # --- run ---
     p_run = subparsers.add_parser(
         "run",
-        help="Start the trading bot",
-        description="Launch the Beast Mode trading bot with market making, directional trading, and portfolio optimization.",
+        help="Start the trading bot (disciplined mode by default)",
+        description=(
+            "Launch the trading bot. Default is disciplined mode with category scoring "
+            "and portfolio enforcement. Use --beast for aggressive mode (not recommended — "
+            "aggressive settings with no guardrails — not recommended)."
+        ),
     )
-    mode_group = p_run.add_mutually_exclusive_group()
-    mode_group.add_argument(
+    live_group = p_run.add_mutually_exclusive_group()
+    live_group.add_argument(
         "--live",
         action="store_true",
         help="Enable live trading with real capital (default: paper trading)",
     )
-    mode_group.add_argument(
+    live_group.add_argument(
         "--paper",
         action="store_true",
         help="Run in paper-trading mode (no real orders)",
+    )
+    strategy_group = p_run.add_mutually_exclusive_group()
+    strategy_group.add_argument(
+        "--disciplined",
+        action="store_true",
+        default=True,
+        help="Disciplined mode: category scoring + portfolio enforcement (DEFAULT)",
+    )
+    strategy_group.add_argument(
+        "--beast",
+        action="store_true",
+        help="Beast mode: aggressive settings, no guardrails (not recommended)",
+    )
+    strategy_group.add_argument(
+        "--safe-compounder",
+        action="store_true",
+        dest="safe_compounder",
+        help="Safe Compounder: NO-side only, edge-based, near-certain outcomes",
     )
     p_run.add_argument(
         "--log-level",
@@ -295,6 +507,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Set logging verbosity (default: INFO)",
     )
     p_run.set_defaults(func=cmd_run)
+
+    # --- scores ---
+    p_scores = subparsers.add_parser(
+        "scores",
+        help="Show current category scores",
+        description="Display all trading category scores, win rates, ROI, and allocation limits.",
+    )
+    p_scores.set_defaults(func=cmd_scores)
+
+    # --- history ---
+    p_history = subparsers.add_parser(
+        "history",
+        help="Show trade history with category breakdown",
+        description="Display closed trade history grouped by category, win rate, and P&L.",
+    )
+    p_history.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Number of recent trades to show (default: 50)",
+    )
+    p_history.set_defaults(func=cmd_history)
 
     # --- dashboard ---
     p_dash = subparsers.add_parser(
