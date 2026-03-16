@@ -59,7 +59,14 @@ async def scan_and_log():
 
     # 1. Ingest fresh market data
     try:
-        markets = await run_ingestion()
+        market_queue: asyncio.Queue = asyncio.Queue()
+        await run_ingestion(db, market_queue)
+
+        # Drain the queue to collect ingested markets
+        markets = []
+        while not market_queue.empty():
+            markets.append(market_queue.get_nowait())
+
         if not markets:
             logger.info("No markets returned from ingestion.")
             return 0
