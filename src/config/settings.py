@@ -78,8 +78,19 @@ class TradingConfig:
     min_volume: float = 500.0           # SANE: Higher volume requirement (was 200 beast mode)
     max_time_to_expiry_days: int = 14   # SANE: Shorter timeframes (was 30)
     
-    # AI decision making — DISCIPLINED THRESHOLDS
-    min_confidence_to_trade: float = 0.65   # SANE: 65% confidence minimum (was 0.50 beast mode)
+    # AI decision making — DATA-DRIVEN THRESHOLDS  
+    min_confidence_to_trade: float = 0.60   # OPTIMIZED: 60% confidence minimum (reduced from 65% due to zero-trade issue)
+                                           # Based on analysis: 65% was too conservative, bot finding 0 eligible markets
+                                           # NCAAB NO-side showed 74% WR at +10% ROI, suggesting value at lower thresholds
+    
+    # Category-specific confidence adjustments (applied as multipliers to base threshold)
+    category_confidence_adjustments: Dict[str, float] = field(default_factory=lambda: {
+        "sports": 0.90,      # Sports showed best performance (NCAAB 74% WR), lower threshold
+        "economics": 1.15,   # Economics showed -70% ROI, higher threshold required  
+        "politics": 1.05,    # Slight increase for political volatility
+        "default": 1.0       # Base multiplier for other categories
+    })
+    
     scan_interval_seconds: int = 60      # SANE: 60-second scan interval (was 30)
     
     # AI model configuration
