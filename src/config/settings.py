@@ -30,11 +30,11 @@ class EnsembleConfig:
     enabled: bool = True
     # Model roster for ensemble decisions
     models: Dict[str, Dict] = field(default_factory=lambda: {
-        "grok-4.20-beta-0309-reasoning": {"provider": "xai", "role": "forecaster", "weight": 0.30},
-        "anthropic/claude-sonnet-4.6": {"provider": "openrouter", "role": "news_analyst", "weight": 0.20},
-        "openai/gpt-5.2": {"provider": "openrouter", "role": "bull_researcher", "weight": 0.20},
-        "google/gemini-3.1-pro-preview": {"provider": "openrouter", "role": "bear_researcher", "weight": 0.15},
-        "deepseek/deepseek-r1-0528": {"provider": "openrouter", "role": "risk_manager", "weight": 0.15},
+        "grok-beta": {"provider": "xai", "role": "forecaster", "weight": 0.30},
+        "anthropic/claude-3.5-sonnet": {"provider": "openrouter", "role": "news_analyst", "weight": 0.20},
+        "openai/gpt-4o": {"provider": "openrouter", "role": "bull_researcher", "weight": 0.20},
+        "google/gemini-flash-1.5": {"provider": "openrouter", "role": "bear_researcher", "weight": 0.15},
+        "deepseek/deepseek-r1": {"provider": "openrouter", "role": "risk_manager", "weight": 0.15},
     })
     min_models_for_consensus: int = 3
     disagreement_threshold: float = 0.25  # Std dev above this = low confidence
@@ -94,7 +94,7 @@ class TradingConfig:
     scan_interval_seconds: int = 60      # SANE: 60-second scan interval (was 30)
     
     # AI model configuration
-    primary_model: str = "grok-4.20-beta-0309-reasoning"  # Latest xAI frontier reasoning model (March 2026)
+    primary_model: str = "grok-beta"  # xAI Grok model for forecasting
     fallback_model: str = "grok-4-1-fast-non-reasoning"  # Fallback to fast non-reasoning variant
     ai_temperature: float = 0  # Lower temperature for more consistent JSON output
     ai_max_tokens: int = 8000    # Reasonable limit for reasoning models (grok-4 works better with 8000)

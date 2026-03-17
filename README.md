@@ -63,7 +63,7 @@ python cli.py dashboard
 ## ✅ Features
 
 ### Multi-Model AI Ensemble
-- ✅ **Five frontier LLMs** collaborate on every decision — Grok-4, Claude Sonnet 4, GPT-4o, Gemini 2.5 Flash, DeepSeek R1
+- ✅ **Five frontier LLMs** collaborate on every decision — Grok-beta, Claude 3.5 Sonnet, GPT-4o, Gemini Flash 1.5, DeepSeek R1
 - ✅ **Role-based specialization** — each model plays a distinct analytical role (forecaster, bull, bear, risk manager, news analyst)
 - ✅ **Consensus gating** — positions are skipped when models diverge beyond a configurable confidence threshold
 - ✅ **Deterministic outputs** — temperature=0 for reproducible AI reasoning
@@ -103,7 +103,7 @@ The bot runs a four-stage pipeline on a continuous loop:
   INGEST               DECIDE (5-Model Ensemble)    EXECUTE       TRACK
  --------             ─────────────────────────    ---------    --------
                       ┌─────────────────────────┐
-  Kalshi    ────────► │  Grok-4  (Forecaster 30%)│
+  Kalshi    ────────► │  Grok-β  (Forecaster 30%)│
   REST API            ├─────────────────────────┤
                       │  Claude  (News Analyst 20%)│
   WebSocket ────────► ├─────────────────────────┤
@@ -125,10 +125,10 @@ Each of the five models analyzes the incoming data from its assigned perspective
 
 | Model | Role | Weight |
 |---|---|---|
-| Grok-4 (xAI) | Lead Forecaster | 30% |
-| Claude Sonnet 4 (OpenRouter) | News Analyst | 20% |
+| Grok-beta (xAI) | Lead Forecaster | 30% |
+| Claude 3.5 Sonnet (OpenRouter) | News Analyst | 20% |
 | GPT-4o (OpenRouter) | Bull Researcher | 20% |
-| Gemini 2.5 Flash (OpenRouter) | Bear Researcher | 15% |
+| Gemini Flash 1.5 (OpenRouter) | Bear Researcher | 15% |
 | DeepSeek R1 (OpenRouter) | Risk Manager | 15% |
 
 If the weighted confidence falls below `min_confidence_to_trade` (default: 0.50), the opportunity is skipped. If models disagree significantly, position size is automatically reduced.
