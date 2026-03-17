@@ -33,7 +33,7 @@ class LimitOrder:
     """Represents a limit order in the market making strategy."""
     market_id: str
     side: str  # "YES" or "NO"
-    price: float  # Price in cents (0-100)
+    price: float  # Price in dollars (0.00-1.00)
     quantity: int
     order_type: str = "limit"
     status: str = "pending"  # pending, placed, filled, cancelled
@@ -95,8 +95,8 @@ class AdvancedMarketMaker:
         self.logger = get_trading_logger("market_maker")
         
         # Market making parameters
-        self.min_spread = getattr(settings.trading, 'min_spread_for_making', 0.03)  # 3 cents minimum
-        self.max_spread = getattr(settings.trading, 'max_bid_ask_spread', 0.10)  # 10 cents maximum
+        self.min_spread = getattr(settings.trading, 'min_spread_for_making', 0.03)  # $0.03 minimum
+        self.max_spread = getattr(settings.trading, 'max_bid_ask_spread', 0.10)  # $0.10 maximum
         self.target_inventory = 0.0  # Neutral inventory target
         self.inventory_penalty = getattr(settings.trading, 'max_inventory_risk', 0.01)
         self.volatility_multiplier = 2.0  # Volatility adjustment factor
@@ -129,8 +129,15 @@ class AdvancedMarketMaker:
                 if not market_data:
                     continue
                     
-                current_yes_price = market_data.get('yes_price', 0) / 100
-                current_no_price = market_data.get('no_price', 0) / 100
+                # Handle both new and old field formats
+                current_yes_price = float(market_data.get('yes_bid_dollars', 0) or market_data.get('yes_price', 0) or 0)
+                current_no_price = float(market_data.get('no_bid_dollars', 0) or market_data.get('no_price', 0) or 0)
+                
+                # Convert cents to dollars if needed
+                if current_yes_price > 1.0:
+                    current_yes_price = current_yes_price / 100.0
+                if current_no_price > 1.0:
+                    current_no_price = current_no_price / 100.0
                 
                 # Skip if prices are extreme (hard to make markets) - relaxed thresholds
                 if current_yes_price < 0.02 or current_yes_price > 0.98:
@@ -432,8 +439,10 @@ class AdvancedMarketMaker:
                     order.placed_at = datetime.now()
                     order.order_id = response['order'].get('order_id', client_order_id)
                     
+                    # Convert cents back to dollars for display
+                    display_price = order.price / 100 if order.price > 1.0 else order.price
                     self.logger.info(
-                        f"✅ LIVE limit order placed: {order.side} {order.quantity} at {order.price:.1f}¢ "
+                        f"✅ LIVE limit order placed: {order.side} {order.quantity} at ${display_price:.2f} "
                         f"for market {order.market_id} (Order ID: {order.order_id})"
                     )
                 else:

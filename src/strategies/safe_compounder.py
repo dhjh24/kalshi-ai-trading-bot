@@ -56,10 +56,10 @@ SKIP_TITLE_PHRASES = [
     "mention", "say in", "speech mention", "address mention",
 ]
 
-# Thresholds
+# Thresholds (all in dollar format 0.00-1.00)
 MIN_VOLUME = 10
-MIN_NO_ASK = 80      # Lowest NO ask must be > 80¢
-MIN_EDGE = 5         # Edge (EV - price) must be > 5¢
+MIN_NO_ASK = 0.80      # Lowest NO ask must be > $0.80
+MIN_EDGE = 0.05        # Edge (EV - price) must be > $0.05
 MAX_POSITION_PCT = 0.10    # Max 10% of portfolio per position
 USE_KELLY = True
 MIN_CONFIDENCE = 0.4
@@ -74,42 +74,42 @@ def should_skip(ticker: str) -> bool:
     return any(upper.startswith(p.upper()) for p in SKIP_PREFIXES)
 
 
-def estimate_true_no_prob(yes_last: int, hours_to_expiry: float) -> int:
+def estimate_true_no_prob(yes_last: float, hours_to_expiry: float) -> float:
     """
     Estimate the true probability that NO wins.
-    Returns estimated true NO probability in cents (0-100).
+    Returns estimated true NO probability in dollars (0.00-1.00).
     """
-    base_prob = 100 - yes_last
+    base_prob = 1.0 - yes_last
 
     if hours_to_expiry <= 0:
         return base_prob
 
     if hours_to_expiry <= 24:
-        if yes_last <= 5:
-            return min(99, base_prob + 4)
-        elif yes_last <= 10:
-            return min(98, base_prob + 3)
-        elif yes_last <= 15:
-            return min(97, base_prob + 2)
+        if yes_last <= 0.05:
+            return min(0.99, base_prob + 0.04)
+        elif yes_last <= 0.10:
+            return min(0.98, base_prob + 0.03)
+        elif yes_last <= 0.15:
+            return min(0.97, base_prob + 0.02)
         else:
-            return min(96, base_prob + 1)
+            return min(0.96, base_prob + 0.01)
     elif hours_to_expiry <= 72:
-        if yes_last <= 5:
-            return min(99, base_prob + 3)
-        elif yes_last <= 10:
-            return min(97, base_prob + 2)
+        if yes_last <= 0.05:
+            return min(0.99, base_prob + 0.03)
+        elif yes_last <= 0.10:
+            return min(0.97, base_prob + 0.02)
         else:
-            return base_prob + 1
+            return base_prob + 0.01
     elif hours_to_expiry <= 168:
-        if yes_last <= 5:
-            return min(98, base_prob + 2)
-        elif yes_last <= 10:
-            return min(96, base_prob + 1)
+        if yes_last <= 0.05:
+            return min(0.98, base_prob + 0.02)
+        elif yes_last <= 0.10:
+            return min(0.96, base_prob + 0.01)
         else:
             return base_prob
     else:
-        if yes_last <= 3:
-            return min(97, base_prob + 1)
+        if yes_last <= 0.03:
+            return min(0.97, base_prob + 0.01)
         return base_prob
 
 
@@ -126,19 +126,38 @@ def market_confidence_score(ticker: str, orderbook: dict, market: dict) -> Tuple
     """Return (confidence_score 0-1, reason_str) for a market."""
     reasons = []
 
-    no_side = orderbook.get("no", [])
-    yes_side = orderbook.get("yes", [])
+    # Handle both new and old orderbook formats
+    no_side = orderbook.get("no_dollars", orderbook.get("no", []))
+    yes_side = orderbook.get("yes_dollars", orderbook.get("yes", []))
 
     all_levels = []
-    for price, qty in yes_side:
-        all_levels.append((100 - price, qty))
-    for price, qty in no_side:
-        all_levels.append((price, qty))
+    for price_data, qty_data in yes_side:
+        try:
+            # Handle both old [price_cents, qty] and new [price_dollars_string, size_string]
+            price = float(price_data)
+            qty = int(qty_data)
+            # Convert cents to dollars if needed
+            if price > 1.0:
+                price = price / 100.0
+            all_levels.append((1.0 - price, qty))  # Convert YES to NO price in dollars
+        except (ValueError, TypeError):
+            continue
+    
+    for price_data, qty_data in no_side:
+        try:
+            price = float(price_data)
+            qty = int(qty_data)
+            # Convert cents to dollars if needed
+            if price > 1.0:
+                price = price / 100.0
+            all_levels.append((price, qty))
+        except (ValueError, TypeError):
+            continue
 
     if all_levels:
         best_ask = min(p for p, q in all_levels)
         total_vol = sum(q for _, q in all_levels)
-        vol_within_3c = sum(q for p, q in all_levels if p <= best_ask + 3)
+        vol_within_3c = sum(q for p, q in all_levels if p <= best_ask + 0.03)  # 3¢ = $0.03
         depth_ratio = vol_within_3c / max(total_vol, 1)
     else:
         depth_ratio = 0.0
@@ -146,12 +165,28 @@ def market_confidence_score(ticker: str, orderbook: dict, market: dict) -> Tuple
 
     best_no_ask = None
     if yes_side:
-        best_no_ask = 100 - max(p for p, q in yes_side)
-    best_no_bid = max((p for p, q in no_side), default=0) if no_side else 0
+        try:
+            highest_yes_bid = max(float(p) for p, q in yes_side)
+            # Convert cents to dollars if needed
+            if highest_yes_bid > 1.0:
+                highest_yes_bid = highest_yes_bid / 100.0
+            best_no_ask = 1.0 - highest_yes_bid
+        except (ValueError, TypeError):
+            pass
+    
+    best_no_bid = 0
+    if no_side:
+        try:
+            best_no_bid = max(float(p) for p, q in no_side)
+            # Convert cents to dollars if needed
+            if best_no_bid > 1.0:
+                best_no_bid = best_no_bid / 100.0
+        except (ValueError, TypeError):
+            pass
 
     if best_no_ask and best_no_bid > 0:
         spread = best_no_ask - best_no_bid
-        spread_pct = spread / max(best_no_ask, 1)
+        spread_pct = spread / max(best_no_ask, 0.01)
         spread_score = max(0, 1.0 - (spread_pct / 0.10))
         if spread_pct > 0.05:
             reasons.append("wide spread")
@@ -160,18 +195,23 @@ def market_confidence_score(ticker: str, orderbook: dict, market: dict) -> Tuple
         if not reasons:
             reasons.append("unclear spread")
 
-    volume = market.get("volume", 0)
+    volume = float(market.get("volume_fp", 0) or market.get("volume", 0) or 0)
     days_to_expiry = market.get("_days_to_expiry", 30)
     vol_per_day = volume / max(days_to_expiry, 1)
     volume_score = min(1.0, vol_per_day / 50.0)
     if vol_per_day < 10:
         reasons.append("thin volume")
 
-    yes_last = market.get("last_price", 50)
+    # Handle both new and old price formats
+    yes_last = float(market.get("last_price_dollars", 0) or market.get("last_price", 0) or 0)
+    # Convert old cent format to dollar format if needed
+    if yes_last > 1.0:
+        yes_last = yes_last / 100.0
+    
     if best_no_ask:
-        price_gap = abs(best_no_ask - (100 - yes_last))
-        stability_score = max(0, 1.0 - (price_gap / 15.0))
-        if price_gap > 8:
+        price_gap = abs(best_no_ask - (1.0 - yes_last))
+        stability_score = max(0, 1.0 - (price_gap / 0.15))  # 15¢ = $0.15
+        if price_gap > 0.08:  # 8¢ = $0.08
             reasons.append("price gap")
     else:
         stability_score = 0.3
@@ -234,7 +274,7 @@ class SafeCompounder:
         logger.info("SAFE COMPOUNDER v5 — EDGE-BASED NO-SIDE")
         logger.info(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         logger.info(
-            "Rules: NO only | ask > %d¢ | edge > %d¢ | max %.0f%%/position | maker orders",
+            "Rules: NO only | ask > $%.2f | edge > $%.2f | max %.0f%%/position | maker orders",
             self.min_no_ask, self.min_edge, self.max_position_pct * 100,
         )
         logger.info("=" * 70)
@@ -257,11 +297,11 @@ class SafeCompounder:
         print(f"  Fetched {len(markets)} markets", flush=True)
 
         # Step 2: Filter NO candidates
-        print("\n🔍 Step 2: Finding NO-side candidates (YES ≤ 20¢)...", flush=True)
+        print("\n🔍 Step 2: Finding NO-side candidates (YES ≤ $0.20)...", flush=True)
         candidates = self._find_no_candidates(markets)
 
         # Step 3: Orderbook + edge check
-        print(f"\n📊 Step 3: Checking orderbooks for edge ≥ {self.min_edge}¢...", flush=True)
+        print(f"\n📊 Step 3: Checking orderbooks for edge ≥ ${self.min_edge:.2f}...", flush=True)
         opportunities = await self._check_orderbook_and_price(candidates)
 
         # Display top opportunities
@@ -271,9 +311,9 @@ class SafeCompounder:
         print(f"\n📋 Top Opportunities:", flush=True)
         for opp in sorted_opps[:20]:
             print(
-                f"  NO ask:{opp['lowest_no_ask']}¢ → our:{opp['our_price']}¢ | "
-                f"EV:{opp['true_no_prob']}¢ edge:{opp['edge']}¢ | "
-                f"YES@{opp['yes_last']}¢ | {opp['roi_pct']:.1f}% "
+                f"  NO ask:${opp['lowest_no_ask']:.2f} → our:${opp['our_price']:.2f} | "
+                f"EV:${opp['true_no_prob']:.2f} edge:${opp['edge']:.2f} | "
+                f"YES@${opp['yes_last']:.2f} | {opp['roi_pct']:.1f}% "
                 f"({opp['annualized_roi']:.0f}%ann) | "
                 f"{opp['days_to_expiry']}d | vol:{opp['volume']} | {opp['ticker']}",
                 flush=True,
@@ -281,7 +321,7 @@ class SafeCompounder:
             print(f"    {opp['title']}", flush=True)
 
         # Step 4: Place orders
-        print(f"\n🚀 Step 4: Placing maker orders (ask - 1¢)...", flush=True)
+        print(f"\n🚀 Step 4: Placing maker orders (ask - $0.01)...", flush=True)
         stats = await self._place_resting_orders(sorted_opps, portfolio, cash)
 
         elapsed = time.time() - start
@@ -292,7 +332,7 @@ class SafeCompounder:
         print(f"{'='*70}", flush=True)
         print(f"  Markets scanned:      {len(markets)}", flush=True)
         print(f"  NO candidates:        {len(candidates)}", flush=True)
-        print(f"  With edge > {self.min_edge}¢:      {len(opportunities)}", flush=True)
+        print(f"  With edge > ${self.min_edge:.2f}:      {len(opportunities)}", flush=True)
         print(f"  Orders placed:        {stats['placed']}", flush=True)
         print(f"  Instantly filled:     {stats['filled']}", flush=True)
         print(f"  Skipped (existing):   {stats['skipped_existing']}", flush=True)
@@ -351,11 +391,14 @@ class SafeCompounder:
             if any(phrase in title_lower for phrase in SKIP_TITLE_PHRASES):
                 continue
 
-            if m.get("volume", 0) < MIN_VOLUME:
+            if int(float(m.get("volume_fp", 0) or m.get("volume", 0) or 0)) < MIN_VOLUME:
                 continue
 
-            yes_last = m.get("last_price", 50)
-            if yes_last > 20:
+            yes_last = float(m.get("last_price_dollars", 0) or m.get("last_price", 0) or 0)
+            # Convert old cent format to dollar format if needed
+            if yes_last > 1.0:
+                yes_last = yes_last / 100.0
+            if yes_last > 0.20:  # Only consider markets with YES ≤ $0.20
                 continue
 
             close_time = m.get("close_time", "")
@@ -379,7 +422,7 @@ class SafeCompounder:
                 "_days_to_expiry": round(hours_to_expiry / 24, 1),
             })
 
-        logger.info("Found %d NO-side candidates (YES last <= 20¢)", len(candidates))
+        logger.info("Found %d NO-side candidates (YES last <= $0.20)", len(candidates))
         return candidates
 
     async def _check_orderbook_and_price(self, candidates: List[Dict]) -> List[Dict]:
@@ -392,7 +435,8 @@ class SafeCompounder:
 
             try:
                 ob_resp = await self.client.get_orderbook(ticker, depth=10)
-                ob = ob_resp.get("orderbook", {})
+                # Handle both new and old orderbook formats
+                ob = ob_resp.get("orderbook_fp", ob_resp.get("orderbook", {}))
                 await asyncio.sleep(0.12)
             except Exception as e:
                 logger.debug("Orderbook fetch failed for %s: %s", ticker, e)
@@ -405,18 +449,33 @@ class SafeCompounder:
                 )
                 continue
 
-            yes_bids = ob.get("yes", [])
-            no_bids = ob.get("no", [])
+            # Handle both new and old orderbook formats
+            yes_bids = ob.get("yes_dollars", ob.get("yes", []))
+            no_bids = ob.get("no_dollars", ob.get("no", []))
 
             lowest_no_ask = None
             if yes_bids:
-                highest_yes_bid = max(b[0] for b in yes_bids)
-                lowest_no_ask = 100 - highest_yes_bid
+                try:
+                    highest_yes_bid = max(float(b[0]) for b in yes_bids)
+                    # Convert cents to dollars if needed
+                    if highest_yes_bid > 1.0:
+                        highest_yes_bid = highest_yes_bid / 100.0
+                    lowest_no_ask = 1.0 - highest_yes_bid
+                except (ValueError, TypeError):
+                    pass
 
-            best_no_bid = max((b[0] for b in no_bids), default=0) if no_bids else 0
+            best_no_bid = 0
+            if no_bids:
+                try:
+                    best_no_bid = max(float(b[0]) for b in no_bids)
+                    # Convert cents to dollars if needed
+                    if best_no_bid > 1.0:
+                        best_no_bid = best_no_bid / 100.0
+                except (ValueError, TypeError):
+                    pass
 
             if lowest_no_ask is None and best_no_bid > 0:
-                lowest_no_ask = best_no_bid + 2
+                lowest_no_ask = best_no_bid + 0.02  # 2¢ = $0.02
 
             if lowest_no_ask is None:
                 continue
@@ -428,20 +487,25 @@ class SafeCompounder:
             if edge < self.min_edge:
                 continue
 
-            our_price = lowest_no_ask - 1
+            our_price = lowest_no_ask - 0.01  # 1¢ = $0.01
             if our_price < self.min_no_ask:
                 continue
 
-            profit_per_contract = 100 - our_price
+            profit_per_contract = 1.0 - our_price
             roi_pct = profit_per_contract / our_price * 100
             days = m["_days_to_expiry"] if m["_days_to_expiry"] > 0 else 1
             annualized_roi = (profit_per_contract / our_price) * (365 / days) * 100
 
+            yes_last_val = float(m.get("last_price_dollars", 0) or m.get("last_price", 0) or 0)
+            # Convert cents to dollars if needed
+            if yes_last_val > 1.0:
+                yes_last_val = yes_last_val / 100.0
+            
             opportunities.append({
                 "ticker": ticker,
                 "title": m.get("title", "")[:70],
                 "side": "no",
-                "yes_last": m.get("last_price", 0),
+                "yes_last": yes_last_val,
                 "true_no_prob": true_no_prob,
                 "lowest_no_ask": lowest_no_ask,
                 "our_price": our_price,
@@ -449,7 +513,7 @@ class SafeCompounder:
                 "profit": profit_per_contract,
                 "roi_pct": roi_pct,
                 "annualized_roi": annualized_roi,
-                "volume": m.get("volume", 0),
+                "volume": int(float(m.get("volume_fp", 0) or m.get("volume", 0) or 0)),
                 "days_to_expiry": m["_days_to_expiry"],
                 "close_time": m.get("close_time", "")[:10],
                 "best_no_bid": best_no_bid,
@@ -462,7 +526,7 @@ class SafeCompounder:
                 )
 
         logger.info(
-            "%d opportunities with edge > %d¢", len(opportunities), self.min_edge
+            "%d opportunities with edge > $%.2f", len(opportunities), self.min_edge
         )
         return opportunities
 
@@ -518,20 +582,20 @@ class SafeCompounder:
                 continue
 
             price = opp["our_price"]
-            cost = contracts * price
-            profit = contracts * opp["profit"]
+            cost = contracts * price * 100  # Convert dollars to cents for cost calculation
+            profit = contracts * opp["profit"] * 100  # Convert dollars to cents for profit calculation
 
             if self.dry_run:
                 kelly_info = ""
                 if self.use_kelly:
-                    true_prob = opp["true_no_prob"] / 100
-                    odds = (100 - price) / price
+                    true_prob = opp["true_no_prob"]  # Already in 0-1 format
+                    odds = (1.0 - price) / price  # Dollar format
                     kf = kelly_fraction(true_prob, odds)
                     kelly_info = f" kelly:{kf:.1%}"
                 print(
-                    f"  🏷️ [DRY] NO x{contracts} @ {price}¢ | "
-                    f"ask:{opp['lowest_no_ask']}¢ EV:{opp['true_no_prob']}¢ "
-                    f"edge:{opp['edge']}¢ | "
+                    f"  🏷️ [DRY] NO x{contracts} @ ${price:.2f} | "
+                    f"ask:${opp['lowest_no_ask']:.2f} EV:${opp['true_no_prob']:.2f} "
+                    f"edge:${opp['edge']:.2f} | "
                     f"+${profit/100:.2f} ({opp['roi_pct']:.1f}% / {opp['annualized_roi']:.0f}%ann) | "
                     f"{opp['days_to_expiry']}d{kelly_info}",
                     flush=True,
@@ -543,12 +607,14 @@ class SafeCompounder:
                 continue
 
             try:
+                # Convert dollar price to cents for API call
+                price_cents = int(price * 100)
                 r = await self.client.place_order(
                     ticker=ticker,
                     side="no",
                     action="buy",
                     count=contracts,
-                    no_price=price,
+                    no_price=price_cents,
                 )
                 order = r.get("order", {})
                 status = order.get("status", "?")
@@ -557,14 +623,14 @@ class SafeCompounder:
                 if filled > 0:
                     stats["filled"] += filled
                     print(
-                        f"  🎯 FILLED NO x{filled}/{contracts} @ {price}¢ | "
-                        f"edge:{opp['edge']}¢ +${filled * opp['profit']/100:.2f} | {ticker}",
+                        f"  🎯 FILLED NO x{filled}/{contracts} @ ${price:.2f} | "
+                        f"edge:${opp['edge']:.2f} +${filled * opp['profit']/100:.2f} | {ticker}",
                         flush=True,
                     )
                 else:
                     print(
-                        f"  ✅ NO x{contracts} @ {price}¢ | {status} | "
-                        f"edge:{opp['edge']}¢ {opp['roi_pct']:.1f}% | {ticker}",
+                        f"  ✅ NO x{contracts} @ ${price:.2f} | {status} | "
+                        f"edge:${opp['edge']:.2f} {opp['roi_pct']:.1f}% | {ticker}",
                         flush=True,
                     )
 
@@ -584,11 +650,11 @@ class SafeCompounder:
     def _calculate_position_size(self, opp: Dict, portfolio: int, cash: int) -> int:
         """Size each position using Kelly or fixed fraction."""
         max_position_value = int(portfolio * self.max_position_pct)
-        price = opp["our_price"]
+        price = opp["our_price"]  # Already in dollar format
 
         if self.use_kelly:
-            true_prob = opp["true_no_prob"] / 100
-            odds = (100 - price) / price
+            true_prob = opp["true_no_prob"]  # Already in 0-1 format
+            odds = (1.0 - price) / price  # Dollar format
             kf = kelly_fraction(true_prob, odds)
             half_kelly_f = kf * 0.5
             kelly_position = int(portfolio * half_kelly_f)
@@ -596,7 +662,9 @@ class SafeCompounder:
         else:
             position_value = max_position_value
 
-        contracts = max(1, position_value // price)
+        # Convert price to cents for position calculation
+        price_cents = int(price * 100)
+        contracts = max(1, position_value // price_cents)
         contracts = min(contracts, 200)
         return contracts
 
@@ -610,8 +678,17 @@ class SafeCompounder:
             for o in yes_orders:
                 try:
                     await self.client.cancel_order(o["order_id"])
+                    yes_price = o.get('yes_price', 0)
+                    if isinstance(yes_price, (int, float)) and yes_price > 0:
+                        # Convert cents to dollars if needed for display
+                        if yes_price > 1.0:
+                            price_display = f"${yes_price/100:.2f}"
+                        else:
+                            price_display = f"${yes_price:.2f}"
+                    else:
+                        price_display = "?"
                     print(
-                        f"  🗑️ Cancelled YES: {o['ticker']} @ {o.get('yes_price', '?')}¢",
+                        f"  🗑️ Cancelled YES: {o['ticker']} @ {price_display}",
                         flush=True,
                     )
                     cancelled += 1
@@ -658,6 +735,11 @@ class SafeCompounder:
                 count = f.get("count", 0)
                 price = f.get("yes_price", f.get("no_price", 0))
                 created = f.get("created_time", "")[:16]
-                print(f"  {created} | {side} x{count} @ {price}¢ | {ticker}", flush=True)
+                # Convert cents to dollars if needed for display
+                if isinstance(price, (int, float)) and price > 1.0:
+                    price_display = f"${price/100:.2f}"
+                else:
+                    price_display = f"${price:.2f}" if isinstance(price, (int, float)) else f"{price}¢"
+                print(f"  {created} | {side} x{count} @ {price_display} | {ticker}", flush=True)
         except Exception:
             pass

@@ -35,8 +35,8 @@ class QuickFlipOpportunity:
     market_id: str
     market_title: str
     side: str  # "YES" or "NO"
-    entry_price: float  # Price to buy at (in cents)
-    exit_price: float   # Price to sell at (in cents)
+    entry_price: float  # Price to buy at (in dollars)
+    exit_price: float   # Price to sell at (in dollars)
     quantity: int
     expected_profit: float  # Profit per contract if successful
     confidence_score: float  # How confident we are this will work (0-1)
@@ -47,8 +47,8 @@ class QuickFlipOpportunity:
 @dataclass
 class QuickFlipConfig:
     """Configuration for quick flip strategy."""
-    min_entry_price: int = 1    # Minimum entry price in cents
-    max_entry_price: int = 20   # Maximum entry price in cents
+    min_entry_price: float = 0.01   # Minimum entry price in dollars
+    max_entry_price: float = 0.20   # Maximum entry price in dollars
     min_profit_margin: float = 1.0  # Minimum profit margin (100% = double)
     max_position_size: int = 100    # Maximum contracts per position
     max_concurrent_positions: int = 50  # Maximum simultaneous positions
@@ -105,8 +105,15 @@ class QuickFlipScalpingStrategy:
                     continue
                 
                 market_info = market_data.get('market', {})
-                yes_price = market_info.get('yes_ask', 0)
-                no_price = market_info.get('no_ask', 0)
+                # Handle both new and old field formats
+                yes_price = float(market_info.get('yes_ask_dollars', 0) or market_info.get('yes_ask', 0) or 0)
+                no_price = float(market_info.get('no_ask_dollars', 0) or market_info.get('no_ask', 0) or 0)
+                
+                # Convert cents to dollars if needed
+                if yes_price > 1.0:
+                    yes_price = yes_price / 100.0
+                if no_price > 1.0:
+                    no_price = no_price / 100.0
                 
                 # Check if prices are in our target range
                 yes_opportunity = await self._evaluate_price_opportunity(
@@ -150,7 +157,7 @@ class QuickFlipScalpingStrategy:
         self,
         market: Market,
         side: str,
-        current_price: int,
+        current_price: float,
         market_info: dict
     ) -> Optional[QuickFlipOpportunity]:
         """
@@ -166,8 +173,8 @@ class QuickFlipScalpingStrategy:
         # Calculate potential exit price (at least min profit margin)
         min_exit_price = current_price * (1 + self.config.min_profit_margin)
         
-        # Don't target prices above 95¢ (too close to ceiling)
-        if min_exit_price > 95:
+        # Don't target prices above $0.95 (too close to ceiling)
+        if min_exit_price > 0.95:
             return None
         
         # Use AI to assess movement probability and suggest exit price
@@ -176,10 +183,10 @@ class QuickFlipScalpingStrategy:
         if movement_analysis['confidence'] < self.config.confidence_threshold:
             return None
         
-        # Calculate position size
+        # Calculate position size (current_price already in dollars)
         quantity = min(
             self.config.max_position_size,
-            int(self.config.capital_per_trade / (current_price / 100))
+            int(self.config.capital_per_trade / current_price)
         )
         
         if quantity < 1:
@@ -204,7 +211,7 @@ class QuickFlipScalpingStrategy:
         self, 
         market: Market, 
         side: str, 
-        current_price: int
+        current_price: float
     ) -> dict:
         """
         Use AI to analyze potential for quick price movement.
@@ -214,7 +221,7 @@ class QuickFlipScalpingStrategy:
             prompt = f"""
 QUICK SCALP ANALYSIS for {market.title}
 
-Current {side} price: {current_price}¢
+Current {side} price: ${current_price:.2f}
 Market closes: {datetime.fromtimestamp(market.expiration_ts).strftime('%Y-%m-%d %H:%M')}
 
 Analyze for IMMEDIATE (next 30 minutes) price movement potential:
@@ -225,7 +232,7 @@ Analyze for IMMEDIATE (next 30 minutes) price movement potential:
 4. Confidence level (0-1) for upward movement
 
 Respond with:
-TARGET_PRICE: [realistic price in cents]
+TARGET_PRICE: [realistic price in dollars, e.g. 0.15]
 CONFIDENCE: [0.0-1.0]
 REASON: [brief explanation]
 """
@@ -242,14 +249,14 @@ REASON: [brief explanation]
             if response is None:
                 self.logger.info(f"AI analysis unavailable for {market.market_id}, using conservative defaults")
                 return {
-                    'target_price': current_price + 2,  # Very conservative target
+                    'target_price': current_price + 0.02,  # Very conservative target ($0.02 increase)
                     'confidence': 0.2,  # Low confidence
                     'reason': "AI analysis unavailable due to API limits"
                 }
             
             # Parse response safely
             lines = response.strip().split('\n')
-            target_price = current_price * 2  # Default fallback
+            target_price = current_price + 0.05  # Default fallback ($0.05 increase)
             confidence = 0.5
             reason = "Default analysis"
             
@@ -267,8 +274,8 @@ REASON: [brief explanation]
                 elif 'REASON:' in line:
                     reason = line.split(':', 1)[1].strip()
             
-            # Ensure target price is reasonable
-            target_price = max(current_price + 1, min(target_price, 95))
+            # Ensure target price is reasonable (at least $0.01 increase, max $0.95)
+            target_price = max(current_price + 0.01, min(target_price, 0.95))
             
             return {
                 'target_price': target_price,
@@ -279,7 +286,7 @@ REASON: [brief explanation]
         except Exception as e:
             self.logger.error(f"Error in movement analysis: {e}")
             return {
-                'target_price': current_price * 2,
+                'target_price': current_price + 0.05,
                 'confidence': 0.3,
                 'reason': f"Analysis failed: {e}"
             }
@@ -339,11 +346,11 @@ REASON: [brief explanation]
                 market_id=opportunity.market_id,
                 side=opportunity.side,
                 quantity=opportunity.quantity,
-                entry_price=opportunity.entry_price / 100,  # Convert to dollars
+                entry_price=opportunity.entry_price,  # Already in dollars
                 live=False,  # Will be set to True after execution
                 timestamp=datetime.now(),
                 rationale=f"QUICK FLIP: {opportunity.movement_indicator} | "
-                         f"Target: {opportunity.entry_price}¢→{opportunity.exit_price}¢",
+                         f"Target: ${opportunity.entry_price:.2f}→${opportunity.exit_price:.2f}",
                 strategy="quick_flip_scalping"
             )
             
@@ -370,7 +377,7 @@ REASON: [brief explanation]
                 self.active_positions[opportunity.market_id] = position
                 self.logger.info(
                     f"✅ Quick flip entry: {opportunity.side} {opportunity.quantity} "
-                    f"at {opportunity.entry_price}¢ for {opportunity.market_id}"
+                    f"at ${opportunity.entry_price:.2f} for {opportunity.market_id}"
                 )
                 return True
             else:
@@ -412,7 +419,7 @@ REASON: [brief explanation]
                 
                 self.logger.info(
                     f"🎯 Sell order placed: {position.side} {position.quantity} "
-                    f"at {opportunity.exit_price}¢ for {opportunity.market_id}"
+                    f"at ${opportunity.exit_price:.2f} for {opportunity.market_id}"
                 )
                 return True
             else:

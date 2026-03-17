@@ -559,9 +559,14 @@ class OpenRouterClient(TradingLoggerMixin):
     ) -> str:
         """Build a concise trading-decision prompt."""
         title = market_data.get("title", "Unknown Market")
-        yes_price = (market_data.get("yes_bid", 0) + market_data.get("yes_ask", 100)) / 2
-        no_price = (market_data.get("no_bid", 0) + market_data.get("no_ask", 100)) / 2
-        volume = market_data.get("volume", 0)
+        # Support both new dollar-denominated and legacy cent-based API fields
+        if "yes_bid_dollars" in market_data:
+            yes_price = (float(market_data.get("yes_bid_dollars", 0) or 0) + float(market_data.get("yes_ask_dollars", 0) or 0)) / 2
+            no_price = (float(market_data.get("no_bid_dollars", 0) or 0) + float(market_data.get("no_ask_dollars", 0) or 0)) / 2
+        else:
+            yes_price = (market_data.get("yes_bid", 0) + market_data.get("yes_ask", 100)) / 2
+            no_price = (market_data.get("no_bid", 0) + market_data.get("no_ask", 100)) / 2
+        volume = int(float(market_data.get("volume_fp", 0) or market_data.get("volume", 0) or 0))
         days_to_expiry = market_data.get("days_to_expiry", "Unknown")
         rules = market_data.get("rules", "No specific rules provided")
 

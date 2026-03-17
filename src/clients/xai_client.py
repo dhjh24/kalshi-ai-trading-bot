@@ -663,9 +663,9 @@ Required format:
         prompt_params = {
             "ticker": market_data.get("ticker", "UNKNOWN"),
             "title": market_data.get("title", "Unknown Market"),
-            "yes_price": market_data.get("yes_bid", 0),
-            "no_price": market_data.get("no_bid", 0),
-            "volume": market_data.get("volume", 0),
+            "yes_price": float(market_data.get("yes_bid_dollars", 0) or market_data.get("yes_bid", 0) or 0),
+            "no_price": float(market_data.get("no_bid_dollars", 0) or market_data.get("no_bid", 0) or 0),
+            "volume": int(float(market_data.get("volume_fp", 0) or market_data.get("volume", 0) or 0)),
             "close_time": close_time,
             "days_to_expiry": days_to_expiry,
             "news_summary": news_summary[:1000],  # Limit news length

@@ -389,9 +389,9 @@ class UnifiedAdvancedTradingSystem:
             
             # Configure quick flip strategy for our capital allocation
             quick_flip_config = QuickFlipConfig(
-                min_entry_price=1,      # Start with 1¢ opportunities
-                max_entry_price=15,     # Up to 15¢ entries
-                min_profit_margin=1.0,  # 100% minimum return (1¢ → 2¢)
+                min_entry_price=0.01,   # Start with $0.01 opportunities
+                max_entry_price=0.15,   # Up to $0.15 entries
+                min_profit_margin=1.0,  # 100% minimum return ($0.01 → $0.02)
                 max_position_size=100,  # Max 100 contracts per position
                 max_concurrent_positions=min(25, int(self.quick_flip_capital / 20)),  # Scale with capital
                 capital_per_trade=min(50.0, self.quick_flip_capital / 10),  # Spread risk

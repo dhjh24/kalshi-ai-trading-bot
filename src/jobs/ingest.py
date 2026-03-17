@@ -28,18 +28,31 @@ async def process_and_queue_markets(
     markets_to_upsert = []
     for market_data in markets_data:
         # A simple approach is to take the average of bid and ask.
-        yes_price = (market_data.get("yes_bid", 0) + market_data.get("yes_ask", 0)) / 2
-        no_price = (market_data.get("no_bid", 0) + market_data.get("no_ask", 0)) / 2
+        # Kalshi API v2 uses dollar-denominated fields (yes_bid_dollars, yes_ask_dollars)
+        # These are already in dollars (e.g., 0.5000 = $0.50)
+        # Fall back to legacy cent-based fields (yes_bid, yes_ask) divided by 100
+        if "yes_bid_dollars" in market_data:
+            yes_bid = float(market_data.get("yes_bid_dollars", 0) or 0)
+            yes_ask = float(market_data.get("yes_ask_dollars", 0) or 0)
+            no_bid = float(market_data.get("no_bid_dollars", 0) or 0)
+            no_ask = float(market_data.get("no_ask_dollars", 0) or 0)
+            yes_price = (yes_bid + yes_ask) / 2
+            no_price = (no_bid + no_ask) / 2
+        else:
+            # Legacy API: values in cents (0-100)
+            yes_price = (market_data.get("yes_bid", 0) + market_data.get("yes_ask", 0)) / 2 / 100
+            no_price = (market_data.get("no_bid", 0) + market_data.get("no_ask", 0)) / 2 / 100
 
-        volume = int(market_data.get("volume", 0))
+        # Kalshi API v2 uses volume_fp (string/float) instead of volume (int)
+        volume = int(float(market_data.get("volume_fp", 0) or market_data.get("volume", 0) or 0))
 
         has_position = market_data["ticker"] in existing_position_market_ids
 
         market = Market(
             market_id=market_data["ticker"],
             title=market_data["title"],
-            yes_price=yes_price / 100,
-            no_price=no_price / 100,
+            yes_price=yes_price,
+            no_price=no_price,
             volume=volume,
             expiration_ts=int(
                 datetime.fromisoformat(
