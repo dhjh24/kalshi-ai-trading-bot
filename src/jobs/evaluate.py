@@ -101,6 +101,13 @@ async def analyze_ai_costs(db_manager: DatabaseManager) -> Dict:
     xai_requests_today = xai_tracker["request_count"] if xai_tracker else 0
     trading_paused = (xai_tracker["is_exhausted"] if xai_tracker else False)
 
+    # Guard against false-positive "paused" state: if no requests have been
+    # made today and cost is $0, the tracker cannot legitimately be exhausted
+    # (e.g. stale pickle, first-boot race condition). Clear the flag so the
+    # dashboard doesn't show "PAUSED — DAILY LIMIT REACHED" on a fresh day.
+    if trading_paused and xai_requests_today == 0 and xai_cost_today == 0.0:
+        trading_paused = False
+
     # Use the higher of DB cost vs. pickle cost (DB is authoritative going
     # forward; pickle is the fallback for backwards-compat).
     db_today_cost = daily_costs[today]['cost']
@@ -270,8 +277,11 @@ async def run_evaluation():
         budget_utilization = daily_cost / actual_limit if actual_limit else 0
         trading_paused = cost_analysis.get('trading_paused', False)
         
+        xai_requests_today = cost_analysis.get('xai_requests_today', 0)
         health_status = "🟢 HEALTHY"
-        if trading_paused:
+        # Only mark as paused when actual usage confirms the limit was reached.
+        # Avoid false-positive when 0 requests and $0 cost (stale pickle / fresh day).
+        if trading_paused and (daily_cost > 0 or xai_requests_today > 0):
             health_status = "🔴 PAUSED — DAILY LIMIT REACHED"
         elif budget_utilization > 0.9:
             health_status = "🔴 OVER BUDGET"

@@ -92,11 +92,14 @@ def generate_html(output_path: str = None) -> str:
   .neg {{ color: var(--red); }}
   .table-wrap {{ overflow-x: auto; }}
   a {{ color: var(--blue); text-decoration: none; }}
+  .mode-banner {{ background: #1c2a1c; border: 1px solid var(--green); border-radius: 8px;
+                   padding: .6rem 1rem; margin-bottom: 1rem; color: var(--green); font-size: .9rem; }}
   footer {{ margin-top: 2rem; text-align: center; color: #484f58; font-size: .8rem; }}
 </style>
 </head>
 <body>
 <h1>📊 Paper Trading Dashboard</h1>
+<div class="mode-banner">📝 PAPER MODE — All positions and P&amp;L are <strong>simulated</strong>. No real money is at risk.</div>
 <p class="subtitle">Kalshi AI Trading Bot — Signal tracker &amp; hypothetical P&amp;L · Updated {now}</p>
 
 <div class="stats">
