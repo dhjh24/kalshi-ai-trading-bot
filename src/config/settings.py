@@ -140,7 +140,10 @@ class TradingConfig:
     max_analyses_per_market_per_day: int = 4  # INCREASED: More analyses per day (was 2, now 4)
     
     # Daily AI spending limits - SAFETY CONTROLS
-    daily_ai_cost_limit: float = 50.0  # Maximum daily spending on AI API calls (USD)
+    # Default is $10/day — conservative limit to prevent runaway API spend.
+    # Raise via DAILY_AI_COST_LIMIT env var or by editing this value directly.
+    # e.g. export DAILY_AI_COST_LIMIT=25  (for more aggressive scanning)
+    daily_ai_cost_limit: float = field(default_factory=lambda: float(os.getenv("DAILY_AI_COST_LIMIT", "10.0")))
     enable_daily_cost_limiting: bool = True  # Enable daily cost limits
     sleep_when_limit_reached: bool = True  # Sleep until next day when limit reached
 

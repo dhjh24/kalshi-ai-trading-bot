@@ -78,7 +78,7 @@ python cli.py dashboard
 - ✅ **Hard daily loss limit** — stops trading at 15% drawdown
 - ✅ **Max drawdown circuit breaker** — halts at 50% portfolio drawdown
 - ✅ **Sector concentration cap** — no more than 90% in any single category
-- ✅ **Daily AI cost budget** — stops spending when API costs hit $50/day
+- ✅ **Daily AI cost budget** — stops spending when API costs hit the configurable daily limit (default: $10/day)
 
 ### Dynamic Exit Strategies
 - ✅ Trailing take-profit at 20% gain
@@ -310,8 +310,19 @@ ai_max_tokens          = 8000
 
 # Risk management
 max_daily_loss_pct     = 15.0    # Hard daily loss limit
-daily_ai_cost_limit    = 50.0    # Max daily AI API spend (USD)
+daily_ai_cost_limit    = 10.0    # Max daily AI API spend (USD) — default $10/day
 ```
+
+> **💸 Controlling AI spend (important for `movement_prediction` / xAI costs)**
+>
+> The bot checks daily spend limits **before every xAI API call** — including `search()` and all market analysis calls. Once the limit is reached, all AI calls are skipped until the next calendar day.
+>
+> Key knobs:
+> - `DAILY_AI_COST_LIMIT` env var (or `daily_ai_cost_limit` in `TradingConfig`) — max USD per day. **Default: $10.** Raise it only when you're comfortable with the spend. Example: `export DAILY_AI_COST_LIMIT=25`
+> - `scan_interval_seconds` — how often the bot scans markets. Lower = more AI calls per hour. Default: 60 seconds.
+> - `max_analyses_per_market_per_day` — cap on AI analyses per individual market per day. Default: 4.
+>
+> The `movement_prediction` strategy runs AI analysis on **every scan cycle** for all candidate markets. If you have many active markets and a short scan interval, costs add up fast. Reduce `scan_interval_seconds` (e.g. `120`) or lower `max_analyses_per_market_per_day` (e.g. `2`) to cut frequency.
 
 The ensemble configuration (model roster, weights, debate settings) lives in `EnsembleConfig` in the same file.
 

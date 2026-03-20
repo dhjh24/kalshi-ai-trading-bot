@@ -39,7 +39,7 @@ class DailyUsageTracker:
     date: str
     total_cost: float = 0.0
     request_count: int = 0
-    daily_limit: float = 50.0  # Default $50 daily limit
+    daily_limit: float = 10.0  # Default $10 daily limit (override via DAILY_AI_COST_LIMIT env var)
     is_exhausted: bool = False
     last_exhausted_time: Optional[datetime] = None
 
@@ -275,6 +275,16 @@ class XAIClient(TradingLoggerMixin):
         Implements intelligent query processing, caching, and fallbacks.
         """
         try:
+            # Check daily limits BEFORE making any API call
+            if not await self._check_daily_limits():
+                self.logger.info(
+                    "Daily AI cost limit reached — search skipped",
+                    query=query[:50],
+                    daily_cost=self.daily_tracker.total_cost,
+                    daily_limit=self.daily_tracker.daily_limit,
+                )
+                return self._get_fallback_context(query, max_length)
+
             # Process and optimize the search query
             optimized_query = self._optimize_search_query(query)
             
