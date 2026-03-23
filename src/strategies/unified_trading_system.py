@@ -595,7 +595,7 @@ class UnifiedAdvancedTradingSystem:
                     
                     # Execute the position
                     live_mode = getattr(settings.trading, 'live_trading_enabled', False)
-                    self.logger.info(f"🎛️ Trading mode check: live_mode={live_mode} for market {opportunity.ticker}")
+                    self.logger.info(f"🎛️ Trading mode check: live_mode={live_mode} for market {opportunity.market_id}")
                     
                     success = await execute_position(
                         position=position,
