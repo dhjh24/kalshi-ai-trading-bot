@@ -480,7 +480,7 @@ class SafeCompounder:
         
         # Sort by estimated edge potential: lowest YES price + highest volume + soonest expiry
         # Then cap to top 500 to keep orderbook checks under ~1 minute
-        MAX_ORDERBOOK_CHECKS = 500
+        MAX_ORDERBOOK_CHECKS = 200
         if len(candidates) > MAX_ORDERBOOK_CHECKS:
             candidates.sort(key=lambda c: (
                 -c["_true_no_prob"],  # Highest estimated NO probability first
@@ -505,7 +505,9 @@ class SafeCompounder:
                 ob_resp = await self.client.get_orderbook(ticker, depth=10)
                 # Handle both new and old orderbook formats
                 ob = ob_resp.get("orderbook_fp", ob_resp.get("orderbook", {}))
-                await asyncio.sleep(0.12)
+                # No extra sleep — client already has 0.5s rate limiter
+                if (i + 1) % 50 == 0:
+                    logger.info("Orderbook progress: %d/%d checked", i + 1, len(candidates))
             except Exception as e:
                 logger.debug("Orderbook fetch failed for %s: %s", ticker, e)
                 continue
