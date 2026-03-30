@@ -30,10 +30,10 @@ class EnsembleConfig:
     enabled: bool = True
     # Model roster for ensemble decisions
     models: Dict[str, Dict] = field(default_factory=lambda: {
-        "grok-3": {"provider": "xai", "role": "forecaster", "weight": 0.30},
-        "anthropic/claude-3.5-sonnet": {"provider": "openrouter", "role": "news_analyst", "weight": 0.20},
-        "openai/gpt-4o": {"provider": "openrouter", "role": "bull_researcher", "weight": 0.20},
-        "google/gemini-flash-1.5": {"provider": "openrouter", "role": "bear_researcher", "weight": 0.15},
+        "grok-4-1-fast-reasoning": {"provider": "xai", "role": "forecaster", "weight": 0.30},
+        "anthropic/claude-sonnet-4": {"provider": "openrouter", "role": "lead_analyst", "weight": 0.20},
+        "openai/gpt-4.1": {"provider": "openrouter", "role": "bull_researcher", "weight": 0.20},
+        "google/gemini-2.5-pro-preview": {"provider": "openrouter", "role": "bear_researcher", "weight": 0.15},
         "deepseek/deepseek-r1": {"provider": "openrouter", "role": "risk_manager", "weight": 0.15},
     })
     min_models_for_consensus: int = 3

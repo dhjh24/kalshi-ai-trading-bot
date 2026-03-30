@@ -61,9 +61,11 @@ def cmd_run(args: argparse.Namespace) -> None:
             print("\nTrading bot stopped by user.")
         return
 
-    # DEFAULT: disciplined mode (with or without --disciplined flag)
-    print("🛡️  DISCIPLINED MODE (default)")
-    print("   Category scoring + portfolio enforcement active.")
+    # DEFAULT: AI Ensemble mode (disciplined settings active)
+    print("🤖  AI ENSEMBLE MODE (default)")
+    print("   5-model ensemble: Grok 4.1 · Claude Sonnet 4 · GPT-4.1 · Gemini 2.5 Pro · DeepSeek R1")
+    print("   Category scoring + portfolio guardrails active.")
+    print("   Use --safe-compounder for conservative math-only mode.")
     print("   Use --beast to run without guardrails (not recommended).")
 
     from beast_mode_bot import BeastModeBot
@@ -457,10 +459,10 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
-            "  python cli.py run                      Start in disciplined mode (default, paper)\n"
-            "  python cli.py run --live               Disciplined mode with real capital\n"
-            "  python cli.py run --disciplined --live Explicit disciplined live trading\n"
-            "  python cli.py run --safe-compounder    NO-side edge-based strategy\n"
+            "  python cli.py run                      Start AI Ensemble mode (default, paper)\n"
+            "  python cli.py run --live               AI Ensemble with real capital\n"
+            "  python cli.py run --safe-compounder    Safe Compounder: conservative, math-only\n"
+            "  python cli.py run --safe-compounder --live  Safe Compounder live\n"
             "  python cli.py run --beast              Beast mode (aggressive, not recommended)\n"
             "  python cli.py scores                   Show category scores\n"
             "  python cli.py history                  Show trade history + category breakdown\n"
@@ -475,9 +477,11 @@ def build_parser() -> argparse.ArgumentParser:
         "run",
         help="Start the trading bot (disciplined mode by default)",
         description=(
-            "Launch the trading bot. Default is disciplined mode with category scoring "
-            "and portfolio enforcement. Use --beast for aggressive mode (not recommended — "
-            "aggressive settings with no guardrails — not recommended)."
+            "Launch the trading bot. Default is AI Ensemble mode: five frontier LLMs "
+            "(Grok 4.1, Claude Sonnet 4, GPT-4.1, Gemini 2.5 Pro, DeepSeek R1) debate "
+            "every trade with category scoring and portfolio guardrails. "
+            "Use --safe-compounder for conservative math-only mode. "
+            "Use --beast for aggressive mode without guardrails (not recommended)."
         ),
     )
     live_group = p_run.add_mutually_exclusive_group()

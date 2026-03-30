@@ -164,28 +164,83 @@ async def run_ingestion(
             else:
                 logger.warning(f"Could not find market with ticker: {market_ticker}")
         else:
-            logger.info("Fetching all active markets from Kalshi API with pagination.")
+            # Primary: fetch via events API (Kalshi migrated all tickers to KXMVE*,
+            # so /markets only returns parlay tickers. Real markets live under events.)
+            logger.info("Fetching markets via events API (with nested markets).")
+            seen_tickers = set()
             cursor = None
-            while True:
-                response = await kalshi_client.get_markets(limit=100, cursor=cursor)
-                markets_page = response.get("markets", [])
-
-                active_markets = [m for m in markets_page if m["status"] == "active"]
-                if active_markets:
-                    logger.info(
-                        f"Fetched {len(markets_page)} markets, {len(active_markets)} are active."
+            events_page = 0
+            try:
+                while True:
+                    params = {"status": "open", "limit": 100, "with_nested_markets": "true"}
+                    if cursor:
+                        params["cursor"] = cursor
+                    
+                    resp = await kalshi_client._make_authenticated_request(
+                        "GET", "/trade-api/v2/events", params=params
                     )
-                    await process_and_queue_markets(
-                        active_markets,
-                        db_manager,
-                        queue,
-                        existing_position_market_ids,
-                        logger,
-                    )
+                    events = resp.get("events", [])
+                    if not events:
+                        break
+                    
+                    batch = []
+                    for event in events:
+                        for m in event.get("markets", []):
+                            ticker = m.get("ticker", "")
+                            if ticker and ticker not in seen_tickers and m.get("status") == "active":
+                                seen_tickers.add(ticker)
+                                batch.append(m)
+                    
+                    if batch:
+                        logger.info(f"Fetched {len(batch)} active markets from events page {events_page}.")
+                        await process_and_queue_markets(
+                            batch,
+                            db_manager,
+                            queue,
+                            existing_position_market_ids,
+                            logger,
+                        )
+                    
+                    cursor = resp.get("cursor")
+                    if not cursor:
+                        break
+                    events_page += 1
+                    if events_page > 100:
+                        break
+                    
+                    await asyncio.sleep(0.1)
+            except Exception as events_err:
+                logger.warning(f"Events API failed, falling back to /markets: {events_err}")
+            
+            # Fallback: also check /markets for anything missed
+            if len(seen_tickers) < 100:
+                logger.info(f"Few markets from events ({len(seen_tickers)}), also fetching /markets.")
+                cursor = None
+                while True:
+                    response = await kalshi_client.get_markets(limit=100, cursor=cursor)
+                    markets_page = response.get("markets", [])
 
-                cursor = response.get("cursor")
-                if not cursor:
-                    break
+                    active_markets = [m for m in markets_page if m["status"] == "active" 
+                                     and m.get("ticker", "") not in seen_tickers]
+                    if active_markets:
+                        for m in active_markets:
+                            seen_tickers.add(m.get("ticker", ""))
+                        logger.info(
+                            f"Fetched {len(markets_page)} markets, {len(active_markets)} new active."
+                        )
+                        await process_and_queue_markets(
+                            active_markets,
+                            db_manager,
+                            queue,
+                            existing_position_market_ids,
+                            logger,
+                        )
+
+                    cursor = response.get("cursor")
+                    if not cursor:
+                        break
+            
+            logger.info(f"Total unique markets ingested: {len(seen_tickers)}")
 
     except Exception as e:
         logger.error(

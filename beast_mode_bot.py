@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 """
-Beast Mode Trading Bot 🚀
+Kalshi AI Trading Bot — Multi-Model AI Ensemble 🚀
 
-Main entry point for the Unified Advanced Trading System that orchestrates:
-- Market Making Strategy (40% allocation)
-- Directional Trading with Portfolio Optimization (50% allocation) 
-- Arbitrage Detection (10% allocation)
+Main entry point for the Unified Advanced Trading System.
+Five frontier LLMs debate every trade — positions only open when they agree.
 
-Features:
-- No time restrictions (trade any deadline)
-- Dynamic exit strategies
-- Kelly Criterion portfolio optimization
-- Real-time risk management
-- Market making for spread profits
+Ensemble roster (configured in src/config/settings.py):
+- Grok 4.1 (xAI)           — Forecaster           30%
+- Claude Sonnet 4 (OpenRouter) — Lead Analyst       20%
+- GPT-4.1 (OpenRouter)     — Bull Researcher        20%
+- Gemini 2.5 Pro (OpenRouter) — Bear Researcher     15%
+- DeepSeek R1 (OpenRouter) — Risk Manager           15%
 
 Usage:
-    python beast_mode_bot.py              # Paper trading mode
+    python beast_mode_bot.py              # Paper trading mode (default)
     python beast_mode_bot.py --live       # Live trading mode
     python beast_mode_bot.py --dashboard  # Live dashboard mode
+
+Recommended: use cli.py for the unified CLI interface.
+    python cli.py run                     # AI ensemble (default)
+    python cli.py run --safe-compounder   # Conservative math-only mode
 """
 
 import asyncio

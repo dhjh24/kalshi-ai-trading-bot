@@ -82,6 +82,10 @@ class XAIClient(TradingLoggerMixin):
         self.is_api_exhausted = False
         self.api_exhausted_until = None
         
+        # OpenRouter fallback (lazy-init on first xAI failure)
+        self._openrouter_client = None
+        self._openrouter_default_model = "anthropic/claude-sonnet-4"
+        
         self.logger.info(
             "xAI client initialized",
             primary_model=self.primary_model,
@@ -972,6 +976,43 @@ Required format:
             self.logger.error(f"Fallback model failed: {str(e)}")
             return None
 
+    def _get_openrouter_client(self):
+        """Lazy-init OpenRouter client for fallback."""
+        if self._openrouter_client is None:
+            try:
+                from src.clients.openrouter_client import OpenRouterClient
+                self._openrouter_client = OpenRouterClient(
+                    default_model=self._openrouter_default_model
+                )
+                self.logger.info("OpenRouter fallback client initialized")
+            except Exception as e:
+                self.logger.error(f"Failed to init OpenRouter fallback: {e}")
+        return self._openrouter_client
+
+    async def _openrouter_fallback(
+        self, prompt: str, max_tokens: Optional[int] = None, temperature: Optional[float] = None
+    ) -> Optional[str]:
+        """Fallback to OpenRouter when xAI is exhausted/failed."""
+        client = self._get_openrouter_client()
+        if client is None:
+            return None
+        try:
+            content, cost, _, _ = await client.get_completion(
+                prompt=prompt,
+                max_tokens=max_tokens or self.max_tokens,
+                temperature=temperature or 0.1,
+            )
+            if content:
+                self.logger.info(
+                    "OpenRouter fallback succeeded",
+                    model=client.default_model,
+                    cost=cost
+                )
+            return content
+        except Exception as e:
+            self.logger.error(f"OpenRouter fallback failed: {e}")
+            return None
+
     async def get_completion(
         self,
         prompt: str,
@@ -984,6 +1025,7 @@ Required format:
         """
         Get a simple completion from the AI model.
         Returns the raw response text or None if failed/exhausted.
+        Falls back to OpenRouter if xAI is exhausted or fails.
         """
         try:
             messages = [xai_user(prompt)]
@@ -996,12 +1038,16 @@ Required format:
             # Check if we got a None response (API exhausted or failed)
             if response_content is None:
                 self.logger.info(
-                    "AI completion skipped due to API limits or exhaustion",
+                    "xAI exhausted, trying OpenRouter fallback",
                     strategy=strategy,
                     query_type=query_type,
                     market_id=market_id
                 )
-                return None
+                # Fallback to OpenRouter
+                response_content = await self._openrouter_fallback(prompt, max_tokens, temperature)
+                if response_content is None:
+                    return None
+                cost = 0.0  # OpenRouter tracks its own costs
             
             # Log the query and response
             await self._log_query(
@@ -1016,8 +1062,10 @@ Required format:
             return response_content
                     
         except Exception as e:
-            self.logger.error(f"Error in get_completion: {e}")
-            return None
+            self.logger.error(f"xAI error, trying OpenRouter fallback: {e}")
+            # Try OpenRouter as last resort
+            result = await self._openrouter_fallback(prompt, max_tokens, temperature)
+            return result
 
     async def close(self) -> None:
         """No-op for xAI client as it doesn't require closing."""
