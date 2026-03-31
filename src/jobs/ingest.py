@@ -205,7 +205,11 @@ async def run_ingestion(
                     if not cursor:
                         break
                     events_page += 1
-                    if events_page > 100:
+                    # Cap at 20 pages (~2000 events, ~5000+ markets) to avoid
+                    # 16+ minute ingestion that blocks the trading cycle.
+                    # Most high-volume tradeable markets appear in the first pages.
+                    if events_page > 20:
+                        logger.info(f"Reached page limit (20), stopping ingestion with {len(seen_tickers)} markets.")
                         break
                     
                     await asyncio.sleep(0.1)

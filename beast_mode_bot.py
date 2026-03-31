@@ -127,10 +127,14 @@ class BeastModeBot:
             
             # Start market ingestion first
             self.logger.info("🔄 Starting market ingestion...")
-            ingestion_task = asyncio.create_task(self._run_market_ingestion(db_manager, kalshi_client))
+            # Run initial ingestion synchronously so trading cycles have data
+            self.logger.info("📥 Running initial market ingestion (this may take 1-2 minutes)...")
+            market_queue = asyncio.Queue()
+            await run_ingestion(db_manager, market_queue)
+            self.logger.info("✅ Initial market ingestion complete. Starting trading cycles.")
             
-            # Wait for initial market data ingestion
-            await asyncio.sleep(10)
+            # Then start background refresh loop
+            ingestion_task = asyncio.create_task(self._run_market_ingestion(db_manager, kalshi_client))
             
             # Run remaining background tasks
             self.logger.info("🚀 Starting trading and monitoring tasks...")
