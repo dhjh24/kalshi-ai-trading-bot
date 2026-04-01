@@ -282,7 +282,7 @@ kalshi-ai-trading-bot/
 │
 ├── src/
 │   ├── agents/                # Multi-model ensemble (lead analyst, bull/bear, risk, forecaster)
-│   ├── clients/               # API clients (Kalshi, xAI, OpenRouter, WebSocket, model router)
+│   ├── clients/               # API clients (Kalshi, OpenRouter, WebSocket, model router)
 │   ├── config/                # Settings and trading parameters
 │   ├── data/                  # News aggregation and sentiment analysis
 │   ├── events/                # Async event bus for real-time streaming
@@ -553,11 +553,10 @@ The Kalshi `/markets` endpoint now only returns parlay tickers (`KXMVE*`). Real 
 <details>
 <summary><strong>Model not found / API errors</strong></summary>
 
-Model names on OpenRouter and xAI change periodically. Update `EnsembleConfig.models` in `src/config/settings.py` with the current model identifiers:
-- xAI models: [console.x.ai](https://console.x.ai/)
+Model names on OpenRouter change periodically. Update `EnsembleConfig.models` in `src/config/settings.py` with the current model identifiers:
 - OpenRouter models: [openrouter.ai/models](https://openrouter.ai/models)
 
-You can also override the primary xAI model via environment variable: `export PRIMARY_MODEL=grok-4-1-fast-reasoning`
+You can also override the primary model via environment variable: `export PRIMARY_MODEL=anthropic/claude-sonnet-4.5`
 
 </details>
 
@@ -621,7 +620,7 @@ Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for full guide
 - [Kalshi API Authentication](https://trading-api.readme.io/reference/authentication)
 - [Kalshi Markets Overview](https://kalshi.com/markets)
 - [OpenRouter Model Catalog](https://openrouter.ai/models)
-- [xAI API (Grok)](https://console.x.ai/)
+- [OpenRouter](https://openrouter.ai/) (unified access to all models)
 
 ---
 
