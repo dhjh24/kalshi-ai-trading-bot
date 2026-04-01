@@ -117,11 +117,11 @@ class XAIClient(TradingLoggerMixin):
                     )
                 else:
                     # Always sync daily_limit from settings (user may have changed it)
-                    if tracker.daily_limit != daily_limit:
-                        tracker.daily_limit = daily_limit
-                        # Un-exhaust if new limit is higher than current cost
-                        if tracker.is_exhausted and tracker.total_cost < daily_limit:
-                            tracker.is_exhausted = False
+                    tracker.daily_limit = daily_limit
+                    # Un-exhaust if cost is below limit (handles stale is_exhausted
+                    # from previous bot runs, or limit increases)
+                    if tracker.is_exhausted and tracker.total_cost < daily_limit:
+                        tracker.is_exhausted = False
                 return tracker
         except Exception as e:
             self.logger.warning(f"Failed to load daily tracker: {e}")
