@@ -499,6 +499,44 @@ Any model listed at [openrouter.ai/models](https://openrouter.ai/models) works. 
 ## 🔧 Troubleshooting
 
 <details>
+<summary><strong>"no such table: positions" error on fresh install</strong></summary>
+
+The database file (`trading_system.db`) is not committed to the repo — it's created at runtime. On a fresh clone, if you run the dashboard or bot before the tables have been created, you'll see:
+
+```
+Error getting performance: no such table: positions
+```
+
+**Fix:** The bot now auto-initializes the database on startup. Just run it normally:
+
+```bash
+python cli.py run --paper
+# or
+python beast_mode_bot.py
+```
+
+If you want to initialize the database manually (e.g., to verify the schema before starting the bot):
+
+```bash
+python -m src.utils.database
+```
+
+This creates all required tables: `markets`, `positions`, `trade_logs`, `market_analyses`, `daily_cost_tracking`, `llm_queries`, and `analysis_reports`.
+
+</details>
+
+<details>
+<summary><strong>AdGuard (macOS) blocks dependency downloads during setup</strong></summary>
+
+If you have AdGuard running as a **system-level proxy** on macOS, `pip install` may time out while downloading packages during `python setup.py` or `pip install -r requirements.txt`.
+
+**Fix:** Temporarily disable AdGuard at the system level before running setup, then re-enable it after installation completes.
+
+Note: AdGuard running as a **browser extension only** (not system-level) does not affect pip and requires no action.
+
+</details>
+
+<details>
 <summary><strong>Bot not placing live trades despite --live flag</strong></summary>
 
 Check logs for the mode confirmation string:

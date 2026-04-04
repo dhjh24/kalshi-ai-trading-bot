@@ -55,6 +55,7 @@ async def scan_and_log():
 
     kalshi = KalshiClient()
     db = DatabaseManager()
+    await db.initialize()  # Ensure all tables exist before any DB operations
     xai = XAIClient(db_manager=db)
 
     # 1. Ingest fresh market data

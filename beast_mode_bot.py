@@ -91,6 +91,8 @@ class BeastModeBot:
         try:
             self.logger.info("🚀 Starting Beast Mode Dashboard Mode")
             dashboard = BeastModeDashboard()
+            # Initialize the database so all tables exist before the dashboard queries them
+            await dashboard.db_manager.initialize()
             await dashboard.show_live_dashboard()
         except KeyboardInterrupt:
             self.logger.info("👋 Dashboard mode stopped")

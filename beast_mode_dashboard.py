@@ -455,6 +455,8 @@ async def main():
     dashboard = BeastModeDashboard()
 
     try:
+        # Initialize the database first so all tables exist before any queries
+        await dashboard.db_manager.initialize()
         await dashboard.unified_system.async_initialize()
 
         if args.summary:

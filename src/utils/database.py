@@ -86,6 +86,11 @@ class DatabaseManager(TradingLoggerMixin):
 
     async def initialize(self) -> None:
         """Initialize database schema and run migrations."""
+        # Ensure the parent directory exists (e.g. data/ on a fresh clone)
+        import os
+        db_dir = os.path.dirname(os.path.abspath(self.db_path))
+        os.makedirs(db_dir, exist_ok=True)
+
         async with aiosqlite.connect(self.db_path) as db:
             await self._create_tables(db)
             await self._run_migrations(db)
@@ -1016,3 +1021,16 @@ class DatabaseManager(TradingLoggerMixin):
                 positions.append(position)
             
             return positions
+
+if __name__ == "__main__":
+    import asyncio
+    import os
+
+    async def _init():
+        db_path = os.getenv("DB_PATH", "trading_system.db")
+        manager = DatabaseManager(db_path=db_path)
+        await manager.initialize()
+        print(f"✅ Database initialized at {os.path.abspath(db_path)}")
+        print("   Tables: markets, positions, trade_logs, market_analyses, daily_cost_tracking, llm_queries, analysis_reports")
+
+    asyncio.run(_init())
