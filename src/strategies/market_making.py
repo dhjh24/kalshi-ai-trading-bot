@@ -480,9 +480,9 @@ class AdvancedMarketMaker:
                 temperature=0.1   # Lower for consistency
             )
             
-            # Check if AI response is None (API exhausted or failed)
+            # Check if AI response is None (provider unavailable or failed)
             if response is None:
-                self.logger.info(f"AI analysis unavailable for {market.market_id} due to API limits, using conservative defaults")
+                self.logger.info(f"AI analysis unavailable for {market.market_id}, using conservative defaults")
                 return {
                     'probability': 0.5,  # Neutral probability
                     'confidence': 0.2,   # Low confidence

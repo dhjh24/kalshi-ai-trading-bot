@@ -4,7 +4,7 @@ Kalshi AI Trading Bot — Multi-Model AI Ensemble 🚀
 
 Main entry point for the Unified Advanced Trading System.
 Five frontier LLMs debate every trade — positions only open when they agree.
-All models route through OpenRouter (single API key).
+Model access routes through the configured provider backend (OpenAI or OpenRouter).
 
 Ensemble roster (configured in src/config/settings.py):
 - Claude Sonnet 4.5 (OpenRouter) — Lead Analyst     30%
@@ -119,7 +119,8 @@ class BeastModeBot:
             # Initialize multi-model router — all models via OpenRouter
             self.model_router = ModelRouter(db_manager=db_manager)
             self.logger.info(
-                "ModelRouter initialized for multi-model ensemble (all via OpenRouter)",
+                "ModelRouter initialized for multi-model ensemble",
+                provider=settings.api.resolve_llm_provider(),
                 ensemble_enabled=settings.ensemble.enabled,
             )
             

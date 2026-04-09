@@ -114,6 +114,28 @@ class TestOpenRouterClient:
         expected = client._calculate_cost("x-ai/grok-4.1-fast", 100, 50)
         assert metadata.cost == pytest.approx(expected)
 
+    def test_build_request_kwargs_truncates_fallback_models_to_three(self):
+        """OpenRouter should never send more than 3 fallback models in one request."""
+        client = OpenRouterClient.__new__(OpenRouterClient)
+        client._logger = MagicMock()
+
+        kwargs = client._build_request_kwargs(
+            messages=[{"role": "user", "content": "hello"}],
+            model="anthropic/claude-sonnet-4.5",
+            fallback_models=[
+                "google/gemini-3.1-pro-preview",
+                "openai/gpt-5.4",
+                "deepseek/deepseek-v3.2",
+                "x-ai/grok-4.1-fast",
+            ],
+        )
+
+        assert kwargs["extra_body"]["models"] == [
+            "google/gemini-3.1-pro-preview",
+            "openai/gpt-5.4",
+            "deepseek/deepseek-v3.2",
+        ]
+
     @pytest.mark.asyncio
     async def test_get_completion_passes_openrouter_request_shape(self):
         """Request payload should include fallback models and OpenRouter-specific fields."""
@@ -248,6 +270,34 @@ class TestModelRouter:
         kwargs = openrouter_client.get_completion.await_args.kwargs
         assert kwargs["model"] == "openai/gpt-5.4"
         assert "deepseek/deepseek-v3.2" in kwargs["fallback_models"]
+
+    @pytest.mark.asyncio
+    async def test_router_uses_openai_client_when_provider_defaults_to_openai(self):
+        """OpenAI should be used as the active backend when selected in settings."""
+        from src.clients.model_router import ModelRouter
+
+        openai_client = MagicMock()
+        openai_client.get_completion = AsyncMock(return_value="ok")
+        openai_client.last_request_metadata = SimpleNamespace(
+            actual_model="openai/gpt-5.4"
+        )
+        openrouter_client = MagicMock()
+        openrouter_client.get_completion = AsyncMock(return_value="unexpected")
+
+        with patch("src.clients.model_router.settings") as mock_settings:
+            mock_settings.api.resolve_llm_provider.return_value = "openai"
+            mock_settings.trading.daily_ai_cost_limit = 50.0
+
+            router = ModelRouter(
+                openai_client=openai_client,
+                openrouter_client=openrouter_client,
+            )
+
+        result = await router.get_completion("hello", capability="reasoning")
+
+        assert result == "ok"
+        openai_client.get_completion.assert_awaited()
+        openrouter_client.get_completion.assert_not_awaited()
 
     def test_cost_summary_contains_provider_and_health(self):
         """Aggregate summaries should keep provider and health sections."""

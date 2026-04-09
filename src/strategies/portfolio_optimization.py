@@ -1245,9 +1245,9 @@ async def _get_fast_ai_prediction(
             temperature=0.1   # Low temperature for consistency
         )
         
-        # Check if AI response is None (API exhausted or failed)
+        # Check if AI response is None (provider unavailable or failed)
         if response_text is None:
-            logging.getLogger("portfolio_opportunities").info(f"AI analysis unavailable for {market.market_id} due to API limits")
+            logging.getLogger("portfolio_opportunities").info(f"AI analysis unavailable for {market.market_id}")
             return None, None
         
         # Parse JSON from the response text

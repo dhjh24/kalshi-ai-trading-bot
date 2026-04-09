@@ -199,7 +199,7 @@ REASON: [brief explanation]
                 return {
                     "target_price": min(0.95, current_price + 0.02),
                     "confidence": 0.2,
-                    "reason": "AI analysis unavailable due to API limits",
+                    "reason": "AI analysis unavailable",
                 }
 
             target_price = min(0.95, current_price + 0.05)

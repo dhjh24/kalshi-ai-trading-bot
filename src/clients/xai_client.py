@@ -56,7 +56,7 @@ class XAIClient(TradingLoggerMixin):
     """
     Compatibility shim that replaces the old xAI SDK client.
 
-    All completions are forwarded to OpenRouter.  The daily-cost-tracking
+    All completions are forwarded to the configured LLM provider.  The daily-cost-tracking
     interface (daily_tracker, _check_daily_limits, _update_daily_cost) is
     preserved so that existing callers (beast_mode_bot) continue to work
     without modification.
@@ -80,11 +80,13 @@ class XAIClient(TradingLoggerMixin):
         self.usage_file = "logs/daily_ai_usage.pkl"
         self.daily_tracker = self._load_daily_tracker()
 
-        # Lazy OpenRouter client (initialised on first LLM call)
-        self._openrouter_client = None
+        # Lazy provider client (initialised on first LLM call)
+        self._provider_client = None
+        self._provider_name = settings.api.resolve_llm_provider()
 
         self.logger.info(
-            "XAIClient (OpenRouter delegate) initialized",
+            "XAIClient initialized",
+            provider=self._provider_name,
             primary_model=self.primary_model,
             daily_limit=self.daily_tracker.daily_limit,
             today_cost=self.daily_tracker.total_cost,
@@ -171,19 +173,38 @@ class XAIClient(TradingLoggerMixin):
         return True
 
     # ------------------------------------------------------------------
-    # OpenRouter delegation
+    # Provider delegation
     # ------------------------------------------------------------------
 
-    def _get_openrouter_client(self):
-        """Lazy-init OpenRouter client."""
-        if self._openrouter_client is None:
+    def _get_provider_client(self):
+        """Lazy-init the configured provider client."""
+        if self._provider_client is None:
             try:
-                from src.clients.openrouter_client import OpenRouterClient
-                self._openrouter_client = OpenRouterClient(db_manager=self.db_manager)
-                self.logger.info("OpenRouter client initialised (via XAIClient shim)")
+                if self._provider_name == "openai":
+                    from src.clients.openai_client import OpenAIClient
+
+                    self._provider_client = OpenAIClient(db_manager=self.db_manager)
+                else:
+                    from src.clients.openrouter_client import OpenRouterClient
+
+                    self._provider_client = OpenRouterClient(db_manager=self.db_manager)
+                self.logger.info(
+                    "LLM provider client initialised (via XAIClient shim)",
+                    provider=self._provider_name,
+                )
             except Exception as e:
-                self.logger.error(f"Failed to init OpenRouter client: {e}")
-        return self._openrouter_client
+                self.logger.error(f"Failed to init provider client: {e}")
+        return self._provider_client
+
+    def _mirror_provider_usage(self, client: Any, result: Any) -> None:
+        """Mirror provider-side usage into the compatibility shim totals."""
+        if result is None:
+            return
+        metadata = getattr(client, "last_request_metadata", None)
+        cost = getattr(metadata, "cost", 0.0) if metadata is not None else 0.0
+        self.total_cost += cost
+        self.request_count += 1
+        self.daily_tracker = self._load_daily_tracker()
 
     async def get_completion(
         self,
@@ -195,14 +216,14 @@ class XAIClient(TradingLoggerMixin):
         market_id: Optional[str] = None,
     ) -> Optional[str]:
         """
-        Get a completion via OpenRouter.  Delegates to OpenRouterClient and
+        Get a completion via the configured provider. Delegates to the provider client and
         updates the local daily cost tracker so that beast_mode_bot's limit
         checks stay accurate.
         """
         if not await self._check_daily_limits():
             return None
 
-        client = self._get_openrouter_client()
+        client = self._get_provider_client()
         if client is None:
             return None
 
@@ -217,13 +238,7 @@ class XAIClient(TradingLoggerMixin):
                 market_id=market_id,
             )
 
-            # Mirror cost into our daily tracker
-            if result is not None:
-                cost = getattr(client, "_last_request_cost", 0.0)
-                self.total_cost += cost
-                self.request_count += 1
-                self.daily_tracker = self._load_daily_tracker()
-
+            self._mirror_provider_usage(client, result)
             return result
 
         except Exception as e:
@@ -236,11 +251,11 @@ class XAIClient(TradingLoggerMixin):
         portfolio_data: Dict,
         news_summary: str = "",
     ) -> Optional[TradingDecision]:
-        """Get a trading decision via OpenRouter."""
+        """Get a trading decision via the configured provider."""
         if not await self._check_daily_limits():
             return None
 
-        client = self._get_openrouter_client()
+        client = self._get_provider_client()
         if client is None:
             return None
 
@@ -252,12 +267,7 @@ class XAIClient(TradingLoggerMixin):
                 model=self.primary_model,
             )
 
-            if decision is not None:
-                cost = getattr(client, "_last_request_cost", 0.0)
-                self.total_cost += cost
-                self.request_count += 1
-                self.daily_tracker = self._load_daily_tracker()
-
+            self._mirror_provider_usage(client, decision)
             return decision
 
         except Exception as e:
@@ -275,8 +285,8 @@ class XAIClient(TradingLoggerMixin):
 
     async def close(self) -> None:
         """Clean up resources."""
-        if self._openrouter_client:
-            await self._openrouter_client.close()
+        if self._provider_client:
+            await self._provider_client.close()
         self.logger.info(
             "XAIClient closed",
             total_estimated_cost=self.total_cost,

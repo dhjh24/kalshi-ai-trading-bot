@@ -9,9 +9,8 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
-from src.clients.openrouter_client import OpenRouterClient
 from src.config.settings import settings
 from src.data.news_aggregator import NewsAggregator, NewsArticle
 from src.utils.logging_setup import TradingLoggerMixin
@@ -79,9 +78,9 @@ class SentimentAnalyzer(TradingLoggerMixin):
     def __init__(
         self,
         news_aggregator: Optional[NewsAggregator] = None,
-        openrouter_client: Optional[OpenRouterClient] = None,
+        provider_client: Optional[Any] = None,
     ) -> None:
-        self._client = openrouter_client or OpenRouterClient()
+        self._client = provider_client or self._build_provider_client()
         self._model = settings.sentiment.sentiment_model
         self._news = news_aggregator or NewsAggregator()
 
@@ -95,8 +94,21 @@ class SentimentAnalyzer(TradingLoggerMixin):
         self.logger.info(
             "SentimentAnalyzer initialized",
             model=self._model,
+            provider=settings.api.resolve_llm_provider(),
             cache_ttl_minutes=settings.sentiment.cache_ttl_minutes,
         )
+
+    @staticmethod
+    def _build_provider_client() -> Any:
+        """Instantiate the provider client selected in settings."""
+        if settings.api.resolve_llm_provider() == "openai":
+            from src.clients.openai_client import OpenAIClient
+
+            return OpenAIClient()
+
+        from src.clients.openrouter_client import OpenRouterClient
+
+        return OpenRouterClient()
 
     # ------------------------------------------------------------------
     # Public API
@@ -318,7 +330,7 @@ class SentimentAnalyzer(TradingLoggerMixin):
             elapsed = time.monotonic() - start
 
             if not content:
-                raise ValueError("OpenRouter returned no sentiment content")
+                raise ValueError("LLM provider returned no sentiment content")
             content = content.strip()
 
             # Track cost

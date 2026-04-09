@@ -29,6 +29,59 @@ def _get_kalshi_base_url() -> str:
     return "https://api.elections.kalshi.com"
 
 
+def _get_llm_provider() -> str:
+    """Return the requested LLM provider mode."""
+    return os.getenv("LLM_PROVIDER", "auto").strip().lower() or "auto"
+
+
+def _resolve_default_llm_provider() -> str:
+    """
+    Resolve the effective provider from environment state.
+
+    `auto` prefers direct OpenAI access when an API key is configured, then
+    falls back to OpenRouter.
+    """
+    provider = _get_llm_provider()
+    if provider != "auto":
+        return provider
+    if os.getenv("OPENAI_API_KEY", "").strip():
+        return "openai"
+    return "openrouter"
+
+
+def _get_default_primary_model() -> str:
+    """Return the default primary model for the active provider."""
+    env_override = os.getenv("PRIMARY_MODEL", "").strip()
+    if env_override:
+        return env_override
+
+    if _resolve_default_llm_provider() == "openai":
+        return "openai/gpt-5.4"
+    return "anthropic/claude-sonnet-4.5"
+
+
+def _get_default_fallback_model() -> str:
+    """Return the default fallback model for the active provider."""
+    env_override = os.getenv("FALLBACK_MODEL", "").strip()
+    if env_override:
+        return env_override
+
+    if _resolve_default_llm_provider() == "openai":
+        return "openai/o3"
+    return "deepseek/deepseek-v3.2"
+
+
+def _get_default_sentiment_model() -> str:
+    """Return the default sentiment model for the active provider."""
+    env_override = os.getenv("SENTIMENT_MODEL", "").strip()
+    if env_override:
+        return env_override
+
+    if _resolve_default_llm_provider() == "openai":
+        return "openai/gpt-4.1"
+    return "google/gemini-3.1-flash-lite-preview"
+
+
 @dataclass
 class APIConfig:
     """API configuration settings."""
@@ -37,6 +90,7 @@ class APIConfig:
     kalshi_base_url: str = field(default_factory=_get_kalshi_base_url)
     openai_api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
     openrouter_api_key: str = field(default_factory=lambda: os.getenv("OPENROUTER_API_KEY", ""))
+    llm_provider: str = field(default_factory=_get_llm_provider)
     openai_base_url: str = "https://api.openai.com/v1"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_http_referer: str = field(
@@ -58,6 +112,14 @@ class APIConfig:
         if self.openrouter_title:
             headers["X-OpenRouter-Title"] = self.openrouter_title
         return headers
+
+    def resolve_llm_provider(self) -> str:
+        """Return the effective provider after applying `auto` fallback rules."""
+        if self.llm_provider != "auto":
+            return self.llm_provider
+        if self.openai_api_key:
+            return "openai"
+        return "openrouter"
 
 
 @dataclass
@@ -102,12 +164,30 @@ class EnsembleConfig:
 
     def get_role_model_map(self) -> Dict[str, str]:
         """Return role -> model mapping used by the ensemble/debate system."""
-        role_map = {
-            cfg["role"]: model_id
-            for model_id, cfg in self.normalized_models().items()
-            if cfg["role"]
-        }
-        role_map["trader"] = self.trader_model
+        provider = settings.api.resolve_llm_provider()
+        if provider == "openai":
+            role_map = {
+                cfg["role"]: model_id
+                for model_id, cfg in self.normalized_models().items()
+                if cfg["role"] and cfg.get("provider") == "openai"
+            }
+            openai_defaults = {
+                "forecaster": "openai/gpt-4.1",
+                "news_analyst": "openai/o3",
+                "bull_researcher": "openai/o3",
+                "bear_researcher": "openai/gpt-4.1",
+                "risk_manager": "openai/gpt-5.4",
+                "trader": "openai/gpt-5.4",
+            }
+            role_map = {**openai_defaults, **role_map}
+        else:
+            role_map = {
+                cfg["role"]: model_id
+                for model_id, cfg in self.normalized_models().items()
+                if cfg["role"]
+            }
+
+        role_map["trader"] = role_map.get("trader", self.trader_model)
         return role_map
 
     def get_role_weights(self) -> Dict[str, float]:
@@ -129,7 +209,7 @@ class SentimentConfig:
         "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml",
         "https://feeds.bbci.co.uk/news/business/rss.xml",
     ])
-    sentiment_model: str = "google/gemini-3.1-flash-lite-preview"  # Fast/cheap for sentiment ($0.25/M)
+    sentiment_model: str = field(default_factory=_get_default_sentiment_model)
     cache_ttl_minutes: int = 30
     max_articles_per_source: int = 10
     relevance_threshold: float = 0.3
@@ -169,8 +249,8 @@ class TradingConfig:
     scan_interval_seconds: int = 60      # SANE: 60-second scan interval (was 30)
     
     # AI model configuration
-    primary_model: str = "anthropic/claude-sonnet-4.5"  # Primary model via OpenRouter
-    fallback_model: str = "deepseek/deepseek-v3.2"  # Fallback model via OpenRouter
+    primary_model: str = field(default_factory=_get_default_primary_model)
+    fallback_model: str = field(default_factory=_get_default_fallback_model)
     ai_temperature: float = 0  # Lower temperature for more consistent JSON output
     ai_max_tokens: int = 8000    # Reasonable limit for reasoning-oriented models
     
@@ -339,8 +419,21 @@ class Settings:
         if self.api.kalshi_env not in {"prod", "demo"}:
             raise ValueError("KALSHI_ENV must be 'prod' or 'demo'")
 
+        if self.api.llm_provider not in {"auto", "openai", "openrouter"}:
+            raise ValueError("LLM_PROVIDER must be 'auto', 'openai', or 'openrouter'")
+
         if not self.api.kalshi_api_key:
             raise ValueError("KALSHI_API_KEY environment variable is required")
+
+        if self.api.resolve_llm_provider() == "openai" and not self.api.openai_api_key:
+            raise ValueError(
+                "OPENAI_API_KEY is required when LLM_PROVIDER resolves to 'openai'"
+            )
+
+        if self.api.resolve_llm_provider() == "openrouter" and not self.api.openrouter_api_key:
+            raise ValueError(
+                "OPENROUTER_API_KEY is required when LLM_PROVIDER resolves to 'openrouter'"
+            )
 
         if self.trading.max_position_size_pct <= 0 or self.trading.max_position_size_pct > 100:
             raise ValueError("max_position_size_pct must be between 0 and 100")

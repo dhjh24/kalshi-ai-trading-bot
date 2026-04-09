@@ -10,10 +10,10 @@
 [![Last Commit](https://img.shields.io/github/last-commit/ryanfrigo/kalshi-ai-trading-bot)](https://github.com/ryanfrigo/kalshi-ai-trading-bot/commits/main)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
-**Multi-Model AI Ensemble powered by OpenRouter — autonomous trading for [Kalshi](https://kalshi.com) prediction markets.**
+**Multi-Model AI Ensemble with selectable OpenAI/OpenRouter routing for [Kalshi](https://kalshi.com) prediction markets.**
 
 Five frontier LLMs debate every trade. The system only enters when they agree.  
-Bring any model via OpenRouter. Swap models with one config change.
+Choose direct OpenAI, OpenRouter, or auto-selection. Swap models with one config change.
 
 [Quick Start](#-quick-start) · [Features](#-features) · [How It Works](#-how-it-works) · [Configuration](#configuration-reference) · [Contributing](CONTRIBUTING.md) · [Kalshi API Docs](https://docs.kalshi.com/welcome)
 
@@ -56,17 +56,18 @@ python cli.py dashboard
 
 > **Need API keys?**
 > - Kalshi key + private key → [kalshi.com/account/settings](https://kalshi.com/account/settings) ([API docs](https://docs.kalshi.com/welcome))
-> - OpenRouter key → [openrouter.ai](https://openrouter.ai/) (Claude Sonnet 4.5, GPT-5.4, Gemini 3.1 Pro Preview, DeepSeek V3.2, Grok 4.1 Fast — all five models via one key)
+> - OpenAI API key → [platform.openai.com/api-keys](https://platform.openai.com/api-keys) (default provider when configured)
+> - Optional OpenRouter key → [openrouter.ai](https://openrouter.ai/) (for Anthropic, Gemini, DeepSeek, Grok, or mixed-provider ensembles)
 
 ---
 
 ## ✅ Features
 
-### Multi-Model AI Ensemble (via OpenRouter)
+### Multi-Model AI Ensemble
 - ✅ **Five frontier LLMs** collaborate on every decision — Claude Sonnet 4.5, GPT-5.4, Gemini 3.1 Pro Preview, DeepSeek V3.2, Grok 4.1 Fast
 - ✅ **Role-based specialization** — each model plays a distinct analytical role (news analyst, forecaster, risk manager, bull/bear researcher)
-- ✅ **OpenRouter unified access** — all five models route through OpenRouter; single API key, swap any model with one config line
-- ✅ **Docs-aligned request layer** — native OpenRouter fallbacks, strict structured outputs, provider routing preferences, and shared cost accounting
+- ✅ **Provider selection** — choose direct OpenAI, OpenRouter, or auto-selection via `LLM_PROVIDER`
+- ✅ **Docs-aligned request layer** — strict structured outputs, shared cost accounting, and capped OpenRouter native fallbacks
 - ✅ **Consensus gating** — positions are skipped when models diverge beyond a configurable confidence threshold
 - ✅ **Deterministic outputs** — temperature=0 for reproducible AI reasoning
 
@@ -115,7 +116,7 @@ The bot runs a four-stage pipeline on a continuous loop:
   Feeds               ├────────────────────────────────────┤              Drawdown
                       │  Grok 4.1 Fast   (Bear Case     10%)│     Kelly    Cost
   Volume &  ────────► └────────────────────────────────────┘     Sizing   Budget
-  Price Data              All via OpenRouter (single API key)
+  Price Data              Provider-selected routing (OpenAI/OpenRouter)
                           Debate → Consensus → Confidence
 ```
 
@@ -196,11 +197,16 @@ cp env.template .env   # fill in your keys
 | `KALSHI_ENV` | `prod` for the live exchange or `demo` for the demo environment |
 | `KALSHI_API_BASE_URL` | Optional override for custom Kalshi API endpoints |
 | `KALSHI_PRIVATE_KEY_PATH` | Path to your PEM private key file (default: `kalshi_private_key`) |
-| `OPENROUTER_API_KEY` | OpenRouter key — all five AI models route through this (Claude Sonnet 4.5, GPT-5.4, Gemini 3.1 Pro Preview, DeepSeek V3.2, Grok 4.1 Fast) |
+| `LLM_PROVIDER` | `auto` (default), `openai`, or `openrouter` |
+| `OPENAI_API_KEY` | Direct OpenAI API key used when `LLM_PROVIDER` resolves to `openai` |
+| `OPENROUTER_API_KEY` | OpenRouter key used when `LLM_PROVIDER` resolves to `openrouter` |
 | `OPENROUTER_HTTP_REFERER` | Optional app/site URL for OpenRouter attribution headers |
 | `OPENROUTER_TITLE` | Optional app title for OpenRouter attribution headers |
 
 Place your Kalshi private key as `kalshi_private_key` in the project root, or point `KALSHI_PRIVATE_KEY_PATH` at your PEM file. Download it from [Kalshi Settings → API](https://kalshi.com/account/settings). This file is git-ignored.
+
+`LLM_PROVIDER=auto` prefers direct OpenAI access when `OPENAI_API_KEY` is present, and otherwise falls back to OpenRouter.
+ChatGPT/Codex plan access is separate from API-key billing, so this bot still uses API credentials rather than a ChatGPT web-session login.
 
 The bot now uses Kalshi's docs-native fixed-point pricing fields (`*_dollars`, `*_fp`) internally and sends limit-only orders. Live entry orders are submitted as fill-or-kill limit orders at the current best ask; exit orders are resting reduce-only limits.
 
@@ -303,7 +309,7 @@ kalshi-ai-trading-bot/
 └── tests/                     # Pytest test suite
 ```
 
-`src/clients/openai_client.py` remains in the repo for legacy compatibility, but active OpenRouter traffic goes through `src/clients/openrouter_client.py` and `src/clients/model_router.py`.
+`src/clients/openai_client.py`, `src/clients/openrouter_client.py`, and `src/clients/model_router.py` now share the active provider-routing path.
 
 ---
 
@@ -322,12 +328,13 @@ min_volume             = 500     # Minimum contract volume
 max_time_to_expiry_days = 14     # Trade contracts up to 14 days out
 min_confidence_to_trade = 0.45   # Minimum ensemble confidence to enter
 
-# AI settings — all models via OpenRouter
-primary_model          = "anthropic/claude-sonnet-4.5"
+# AI settings
+llm_provider           = "auto"   # auto prefers OpenAI, else OpenRouter
+primary_model          = "openai/gpt-5.4"
 ai_temperature         = 0       # Deterministic outputs
 ai_max_tokens          = 8000
 
-# Ensemble models — all via OpenRouter (swap any with one line)
+# Ensemble models — OpenRouter examples (swap any with one line)
 ensemble_models = {
     "anthropic/claude-sonnet-4.5": {"provider": "openrouter", "role": "news_analyst",   "weight": 0.30},
     "google/gemini-3.1-pro-preview": {"provider": "openrouter", "role": "forecaster",   "weight": 0.30},
@@ -342,8 +349,9 @@ max_daily_loss_pct     = 10.0    # Hard daily loss limit
 daily_ai_cost_limit    = 10.0    # Max daily AI API spend (USD) — default $10/day
 ```
 
-OpenRouter request behavior:
-- Native multi-model fallbacks are passed through OpenRouter instead of retried model-by-model in app code.
+Provider request behavior:
+- `LLM_PROVIDER=auto` prefers direct OpenAI access when available and otherwise uses OpenRouter.
+- OpenRouter-native fallback arrays are capped to the API-supported maximum before requests are sent.
 - JSON-critical calls use strict `response_format` schemas and provider parameter checks.
 - Optional attribution headers come from `OPENROUTER_HTTP_REFERER` and `OPENROUTER_TITLE`.
 
@@ -501,7 +509,7 @@ Edit `EnsembleConfig.models` (and `EnsembleConfig.trader_model` if needed) in `s
 "deepseek/deepseek-v3": {"provider": "openrouter", "role": "bull_researcher", "weight": 0.10},
 ```
 
-Any model listed at [openrouter.ai/models](https://openrouter.ai/models) works. Weights should sum to 1.0. All models use the same `OPENROUTER_API_KEY`, and OpenRouter handles ordered fallback models inside a single request.
+Any model listed at [openrouter.ai/models](https://openrouter.ai/models) works for OpenRouter-backed roles. Direct OpenAI routing uses the configured OpenAI-compatible models and local fallback order. Weights should sum to 1.0.
 
 ### Adding a New Strategy
 

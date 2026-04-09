@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.clients.xai_client import TradingDecision, DailyUsageTracker
+from src.clients.openai_client import OpenAIClient
 from src.clients.openrouter_client import OpenRouterClient, MODEL_PRICING
 from src.config.settings import settings
 from src.utils.logging_setup import TradingLoggerMixin
@@ -50,6 +51,33 @@ FULL_FLEET: List[Tuple[str, str]] = [
     ("openai/gpt-5.4", "openrouter"),
     ("deepseek/deepseek-v3.2", "openrouter"),
     ("x-ai/grok-4.1-fast", "openrouter"),
+]
+
+OPENAI_CAPABILITY_MAP: Dict[str, List[Tuple[str, str]]] = {
+    "fast": [
+        ("openai/gpt-4.1", "openai"),
+        ("openai/o3", "openai"),
+    ],
+    "cheap": [
+        ("openai/gpt-4.1", "openai"),
+        ("openai/o3", "openai"),
+    ],
+    "reasoning": [
+        ("openai/gpt-5.4", "openai"),
+        ("openai/o3", "openai"),
+        ("openai/gpt-4.1", "openai"),
+    ],
+    "balanced": [
+        ("openai/gpt-5.4", "openai"),
+        ("openai/gpt-4.1", "openai"),
+        ("openai/o3", "openai"),
+    ],
+}
+
+OPENAI_FULL_FLEET: List[Tuple[str, str]] = [
+    ("openai/gpt-5.4", "openai"),
+    ("openai/o3", "openai"),
+    ("openai/gpt-4.1", "openai"),
 ]
 
 
@@ -130,6 +158,7 @@ class ModelRouter(TradingLoggerMixin):
 
     def __init__(
         self,
+        openai_client: Optional[OpenAIClient] = None,
         openrouter_client: Optional[OpenRouterClient] = None,
         db_manager: Any = None,
         # xai_client param accepted for backward compat but ignored — all routing
@@ -137,23 +166,26 @@ class ModelRouter(TradingLoggerMixin):
         xai_client: Any = None,
     ):
         self.db_manager = db_manager
+        self.default_provider = settings.api.resolve_llm_provider()
 
-        # Single provider: OpenRouter
+        self.openai_client: Optional[OpenAIClient] = openai_client
         self.openrouter_client: Optional[OpenRouterClient] = openrouter_client
 
         # Daily cost tracking (persisted via pickle, shared with OpenRouterClient)
         self.daily_tracker: DailyUsageTracker = self._load_daily_tracker()
 
-        # Build health trackers for the full fleet
+        # Build health trackers for both provider fleets.
         self.model_health: Dict[str, ModelHealth] = {}
-        for model_name, provider in FULL_FLEET:
+        for model_name, provider in self._all_fleets():
             key = self._model_key(model_name, provider)
             self.model_health[key] = ModelHealth(model=model_name, provider=provider)
 
         self.logger.info(
             "ModelRouter initialized — all models via OpenRouter",
+            default_provider=self.default_provider,
+            openai_available=self.openai_client is not None,
             openrouter_available=self.openrouter_client is not None,
-            fleet_size=len(FULL_FLEET),
+            fleet_size=len(self._active_fleet()),
         )
 
     # ------------------------------------------------------------------
@@ -251,6 +283,23 @@ class ModelRouter(TradingLoggerMixin):
     def _model_key(model: str, provider: str) -> str:
         return f"{provider}::{model}"
 
+    @staticmethod
+    def _all_fleets() -> List[Tuple[str, str]]:
+        """Return the union of supported model/provider pairs."""
+        return list(dict.fromkeys(FULL_FLEET + OPENAI_FULL_FLEET))
+
+    def _active_capability_map(self) -> Dict[str, List[Tuple[str, str]]]:
+        """Return the capability map for the selected provider mode."""
+        if self.default_provider == "openai":
+            return OPENAI_CAPABILITY_MAP
+        return CAPABILITY_MAP
+
+    def _active_fleet(self) -> List[Tuple[str, str]]:
+        """Return the active fleet for the selected provider mode."""
+        if self.default_provider == "openai":
+            return OPENAI_FULL_FLEET
+        return FULL_FLEET
+
     def _ensure_openrouter(self) -> OpenRouterClient:
         """Return the OpenRouter client, creating it on first use if needed."""
         if self.openrouter_client is None:
@@ -258,8 +307,22 @@ class ModelRouter(TradingLoggerMixin):
             self.logger.info("Lazily initialized OpenRouterClient")
         return self.openrouter_client
 
+    def _ensure_openai(self) -> OpenAIClient:
+        """Return the OpenAI client, creating it on first use if needed."""
+        if self.openai_client is None:
+            self.openai_client = OpenAIClient(db_manager=self.db_manager)
+            self.logger.info("Lazily initialized OpenAIClient")
+        return self.openai_client
+
     def _infer_provider(self, model: str) -> str:
-        """All models route through OpenRouter."""
+        """
+        Infer the provider to use for a requested model.
+
+        When OpenAI is the selected provider mode, all routed requests stay on
+        the OpenAI fleet. Otherwise, requests go through OpenRouter.
+        """
+        if self.default_provider == "openai":
+            return "openai"
         return "openrouter"
 
     def _resolve_targets(
@@ -281,14 +344,14 @@ class ModelRouter(TradingLoggerMixin):
             provider = self._infer_provider(model)
             targets.append((model, provider))
         elif capability is not None:
-            cap_targets = CAPABILITY_MAP.get(capability, [])
+            cap_targets = self._active_capability_map().get(capability, [])
             targets.extend(cap_targets)
         else:
-            targets = list(FULL_FLEET)
+            targets = list(self._active_fleet())
 
         # Append remaining fleet members not yet in the list
         seen = set(targets)
-        for entry in FULL_FLEET:
+        for entry in self._active_fleet():
             if entry not in seen:
                 targets.append(entry)
                 seen.add(entry)
@@ -345,8 +408,8 @@ class ModelRouter(TradingLoggerMixin):
         session_id: Optional[str] = None,
         trace: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
-        """Send a completion request through OpenRouter."""
-        client = self._ensure_openrouter()
+        """Send a completion request through the selected provider."""
+        client = self._ensure_openai() if provider == "openai" else self._ensure_openrouter()
         return await client.get_completion(
             prompt=prompt,
             model=model,
@@ -379,8 +442,8 @@ class ModelRouter(TradingLoggerMixin):
         session_id: Optional[str] = None,
         trace: Optional[Dict[str, Any]] = None,
     ) -> Optional[TradingDecision]:
-        """Request a trading decision through OpenRouter."""
-        client = self._ensure_openrouter()
+        """Request a trading decision through the selected provider."""
+        client = self._ensure_openai() if provider == "openai" else self._ensure_openrouter()
         return await client.get_trading_decision(
             market_data=market_data,
             portfolio_data=portfolio_data,
@@ -458,7 +521,7 @@ class ModelRouter(TradingLoggerMixin):
             )
 
             if result is not None:
-                client = self._ensure_openrouter()
+                client = self._ensure_openai() if primary_provider == "openai" else self._ensure_openrouter()
                 actual_model = client.last_request_metadata.actual_model or primary_model
                 actual_provider = self._infer_provider(actual_model)
                 self._record_success(actual_model, actual_provider, time.time() - start)
@@ -473,8 +536,9 @@ class ModelRouter(TradingLoggerMixin):
 
             self._record_failure(primary_model, primary_provider)
             self.logger.warning(
-                "OpenRouter returned no completion after fallbacks",
+                "Provider returned no completion after fallbacks",
                 requested_model=primary_model,
+                provider=primary_provider,
                 fallback_models=fallback_models,
             )
             return None
@@ -542,7 +606,7 @@ class ModelRouter(TradingLoggerMixin):
             )
 
             if decision is not None:
-                client = self._ensure_openrouter()
+                client = self._ensure_openai() if primary_provider == "openai" else self._ensure_openrouter()
                 actual_model = client.last_request_metadata.actual_model or primary_model
                 actual_provider = self._infer_provider(actual_model)
                 self._record_success(actual_model, actual_provider, time.time() - start)
@@ -558,8 +622,9 @@ class ModelRouter(TradingLoggerMixin):
 
             self._record_failure(primary_model, primary_provider)
             self.logger.warning(
-                "OpenRouter returned no trading decision after fallbacks",
+                "Provider returned no trading decision after fallbacks",
                 requested_model=primary_model,
+                provider=primary_provider,
                 fallback_models=fallback_models,
             )
             return None
@@ -581,6 +646,8 @@ class ModelRouter(TradingLoggerMixin):
     def get_total_cost(self) -> float:
         """Return aggregate cost across all providers."""
         total = 0.0
+        if self.openai_client:
+            total += self.openai_client.total_cost
         if self.openrouter_client:
             total += self.openrouter_client.total_cost
         return total
@@ -588,6 +655,8 @@ class ModelRouter(TradingLoggerMixin):
     def get_total_requests(self) -> int:
         """Return aggregate request count across all providers."""
         total = 0
+        if self.openai_client:
+            total += self.openai_client.request_count
         if self.openrouter_client:
             total += self.openrouter_client.request_count
         return total
@@ -610,6 +679,8 @@ class ModelRouter(TradingLoggerMixin):
             },
         }
 
+        if self.openai_client:
+            summary["providers"]["openai"] = self.openai_client.get_cost_summary()
         if self.openrouter_client:
             summary["providers"]["openrouter"] = self.openrouter_client.get_cost_summary()
 
@@ -634,6 +705,8 @@ class ModelRouter(TradingLoggerMixin):
     async def close(self) -> None:
         """Shut down all provider clients."""
         tasks = []
+        if self.openai_client:
+            tasks.append(self.openai_client.close())
         if self.openrouter_client:
             tasks.append(self.openrouter_client.close())
 

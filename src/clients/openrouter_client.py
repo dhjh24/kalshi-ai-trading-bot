@@ -50,6 +50,7 @@ DEFAULT_FALLBACK_ORDER: List[str] = [
     "deepseek/deepseek-v3.2",
     "x-ai/grok-4.1-fast",
 ]
+MAX_OPENROUTER_FALLBACK_MODELS = 3
 
 SHARED_USAGE_FILE = "logs/daily_ai_usage.pkl"
 
@@ -406,6 +407,14 @@ class OpenRouterClient(TradingLoggerMixin):
             for fallback_model in (fallback_models or [])
             if fallback_model and fallback_model != model
         ]
+        if len(normalized_fallbacks) > MAX_OPENROUTER_FALLBACK_MODELS:
+            self.logger.warning(
+                "Truncating OpenRouter fallback list to API-supported maximum",
+                requested_model=model,
+                fallback_count=len(normalized_fallbacks),
+                fallback_limit=MAX_OPENROUTER_FALLBACK_MODELS,
+            )
+            normalized_fallbacks = normalized_fallbacks[:MAX_OPENROUTER_FALLBACK_MODELS]
         if normalized_fallbacks:
             extra_body["models"] = normalized_fallbacks
             extra_body["route"] = "fallback"
@@ -498,6 +507,8 @@ class OpenRouterClient(TradingLoggerMixin):
         than retried locally model-by-model.
         """
         fallback_models = list(fallback_models or self._build_fallback_chain(model)[1:])
+        if len(fallback_models) > MAX_OPENROUTER_FALLBACK_MODELS:
+            fallback_models = fallback_models[:MAX_OPENROUTER_FALLBACK_MODELS]
         last_exc: Optional[Exception] = None
 
         request_kwargs = self._build_request_kwargs(
