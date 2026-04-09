@@ -1,7 +1,6 @@
-import asyncio
 import os
 import pytest
-from unittest.mock import patch, AsyncMock
+from unittest.mock import AsyncMock
 from datetime import datetime
 
 from src.jobs.execute import execute_position
@@ -39,7 +38,41 @@ async def test_execute_position_places_live_order():
     # Create a mock KalshiClient
     from unittest.mock import Mock
     mock_kalshi_client = Mock()
-    mock_kalshi_client.place_order = AsyncMock(return_value={"order": {"order_id": "test-order-123"}})
+    mock_kalshi_client.get_market = AsyncMock(
+        return_value={
+            "market": {
+                "ticker": "LIVE-TEST-1",
+                "yes_bid_dollars": 0.58,
+                "yes_ask_dollars": 0.60,
+                "no_bid_dollars": 0.38,
+                "no_ask_dollars": 0.40,
+            }
+        }
+    )
+    mock_kalshi_client.place_order = AsyncMock(
+        return_value={
+            "order": {
+                "order_id": "test-order-123",
+                "status": "filled",
+                "fill_count_fp": "10",
+                "yes_price_dollars": "0.6000",
+            }
+        }
+    )
+    mock_kalshi_client.get_fills = AsyncMock(
+        return_value={
+            "fills": [
+                {
+                    "ticker": "LIVE-TEST-1",
+                    "client_order_id": "ignored",
+                    "order_id": "test-order-123",
+                    "count_fp": "10",
+                    "yes_price_dollars": "0.6000",
+                    "purchased_side": "yes",
+                }
+            ]
+        }
+    )
     mock_kalshi_client.close = AsyncMock()
 
     try:
@@ -62,6 +95,10 @@ async def test_execute_position_places_live_order():
         assert call_args.kwargs['ticker'] == "LIVE-TEST-1"
         assert call_args.kwargs['side'] == "yes"
         assert call_args.kwargs['count'] == 10
+        assert call_args.kwargs['time_in_force'] == "fill_or_kill"
+        assert call_args.kwargs['type_'] == "limit"
+        assert 'yes_price_dollars' in call_args.kwargs
+        assert 'type' not in call_args.kwargs
         assert 'client_order_id' in call_args.kwargs
 
         assert updated_position is not None, "Position should still exist."
@@ -181,3 +218,7 @@ async def test_profit_taking_orders():
         await kalshi_client.close()
         if os.path.exists(test_db):
             os.remove(test_db) 
+
+
+test_sell_limit_order_functionality = pytest.mark.live_kalshi(test_sell_limit_order_functionality)
+test_profit_taking_orders = pytest.mark.live_kalshi(test_profit_taking_orders)

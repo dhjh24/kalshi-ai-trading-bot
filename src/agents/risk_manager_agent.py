@@ -15,7 +15,29 @@ class RiskManagerAgent(BaseAgent):
 
     AGENT_NAME = "risk_manager"
     AGENT_ROLE = "risk_manager"
-    DEFAULT_MODEL = "deepseek/deepseek-v3.2"
+    DEFAULT_MODEL = "openai/gpt-5.4"
+    RESPONSE_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "risk_score": {"type": "number"},
+            "recommended_size_pct": {"type": "number"},
+            "ev_estimate": {"type": "number"},
+            "max_loss_pct": {"type": "number"},
+            "edge_durability_hours": {"type": "number"},
+            "should_trade": {"type": "boolean"},
+            "reasoning": {"type": "string"},
+        },
+        "required": [
+            "risk_score",
+            "recommended_size_pct",
+            "ev_estimate",
+            "max_loss_pct",
+            "edge_durability_hours",
+            "should_trade",
+            "reasoning",
+        ],
+        "additionalProperties": False,
+    }
 
     SYSTEM_PROMPT = (
         "You are a quantitative risk manager for a prediction-market trading "
@@ -32,7 +54,7 @@ class RiskManagerAgent(BaseAgent):
         "   and lower risk = larger position.\n"
         "4. WORST CASE -- What is the maximum loss, and is it acceptable?\n"
         "5. EDGE DURABILITY -- How long will the informational edge last?\n\n"
-        "Return your analysis as a JSON object (inside a ```json``` code block) "
+        "Return your analysis as a JSON object only. Do not include markdown fences. "
         "with the following keys:\n"
         '  "risk_score": float (1.0-10.0),\n'
         '  "recommended_size_pct": float (0.0-100.0, percent of capital),\n'
@@ -101,7 +123,7 @@ class RiskManagerAgent(BaseAgent):
             f"trade.\n\n"
             f"{summary}{agents_section}{portfolio_section}\n\n"
             f"Calculate EV, assess risk, and recommend position sizing.\n"
-            f"Return ONLY a JSON object inside a ```json``` code block."
+            f"Return ONLY a JSON object."
         )
 
     def _parse_result(self, raw_json: dict) -> dict:

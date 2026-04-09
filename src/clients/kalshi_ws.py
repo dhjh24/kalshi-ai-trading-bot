@@ -9,6 +9,7 @@ incoming messages to registered callbacks and/or the global EventBus.
 import asyncio
 import base64
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -115,7 +116,7 @@ class KalshiWebSocket(TradingLoggerMixin):
                 published to the global :class:`EventBus`.
         """
         self.api_key: str = api_key or settings.api.kalshi_api_key
-        self.private_key_path: str = private_key_path
+        self.private_key_path: str = os.environ.get("KALSHI_PRIVATE_KEY_PATH", private_key_path)
         self.publish_to_event_bus: bool = publish_to_event_bus
 
         self._private_key: Any = None
@@ -361,14 +362,32 @@ class KalshiWebSocket(TradingLoggerMixin):
     # Message dispatch
     # ------------------------------------------------------------------
 
+    def _normalize_message(self, msg: Dict[str, Any]) -> Dict[str, Any]:
+        """Flatten documented {type, sid, msg} payloads for internal consumers."""
+        if not isinstance(msg, dict):
+            return {}
+
+        payload = msg.get("msg")
+        if isinstance(payload, dict):
+            normalized = dict(payload)
+            normalized.setdefault("type", msg.get("type", ""))
+            normalized.setdefault("sid", msg.get("sid"))
+            normalized.setdefault("seq", msg.get("seq"))
+            normalized.setdefault("market_ticker", payload.get("market_ticker", payload.get("ticker")))
+            normalized["raw_message"] = msg
+            return normalized
+
+        return msg
+
     async def _dispatch(self, raw: str) -> None:
         """Parse an incoming JSON message and fan out to callbacks + EventBus."""
         try:
-            msg: Dict[str, Any] = json.loads(raw)
+            raw_msg: Dict[str, Any] = json.loads(raw)
         except json.JSONDecodeError:
             self.logger.warning("Received non-JSON message", raw=raw[:200])
             return
 
+        msg = self._normalize_message(raw_msg)
         msg_type = msg.get("type", "")
 
         # Map Kalshi message types to our internal channel keys and EventBus event types

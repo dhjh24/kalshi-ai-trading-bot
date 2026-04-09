@@ -18,7 +18,27 @@ class TraderAgent(BaseAgent):
 
     AGENT_NAME = "trader"
     AGENT_ROLE = "trader"
-    DEFAULT_MODEL = "grok-4-1-fast-reasoning"
+    DEFAULT_MODEL = "x-ai/grok-4.1-fast"
+    RESPONSE_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["BUY", "SELL", "SKIP"]},
+            "side": {"type": "string", "enum": ["YES", "NO"]},
+            "limit_price": {"type": "integer"},
+            "confidence": {"type": "number"},
+            "position_size_pct": {"type": "number"},
+            "reasoning": {"type": "string"},
+        },
+        "required": [
+            "action",
+            "side",
+            "limit_price",
+            "confidence",
+            "position_size_pct",
+            "reasoning",
+        ],
+        "additionalProperties": False,
+    }
 
     SYSTEM_PROMPT = (
         "You are the head trader at an AI-powered prediction market fund. "
@@ -35,7 +55,7 @@ class TraderAgent(BaseAgent):
         "   the market.\n"
         "5. CONVICTION -- You need high conviction from multiple sources to act. "
         "   When in doubt, SKIP.\n\n"
-        "Return your decision as a JSON object (inside a ```json``` code block) "
+        "Return your decision as a JSON object only. Do not include markdown fences. "
         "with the following keys:\n"
         '  "action": "BUY" | "SELL" | "SKIP",\n'
         '  "side": "YES" | "NO",\n'
@@ -127,7 +147,7 @@ class TraderAgent(BaseAgent):
             f"=== MARKET ===\n{summary}\n\n"
             f"=== TEAM ANALYSIS ===\n{briefing}{portfolio_note}\n\n"
             f"Make your final BUY/SELL/SKIP decision. Be decisive but disciplined.\n"
-            f"Return ONLY a JSON object inside a ```json``` code block."
+            f"Return ONLY a JSON object."
         )
 
     def _parse_result(self, raw_json: dict) -> dict:

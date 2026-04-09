@@ -25,15 +25,6 @@ from src.utils.logging_setup import get_trading_logger
 
 logger = get_trading_logger("ensemble")
 
-# Default weights from EnsembleConfig; keyed by agent role
-_DEFAULT_WEIGHTS: Dict[str, float] = {
-    "forecaster": 0.30,
-    "news_analyst": 0.20,
-    "bull_researcher": 0.20,
-    "bear_researcher": 0.15,
-    "risk_manager": 0.15,
-}
-
 # Path where calibration records are stored
 _CALIBRATION_FILE = Path("logs/ensemble_calibration.json")
 
@@ -75,7 +66,7 @@ class EnsembleRunner:
                         ``settings.ensemble.disagreement_threshold``.
         """
         self.agents: Dict[str, BaseAgent] = agents or self._default_agents()
-        self.weights = weights or dict(_DEFAULT_WEIGHTS)
+        self.weights = weights or settings.ensemble.get_role_weights()
         self.min_models = min_models or settings.ensemble.min_models_for_consensus
         self.disagreement_threshold = (
             disagreement_threshold
@@ -396,12 +387,13 @@ class EnsembleRunner:
     @staticmethod
     def _default_agents() -> Dict[str, BaseAgent]:
         """Create the default set of agents from EnsembleConfig."""
+        role_models = settings.ensemble.get_role_model_map()
         return {
-            "forecaster": ForecasterAgent(),
-            "news_analyst": NewsAnalystAgent(),
-            "bull_researcher": BullResearcher(),
-            "bear_researcher": BearResearcher(),
-            "risk_manager": RiskManagerAgent(),
+            "forecaster": ForecasterAgent(model_name=role_models.get("forecaster")),
+            "news_analyst": NewsAnalystAgent(model_name=role_models.get("news_analyst")),
+            "bull_researcher": BullResearcher(model_name=role_models.get("bull_researcher")),
+            "bear_researcher": BearResearcher(model_name=role_models.get("bear_researcher")),
+            "risk_manager": RiskManagerAgent(model_name=role_models.get("risk_manager")),
         }
 
     @staticmethod

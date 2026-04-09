@@ -17,6 +17,23 @@ import sys
 from pathlib import Path
 
 
+def _ensure_utf8_console() -> None:
+    """Prefer UTF-8 console streams so icon output doesn't fail on Windows."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            encoding = getattr(stream, "encoding", "") or ""
+            if encoding.lower() != "utf-8":
+                reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            continue
+
+
+_ensure_utf8_console()
+
+
 # ---------------------------------------------------------------------------
 # Subcommand implementations
 # ---------------------------------------------------------------------------
@@ -146,23 +163,26 @@ def cmd_status(args: argparse.Namespace) -> None:
 
     async def _status() -> None:
         from src.clients.kalshi_client import KalshiClient
+        from src.utils.kalshi_normalization import (
+            get_balance_dollars,
+            get_portfolio_value_dollars,
+            get_position_exposure_dollars,
+        )
 
         client = KalshiClient()
         try:
             # Fetch balance
             balance_resp = await client.get_balance()
-            balance_cents = balance_resp.get("balance", 0)
-            balance_usd = balance_cents / 100.0
+            balance_usd = get_balance_dollars(balance_resp)
 
             # Fetch positions — Kalshi API v2 returns event_positions and market_positions
-            portfolio_value_cents = balance_resp.get("portfolio_value", 0)
-            portfolio_value_usd = portfolio_value_cents / 100.0
+            portfolio_value_usd = get_portfolio_value_dollars(balance_resp)
 
             positions_resp = await client.get_positions()
             event_positions = positions_resp.get("event_positions", [])
             active_positions = [
                 p for p in event_positions
-                if float(p.get("event_exposure_dollars", "0")) > 0
+                if get_position_exposure_dollars(p) > 0
             ]
 
             # Display
@@ -185,7 +205,7 @@ def cmd_status(args: argparse.Namespace) -> None:
 
                 for pos in active_positions:
                     ticker = pos.get("event_ticker", "???")
-                    exposure = float(pos.get("event_exposure_dollars", "0"))
+                    exposure = get_position_exposure_dollars(pos)
                     cost = float(pos.get("total_cost_dollars", "0"))
                     pnl = float(pos.get("realized_pnl_dollars", "0"))
                     fees = float(pos.get("fees_paid_dollars", "0"))
@@ -398,13 +418,20 @@ def cmd_health(args: argparse.Namespace) -> None:
         else:
             fail(f"{var} is missing or placeholder")
 
+    private_key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH", "kalshi_private_key").strip() or "kalshi_private_key"
+    if Path(private_key_path).exists():
+        ok("KALSHI private key file exists", private_key_path)
+    else:
+        fail("KALSHI private key file missing", private_key_path)
+
     # 3. Kalshi API connection
     async def _check_api() -> None:
         from src.clients.kalshi_client import KalshiClient
+        from src.utils.kalshi_normalization import get_balance_dollars
         client = KalshiClient()
         try:
             balance_resp = await client.get_balance()
-            balance_usd = balance_resp.get("balance", 0) / 100.0
+            balance_usd = get_balance_dollars(balance_resp)
             ok("Kalshi API connection", f"balance=${balance_usd:,.2f}")
         except Exception as exc:
             fail("Kalshi API connection", str(exc))

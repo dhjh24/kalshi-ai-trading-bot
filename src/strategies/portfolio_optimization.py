@@ -35,6 +35,13 @@ from src.utils.database import DatabaseManager, Market, Position
 from src.clients.kalshi_client import KalshiClient
 from src.clients.xai_client import XAIClient
 from src.config.settings import settings
+from src.utils.kalshi_normalization import (
+    get_balance_dollars,
+    get_mid_price,
+    get_portfolio_value_dollars,
+    get_position_exposure_dollars,
+    get_position_ticker,
+)
 from src.utils.logging_setup import get_trading_logger
 from src.utils.market_prices import get_market_prices
 
@@ -844,7 +851,7 @@ async def create_market_opportunities_from_markets(
             
             # FIXED: Extract from nested 'market' object (same fix as immediate trading)
             market_info = market_data.get('market', {})
-            market_prob = market_info.get('yes_price', 50) / 100
+            market_prob = get_mid_price(market_info, "YES")
             
             # Skip markets with extreme prices (too risky for portfolio)
             if market_prob < 0.05 or market_prob > 0.95:
@@ -965,21 +972,21 @@ async def _evaluate_immediate_trade(
         # Get portfolio value for position sizing
         try:
             balance_response = await kalshi_client.get_balance()
-            available_cash = balance_response.get('balance', 0) / 100  # Convert cents to dollars
+            available_cash = get_balance_dollars(balance_response)
             
             # Get current positions to calculate total portfolio value
             # Kalshi API v2 returns portfolio_value in balance response (in cents)
-            total_position_value = balance_response.get('portfolio_value', 0) / 100  # Convert cents to dollars
+            total_position_value = get_portfolio_value_dollars(balance_response)
 
             # Log active positions for visibility
             positions_response = await kalshi_client.get_positions()
             event_positions = positions_response.get('event_positions', []) if isinstance(positions_response, dict) else []
-            active_positions = [p for p in event_positions if float(p.get('event_exposure_dollars', '0')) > 0]
+            active_positions = [p for p in event_positions if get_position_exposure_dollars(p) > 0]
             if active_positions:
                 logger.info(f"📊 Active positions: {len(active_positions)}")
                 for pos in active_positions:
-                    ticker = pos.get('event_ticker', '?')
-                    exposure = float(pos.get('event_exposure_dollars', '0'))
+                    ticker = get_position_ticker(pos) or '?'
+                    exposure = get_position_exposure_dollars(pos)
                     logger.info(f"  📌 {ticker}: exposure=${exposure:.2f}")
             
             total_portfolio_value = available_cash + total_position_value
@@ -1234,7 +1241,7 @@ async def _get_fast_ai_prediction(
         # Use AI analysis for portfolio optimization - higher tokens for reasoning models  
         response_text = await xai_client.get_completion(
             prompt,
-            max_tokens=3000,  # Higher for reasoning models like grok-4
+            max_tokens=3000,  # Higher budget for reasoning-oriented models
             temperature=0.1   # Low temperature for consistency
         )
         
@@ -1324,4 +1331,4 @@ async def run_portfolio_optimization(
         
     except Exception as e:
         logger.error(f"Error in portfolio optimization: {e}")
-        return AdvancedPortfolioOptimizer(db_manager, kalshi_client, xai_client)._empty_allocation() 
+        return AdvancedPortfolioOptimizer(db_manager, kalshi_client, xai_client)._empty_allocation()

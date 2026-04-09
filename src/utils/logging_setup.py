@@ -16,6 +16,24 @@ from structlog import configure, get_logger
 from src.config.settings import settings
 
 
+def _ensure_utf8_console() -> None:
+    """Prefer UTF-8 console streams so emoji/log output doesn't crash on Windows."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            encoding = getattr(stream, "encoding", "") or ""
+            if encoding.lower() != "utf-8":
+                reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            # Some redirected or already-closed streams cannot be reconfigured.
+            continue
+
+
+_ensure_utf8_console()
+
+
 def setup_logging(log_level: str = "INFO") -> None:
     """
     Set up structured logging for the trading system.
@@ -63,9 +81,10 @@ def setup_logging(log_level: str = "INFO") -> None:
     logging.basicConfig(
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         level=getattr(logging, log_level.upper()),
+        force=True,
         handlers=[
-            logging.FileHandler(log_file),
-            logging.FileHandler(latest_log, mode='w'),
+            logging.FileHandler(log_file, encoding="utf-8"),
+            logging.FileHandler(latest_log, mode='w', encoding="utf-8"),
             logging.StreamHandler(sys.stdout),
         ],
     )

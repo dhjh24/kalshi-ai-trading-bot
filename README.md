@@ -15,7 +15,7 @@
 Five frontier LLMs debate every trade. The system only enters when they agree.  
 Bring any model via OpenRouter. Swap models with one config change.
 
-[Quick Start](#-quick-start) · [Features](#-features) · [How It Works](#-how-it-works) · [Configuration](#configuration-reference) · [Contributing](CONTRIBUTING.md) · [Kalshi API Docs](https://trading-api.readme.io/reference/getting-started)
+[Quick Start](#-quick-start) · [Features](#-features) · [How It Works](#-how-it-works) · [Configuration](#configuration-reference) · [Contributing](CONTRIBUTING.md) · [Kalshi API Docs](https://docs.kalshi.com/welcome)
 
 </div>
 
@@ -55,17 +55,18 @@ python cli.py dashboard
 ```
 
 > **Need API keys?**
-> - Kalshi key + private key → [kalshi.com/account/settings](https://kalshi.com/account/settings) ([API docs](https://trading-api.readme.io/reference/getting-started))
-> - OpenRouter key → [openrouter.ai](https://openrouter.ai/) (Claude Sonnet 4.5, GPT-5.4, Gemini 3.1 Pro, DeepSeek V3.2, Grok 4.1 Fast — all five models via one key)
+> - Kalshi key + private key → [kalshi.com/account/settings](https://kalshi.com/account/settings) ([API docs](https://docs.kalshi.com/welcome))
+> - OpenRouter key → [openrouter.ai](https://openrouter.ai/) (Claude Sonnet 4.5, GPT-5.4, Gemini 3.1 Pro Preview, DeepSeek V3.2, Grok 4.1 Fast — all five models via one key)
 
 ---
 
 ## ✅ Features
 
 ### Multi-Model AI Ensemble (via OpenRouter)
-- ✅ **Five frontier LLMs** collaborate on every decision — Claude Sonnet 4.5, GPT-5.4, Gemini 3.1 Pro, DeepSeek V3.2, Grok 4.1 Fast
-- ✅ **Role-based specialization** — each model plays a distinct analytical role (lead analyst, forecaster, risk manager, bull/bear researcher)
+- ✅ **Five frontier LLMs** collaborate on every decision — Claude Sonnet 4.5, GPT-5.4, Gemini 3.1 Pro Preview, DeepSeek V3.2, Grok 4.1 Fast
+- ✅ **Role-based specialization** — each model plays a distinct analytical role (news analyst, forecaster, risk manager, bull/bear researcher)
 - ✅ **OpenRouter unified access** — all five models route through OpenRouter; single API key, swap any model with one config line
+- ✅ **Docs-aligned request layer** — native OpenRouter fallbacks, strict structured outputs, provider routing preferences, and shared cost accounting
 - ✅ **Consensus gating** — positions are skipped when models diverge beyond a configurable confidence threshold
 - ✅ **Deterministic outputs** — temperature=0 for reproducible AI reasoning
 
@@ -104,9 +105,9 @@ The bot runs a four-stage pipeline on a continuous loop:
   INGEST               DECIDE (5-Model Ensemble)              EXECUTE       TRACK
  --------             ────────────────────────────────────   ---------    --------
                       ┌────────────────────────────────────┐
-  Kalshi    ────────► │  Claude Sonnet 4.5 (Lead Analyst 30%)│
+  Kalshi    ────────► │  Claude Sonnet 4.5 (News Analyst 30%)│
   Events API          ├────────────────────────────────────┤
-                      │  Gemini 3.1 Pro  (Forecaster    30%)│
+                      │ Gemini 3.1 Pro Preview (Forecaster 30%)│
   WebSocket ────────► ├────────────────────────────────────┤
   Stream              │  GPT-5.4         (Risk Manager  20%)│ ──► Kalshi  ──► P&L
                       ├────────────────────────────────────┤     Order       Win Rate
@@ -126,15 +127,15 @@ Each of the five models analyzes the incoming data from its assigned perspective
 
 | Model | Role | Provider | Weight |
 |---|---|---|---|
-| Claude Sonnet 4.5 | Lead Analyst | OpenRouter | 30% |
-| Gemini 3.1 Pro | Forecaster | OpenRouter | 30% |
+| Claude Sonnet 4.5 | News Analyst | OpenRouter | 30% |
+| Gemini 3.1 Pro Preview | Forecaster | OpenRouter | 30% |
 | GPT-5.4 | Risk Manager | OpenRouter | 20% |
 | DeepSeek V3.2 | Bull Researcher | OpenRouter | 10% |
 | Grok 4.1 Fast | Bear Researcher | OpenRouter | 10% |
 
 If the weighted confidence falls below `min_confidence_to_trade` (default: 0.45), the opportunity is skipped. If models disagree significantly, position size is automatically reduced.
 
-> **Bring your own model** — All five models are swappable with one config change in `src/config/settings.py`. Any model on [openrouter.ai/models](https://openrouter.ai/models) works. Single API key for the entire fleet.
+> **Bring your own model** — All five models are swappable with one config change in `src/config/settings.py`. Requests use OpenRouter-native fallbacks plus strict JSON schemas for structured outputs. Any compatible model on [openrouter.ai/models](https://openrouter.ai/models) works.
 
 ### Stage 3 — Execute
 Qualifying trades are sized using the **Kelly Criterion** (fractional 0.25x) and routed through Kalshi's order API.
@@ -149,8 +150,8 @@ Every decision is written to a local SQLite database. The dashboard and CLI comm
 ### Prerequisites
 
 - Python 3.12 or later
-- A [Kalshi](https://kalshi.com) account with API access ([API docs](https://trading-api.readme.io/reference/getting-started))
-- An [OpenRouter](https://openrouter.ai/) API key — provides all five models (Claude Sonnet 4.5, GPT-5.4, Gemini 3.1 Pro, DeepSeek V3.2, Grok 4.1 Fast) via a single key
+- A [Kalshi](https://kalshi.com) account with API access ([API docs](https://docs.kalshi.com/welcome))
+- An [OpenRouter](https://openrouter.ai/) API key — provides all five models (Claude Sonnet 4.5, GPT-5.4, Gemini 3.1 Pro Preview, DeepSeek V3.2, Grok 4.1 Fast) via a single key
 
 ### Automated Setup (Recommended)
 
@@ -192,9 +193,16 @@ cp env.template .env   # fill in your keys
 | Variable | Description |
 |---|---|
 | `KALSHI_API_KEY` | Your Kalshi API key ID |
-| `OPENROUTER_API_KEY` | OpenRouter key — all five AI models route through this (Claude Sonnet 4.5, GPT-5.4, Gemini 3.1 Pro, DeepSeek V3.2, Grok 4.1 Fast) |
+| `KALSHI_ENV` | `prod` for the live exchange or `demo` for the demo environment |
+| `KALSHI_API_BASE_URL` | Optional override for custom Kalshi API endpoints |
+| `KALSHI_PRIVATE_KEY_PATH` | Path to your PEM private key file (default: `kalshi_private_key`) |
+| `OPENROUTER_API_KEY` | OpenRouter key — all five AI models route through this (Claude Sonnet 4.5, GPT-5.4, Gemini 3.1 Pro Preview, DeepSeek V3.2, Grok 4.1 Fast) |
+| `OPENROUTER_HTTP_REFERER` | Optional app/site URL for OpenRouter attribution headers |
+| `OPENROUTER_TITLE` | Optional app title for OpenRouter attribution headers |
 
-Place your Kalshi private key as `kalshi_private_key` (no extension) in the project root. Download from [Kalshi Settings → API](https://kalshi.com/account/settings). This file is git-ignored.
+Place your Kalshi private key as `kalshi_private_key` in the project root, or point `KALSHI_PRIVATE_KEY_PATH` at your PEM file. Download it from [Kalshi Settings → API](https://kalshi.com/account/settings). This file is git-ignored.
+
+The bot now uses Kalshi's docs-native fixed-point pricing fields (`*_dollars`, `*_fp`) internally and sends limit-only orders. Live entry orders are submitted as fill-or-kill limit orders at the current best ask; exit orders are resting reduce-only limits.
 
 ### Initialize the Database
 
@@ -282,7 +290,7 @@ kalshi-ai-trading-bot/
 │
 ├── src/
 │   ├── agents/                # Multi-model ensemble (lead analyst, bull/bear, risk, forecaster)
-│   ├── clients/               # API clients (Kalshi, OpenRouter, WebSocket, model router)
+│   ├── clients/               # API clients (Kalshi, OpenRouter, model router, legacy compatibility shims)
 │   ├── config/                # Settings and trading parameters
 │   ├── data/                  # News aggregation and sentiment analysis
 │   ├── events/                # Async event bus for real-time streaming
@@ -294,6 +302,8 @@ kalshi-ai-trading-bot/
 ├── docs/                      # Additional documentation + paper dashboard HTML
 └── tests/                     # Pytest test suite
 ```
+
+`src/clients/openai_client.py` remains in the repo for legacy compatibility, but active OpenRouter traffic goes through `src/clients/openrouter_client.py` and `src/clients/model_router.py`.
 
 ---
 
@@ -319,17 +329,23 @@ ai_max_tokens          = 8000
 
 # Ensemble models — all via OpenRouter (swap any with one line)
 ensemble_models = {
-    "anthropic/claude-sonnet-4.5": {"provider": "openrouter", "role": "lead_analyst",   "weight": 0.30},
-    "google/gemini-3.1-pro":       {"provider": "openrouter", "role": "forecaster",     "weight": 0.30},
+    "anthropic/claude-sonnet-4.5": {"provider": "openrouter", "role": "news_analyst",   "weight": 0.30},
+    "google/gemini-3.1-pro-preview": {"provider": "openrouter", "role": "forecaster",   "weight": 0.30},
     "openai/gpt-5.4":              {"provider": "openrouter", "role": "risk_manager",   "weight": 0.20},
     "deepseek/deepseek-v3.2":      {"provider": "openrouter", "role": "bull_researcher","weight": 0.10},
-    "x-ai/grok-4.1-fast":         {"provider": "openrouter", "role": "bear_researcher","weight": 0.10},
+    "x-ai/grok-4.1-fast":          {"provider": "openrouter", "role": "bear_researcher","weight": 0.10},
 }
+trader_model           = "x-ai/grok-4.1-fast"
 
 # Risk management
 max_daily_loss_pct     = 10.0    # Hard daily loss limit
 daily_ai_cost_limit    = 10.0    # Max daily AI API spend (USD) — default $10/day
 ```
+
+OpenRouter request behavior:
+- Native multi-model fallbacks are passed through OpenRouter instead of retried model-by-model in app code.
+- JSON-critical calls use strict `response_format` schemas and provider parameter checks.
+- Optional attribution headers come from `OPENROUTER_HTTP_REFERER` and `OPENROUTER_TITLE`.
 
 > **💸 Controlling AI spend**
 >
@@ -478,14 +494,14 @@ mypy src/
 
 ### Swapping Models
 
-Edit `EnsembleConfig.models` in `src/config/settings.py`:
+Edit `EnsembleConfig.models` (and `EnsembleConfig.trader_model` if needed) in `src/config/settings.py`:
 
 ```python
 # Example: swap DeepSeek V3.2 for a cheaper model
 "deepseek/deepseek-v3": {"provider": "openrouter", "role": "bull_researcher", "weight": 0.10},
 ```
 
-Any model listed at [openrouter.ai/models](https://openrouter.ai/models) works. Weights should sum to 1.0. All models use the same `OPENROUTER_API_KEY`.
+Any model listed at [openrouter.ai/models](https://openrouter.ai/models) works. Weights should sum to 1.0. All models use the same `OPENROUTER_API_KEY`, and OpenRouter handles ordered fallback models inside a single request.
 
 ### Adding a New Strategy
 
@@ -594,7 +610,7 @@ The Kalshi `/markets` endpoint now only returns parlay tickers (`KXMVE*`). Real 
 Model names on OpenRouter change periodically. Update `EnsembleConfig.models` in `src/config/settings.py` with the current model identifiers:
 - OpenRouter models: [openrouter.ai/models](https://openrouter.ai/models)
 
-You can also override the primary model via environment variable: `export PRIMARY_MODEL=anthropic/claude-sonnet-4.5`
+If you need to update the debate synthesizer too, also update `EnsembleConfig.trader_model`.
 
 </details>
 
@@ -654,8 +670,8 @@ Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for full guide
 
 ## 📚 Resources
 
-- [Kalshi Trading API Docs](https://trading-api.readme.io/reference/getting-started)
-- [Kalshi API Authentication](https://trading-api.readme.io/reference/authentication)
+- [Kalshi Trading API Docs](https://docs.kalshi.com/welcome)
+- [Kalshi API Authentication](https://docs.kalshi.com/getting_started/quick_start_authenticated_requests)
 - [Kalshi Markets Overview](https://kalshi.com/markets)
 - [OpenRouter Model Catalog](https://openrouter.ai/models)
 - [OpenRouter](https://openrouter.ai/) (unified access to all models)

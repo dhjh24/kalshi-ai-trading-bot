@@ -15,7 +15,19 @@ class ForecasterAgent(BaseAgent):
 
     AGENT_NAME = "forecaster"
     AGENT_ROLE = "forecaster"
-    DEFAULT_MODEL = "grok-4-1-fast-reasoning"
+    DEFAULT_MODEL = "google/gemini-3.1-pro-preview"
+    RESPONSE_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "probability": {"type": "number"},
+            "confidence": {"type": "number"},
+            "base_rate": {"type": "number"},
+            "side": {"type": "string", "enum": ["yes", "no"]},
+            "reasoning": {"type": "string"},
+        },
+        "required": ["probability", "confidence", "base_rate", "side", "reasoning"],
+        "additionalProperties": False,
+    }
 
     SYSTEM_PROMPT = (
         "You are a world-class probability forecaster specialising in prediction "
@@ -29,7 +41,7 @@ class ForecasterAgent(BaseAgent):
         "rate if uncertain.\n"
         "4. State your confidence in your own estimate (how sure are you that "
         "your probability is well-calibrated?).\n\n"
-        "Return your analysis as a JSON object (inside a ```json``` code block) "
+        "Return your analysis as a JSON object only. Do not include markdown fences. "
         "with the following keys:\n"
         '  "probability": float (0.0-1.0, your estimated TRUE YES probability),\n'
         '  "confidence": float (0.0-1.0, confidence in your own estimate),\n'
@@ -52,7 +64,7 @@ class ForecasterAgent(BaseAgent):
             f"YES probability.\n\n"
             f"{summary}{portfolio_note}\n\n"
             f"Think step-by-step: base rate -> current conditions -> calibration.\n"
-            f"Return ONLY a JSON object inside a ```json``` code block."
+            f"Return ONLY a JSON object."
         )
 
     def _parse_result(self, raw_json: dict) -> dict:

@@ -1,223 +1,173 @@
 """
 Quick Flip Scalping Strategy
 
-This strategy implements rapid scalping by:
-1. Identifying markets with potential for quick price movements
-2. Buying contracts at low prices (1¢, 5¢, etc.)
-3. Immediately placing sell limit orders for higher prices (2¢, 10¢, etc.)
-4. Managing multiple concurrent positions across many markets
-
-Key advantages:
-- Low capital requirement per trade
-- Quick turnover without long-term capital lock-up
-- Limited downside risk per position
-- Scalable across many markets simultaneously
+Buy low-priced contracts, immediately rest an exit order, and cut stale
+positions with docs-compatible limit orders only.
 """
 
-import asyncio
-import logging
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from __future__ import annotations
+
 from dataclasses import dataclass
-import numpy as np
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+import uuid
 
 from src.clients.kalshi_client import KalshiClient
 from src.clients.xai_client import XAIClient
-from src.utils.database import DatabaseManager, Market, Position
 from src.config.settings import settings
+from src.jobs.execute import execute_position, place_sell_limit_order
+from src.utils.database import DatabaseManager, Market, Position
+from src.utils.kalshi_normalization import (
+    build_limit_order_price_fields,
+    get_best_ask_price,
+    get_best_bid_price,
+)
 from src.utils.logging_setup import get_trading_logger
-from src.jobs.execute import place_sell_limit_order
 
 
 @dataclass
 class QuickFlipOpportunity:
     """Represents a quick flip scalping opportunity."""
+
     market_id: str
     market_title: str
-    side: str  # "YES" or "NO"
-    entry_price: float  # Price to buy at (in dollars)
-    exit_price: float   # Price to sell at (in dollars)
+    side: str
+    entry_price: float
+    exit_price: float
     quantity: int
-    expected_profit: float  # Profit per contract if successful
-    confidence_score: float  # How confident we are this will work (0-1)
-    movement_indicator: str  # Why we think price will move
-    max_hold_time: int  # Maximum time to hold before cutting losses (minutes)
+    expected_profit: float
+    confidence_score: float
+    movement_indicator: str
+    max_hold_time: int
 
 
 @dataclass
 class QuickFlipConfig:
     """Configuration for quick flip strategy."""
-    min_entry_price: float = 0.01   # Minimum entry price in dollars
-    max_entry_price: float = 0.20   # Maximum entry price in dollars
-    min_profit_margin: float = 1.0  # Minimum profit margin (100% = double)
-    max_position_size: int = 100    # Maximum contracts per position
-    max_concurrent_positions: int = 50  # Maximum simultaneous positions
-    capital_per_trade: float = 50.0    # Maximum capital per trade
-    confidence_threshold: float = 0.6   # Minimum confidence to trade
-    max_hold_minutes: int = 30         # Maximum hold time before exit
+
+    min_entry_price: float = 0.01
+    max_entry_price: float = 0.20
+    min_profit_margin: float = 1.0
+    max_position_size: int = 100
+    max_concurrent_positions: int = 50
+    capital_per_trade: float = 50.0
+    confidence_threshold: float = 0.6
+    max_hold_minutes: int = 30
 
 
 class QuickFlipScalpingStrategy:
-    """
-    Implements the quick flip scalping strategy.
-    """
-    
+    """Implements a fast-turnover scalp strategy."""
+
     def __init__(
         self,
         db_manager: DatabaseManager,
-        kalshi_client: KalshiClient, 
+        kalshi_client: KalshiClient,
         xai_client: XAIClient,
-        config: Optional[QuickFlipConfig] = None
-    ):
+        config: Optional[QuickFlipConfig] = None,
+    ) -> None:
         self.db_manager = db_manager
         self.kalshi_client = kalshi_client
         self.xai_client = xai_client
         self.config = config or QuickFlipConfig()
         self.logger = get_trading_logger("quick_flip_scalping")
-        
-        # Track active positions for this strategy
         self.active_positions: Dict[str, Position] = {}
-        self.pending_sells: Dict[str, dict] = {}  # Track pending sell orders
-        
+        self.pending_sells: Dict[str, dict] = {}
+
     async def identify_quick_flip_opportunities(
-        self, 
+        self,
         markets: List[Market],
-        available_capital: float
+        available_capital: float,
     ) -> List[QuickFlipOpportunity]:
-        """
-        Identify markets suitable for quick flip scalping.
-        
-        Criteria:
-        1. Low current prices (1¢-20¢ range)
-        2. High volatility or recent movement
-        3. AI confidence in directional movement
-        4. Sufficient liquidity for entry/exit
-        """
-        opportunities = []
-        
-        self.logger.info(f"🔍 Analyzing {len(markets)} markets for quick flip opportunities")
-        
+        """Find quick-flip candidates from the provided markets."""
+        opportunities: List[QuickFlipOpportunity] = []
+        self.logger.info(f"Analyzing {len(markets)} markets for quick flip opportunities")
+
         for market in markets:
             try:
-                # Get current market data
-                market_data = await self.kalshi_client.get_market(market.market_id)
-                if not market_data:
+                market_response = await self.kalshi_client.get_market(market.market_id)
+                market_info = market_response.get("market", {})
+                if not market_info:
                     continue
-                
-                market_info = market_data.get('market', {})
-                # Handle both new and old field formats
-                yes_price = float(market_info.get('yes_ask_dollars', 0) or market_info.get('yes_ask', 0) or 0)
-                no_price = float(market_info.get('no_ask_dollars', 0) or market_info.get('no_ask', 0) or 0)
-                
-                # Convert cents to dollars if needed
-                if yes_price > 1.0:
-                    yes_price = yes_price / 100.0
-                if no_price > 1.0:
-                    no_price = no_price / 100.0
-                
-                # Check if prices are in our target range
-                yes_opportunity = await self._evaluate_price_opportunity(
-                    market, "YES", yes_price, market_info
-                )
-                no_opportunity = await self._evaluate_price_opportunity(
-                    market, "NO", no_price, market_info
-                )
-                
-                if yes_opportunity:
-                    opportunities.append(yes_opportunity)
-                if no_opportunity:
-                    opportunities.append(no_opportunity)
-                    
-            except Exception as e:
-                self.logger.error(f"Error analyzing market {market.market_id}: {e}")
-                continue
-        
-        # Sort by expected profit and confidence
+
+                for side in ("YES", "NO"):
+                    ask_price = get_best_ask_price(market_info, side)
+                    opportunity = await self._evaluate_price_opportunity(
+                        market,
+                        side,
+                        ask_price,
+                    )
+                    if opportunity:
+                        opportunities.append(opportunity)
+            except Exception as exc:
+                self.logger.error(f"Error analyzing market {market.market_id}: {exc}")
+
         opportunities.sort(
-            key=lambda x: x.expected_profit * x.confidence_score, 
-            reverse=True
+            key=lambda opp: opp.expected_profit * opp.confidence_score,
+            reverse=True,
         )
-        
-        # Limit by available capital and max concurrent positions
+
         max_positions = min(
             self.config.max_concurrent_positions,
-            int(available_capital / self.config.capital_per_trade)
+            int(available_capital / max(self.config.capital_per_trade, 1)),
         )
-        
-        filtered_opportunities = opportunities[:max_positions]
-        
+        filtered = opportunities[:max_positions]
         self.logger.info(
-            f"🎯 Found {len(filtered_opportunities)} quick flip opportunities "
+            f"Found {len(filtered)} quick flip opportunities "
             f"(from {len(opportunities)} total analyzed)"
         )
-        
-        return filtered_opportunities
-    
+        return filtered
+
     async def _evaluate_price_opportunity(
         self,
         market: Market,
         side: str,
         current_price: float,
-        market_info: dict
     ) -> Optional[QuickFlipOpportunity]:
-        """
-        Evaluate if a specific side of a market presents a good quick flip opportunity.
-        """
-        if not current_price or current_price <= 0:
+        """Score a single market side for quick-flip suitability."""
+        if current_price <= 0:
             return None
-            
-        # Check if price is in our target range
         if current_price < self.config.min_entry_price or current_price > self.config.max_entry_price:
             return None
-        
-        # Calculate potential exit price (at least min profit margin)
+
         min_exit_price = current_price * (1 + self.config.min_profit_margin)
-        
-        # Don't target prices above $0.95 (too close to ceiling)
         if min_exit_price > 0.95:
             return None
-        
-        # Use AI to assess movement probability and suggest exit price
+
         movement_analysis = await self._analyze_market_movement(market, side, current_price)
-        
-        if movement_analysis['confidence'] < self.config.confidence_threshold:
+        if movement_analysis["confidence"] < self.config.confidence_threshold:
             return None
-        
-        # Calculate position size (current_price already in dollars)
+
         quantity = min(
             self.config.max_position_size,
-            int(self.config.capital_per_trade / current_price)
+            int(self.config.capital_per_trade / current_price),
         )
-        
         if quantity < 1:
             return None
-        
-        expected_profit = quantity * ((movement_analysis['target_price'] - current_price) / 100)
-        
+
+        target_price = movement_analysis["target_price"]
+        expected_profit = quantity * max(0.0, target_price - current_price)
+
         return QuickFlipOpportunity(
-                            market_id=market.market_id,
+            market_id=market.market_id,
             market_title=market.title,
             side=side,
             entry_price=current_price,
-            exit_price=movement_analysis['target_price'],
+            exit_price=target_price,
             quantity=quantity,
             expected_profit=expected_profit,
-            confidence_score=movement_analysis['confidence'],
-            movement_indicator=movement_analysis['reason'],
-            max_hold_time=self.config.max_hold_minutes
+            confidence_score=movement_analysis["confidence"],
+            movement_indicator=movement_analysis["reason"],
+            max_hold_time=self.config.max_hold_minutes,
         )
-    
+
     async def _analyze_market_movement(
-        self, 
-        market: Market, 
-        side: str, 
-        current_price: float
+        self,
+        market: Market,
+        side: str,
+        current_price: float,
     ) -> dict:
-        """
-        Use AI to analyze potential for quick price movement.
-        """
+        """Use AI to estimate short-horizon upside potential."""
         try:
-            # Create focused prompt for quick movement analysis
             prompt = f"""
 QUICK SCALP ANALYSIS for {market.title}
 
@@ -226,9 +176,9 @@ Market closes: {datetime.fromtimestamp(market.expiration_ts).strftime('%Y-%m-%d 
 
 Analyze for IMMEDIATE (next 30 minutes) price movement potential:
 
-1. Is there likely catalysts/news that could move price UP in next 30 min?
+1. Is there likely catalyst/news that could move price UP in the next 30 minutes?
 2. Current momentum/volatility indicators
-3. What price could {side} realistically reach in 30 min?
+3. What price could {side} realistically reach in 30 minutes?
 4. Confidence level (0-1) for upward movement
 
 Respond with:
@@ -242,283 +192,240 @@ REASON: [brief explanation]
                 max_tokens=3000,
                 strategy="quick_flip_scalping",
                 query_type="movement_prediction",
-                market_id=market.market_id
+                market_id=market.market_id,
             )
-            
-            # Check if AI response is None (API exhausted or failed)
+
             if response is None:
-                self.logger.info(f"AI analysis unavailable for {market.market_id}, using conservative defaults")
                 return {
-                    'target_price': current_price + 0.02,  # Very conservative target ($0.02 increase)
-                    'confidence': 0.2,  # Low confidence
-                    'reason': "AI analysis unavailable due to API limits"
+                    "target_price": min(0.95, current_price + 0.02),
+                    "confidence": 0.2,
+                    "reason": "AI analysis unavailable due to API limits",
                 }
-            
-            # Parse response safely
-            lines = response.strip().split('\n')
-            target_price = current_price + 0.05  # Default fallback ($0.05 increase)
+
+            target_price = min(0.95, current_price + 0.05)
             confidence = 0.5
             reason = "Default analysis"
-            
-            for line in lines:
-                if 'TARGET_PRICE:' in line:
+
+            for line in response.strip().splitlines():
+                if "TARGET_PRICE:" in line:
                     try:
-                        target_price = float(line.split(':')[1].strip())
-                    except:
+                        target_price = float(line.split(":", 1)[1].strip())
+                    except Exception:
                         pass
-                elif 'CONFIDENCE:' in line:
+                elif "CONFIDENCE:" in line:
                     try:
-                        confidence = float(line.split(':')[1].strip())
-                    except:
+                        confidence = float(line.split(":", 1)[1].strip())
+                    except Exception:
                         pass
-                elif 'REASON:' in line:
-                    reason = line.split(':', 1)[1].strip()
-            
-            # Ensure target price is reasonable (at least $0.01 increase, max $0.95)
+                elif "REASON:" in line:
+                    reason = line.split(":", 1)[1].strip()
+
             target_price = max(current_price + 0.01, min(target_price, 0.95))
-            
             return {
-                'target_price': target_price,
-                'confidence': confidence,
-                'reason': reason
+                "target_price": target_price,
+                "confidence": confidence,
+                "reason": reason,
             }
-            
-        except Exception as e:
-            self.logger.error(f"Error in movement analysis: {e}")
+        except Exception as exc:
+            self.logger.error(f"Error in movement analysis: {exc}")
             return {
-                'target_price': current_price + 0.05,
-                'confidence': 0.3,
-                'reason': f"Analysis failed: {e}"
+                "target_price": min(0.95, current_price + 0.05),
+                "confidence": 0.3,
+                "reason": f"Analysis failed: {exc}",
             }
-    
+
     async def execute_quick_flip_opportunities(
         self,
-        opportunities: List[QuickFlipOpportunity]
+        opportunities: List[QuickFlipOpportunity],
     ) -> Dict:
-        """
-        Execute quick flip trades and immediately place sell orders.
-        """
+        """Execute quick-flip entries and queue corresponding exit orders."""
         results = {
-            'positions_created': 0,
-            'sell_orders_placed': 0,
-            'total_capital_used': 0.0,
-            'expected_profit': 0.0,
-            'failed_executions': 0
+            "positions_created": 0,
+            "sell_orders_placed": 0,
+            "total_capital_used": 0.0,
+            "expected_profit": 0.0,
+            "failed_executions": 0,
         }
-        
-        self.logger.info(f"🚀 Executing {len(opportunities)} quick flip opportunities")
-        
+
+        self.logger.info(f"Executing {len(opportunities)} quick flip opportunities")
+
         for opportunity in opportunities:
             try:
                 success = await self._execute_single_quick_flip(opportunity)
-                
-                if success:
-                    results['positions_created'] += 1
-                    results['total_capital_used'] += opportunity.quantity * (opportunity.entry_price / 100)
-                    results['expected_profit'] += opportunity.expected_profit
-                    
-                    # Try to place sell order immediately
-                    sell_success = await self._place_immediate_sell_order(opportunity)
-                    if sell_success:
-                        results['sell_orders_placed'] += 1
-                else:
-                    results['failed_executions'] += 1
-                    
-            except Exception as e:
-                self.logger.error(f"Error executing quick flip for {opportunity.market_id}: {e}")
-                results['failed_executions'] += 1
-                continue
-        
+                if not success:
+                    results["failed_executions"] += 1
+                    continue
+
+                results["positions_created"] += 1
+                results["total_capital_used"] += opportunity.quantity * opportunity.entry_price
+                results["expected_profit"] += opportunity.expected_profit
+
+                sell_success = await self._place_immediate_sell_order(opportunity)
+                if sell_success:
+                    results["sell_orders_placed"] += 1
+            except Exception as exc:
+                self.logger.error(f"Error executing quick flip for {opportunity.market_id}: {exc}")
+                results["failed_executions"] += 1
+
         self.logger.info(
-            f"✅ Quick Flip Execution Summary: "
-            f"{results['positions_created']} positions, "
+            f"Quick flip summary: {results['positions_created']} positions, "
             f"{results['sell_orders_placed']} sell orders, "
-            f"${results['total_capital_used']:.0f} capital used"
+            f"${results['total_capital_used']:.2f} capital used"
         )
-        
         return results
-    
+
     async def _execute_single_quick_flip(self, opportunity: QuickFlipOpportunity) -> bool:
-        """Execute a single quick flip trade."""
+        """Create and execute one quick-flip entry."""
         try:
-            # Create position object
             position = Position(
                 market_id=opportunity.market_id,
                 side=opportunity.side,
                 quantity=opportunity.quantity,
-                entry_price=opportunity.entry_price,  # Already in dollars
-                live=False,  # Will be set to True after execution
+                entry_price=opportunity.entry_price,
+                live=False,
                 timestamp=datetime.now(),
-                rationale=f"QUICK FLIP: {opportunity.movement_indicator} | "
-                         f"Target: ${opportunity.entry_price:.2f}→${opportunity.exit_price:.2f}",
-                strategy="quick_flip_scalping"
+                rationale=(
+                    f"QUICK FLIP: {opportunity.movement_indicator} | "
+                    f"Target: ${opportunity.entry_price:.2f}->${opportunity.exit_price:.2f}"
+                ),
+                strategy="quick_flip_scalping",
             )
-            
-            # Add to database
+
             position_id = await self.db_manager.add_position(position)
             if position_id is None:
                 self.logger.warning(f"Position already exists for {opportunity.market_id}")
                 return False
-            
+
             position.id = position_id
-            
-            # Execute the position
-            from src.jobs.execute import execute_position
-            live_mode = getattr(settings.trading, 'live_trading_enabled', False)
-            
             success = await execute_position(
                 position=position,
-                live_mode=live_mode,
+                live_mode=getattr(settings.trading, "live_trading_enabled", False),
                 db_manager=self.db_manager,
-                kalshi_client=self.kalshi_client
+                kalshi_client=self.kalshi_client,
             )
-            
             if success:
                 self.active_positions[opportunity.market_id] = position
                 self.logger.info(
-                    f"✅ Quick flip entry: {opportunity.side} {opportunity.quantity} "
-                    f"at ${opportunity.entry_price:.2f} for {opportunity.market_id}"
+                    f"Quick flip entry: {opportunity.side} {opportunity.quantity} "
+                    f"at ${opportunity.entry_price:.4f} for {opportunity.market_id}"
                 )
                 return True
-            else:
-                self.logger.error(f"❌ Failed to execute quick flip for {opportunity.market_id}")
-                return False
-                
-        except Exception as e:
-            self.logger.error(f"Error executing single quick flip: {e}")
+
+            self.logger.error(f"Failed to execute quick flip for {opportunity.market_id}")
             return False
-    
+        except Exception as exc:
+            self.logger.error(f"Error executing single quick flip: {exc}")
+            return False
+
     async def _place_immediate_sell_order(self, opportunity: QuickFlipOpportunity) -> bool:
-        """
-        Place sell limit order immediately after position is filled.
-        """
+        """Place a resting profit-taking order right after entry."""
         try:
             position = self.active_positions.get(opportunity.market_id)
             if not position:
                 self.logger.error(f"No active position found for {opportunity.market_id}")
                 return False
-            
-            # Place sell limit order at target price
-            sell_price = opportunity.exit_price / 100  # Convert to dollars
-            
+
+            sell_price = opportunity.exit_price
             success = await place_sell_limit_order(
                 position=position,
                 limit_price=sell_price,
                 db_manager=self.db_manager,
-                kalshi_client=self.kalshi_client
+                kalshi_client=self.kalshi_client,
             )
-            
-            if success:
-                # Track the pending sell
-                self.pending_sells[opportunity.market_id] = {
-                    'position': position,
-                    'target_price': sell_price,
-                    'placed_at': datetime.now(),
-                    'max_hold_until': datetime.now() + timedelta(minutes=opportunity.max_hold_time)
-                }
-                
-                self.logger.info(
-                    f"🎯 Sell order placed: {position.side} {position.quantity} "
-                    f"at ${opportunity.exit_price:.2f} for {opportunity.market_id}"
-                )
-                return True
-            else:
+            if not success:
                 self.logger.error(f"Failed to place sell order for {opportunity.market_id}")
                 return False
-                
-        except Exception as e:
-            self.logger.error(f"Error placing immediate sell order: {e}")
+
+            self.pending_sells[opportunity.market_id] = {
+                "position": position,
+                "target_price": sell_price,
+                "placed_at": datetime.now(),
+                "max_hold_until": datetime.now() + timedelta(minutes=opportunity.max_hold_time),
+            }
+            self.logger.info(
+                f"Sell order placed: {position.side} {position.quantity} "
+                f"at ${sell_price:.4f} for {opportunity.market_id}"
+            )
+            return True
+        except Exception as exc:
+            self.logger.error(f"Error placing immediate sell order: {exc}")
             return False
-    
+
     async def manage_active_positions(self) -> Dict:
-        """
-        Manage active quick flip positions:
-        1. Check if sell orders have filled
-        2. Cut losses on positions held too long
-        3. Adjust sell prices if needed
-        """
+        """Cut stale positions that have exceeded their hold window."""
         results = {
-            'positions_closed': 0,
-            'orders_adjusted': 0,
-            'losses_cut': 0,
-            'total_pnl': 0.0
+            "positions_closed": 0,
+            "orders_adjusted": 0,
+            "losses_cut": 0,
+            "total_pnl": 0.0,
         }
-        
+
         current_time = datetime.now()
-        positions_to_remove = []
-        
+        positions_to_remove: List[str] = []
+
         for market_id, sell_info in self.pending_sells.items():
             try:
-                position = sell_info['position']
-                max_hold_until = sell_info['max_hold_until']
-                
-                # Check if we should cut losses (held too long)
-                if current_time > max_hold_until:
-                    self.logger.warning(
-                        f"⏰ Quick flip held too long: {market_id}, cutting losses"
-                    )
-                    
-                    # Place market order to exit immediately
-                    cut_success = await self._cut_losses_market_order(position)
-                    if cut_success:
-                        results['losses_cut'] += 1
-                        positions_to_remove.append(market_id)
-                
-                # TODO: Add logic to check if sell order filled
-                # TODO: Add logic to adjust sell price if market moved against us
-                
-            except Exception as e:
-                self.logger.error(f"Error managing position {market_id}: {e}")
-                continue
-        
-        # Clean up closed positions
+                position = sell_info["position"]
+                max_hold_until = sell_info["max_hold_until"]
+                if current_time <= max_hold_until:
+                    continue
+
+                self.logger.warning(f"Quick flip held too long: {market_id}, cutting losses")
+                cut_success = await self._cut_losses_market_order(position)
+                if cut_success:
+                    results["losses_cut"] += 1
+                    positions_to_remove.append(market_id)
+            except Exception as exc:
+                self.logger.error(f"Error managing position {market_id}: {exc}")
+
         for market_id in positions_to_remove:
-            if market_id in self.active_positions:
-                del self.active_positions[market_id]
-            if market_id in self.pending_sells:
-                del self.pending_sells[market_id]
-        
+            self.active_positions.pop(market_id, None)
+            self.pending_sells.pop(market_id, None)
+
         return results
-    
+
     async def _cut_losses_market_order(self, position: Position) -> bool:
-        """Place market order to immediately exit a position."""
+        """Use a docs-compatible immediate limit order instead of market orders."""
         try:
-            # Place market sell order to cut losses
-            import uuid
-            client_order_id = str(uuid.uuid4())
-            
+            market_response = await self.kalshi_client.get_market(position.market_id)
+            market_info = market_response.get("market", {})
+            exit_price = get_best_bid_price(market_info, position.side)
+            if exit_price <= 0 or exit_price >= 1:
+                self.logger.warning(
+                    f"Cannot cut losses for {position.market_id}: invalid best bid {exit_price:.4f}"
+                )
+                return False
+
             order_params = {
                 "ticker": position.market_id,
-                "client_order_id": client_order_id,
+                "client_order_id": str(uuid.uuid4()),
                 "side": position.side.lower(),
                 "action": "sell",
                 "count": position.quantity,
-                "type_": "market"
+                "type_": "limit",
+                "time_in_force": "fill_or_kill",
+                "reduce_only": True,
+                **build_limit_order_price_fields(position.side, exit_price),
             }
-            
-            live_mode = getattr(settings.trading, 'live_trading_enabled', False)
-            
-            if live_mode:
+
+            if getattr(settings.trading, "live_trading_enabled", False):
                 response = await self.kalshi_client.place_order(**order_params)
-                
-                if response and 'order' in response:
+                if response and "order" in response:
                     self.logger.info(
-                        f"🛑 Loss cut order placed: {position.side} {position.quantity} "
-                        f"MARKET SELL for {position.market_id}"
+                        f"Loss cut order placed: {position.side} {position.quantity} "
+                        f"LIMIT SELL @ ${exit_price:.4f} for {position.market_id}"
                     )
                     return True
-                else:
-                    self.logger.error(f"Failed to place loss cut order: {response}")
-                    return False
-            else:
-                self.logger.info(
-                    f"📝 SIMULATED loss cut: {position.side} {position.quantity} "
-                    f"MARKET SELL for {position.market_id}"
-                )
-                return True
-                
-        except Exception as e:
-            self.logger.error(f"Error cutting losses: {e}")
+                self.logger.error(f"Failed to place loss cut order: {response}")
+                return False
+
+            self.logger.info(
+                f"SIMULATED loss cut: {position.side} {position.quantity} "
+                f"LIMIT SELL @ ${exit_price:.4f} for {position.market_id}"
+            )
+            return True
+        except Exception as exc:
+            self.logger.error(f"Error cutting losses: {exc}")
             return False
 
 
@@ -527,63 +434,45 @@ async def run_quick_flip_strategy(
     kalshi_client: KalshiClient,
     xai_client: XAIClient,
     available_capital: float,
-    config: Optional[QuickFlipConfig] = None
+    config: Optional[QuickFlipConfig] = None,
 ) -> Dict:
-    """
-    Main entry point for quick flip scalping strategy.
-    """
+    """Main entry point for the quick-flip strategy."""
     logger = get_trading_logger("quick_flip_main")
-    
+
     try:
-        logger.info("🎯 Starting Quick Flip Scalping Strategy")
-        
-        # Initialize strategy
-        strategy = QuickFlipScalpingStrategy(
-            db_manager, kalshi_client, xai_client, config
-        )
-        
-        # Get available markets
+        logger.info("Starting Quick Flip Scalping Strategy")
+        strategy = QuickFlipScalpingStrategy(db_manager, kalshi_client, xai_client, config)
+
         markets = await db_manager.get_eligible_markets(
-            volume_min=100,  # Lower liquidity requirement for small positions
-            max_days_to_expiry=365  # Accept any timeline for quick flips
+            volume_min=100,
+            max_days_to_expiry=365,
         )
-        
         if not markets:
             logger.warning("No markets available for quick flip analysis")
-            return {'error': 'No markets available'}
-        
-        # Step 1: Identify opportunities
+            return {"error": "No markets available"}
+
         opportunities = await strategy.identify_quick_flip_opportunities(
-            markets, available_capital
+            markets,
+            available_capital,
         )
-        
         if not opportunities:
             logger.info("No quick flip opportunities found")
-            return {'opportunities_found': 0}
-        
-        # Step 2: Execute quick flips
+            return {"opportunities_found": 0}
+
         execution_results = await strategy.execute_quick_flip_opportunities(opportunities)
-        
-        # Step 3: Manage existing positions
         management_results = await strategy.manage_active_positions()
-        
-        # Combine results
         total_results = {
             **execution_results,
             **management_results,
-            'opportunities_analyzed': len(opportunities),
-            'strategy': 'quick_flip_scalping'
+            "opportunities_analyzed": len(opportunities),
+            "strategy": "quick_flip_scalping",
         }
-        
         logger.info(
-            f"🏁 Quick Flip Strategy Complete: "
-            f"{execution_results['positions_created']} new positions, "
-            f"${execution_results['total_capital_used']:.0f} capital used, "
+            f"Quick Flip Strategy Complete: {execution_results['positions_created']} new positions, "
+            f"${execution_results['total_capital_used']:.2f} capital used, "
             f"${execution_results['expected_profit']:.2f} expected profit"
         )
-        
         return total_results
-        
-    except Exception as e:
-        logger.error(f"Error in quick flip strategy: {e}")
-        return {'error': str(e)} 
+    except Exception as exc:
+        logger.error(f"Error in quick flip strategy: {exc}")
+        return {"error": str(exc)}

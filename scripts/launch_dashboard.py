@@ -10,6 +10,24 @@ import sys
 import os
 from pathlib import Path
 
+
+def _ensure_utf8_console():
+    """Prefer UTF-8 console streams so launcher output doesn't crash on Windows."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            encoding = getattr(stream, "encoding", "") or ""
+            if encoding.lower() != "utf-8":
+                reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            continue
+
+
+_ensure_utf8_console()
+
+
 def check_requirements():
     """Check if required packages are installed."""
     required_packages = [

@@ -6,6 +6,12 @@ import asyncio
 from typing import List, Optional, Dict, Any
 from src.clients.kalshi_client import KalshiClient
 from src.utils.database import Market
+from src.utils.kalshi_normalization import (
+    get_market_expiration_ts,
+    get_market_prices,
+    get_market_volume,
+    is_active_market_status,
+)
 import pytest
 
 # Cache for markets to avoid repeated API calls
@@ -50,18 +56,22 @@ async def find_suitable_test_market() -> Optional[Market]:
     markets_data = await get_test_markets(limit=5)  # Only fetch 5 markets
     
     for market_data in markets_data:
-        if (market_data.get('status') == 'active' and 
-            market_data.get('volume', 0) > 500 and  # Lower threshold for testing
-            market_data.get('yes_bid') and market_data.get('no_bid')):
+        yes_bid, yes_ask, no_bid, no_ask = get_market_prices(market_data)
+        if (
+            is_active_market_status(market_data.get('status'))
+            and get_market_volume(market_data) > 500
+            and yes_bid
+            and no_bid
+        ):
             
             # Create Market object from real data
             return Market(
                 market_id=market_data['ticker'],
                 title=market_data['title'],
-                yes_price=(market_data.get('yes_bid', 0) + market_data.get('yes_ask', 0)) / 200,
-                no_price=(market_data.get('no_bid', 0) + market_data.get('no_ask', 0)) / 200,
-                volume=market_data.get('volume', 0),
-                expiration_ts=market_data.get('close_ts', 0),
+                yes_price=(yes_bid + yes_ask) / 2,
+                no_price=(no_bid + no_ask) / 2,
+                volume=get_market_volume(market_data),
+                expiration_ts=get_market_expiration_ts(market_data) or 0,
                 category=market_data.get('category', 'test'),
                 status=market_data.get('status', 'active'),
                 last_updated=None,

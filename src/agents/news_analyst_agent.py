@@ -16,6 +16,18 @@ class NewsAnalystAgent(BaseAgent):
     AGENT_NAME = "news_analyst"
     AGENT_ROLE = "news_analyst"
     DEFAULT_MODEL = "anthropic/claude-sonnet-4.5"
+    RESPONSE_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "sentiment": {"type": "number"},
+            "relevance": {"type": "number"},
+            "key_factors": {"type": "array", "items": {"type": "string"}},
+            "impact_direction": {"type": "string", "enum": ["up", "down", "neutral"]},
+            "reasoning": {"type": "string"},
+        },
+        "required": ["sentiment", "relevance", "key_factors", "impact_direction", "reasoning"],
+        "additionalProperties": False,
+    }
 
     SYSTEM_PROMPT = (
         "You are an expert financial news analyst specialising in prediction "
@@ -31,7 +43,7 @@ class NewsAnalystAgent(BaseAgent):
         "3. KEY FACTORS -- List the 2-5 most important news-driven factors.\n"
         "4. IMPACT DIRECTION -- Does the news push the probability UP or DOWN "
         "relative to the current market price?\n\n"
-        "Return your analysis as a JSON object (inside a ```json``` code block) "
+        "Return your analysis as a JSON object only. Do not include markdown fences. "
         "with the following keys:\n"
         '  "sentiment": float (-1.0 to 1.0),\n'
         '  "relevance": float (0.0 to 1.0),\n'
@@ -56,7 +68,7 @@ class NewsAnalystAgent(BaseAgent):
             f"Assess the news sentiment and relevance for the following "
             f"prediction market.\n\n"
             f"{summary}{news_section}\n\n"
-            f"Return ONLY a JSON object inside a ```json``` code block."
+            f"Return ONLY a JSON object."
         )
 
     def _parse_result(self, raw_json: dict) -> dict:

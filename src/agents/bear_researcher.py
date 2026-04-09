@@ -15,7 +15,27 @@ class BearResearcher(BaseAgent):
 
     AGENT_NAME = "bear_researcher"
     AGENT_ROLE = "bear_researcher"
-    DEFAULT_MODEL = "google/gemini-3-pro-preview"
+    DEFAULT_MODEL = "x-ai/grok-4.1-fast"
+    RESPONSE_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "probability": {"type": "number"},
+            "probability_ceiling": {"type": "number"},
+            "confidence": {"type": "number"},
+            "key_arguments": {"type": "array", "items": {"type": "string"}},
+            "risk_factors": {"type": "array", "items": {"type": "string"}},
+            "reasoning": {"type": "string"},
+        },
+        "required": [
+            "probability",
+            "probability_ceiling",
+            "confidence",
+            "key_arguments",
+            "risk_factors",
+            "reasoning",
+        ],
+        "additionalProperties": False,
+    }
 
     SYSTEM_PROMPT = (
         "You are a sceptical risk analyst whose job is to make the STRONGEST "
@@ -32,7 +52,7 @@ class BearResearcher(BaseAgent):
         "4. RISK FACTORS -- What could go wrong for YES holders?\n"
         "5. HISTORICAL PRECEDENT -- Have similar events failed before?\n\n"
         "Be rigorous and evidence-based. Challenge every assumption.\n\n"
-        "Return your analysis as a JSON object (inside a ```json``` code block) "
+        "Return your analysis as a JSON object only. Do not include markdown fences. "
         "with the following keys:\n"
         '  "probability": float (0.0-1.0, your YES probability estimate -- '
         "typically lower than the bull's),\n"
@@ -72,7 +92,7 @@ class BearResearcher(BaseAgent):
             f"resolves NO.\n\n"
             f"{summary}{forecaster_note}{bull_note}\n\n"
             f"Challenge every assumption. Be rigorous.\n"
-            f"Return ONLY a JSON object inside a ```json``` code block."
+            f"Return ONLY a JSON object."
         )
 
     def _parse_result(self, raw_json: dict) -> dict:

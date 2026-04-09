@@ -1,6 +1,8 @@
 """
-OpenRouter client for AI-powered trading decisions.
-Interfaces with Grok models through OpenRouter for market analysis and trading strategies.
+Legacy OpenAI-compatible client for AI-powered trading decisions.
+
+This module is kept for compatibility, but active OpenRouter traffic is routed
+through ``openrouter_client.py`` and ``model_router.py``.
 """
 
 import asyncio
@@ -15,6 +17,7 @@ from openai import AsyncOpenAI
 from json_repair import repair_json
 
 from src.config.settings import settings
+from src.utils.kalshi_normalization import get_market_prices, get_market_volume
 from src.utils.logging_setup import TradingLoggerMixin, log_error_with_context
 from src.utils.prompts import MULTI_AGENT_PROMPT_TPL
 
@@ -50,8 +53,7 @@ class MarketAnalysis:
 
 class OpenAIClient(TradingLoggerMixin):
     """
-    OpenAI client for AI-powered trading decisions.
-    Uses OpenAI models for market analysis and trading strategy.
+    Legacy OpenAI-compatible client for AI-powered trading decisions.
     """
     
     def __init__(self, api_key: Optional[str] = None):
@@ -135,11 +137,12 @@ class OpenAIClient(TradingLoggerMixin):
         available_balance = portfolio_data.get("available_balance", 0)
         max_trade_value = available_balance * (settings.trading.max_position_size_pct / 100)
         
+        yes_bid, yes_ask, no_bid, no_ask = get_market_prices(market_data)
         prompt_params = {
             "title": market_data['title'],
-            "yes_price": (market_data.get('yes_bid', 0) + market_data.get('yes_ask', 100)) / 2,
-            "no_price": (market_data.get('no_bid', 0) + market_data.get('no_ask', 100)) / 2,
-            "volume": market_data['volume'],
+            "yes_price": (((yes_bid + yes_ask) / 2.0) if yes_bid and yes_ask else max(yes_bid, yes_ask)) * 100,
+            "no_price": (((no_bid + no_ask) / 2.0) if no_bid and no_ask else max(no_bid, no_ask)) * 100,
+            "volume": get_market_volume(market_data),
             "days_to_expiry": days_to_expiry,
             "news_summary": news_summary,
             "cash": available_balance,
@@ -385,4 +388,4 @@ class OpenAIClient(TradingLoggerMixin):
                 "OpenAI client closed",
                 total_cost=self.total_cost,
                 total_requests=self.request_count
-            ) 
+            )

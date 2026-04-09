@@ -15,12 +15,16 @@ from src.clients.kalshi_client import KalshiClient
 from src.clients.xai_client import XAIClient
 from src.utils.database import DatabaseManager, Position, TradeLog
 from src.config.settings import settings
+from src.utils.kalshi_normalization import (
+    get_balance_dollars,
+    get_position_size,
+)
 from src.utils.logging_setup import get_trading_logger
 
 
 class TradingPerformanceAnalyzer:
     """
-    AI-powered trading performance analyzer using Grok4.
+    AI-powered trading performance analyzer using the configured OpenRouter model.
     
     Analyzes:
     - Position performance and win rates
@@ -45,7 +49,7 @@ class TradingPerformanceAnalyzer:
             # Gather all performance data
             performance_data = await self._gather_performance_data()
             
-            # Generate AI analysis using Grok4
+            # Generate AI analysis using the configured OpenRouter model
             ai_analysis = await self._generate_ai_analysis(performance_data)
             
             # Compile final report
@@ -75,15 +79,15 @@ class TradingPerformanceAnalyzer:
             # Kalshi positions
             positions_response = await self.kalshi_client.get_positions()
             kalshi_positions = positions_response.get('market_positions', [])
-            active_positions = [p for p in kalshi_positions if p.get('position', 0) != 0]
+            active_positions = [p for p in kalshi_positions if get_position_size(p) != 0]
             
             # Portfolio value
             balance_response = await self.kalshi_client.get_balance()
-            available_cash = balance_response.get('balance', 0) / 100
+            available_cash = get_balance_dollars(balance_response)
             
             data['portfolio'] = {
                 'active_positions': len(active_positions),
-                'total_contracts': sum(abs(p.get('position', 0)) for p in active_positions),
+                'total_contracts': sum(abs(get_position_size(p)) for p in active_positions),
                 'available_cash': available_cash,
                 'positions_detail': active_positions[:10]  # Top 10 for analysis
             }
@@ -134,35 +138,35 @@ class TradingPerformanceAnalyzer:
                 
                 # Calculate unrealized P&L for current positions
                 cursor = await db.execute("""
-                     SELECT 
-                         COUNT(*) as open_positions,
-                         SUM(entry_price * quantity) as total_exposure
-                     FROM positions 
-                     WHERE status = 'open'
-                 """)
-                 open_position_stats = await cursor.fetchone()
-                 
-                 data['performance'] = {
-                     'overall_stats': {
-                         'total_trades': trade_stats[0] if trade_stats else 0,
-                         'winning_trades': trade_stats[1] if trade_stats else 0,
-                         'win_rate': (trade_stats[1] / trade_stats[0]) if trade_stats and trade_stats[0] > 0 else 0,
-                         'avg_pnl': trade_stats[2] if trade_stats else 0,
-                         'total_pnl': trade_stats[3] if trade_stats else 0,
-                         'worst_loss': trade_stats[4] if trade_stats else 0,
-                         'best_win': trade_stats[5] if trade_stats else 0
-                     },
-                     'position_distribution': dict(position_stats) if position_stats else {},
-                     'open_positions': {
-                         'count': open_position_stats[0] if open_position_stats else 0,
-                         'total_exposure': open_position_stats[1] if open_position_stats else 0
-                     },
-                     'recent_performance': {
-                         'trades_last_7d': recent_stats[0] if recent_stats else 0,
-                         'avg_pnl_last_7d': recent_stats[1] if recent_stats else 0,
-                         'wins_last_7d': recent_stats[2] if recent_stats else 0
-                     }
-                 }
+                    SELECT
+                        COUNT(*) as open_positions,
+                        SUM(entry_price * quantity) as total_exposure
+                    FROM positions
+                    WHERE status = 'open'
+                """)
+                open_position_stats = await cursor.fetchone()
+
+                data['performance'] = {
+                    'overall_stats': {
+                        'total_trades': trade_stats[0] if trade_stats else 0,
+                        'winning_trades': trade_stats[1] if trade_stats else 0,
+                        'win_rate': (trade_stats[1] / trade_stats[0]) if trade_stats and trade_stats[0] > 0 else 0,
+                        'avg_pnl': trade_stats[2] if trade_stats else 0,
+                        'total_pnl': trade_stats[3] if trade_stats else 0,
+                        'worst_loss': trade_stats[4] if trade_stats else 0,
+                        'best_win': trade_stats[5] if trade_stats else 0
+                    },
+                    'position_distribution': dict(position_stats) if position_stats else {},
+                    'open_positions': {
+                        'count': open_position_stats[0] if open_position_stats else 0,
+                        'total_exposure': open_position_stats[1] if open_position_stats else 0
+                    },
+                    'recent_performance': {
+                        'trades_last_7d': recent_stats[0] if recent_stats else 0,
+                        'avg_pnl_last_7d': recent_stats[1] if recent_stats else 0,
+                        'wins_last_7d': recent_stats[2] if recent_stats else 0
+                    }
+                }
                 
         except Exception as e:
             self.logger.warning(f"Error gathering performance data: {e}")
@@ -203,7 +207,7 @@ class TradingPerformanceAnalyzer:
         return data
     
     async def _generate_ai_analysis(self, performance_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Use Grok4 to analyze performance data and generate insights."""
+        """Use the configured OpenRouter model to analyze performance data and generate insights."""
         
         analysis_prompt = f"""
 You are an expert quantitative trading analyst reviewing a Kalshi prediction market trading system. 
@@ -257,7 +261,7 @@ Focus on actionable insights that can immediately improve performance.
             
             return {
                 'raw_analysis': analysis_text,
-                'model': 'grok-4',
+                'model': settings.trading.primary_model,
                 'timestamp': datetime.now().isoformat()
             }
             
@@ -389,4 +393,4 @@ async def run_performance_analysis(
     
     finally:
         if kalshi_client:
-            await kalshi_client.close() 
+            await kalshi_client.close()

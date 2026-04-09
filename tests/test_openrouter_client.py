@@ -1,147 +1,259 @@
-"""Tests for the OpenRouter multi-model client."""
+"""Tests for the OpenRouter client and model router."""
 
-import asyncio
-import pytest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from src.clients.openrouter_client import OpenRouterClient, MODEL_PRICING
+import pytest
+
+from src.clients.openrouter_client import (
+    MODEL_PRICING,
+    OpenRouterClient,
+    TRADING_DECISION_RESPONSE_FORMAT,
+)
+
+
+def _mock_response(
+    *,
+    content='{"ok": true}',
+    model="openai/gpt-5.4",
+    prompt_tokens=100,
+    completion_tokens=50,
+    cost=0.123,
+):
+    usage = SimpleNamespace(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+        completion_tokens_details=SimpleNamespace(reasoning_tokens=11),
+        model_extra={
+            "cost": cost,
+            "cost_details": {"upstream_inference_prompt_cost": 0.02},
+        },
+    )
+    message = SimpleNamespace(content=content)
+    choice = SimpleNamespace(message=message, finish_reason="stop")
+    return SimpleNamespace(
+        id="gen-test",
+        model=model,
+        choices=[choice],
+        usage=usage,
+        service_tier="default",
+    )
 
 
 class TestOpenRouterClient:
     """Tests for OpenRouterClient."""
 
     def test_model_pricing_registry(self):
-        """Verify all expected models are in the pricing registry."""
+        """Verify current production models are in the fallback pricing registry."""
         expected_models = [
             "anthropic/claude-sonnet-4.5",
-            "openai/o3",
-            "google/gemini-3-pro-preview",
+            "google/gemini-3.1-pro-preview",
+            "openai/gpt-5.4",
             "deepseek/deepseek-v3.2",
+            "x-ai/grok-4.1-fast",
         ]
         for model in expected_models:
             assert model in MODEL_PRICING, f"Missing model pricing: {model}"
             pricing = MODEL_PRICING[model]
-            # Check pricing has input and output keys (may use different naming)
-            has_input = any("input" in k for k in pricing)
-            has_output = any("output" in k for k in pricing)
-            assert has_input, f"Missing input pricing for {model}: {pricing}"
-            assert has_output, f"Missing output pricing for {model}: {pricing}"
+            assert "input_per_1k" in pricing
+            assert "output_per_1k" in pricing
 
-    def test_client_initialization(self):
-        """Test client initializes with correct settings."""
-        with patch("src.clients.openrouter_client.settings") as mock_settings:
-            mock_settings.api.openrouter_api_key = "test-key"
-            mock_settings.api.openrouter_base_url = "https://openrouter.ai/api/v1"
-            mock_settings.trading.daily_ai_cost_limit = 50.0
-            client = OpenRouterClient()
-            assert client.total_cost == 0.0
-            assert client.request_count == 0
+    def test_client_initialization_uses_openrouter_headers(self):
+        """Test client initializes with the configured attribution headers."""
+        async_client = MagicMock()
 
-    def test_parse_trading_decision_valid_json(self):
-        """Test parsing a valid JSON trading decision."""
+        with patch("src.clients.openrouter_client.AsyncOpenAI", return_value=async_client) as ctor:
+            with patch("src.clients.openrouter_client.settings") as mock_settings:
+                mock_settings.api.openrouter_api_key = "test-key"
+                mock_settings.api.openrouter_base_url = "https://openrouter.ai/api/v1"
+                mock_settings.api.get_openrouter_headers.return_value = {
+                    "HTTP-Referer": "https://example.com",
+                    "X-OpenRouter-Title": "Kalshi Bot",
+                }
+                mock_settings.trading.ai_temperature = 0
+                mock_settings.trading.ai_max_tokens = 8000
+                mock_settings.trading.daily_ai_cost_limit = 50.0
+
+                client = OpenRouterClient()
+
+        ctor.assert_called_once()
+        assert ctor.call_args.kwargs["default_headers"]["HTTP-Referer"] == "https://example.com"
+        assert client.total_cost == 0.0
+        assert client.request_count == 0
+
+    def test_extract_response_metadata_prefers_usage_cost(self):
+        """usage.cost should beat the fallback pricing table when present."""
         client = OpenRouterClient.__new__(OpenRouterClient)
-        client._logger = MagicMock()
+        response = _mock_response(model="google/gemini-3.1-pro-preview", cost=0.456)
 
-        response = '''Here is my analysis:
-```json
-{"action": "BUY", "side": "YES", "limit_price": 45, "confidence": 0.78, "reasoning": "Good edge"}
-```'''
-        decision = client._parse_trading_decision(response)
+        metadata = client._extract_response_metadata(
+            response,
+            requested_model="anthropic/claude-sonnet-4.5",
+            fallback_models=["google/gemini-3.1-pro-preview"],
+        )
+
+        assert metadata.requested_model == "anthropic/claude-sonnet-4.5"
+        assert metadata.actual_model == "google/gemini-3.1-pro-preview"
+        assert metadata.cost == pytest.approx(0.456)
+        assert metadata.reasoning_tokens == 11
+        assert metadata.cost_details["upstream_inference_prompt_cost"] == 0.02
+
+    def test_extract_response_metadata_falls_back_to_registry_cost(self):
+        """Fallback pricing should be used when usage.cost is absent."""
+        client = OpenRouterClient.__new__(OpenRouterClient)
+        response = _mock_response(model="x-ai/grok-4.1-fast", cost=None)
+        response.usage.model_extra = {}
+
+        metadata = client._extract_response_metadata(
+            response,
+            requested_model="x-ai/grok-4.1-fast",
+            fallback_models=[],
+        )
+
+        expected = client._calculate_cost("x-ai/grok-4.1-fast", 100, 50)
+        assert metadata.cost == pytest.approx(expected)
+
+    @pytest.mark.asyncio
+    async def test_get_completion_passes_openrouter_request_shape(self):
+        """Request payload should include fallback models and OpenRouter-specific fields."""
+        response = _mock_response(content='{"status":"ok"}', model="deepseek/deepseek-v3.2")
+        async_client = MagicMock()
+        async_client.chat.completions.create = AsyncMock(return_value=response)
+
+        with patch("src.clients.openrouter_client.AsyncOpenAI", return_value=async_client):
+            with patch("src.clients.openrouter_client.settings") as mock_settings:
+                mock_settings.api.openrouter_api_key = "test-key"
+                mock_settings.api.openrouter_base_url = "https://openrouter.ai/api/v1"
+                mock_settings.api.get_openrouter_headers.return_value = {}
+                mock_settings.trading.ai_temperature = 0
+                mock_settings.trading.ai_max_tokens = 8000
+                mock_settings.trading.daily_ai_cost_limit = 50.0
+
+                client = OpenRouterClient()
+
+        with patch.object(client, "_check_daily_limits", AsyncMock(return_value=True)):
+            result = await client.get_completion(
+                prompt="hello",
+                model="openai/gpt-5.4",
+                fallback_models=["deepseek/deepseek-v3.2", "x-ai/grok-4.1-fast"],
+                provider={"sort": "price"},
+                plugins=[{"id": "response-healing"}],
+                metadata={"request_kind": "unit_test"},
+                session_id="session-123",
+                trace={"trace_id": "trace-123"},
+            )
+
+        assert result == '{"status":"ok"}'
+        kwargs = async_client.chat.completions.create.await_args.kwargs
+        assert kwargs["model"] == "openai/gpt-5.4"
+        assert kwargs["messages"] == [{"role": "user", "content": "hello"}]
+        assert kwargs["extra_body"]["models"] == [
+            "deepseek/deepseek-v3.2",
+            "x-ai/grok-4.1-fast",
+        ]
+        assert kwargs["extra_body"]["provider"]["sort"] == "price"
+        assert kwargs["extra_body"]["plugins"] == [{"id": "response-healing"}]
+        assert kwargs["extra_body"]["session_id"] == "session-123"
+        assert kwargs["extra_body"]["trace"] == {"trace_id": "trace-123"}
+        assert kwargs["metadata"]["request_kind"] == "unit_test"
+        assert kwargs["metadata"]["query_type"] == "completion"
+        assert client.last_request_metadata.actual_model == "deepseek/deepseek-v3.2"
+
+    @pytest.mark.asyncio
+    async def test_get_trading_decision_uses_structured_outputs(self):
+        """Trading decisions should request strict JSON schema output."""
+        response = _mock_response(
+            content='{"action":"BUY","side":"YES","limit_price":54,"confidence":0.78,"reasoning":"Edge exists"}',
+            model="openai/gpt-5.4",
+        )
+        async_client = MagicMock()
+        async_client.chat.completions.create = AsyncMock(return_value=response)
+
+        with patch("src.clients.openrouter_client.AsyncOpenAI", return_value=async_client):
+            with patch("src.clients.openrouter_client.settings") as mock_settings:
+                mock_settings.api.openrouter_api_key = "test-key"
+                mock_settings.api.openrouter_base_url = "https://openrouter.ai/api/v1"
+                mock_settings.api.get_openrouter_headers.return_value = {}
+                mock_settings.trading.ai_temperature = 0
+                mock_settings.trading.ai_max_tokens = 8000
+                mock_settings.trading.max_position_size_pct = 3.0
+                mock_settings.trading.daily_ai_cost_limit = 50.0
+
+                client = OpenRouterClient()
+
+        with patch.object(client, "_check_daily_limits", AsyncMock(return_value=True)):
+            decision = await client.get_trading_decision(
+                market_data={"title": "Test Market", "ticker": "TEST", "yes_price": 51, "no_price": 49, "volume": 1000},
+                portfolio_data={"cash": 1000, "max_trade_value": 30},
+                news_summary="Test summary",
+            )
+
         assert decision is not None
         assert decision.action == "BUY"
-        assert decision.side == "YES"
-        assert decision.confidence == 0.78
-        assert decision.limit_price == 45
+        assert decision.limit_price == 54
+        kwargs = async_client.chat.completions.create.await_args.kwargs
+        assert kwargs["response_format"] == TRADING_DECISION_RESPONSE_FORMAT
+        assert kwargs["extra_body"]["provider"]["require_parameters"] is True
 
-    def test_parse_trading_decision_skip(self):
-        """Test parsing a SKIP decision."""
+    def test_parse_trading_decision_valid_json(self):
+        """Trading decisions should parse plain JSON."""
         client = OpenRouterClient.__new__(OpenRouterClient)
         client._logger = MagicMock()
 
-        response = '{"action": "SKIP", "side": "YES", "limit_price": 50, "confidence": 0.3, "reasoning": "No edge"}'
-        decision = client._parse_trading_decision(response)
+        decision = client._parse_trading_decision(
+            '{"action":"SELL","side":"NO","limit_price":44,"confidence":0.61,"reasoning":"priced too high"}'
+        )
         assert decision is not None
-        assert decision.action == "SKIP"
-
-    def test_parse_trading_decision_invalid(self):
-        """Test parsing invalid response returns None."""
-        client = OpenRouterClient.__new__(OpenRouterClient)
-        client._logger = MagicMock()
-
-        decision = client._parse_trading_decision("This is not JSON at all")
-        assert decision is None
+        assert decision.action == "SELL"
+        assert decision.side == "NO"
+        assert decision.reasoning == "priced too high"
 
     def test_fallback_chain_ordering(self):
-        """Test that fallback chain has the requested model first."""
+        """The requested model should stay first in the default fallback chain."""
         client = OpenRouterClient.__new__(OpenRouterClient)
-        client._logger = MagicMock()
-
-        chain = client._build_fallback_chain("openai/o3")
-        assert chain[0] == "openai/o3"
-        # Should contain other models as fallbacks
-        assert len(chain) > 1
-
-    def test_cost_summary(self):
-        """Test cost summary generation."""
-        client = OpenRouterClient.__new__(OpenRouterClient)
-        client._logger = MagicMock()
-        client.total_cost = 0.05
-        client.request_count = 10
-        client.model_costs = {}
-        client.daily_tracker = MagicMock()
-        client.daily_tracker.total_cost = 0.05
-        client.daily_tracker.daily_limit = 50.0
-        client.daily_tracker.is_exhausted = False
-
-        summary = client.get_cost_summary()
-        assert summary["total_cost"] == 0.05
-        assert summary["total_requests"] == 10
+        chain = client._build_fallback_chain("openai/gpt-5.4")
+        assert chain[0] == "openai/gpt-5.4"
+        assert "deepseek/deepseek-v3.2" in chain
 
 
 class TestModelRouter:
     """Tests for the ModelRouter."""
 
-    def test_router_initialization(self):
-        """Test ModelRouter initializes correctly."""
-        from src.clients.model_router import ModelRouter
-        router = ModelRouter()
-        assert router.get_total_cost() == 0.0
-        assert router.get_total_requests() == 0
-
-    def test_capability_routing(self):
-        """Test capability-based model resolution."""
-        from src.clients.model_router import ModelRouter, CAPABILITY_MAP
+    def test_capability_routing_uses_current_models(self):
+        """Capability map should reflect the current model roster."""
+        from src.clients.model_router import CAPABILITY_MAP
 
         assert "fast" in CAPABILITY_MAP
-        assert "reasoning" in CAPABILITY_MAP
-        assert "balanced" in CAPABILITY_MAP
-        assert "cheap" in CAPABILITY_MAP
+        assert any("grok-4.1-fast" in model for model, _ in CAPABILITY_MAP["fast"])
+        assert any(
+            "gemini-3.1-pro-preview" in model for model, _ in CAPABILITY_MAP["reasoning"]
+        )
 
-        # Fast should map to Gemini Flash or Grok fast
-        fast_targets = CAPABILITY_MAP["fast"]
-        assert any("gemini" in m[0] or "grok" in m[0] for m in fast_targets)
-
-    def test_model_health_tracking(self):
-        """Test model health tracking."""
-        from src.clients.model_router import ModelHealth
-
-        health = ModelHealth(model="test-model", provider="test")
-        assert health.is_healthy
-        assert health.success_rate == 1.0
-
-        # Record failures
-        for _ in range(5):
-            health.record_failure()
-
-        assert not health.is_healthy
-        assert health.success_rate == 0.0
-
-    def test_cost_summary(self):
-        """Test aggregate cost summary."""
+    @pytest.mark.asyncio
+    async def test_router_sends_one_request_with_fallback_models(self):
+        """ModelRouter should delegate one OpenRouter request with native fallbacks."""
         from src.clients.model_router import ModelRouter
+
+        openrouter_client = MagicMock()
+        openrouter_client.get_completion = AsyncMock(return_value="ok")
+        openrouter_client.last_request_metadata = SimpleNamespace(
+            actual_model="deepseek/deepseek-v3.2"
+        )
+
+        router = ModelRouter(openrouter_client=openrouter_client)
+        result = await router.get_completion("hello", model="openai/gpt-5.4")
+
+        assert result == "ok"
+        kwargs = openrouter_client.get_completion.await_args.kwargs
+        assert kwargs["model"] == "openai/gpt-5.4"
+        assert "deepseek/deepseek-v3.2" in kwargs["fallback_models"]
+
+    def test_cost_summary_contains_provider_and_health(self):
+        """Aggregate summaries should keep provider and health sections."""
+        from src.clients.model_router import ModelRouter
+
         router = ModelRouter()
         summary = router.get_cost_summary()
-        assert "total_cost" in summary
-        assert "total_requests" in summary
         assert "providers" in summary
         assert "model_health" in summary

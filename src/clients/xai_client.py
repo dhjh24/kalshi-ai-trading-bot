@@ -222,7 +222,7 @@ class XAIClient(TradingLoggerMixin):
                 cost = getattr(client, "_last_request_cost", 0.0)
                 self.total_cost += cost
                 self.request_count += 1
-                self._update_daily_cost(cost)
+                self.daily_tracker = self._load_daily_tracker()
 
             return result
 
@@ -256,7 +256,7 @@ class XAIClient(TradingLoggerMixin):
                 cost = getattr(client, "_last_request_cost", 0.0)
                 self.total_cost += cost
                 self.request_count += 1
-                self._update_daily_cost(cost)
+                self.daily_tracker = self._load_daily_tracker()
 
             return decision
 

@@ -15,7 +15,27 @@ class BullResearcher(BaseAgent):
 
     AGENT_NAME = "bull_researcher"
     AGENT_ROLE = "bull_researcher"
-    DEFAULT_MODEL = "openai/o3"
+    DEFAULT_MODEL = "deepseek/deepseek-v3.2"
+    RESPONSE_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "probability": {"type": "number"},
+            "probability_floor": {"type": "number"},
+            "confidence": {"type": "number"},
+            "key_arguments": {"type": "array", "items": {"type": "string"}},
+            "catalysts": {"type": "array", "items": {"type": "string"}},
+            "reasoning": {"type": "string"},
+        },
+        "required": [
+            "probability",
+            "probability_floor",
+            "confidence",
+            "key_arguments",
+            "catalysts",
+            "reasoning",
+        ],
+        "additionalProperties": False,
+    }
 
     SYSTEM_PROMPT = (
         "You are a conviction-driven research analyst whose job is to make the "
@@ -31,7 +51,7 @@ class BullResearcher(BaseAgent):
         "   point estimate.\n"
         "4. CATALYSTS -- What near-term events could push the probability higher?\n\n"
         "Be specific and evidence-based. Avoid vague hand-waving.\n\n"
-        "Return your analysis as a JSON object (inside a ```json``` code block) "
+        "Return your analysis as a JSON object only. Do not include markdown fences. "
         "with the following keys:\n"
         '  "probability": float (0.0-1.0, your YES probability estimate),\n'
         '  "probability_floor": float (0.0-1.0, minimum reasonable YES probability),\n'
@@ -59,7 +79,7 @@ class BullResearcher(BaseAgent):
             f"resolves YES.\n\n"
             f"{summary}{forecaster_note}\n\n"
             f"Be specific, evidence-based, and persuasive.\n"
-            f"Return ONLY a JSON object inside a ```json``` code block."
+            f"Return ONLY a JSON object."
         )
 
     def _parse_result(self, raw_json: dict) -> dict:

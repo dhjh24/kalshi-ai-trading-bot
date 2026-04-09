@@ -77,25 +77,22 @@ async def _run_ensemble_decision(
 
         # Build get_completion callables for each agent role using the model router
         async def _make_completion(model_name):
-            async def _fn(prompt):
+            async def _fn(prompt, **request_options):
                 return await model_router.get_completion(
                     prompt=prompt,
                     model=model_name,
                     strategy="ensemble",
                     query_type="agent_analysis",
                     market_id=market_data.get("ticker"),
+                    **request_options,
                 )
             return _fn
 
         # Map agent roles to their configured models
-        model_map = settings.ensemble.models
+        model_map = settings.ensemble.get_role_model_map()
         completions = {}
-        for model_id, cfg in model_map.items():
-            role = cfg["role"]
+        for role, model_id in model_map.items():
             completions[role] = await _make_completion(model_id)
-        # Trader always uses Grok-4
-        if "trader" not in completions:
-            completions["trader"] = await _make_completion("grok-4")
 
         # Inject news into market_data for agents
         enriched_data = {**market_data, "news_summary": news_summary}
@@ -601,7 +598,7 @@ def estimate_market_volatility(market: Market) -> float:
     """
     try:
         # Get current price to estimate volatility
-        current_price = getattr(market, 'yes_price', 50) / 100  # Convert to 0-1
+        current_price = getattr(market, 'yes_price', 0.5)
         
         # Binary option volatility formula
         intrinsic_vol = np.sqrt(current_price * (1 - current_price))

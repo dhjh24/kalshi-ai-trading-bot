@@ -1,18 +1,16 @@
 """
-Kalshi API client for trading operations.
-Handles authentication, market data, and trade execution.
+Kalshi REST client for market data, portfolio data, and order execution.
 """
+
+from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
-import hmac
 import json
 import os
 import time
-from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Union
+from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urlencode
 
 import httpx
@@ -20,230 +18,254 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 from src.config.settings import settings
+from src.utils.kalshi_normalization import format_price_dollars
 from src.utils.logging_setup import TradingLoggerMixin
 
 
 class KalshiAPIError(Exception):
     """Custom exception for Kalshi API errors."""
-    pass
 
 
 class KalshiClient(TradingLoggerMixin):
-    """
-    Kalshi API client for automated trading.
-    Handles authentication, market data retrieval, and trade execution.
-    """
-    
+    """Async Kalshi client using the docs-native RSA-PSS auth flow."""
+
     def __init__(
-        self, 
-        api_key: Optional[str] = None, 
-        private_key_path: str = None,
+        self,
+        api_key: Optional[str] = None,
+        private_key_path: Optional[str] = None,
         max_retries: int = 5,
-        backoff_factor: float = 0.5
-    ):
-        """
-        Initialize Kalshi client.
-        
-        Args:
-            api_key: Kalshi API key (Key ID from the API key generation)
-            private_key_path: Path to private key file
-            max_retries: Maximum number of retries for failed requests
-            backoff_factor: Factor for exponential backoff
-        """
+        backoff_factor: float = 0.5,
+        base_url: Optional[str] = None,
+    ) -> None:
         self.api_key = api_key or settings.api.kalshi_api_key
-        self.base_url = settings.api.kalshi_base_url
-        self.private_key_path = private_key_path or os.environ.get("KALSHI_PRIVATE_KEY_PATH", "kalshi_private_key.pem")
-        self.private_key = None
+        self.base_url = (base_url or settings.api.kalshi_base_url).rstrip("/")
+        self.private_key_path = (
+            private_key_path
+            or os.environ.get("KALSHI_PRIVATE_KEY_PATH")
+            or "kalshi_private_key"
+        )
         self.max_retries = max_retries
         self.backoff_factor = backoff_factor
-        
-        # Load private key
-        self._load_private_key()
-        
-        # HTTP client with timeouts
+        self.private_key = None
+        self._private_key_loaded = False
+
         self.client = httpx.AsyncClient(
             timeout=30.0,
-            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20)
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
         )
-        
-        self.logger.info("Kalshi client initialized", api_key_length=len(self.api_key) if self.api_key else 0)
-    
+
+        self.logger.info(
+            "Kalshi client initialized",
+            base_url=self.base_url,
+            api_key_length=len(self.api_key) if self.api_key else 0,
+        )
+
     def _load_private_key(self) -> None:
-        """Load private key from file."""
+        """Load the PEM-encoded RSA private key."""
         try:
-            private_key_path = Path(self.private_key_path)
-            if not private_key_path.exists():
+            key_path = Path(self.private_key_path)
+            if not key_path.exists():
                 raise KalshiAPIError(f"Private key file not found: {self.private_key_path}")
-            
-            with open(private_key_path, 'rb') as f:
-                self.private_key = serialization.load_pem_private_key(
-                    f.read(),
-                    password=None
-                )
-            self.logger.info("Private key loaded successfully")
-        except Exception as e:
-            self.logger.error("Failed to load private key", error=str(e))
-            raise KalshiAPIError(f"Failed to load private key: {e}")
-    
+
+            with open(key_path, "rb") as f:
+                self.private_key = serialization.load_pem_private_key(f.read(), password=None)
+            self._private_key_loaded = True
+            self.logger.info("Private key loaded successfully", key_path=str(key_path))
+        except Exception as exc:
+            self.logger.error("Failed to load private key", error=str(exc))
+            raise KalshiAPIError(f"Failed to load private key: {exc}") from exc
+
+    def _ensure_auth_ready(self) -> None:
+        """Validate auth configuration before hitting private Kalshi endpoints."""
+        if not self.api_key:
+            raise KalshiAPIError("KALSHI_API_KEY is not configured")
+
+        if not self._private_key_loaded or self.private_key is None:
+            self._load_private_key()
+
     def _sign_request(self, timestamp: str, method: str, path: str) -> str:
-        """
-        Sign request using RSA PSS signing method as per Kalshi API docs.
-        
-        Args:
-            timestamp: Request timestamp in milliseconds
-            method: HTTP method
-            path: Request path
-        
-        Returns:
-            Base64 encoded signature
-        """
-        # Create message to sign: timestamp + method + path
-        message = timestamp + method.upper() + path
-        message_bytes = message.encode('utf-8')
-        
+        """Sign ``timestamp + method + path`` with RSA-PSS."""
+        message = (timestamp + method.upper() + path).encode("utf-8")
         try:
-            # Sign using RSA PSS as per Kalshi documentation
             signature = self.private_key.sign(
-                message_bytes,
+                message,
                 padding.PSS(
                     mgf=padding.MGF1(hashes.SHA256()),
-                    salt_length=padding.PSS.DIGEST_LENGTH
+                    salt_length=padding.PSS.DIGEST_LENGTH,
                 ),
-                hashes.SHA256()
+                hashes.SHA256(),
             )
-            
-            return base64.b64encode(signature).decode('utf-8')
-        except Exception as e:
-            self.logger.error("Failed to sign request", error=str(e))
-            raise KalshiAPIError(f"Failed to sign request: {e}")
-    
+            return base64.b64encode(signature).decode("utf-8")
+        except Exception as exc:
+            self.logger.error("Failed to sign request", error=str(exc))
+            raise KalshiAPIError(f"Failed to sign request: {exc}") from exc
+
     async def _make_authenticated_request(
         self,
         method: str,
         endpoint: str,
-        params: Optional[Dict] = None,
-        json_data: Optional[Dict] = None,
-        require_auth: bool = True
+        params: Optional[Dict[str, Any]] = None,
+        json_data: Optional[Dict[str, Any]] = None,
+        require_auth: bool = True,
     ) -> Dict[str, Any]:
-        """
-        Make authenticated request to Kalshi API with retry logic.
-        
-        Args:
-            method: HTTP method
-            endpoint: API endpoint
-            params: Query parameters
-            json_data: JSON request body
-            require_auth: Whether authentication is required
-        
-        Returns:
-            API response data
-        """
-        # Prepare request
+        """Make a Kalshi REST request with retries and optional auth."""
+        query_string = urlencode(
+            {
+                key: value
+                for key, value in (params or {}).items()
+                if value is not None and value != ""
+            },
+            doseq=True,
+        )
         url = f"{self.base_url}{endpoint}"
+        if query_string:
+            url = f"{url}?{query_string}"
+
         headers = {
             "Content-Type": "application/json",
-            "Accept": "application/json"
+            "Accept": "application/json",
         }
-        
-        # Add authentication headers if required
+
         if require_auth:
-            # Get current timestamp in milliseconds
+            self._ensure_auth_ready()
             timestamp = str(int(time.time() * 1000))
-            
-            # Create signature
             signature = self._sign_request(timestamp, method, endpoint)
-            
-            headers.update({
-                "KALSHI-ACCESS-KEY": self.api_key,
-                "KALSHI-ACCESS-TIMESTAMP": timestamp,
-                "KALSHI-ACCESS-SIGNATURE": signature
-            })
-        
-        # Prepare body
+            headers.update(
+                {
+                    "KALSHI-ACCESS-KEY": self.api_key,
+                    "KALSHI-ACCESS-TIMESTAMP": timestamp,
+                    "KALSHI-ACCESS-SIGNATURE": signature,
+                }
+            )
+
         body = None
-        if json_data:
-            body = json.dumps(json_data, separators=(',', ':'))
-        
-        # Add query parameters to URL if present
-        if params:
-            query_string = urlencode(params)
-            url = f"{url}?{query_string}"
-        
-        last_exception = None
+        if json_data is not None:
+            body = json.dumps(json_data, separators=(",", ":"))
+
+        last_exception: Optional[Exception] = None
         for attempt in range(self.max_retries):
             try:
-                self.logger.debug(
-                    "Making API request",
-                    method=method,
-                    endpoint=endpoint,
-                    has_auth=require_auth,
-                    attempt=attempt + 1
-                )
-                
-                # Rate limit delay to prevent 429s (200ms = 5 req/s)
                 await asyncio.sleep(0.2)
-                
                 response = await self.client.request(
                     method=method,
                     url=url,
                     headers=headers,
-                    content=body if body else None
+                    content=body,
                 )
-                
                 response.raise_for_status()
                 return response.json()
-                
-            except httpx.HTTPStatusError as e:
-                last_exception = e
-                # Rate limit (429) or server errors (5xx) are worth retrying
-                if e.response.status_code == 429 or e.response.status_code >= 500:
+            except httpx.HTTPStatusError as exc:
+                last_exception = exc
+                status_code = exc.response.status_code
+                if status_code == 429 or status_code >= 500:
                     sleep_time = self.backoff_factor * (2 ** attempt)
                     self.logger.warning(
-                        f"API request failed with status {e.response.status_code}. Retrying in {sleep_time:.2f}s...",
+                        "Kalshi API request failed and will be retried",
                         endpoint=endpoint,
-                        attempt=attempt + 1
+                        status_code=status_code,
+                        attempt=attempt + 1,
+                        backoff_s=sleep_time,
                     )
                     await asyncio.sleep(sleep_time)
-                else:
-                    # Don't retry on other client errors (e.g., 400, 401, 404)
-                    error_msg = f"HTTP {e.response.status_code}: {e.response.text}"
-                    self.logger.error("API request failed without retry", error=error_msg, endpoint=endpoint)
-                    raise KalshiAPIError(error_msg)
-            except Exception as e:
-                last_exception = e
-                self.logger.warning(f"Request failed with general exception. Retrying...", error=str(e), endpoint=endpoint)
+                    continue
+
+                error_msg = f"HTTP {status_code}: {exc.response.text}"
+                self.logger.error("Kalshi API request failed", endpoint=endpoint, error=error_msg)
+                raise KalshiAPIError(error_msg) from exc
+            except Exception as exc:
+                last_exception = exc
                 sleep_time = self.backoff_factor * (2 ** attempt)
+                self.logger.warning(
+                    "Kalshi API request failed with transport error",
+                    endpoint=endpoint,
+                    attempt=attempt + 1,
+                    backoff_s=sleep_time,
+                    error=str(exc),
+                )
                 await asyncio.sleep(sleep_time)
-        
-        raise KalshiAPIError(f"API request failed after {self.max_retries} retries: {last_exception}")
-    
+
+        raise KalshiAPIError(
+            f"API request failed after {self.max_retries} retries: {last_exception}"
+        )
+
     async def get_balance(self) -> Dict[str, Any]:
         """Get account balance."""
         return await self._make_authenticated_request("GET", "/trade-api/v2/portfolio/balance")
-    
+
     async def get_positions(self, ticker: Optional[str] = None) -> Dict[str, Any]:
         """Get portfolio positions."""
-        params = {}
+        params = {"ticker": ticker} if ticker else None
+        return await self._make_authenticated_request(
+            "GET", "/trade-api/v2/portfolio/positions", params=params
+        )
+
+    async def get_fills(
+        self,
+        ticker: Optional[str] = None,
+        limit: int = 100,
+        cursor: Optional[str] = None,
+        order_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get recent fill history."""
+        params: Dict[str, Any] = {"limit": limit}
         if ticker:
             params["ticker"] = ticker
-        return await self._make_authenticated_request("GET", "/trade-api/v2/portfolio/positions", params=params)
-    
-    async def get_fills(self, ticker: Optional[str] = None, limit: int = 100) -> Dict[str, Any]:
-        """Get order fills.""" 
-        params = {"limit": limit}
-        if ticker:
-            params["ticker"] = ticker
-        return await self._make_authenticated_request("GET", "/trade-api/v2/portfolio/fills", params=params)
-    
-    async def get_orders(self, ticker: Optional[str] = None, status: Optional[str] = None) -> Dict[str, Any]:
-        """Get orders."""
-        params = {}
+        if cursor:
+            params["cursor"] = cursor
+        if order_id:
+            params["order_id"] = order_id
+        return await self._make_authenticated_request(
+            "GET", "/trade-api/v2/portfolio/fills", params=params
+        )
+
+    async def get_orders(
+        self,
+        ticker: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 100,
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get current order history."""
+        params: Dict[str, Any] = {"limit": limit}
         if ticker:
             params["ticker"] = ticker
         if status:
             params["status"] = status
-        return await self._make_authenticated_request("GET", "/trade-api/v2/portfolio/orders", params=params)
-    
+        if cursor:
+            params["cursor"] = cursor
+        return await self._make_authenticated_request(
+            "GET", "/trade-api/v2/portfolio/orders", params=params
+        )
+
+    async def get_events(
+        self,
+        limit: int = 100,
+        cursor: Optional[str] = None,
+        status: Optional[str] = None,
+        series_ticker: Optional[str] = None,
+        event_ticker: Optional[str] = None,
+        with_nested_markets: bool = False,
+        with_milestones: bool = False,
+    ) -> Dict[str, Any]:
+        """Get events, optionally including nested markets."""
+        params: Dict[str, Any] = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        if status:
+            params["status"] = status
+        if series_ticker:
+            params["series_ticker"] = series_ticker
+        if event_ticker:
+            params["event_ticker"] = event_ticker
+        if with_nested_markets:
+            params["with_nested_markets"] = "true"
+        if with_milestones:
+            params["with_milestones"] = "true"
+
+        return await self._make_authenticated_request(
+            "GET", "/trade-api/v2/events", params=params, require_auth=False
+        )
+
     async def get_markets(
         self,
         limit: int = 100,
@@ -251,24 +273,10 @@ class KalshiClient(TradingLoggerMixin):
         event_ticker: Optional[str] = None,
         series_ticker: Optional[str] = None,
         status: Optional[str] = None,
-        tickers: Optional[List[str]] = None
+        tickers: Optional[Iterable[str]] = None,
     ) -> Dict[str, Any]:
-        """
-        Get markets data.
-        
-        Args:
-            limit: Maximum number of markets to return
-            cursor: Pagination cursor
-            event_ticker: Filter by event ticker
-            series_ticker: Filter by series ticker
-            status: Filter by market status
-            tickers: List of specific tickers to fetch
-        
-        Returns:
-            Markets data
-        """
-        params = {"limit": limit}
-        
+        """Get market data."""
+        params: Dict[str, Any] = {"limit": limit}
         if cursor:
             params["cursor"] = cursor
         if event_ticker:
@@ -279,62 +287,76 @@ class KalshiClient(TradingLoggerMixin):
             params["status"] = status
         if tickers:
             params["tickers"] = ",".join(tickers)
-        
+
         return await self._make_authenticated_request(
-            "GET", "/trade-api/v2/markets", params=params, require_auth=True
+            "GET", "/trade-api/v2/markets", params=params, require_auth=False
         )
-    
+
     async def get_market(self, ticker: str) -> Dict[str, Any]:
-        """Get specific market data."""
+        """Get a specific market."""
         return await self._make_authenticated_request(
             "GET", f"/trade-api/v2/markets/{ticker}", require_auth=False
         )
-    
+
     async def get_orderbook(self, ticker: str, depth: int = 100) -> Dict[str, Any]:
-        """
-        Get market orderbook.
-        
-        Args:
-            ticker: Market ticker
-            depth: Orderbook depth
-        
-        Returns:
-            Orderbook data
-        """
-        params = {"depth": depth}
+        """Get market orderbook."""
         return await self._make_authenticated_request(
-            "GET", f"/trade-api/v2/markets/{ticker}/orderbook", params=params, require_auth=False
+            "GET",
+            f"/trade-api/v2/markets/{ticker}/orderbook",
+            params={"depth": depth},
+            require_auth=False,
         )
-    
-    async def get_market_history(
+
+    async def get_historical_cutoff(self) -> Dict[str, Any]:
+        """Get the Kalshi live/historical data cutoff."""
+        return await self._make_authenticated_request(
+            "GET", "/trade-api/v2/historical/cutoff", require_auth=False
+        )
+
+    async def get_historical_market(self, ticker: str) -> Dict[str, Any]:
+        """Get historical market data once the market has crossed the cutoff."""
+        return await self._make_authenticated_request(
+            "GET", f"/trade-api/v2/historical/markets/{ticker}", require_auth=False
+        )
+
+    async def get_historical_orders(
         self,
-        ticker: str,
-        start_ts: Optional[int] = None,
-        end_ts: Optional[int] = None,
-        limit: int = 100
+        ticker: Optional[str] = None,
+        limit: int = 100,
+        cursor: Optional[str] = None,
+        status: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Get market price history.
-        
-        Args:
-            ticker: Market ticker
-            start_ts: Start timestamp
-            end_ts: End timestamp
-            limit: Number of records to return
-        
-        Returns:
-            Price history data
-        """
-        params = {"limit": limit}
-        if start_ts:
-            params["start_ts"] = start_ts
-        if end_ts:
-            params["end_ts"] = end_ts
-        
+        """Get historical orders once they are no longer in the live window."""
+        params: Dict[str, Any] = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker
+        if cursor:
+            params["cursor"] = cursor
+        if status:
+            params["status"] = status
         return await self._make_authenticated_request(
-            "GET", f"/trade-api/v2/markets/{ticker}/history", params=params, require_auth=False
+            "GET", "/trade-api/v2/historical/orders", params=params
         )
-    
+
+    async def get_historical_fills(
+        self,
+        ticker: Optional[str] = None,
+        limit: int = 100,
+        cursor: Optional[str] = None,
+        order_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get historical fills once they are no longer in the live window."""
+        params: Dict[str, Any] = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker
+        if cursor:
+            params["cursor"] = cursor
+        if order_id:
+            params["order_id"] = order_id
+        return await self._make_authenticated_request(
+            "GET", "/trade-api/v2/historical/fills", params=params
+        )
+
     async def place_order(
         self,
         ticker: str,
@@ -342,90 +364,68 @@ class KalshiClient(TradingLoggerMixin):
         side: str,
         action: str,
         count: int,
-        type_: str = "market",
+        type_: str = "limit",
         yes_price: Optional[int] = None,
         no_price: Optional[int] = None,
-        expiration_ts: Optional[int] = None
+        yes_price_dollars: Optional[float | str] = None,
+        no_price_dollars: Optional[float | str] = None,
+        expiration_ts: Optional[int] = None,
+        time_in_force: Optional[str] = None,
+        post_only: Optional[bool] = None,
+        reduce_only: Optional[bool] = None,
+        buy_max_cost: Optional[int] = None,
+        sell_position_floor: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """
-        Place a trading order.
-        
-        Args:
-            ticker: Market ticker
-            client_order_id: Unique client order ID
-            side: "yes" or "no"
-            action: "buy" or "sell"
-            count: Number of contracts
-            type_: Order type ("market" or "limit")
-            yes_price: Yes price in cents (for limit orders)
-            no_price: No price in cents (for limit orders)
-            expiration_ts: Order expiration timestamp
-        
-        Returns:
-            Order response
-        """
-        order_data = {
+        """Place a docs-compatible limit order."""
+        order_data: Dict[str, Any] = {
             "ticker": ticker,
             "client_order_id": client_order_id,
             "side": side,
             "action": action,
-            "count": count,
-            "type": type_
+            "count": int(count),
+            "type": type_,
         }
-        
-        if yes_price is not None:
-            order_data["yes_price"] = yes_price
-        if no_price is not None:
-            order_data["no_price"] = no_price
-        if expiration_ts:
-            order_data["expiration_ts"] = expiration_ts
-        
+
+        if yes_price_dollars is not None:
+            order_data["yes_price_dollars"] = format_price_dollars(yes_price_dollars)
+        elif yes_price is not None:
+            order_data["yes_price"] = int(yes_price)
+
+        if no_price_dollars is not None:
+            order_data["no_price_dollars"] = format_price_dollars(no_price_dollars)
+        elif no_price is not None:
+            order_data["no_price"] = int(no_price)
+
+        if expiration_ts is not None:
+            order_data["expiration_ts"] = int(expiration_ts)
+        if time_in_force:
+            order_data["time_in_force"] = time_in_force
+        if post_only is not None:
+            order_data["post_only"] = bool(post_only)
+        if reduce_only is not None:
+            order_data["reduce_only"] = bool(reduce_only)
+        if buy_max_cost is not None:
+            order_data["buy_max_cost"] = int(buy_max_cost)
+        if sell_position_floor is not None:
+            order_data["sell_position_floor"] = int(sell_position_floor)
+
         return await self._make_authenticated_request(
             "POST", "/trade-api/v2/portfolio/orders", json_data=order_data
         )
-    
+
     async def cancel_order(self, order_id: str) -> Dict[str, Any]:
         """Cancel an order."""
         return await self._make_authenticated_request(
             "DELETE", f"/trade-api/v2/portfolio/orders/{order_id}"
         )
-    
-    async def get_trades(
-        self,
-        ticker: Optional[str] = None,
-        limit: int = 100,
-        cursor: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """
-        Get trade history.
-        
-        Args:
-            ticker: Filter by ticker
-            limit: Maximum number of trades to return
-            cursor: Pagination cursor
-        
-        Returns:
-            Trades data
-        """
-        params = {"limit": limit}
-        if ticker:
-            params["ticker"] = ticker
-        if cursor:
-            params["cursor"] = cursor
-        
-        return await self._make_authenticated_request(
-            "GET", "/trade-api/v2/portfolio/trades", params=params
-        )
-    
+
     async def close(self) -> None:
-        """Close the HTTP client."""
+        """Close the underlying HTTP client."""
         await self.client.aclose()
         self.logger.info("Kalshi client closed")
-    
-    async def __aenter__(self):
-        """Async context manager entry."""
+
+    async def __aenter__(self) -> "KalshiClient":
         return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit."""
-        await self.close() 
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        await self.close()

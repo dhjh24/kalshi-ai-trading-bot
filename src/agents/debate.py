@@ -22,6 +22,7 @@ from src.agents.risk_manager_agent import RiskManagerAgent
 from src.agents.trader_agent import TraderAgent
 from src.agents.forecaster_agent import ForecasterAgent
 from src.agents.news_analyst_agent import NewsAnalystAgent
+from src.config.settings import settings
 from src.utils.logging_setup import get_trading_logger
 
 logger = get_trading_logger("debate")
@@ -360,11 +361,12 @@ class DebateRunner:
     @staticmethod
     def _default_agents() -> Dict[str, BaseAgent]:
         """Create the default set of agents for the debate."""
+        role_models = settings.ensemble.get_role_model_map()
         return {
-            "forecaster": ForecasterAgent(),
-            "news_analyst": NewsAnalystAgent(),
-            "bull_researcher": BullResearcher(),
-            "bear_researcher": BearResearcher(),
-            "risk_manager": RiskManagerAgent(),
-            "trader": TraderAgent(),
+            "forecaster": ForecasterAgent(model_name=role_models.get("forecaster")),
+            "news_analyst": NewsAnalystAgent(model_name=role_models.get("news_analyst")),
+            "bull_researcher": BullResearcher(model_name=role_models.get("bull_researcher")),
+            "bear_researcher": BearResearcher(model_name=role_models.get("bear_researcher")),
+            "risk_manager": RiskManagerAgent(model_name=role_models.get("risk_manager")),
+            "trader": TraderAgent(model_name=role_models.get("trader")),
         }

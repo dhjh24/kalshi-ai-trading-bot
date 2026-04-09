@@ -4,7 +4,7 @@ Manages trading parameters, API configurations, and risk management settings.
 """
 
 import os
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
 
@@ -12,17 +12,52 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _get_kalshi_env() -> str:
+    """Return the configured Kalshi environment."""
+    return os.getenv("KALSHI_ENV", "prod").strip().lower() or "prod"
+
+
+def _get_kalshi_base_url() -> str:
+    """Resolve the Kalshi REST base URL from env settings."""
+    override = os.getenv("KALSHI_API_BASE_URL", "").strip()
+    if override:
+        return override.rstrip("/")
+
+    env_name = _get_kalshi_env()
+    if env_name == "demo":
+        return "https://demo-api.kalshi.co"
+    return "https://api.elections.kalshi.com"
+
+
 @dataclass
 class APIConfig:
     """API configuration settings."""
     kalshi_api_key: str = field(default_factory=lambda: os.getenv("KALSHI_API_KEY", ""))
-    kalshi_base_url: str = "https://api.elections.kalshi.com"  # Updated to new API endpoint
+    kalshi_env: str = field(default_factory=_get_kalshi_env)
+    kalshi_base_url: str = field(default_factory=_get_kalshi_base_url)
     openai_api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
     openrouter_api_key: str = field(default_factory=lambda: os.getenv("OPENROUTER_API_KEY", ""))
     openai_base_url: str = "https://api.openai.com/v1"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_http_referer: str = field(
+        default_factory=lambda: os.getenv("OPENROUTER_HTTP_REFERER", "").strip()
+    )
+    openrouter_title: str = field(
+        default_factory=lambda: os.getenv(
+            "OPENROUTER_TITLE", "Kalshi AI Trading Bot"
+        ).strip()
+    )
 
     # xai_api_key removed — all models now route through OpenRouter
+
+    def get_openrouter_headers(self) -> Dict[str, str]:
+        """Return optional OpenRouter attribution headers."""
+        headers: Dict[str, str] = {}
+        if self.openrouter_http_referer:
+            headers["HTTP-Referer"] = self.openrouter_http_referer
+        if self.openrouter_title:
+            headers["X-OpenRouter-Title"] = self.openrouter_title
+        return headers
 
 
 @dataclass
@@ -31,18 +66,57 @@ class EnsembleConfig:
     enabled: bool = True
     # Model roster for ensemble decisions — all via OpenRouter (April 2026)
     models: Dict[str, Dict] = field(default_factory=lambda: {
-        "anthropic/claude-sonnet-4.5": {"provider": "openrouter", "role": "lead_analyst", "weight": 0.30},
-        "google/gemini-3.1-pro": {"provider": "openrouter", "role": "forecaster", "weight": 0.30},
+        "anthropic/claude-sonnet-4.5": {"provider": "openrouter", "role": "news_analyst", "weight": 0.30},
+        "google/gemini-3.1-pro-preview": {"provider": "openrouter", "role": "forecaster", "weight": 0.30},
         "openai/gpt-5.4": {"provider": "openrouter", "role": "risk_manager", "weight": 0.20},
         "deepseek/deepseek-v3.2": {"provider": "openrouter", "role": "bull_researcher", "weight": 0.10},
         "x-ai/grok-4.1-fast": {"provider": "openrouter", "role": "bear_researcher", "weight": 0.10},
     })
+    trader_model: str = "x-ai/grok-4.1-fast"
     min_models_for_consensus: int = 3
     disagreement_threshold: float = 0.25  # Std dev above this = low confidence
     parallel_requests: bool = True
     debate_enabled: bool = True
     calibration_tracking: bool = True
     max_ensemble_cost: float = 0.50  # Max cost per ensemble decision
+
+    @staticmethod
+    def _normalize_role(role: str) -> str:
+        """Normalize legacy role names to the current agent role set."""
+        role = str(role or "").strip()
+        if role == "lead_analyst":
+            return "news_analyst"
+        return role
+
+    def normalized_models(self) -> Dict[str, Dict[str, Any]]:
+        """Return the configured model map with normalized role names."""
+        normalized: Dict[str, Dict[str, Any]] = {}
+        for model_id, cfg in self.models.items():
+            role = self._normalize_role(cfg.get("role", ""))
+            normalized[model_id] = {
+                **cfg,
+                "role": role,
+                "weight": float(cfg.get("weight", 0.0)),
+            }
+        return normalized
+
+    def get_role_model_map(self) -> Dict[str, str]:
+        """Return role -> model mapping used by the ensemble/debate system."""
+        role_map = {
+            cfg["role"]: model_id
+            for model_id, cfg in self.normalized_models().items()
+            if cfg["role"]
+        }
+        role_map["trader"] = self.trader_model
+        return role_map
+
+    def get_role_weights(self) -> Dict[str, float]:
+        """Return role -> weight mapping for weighted ensemble aggregation."""
+        return {
+            cfg["role"]: float(cfg.get("weight", 0.0))
+            for cfg in self.normalized_models().values()
+            if cfg["role"]
+        }
 
 
 @dataclass
@@ -98,7 +172,7 @@ class TradingConfig:
     primary_model: str = "anthropic/claude-sonnet-4.5"  # Primary model via OpenRouter
     fallback_model: str = "deepseek/deepseek-v3.2"  # Fallback model via OpenRouter
     ai_temperature: float = 0  # Lower temperature for more consistent JSON output
-    ai_max_tokens: int = 8000    # Reasonable limit for reasoning models (grok-4 works better with 8000)
+    ai_max_tokens: int = 8000    # Reasonable limit for reasoning-oriented models
     
     # Position sizing (LEGACY - now using Kelly-primary approach)
     default_position_size: float = 3.0  # REDUCED: Now using Kelly Criterion as primary method (was 5%, now 3%)
@@ -262,6 +336,9 @@ class Settings:
 
     def validate(self) -> bool:
         """Validate configuration settings."""
+        if self.api.kalshi_env not in {"prod", "demo"}:
+            raise ValueError("KALSHI_ENV must be 'prod' or 'demo'")
+
         if not self.api.kalshi_api_key:
             raise ValueError("KALSHI_API_KEY environment variable is required")
 
@@ -270,6 +347,19 @@ class Settings:
 
         if self.trading.min_confidence_to_trade <= 0 or self.trading.min_confidence_to_trade > 1:
             raise ValueError("min_confidence_to_trade must be between 0 and 1")
+
+        required_roles = {
+            "news_analyst",
+            "forecaster",
+            "risk_manager",
+            "bull_researcher",
+            "bear_researcher",
+            "trader",
+        }
+        missing_roles = required_roles - set(self.ensemble.get_role_model_map())
+        if missing_roles:
+            missing = ", ".join(sorted(missing_roles))
+            raise ValueError(f"ensemble config is missing required roles: {missing}")
 
         return True
 
@@ -282,4 +372,4 @@ try:
     settings.validate()
 except ValueError as e:
     print(f"Configuration validation error: {e}")
-    print("Please check your environment variables and configuration.") 
+    print("Please check your environment variables and configuration.")

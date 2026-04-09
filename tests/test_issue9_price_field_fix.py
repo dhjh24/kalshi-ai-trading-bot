@@ -22,7 +22,7 @@ from src.jobs.execute import execute_position
 from datetime import datetime
 
 
-class TestIssue9PriceFieldFix(unittest.TestCase):
+class TestIssue9PriceFieldFix(unittest.IsolatedAsyncioTestCase):
     """Test the fix for Issue #9 - order payload price fields"""
     
     def setUp(self):
@@ -33,10 +33,10 @@ class TestIssue9PriceFieldFix(unittest.TestCase):
         # Mock market data with typical ask/bid prices
         self.mock_market_data = {
             'market': {
-                'yes_ask': 45,  # 45 cents
-                'no_ask': 55,   # 55 cents  
-                'yes_bid': 40,
-                'no_bid': 50
+                'yes_ask_dollars': 0.45,
+                'no_ask_dollars': 0.55,
+                'yes_bid_dollars': 0.40,
+                'no_bid_dollars': 0.50,
             }
         }
     
@@ -65,19 +65,20 @@ class TestIssue9PriceFieldFix(unittest.TestCase):
             "side": side_lower,
             "action": "buy",
             "count": yes_position.quantity,
-            "type": "market"
+            "type": "limit",
+            "time_in_force": "fill_or_kill",
         }
         
         # Apply the fix logic
         if side_lower == "yes":
-            yes_ask = market.get('yes_ask', 0)
+            yes_ask = market.get('yes_ask_dollars', 0)
             if yes_ask > 0:
-                order_params["yes_price"] = yes_ask
+                order_params["yes_price_dollars"] = f"{yes_ask:.4f}"
         
         # Verify the fix
-        self.assertIn("yes_price", order_params, "YES order should include yes_price field")
-        self.assertNotIn("no_price", order_params, "YES order should not include no_price field")
-        self.assertEqual(order_params["yes_price"], 45, "yes_price should be the ask price")
+        self.assertIn("yes_price_dollars", order_params, "YES order should include yes_price_dollars field")
+        self.assertNotIn("no_price_dollars", order_params, "YES order should not include no_price_dollars field")
+        self.assertEqual(order_params["yes_price_dollars"], "0.4500", "yes_price_dollars should be the ask price")
     
     def test_no_position_order_params(self):
         """Test that NO positions create orders with no_price field"""
@@ -104,19 +105,20 @@ class TestIssue9PriceFieldFix(unittest.TestCase):
             "side": side_lower,
             "action": "buy", 
             "count": no_position.quantity,
-            "type": "market"
+            "type": "limit",
+            "time_in_force": "fill_or_kill",
         }
         
         # Apply the fix logic
         if side_lower == "no":
-            no_ask = market.get('no_ask', 0)
+            no_ask = market.get('no_ask_dollars', 0)
             if no_ask > 0:
-                order_params["no_price"] = no_ask
+                order_params["no_price_dollars"] = f"{no_ask:.4f}"
         
         # Verify the fix
-        self.assertIn("no_price", order_params, "NO order should include no_price field")
-        self.assertNotIn("yes_price", order_params, "NO order should not include yes_price field")
-        self.assertEqual(order_params["no_price"], 55, "no_price should be the ask price")
+        self.assertIn("no_price_dollars", order_params, "NO order should include no_price_dollars field")
+        self.assertNotIn("yes_price_dollars", order_params, "NO order should not include yes_price_dollars field")
+        self.assertEqual(order_params["no_price_dollars"], "0.5500", "no_price_dollars should be the ask price")
     
     async def test_execute_position_with_fix(self):
         """Test that execute_position function uses the fix correctly"""
@@ -124,7 +126,23 @@ class TestIssue9PriceFieldFix(unittest.TestCase):
         # Mock the kalshi client to return market data
         self.mock_kalshi_client.get_market.return_value = self.mock_market_data
         self.mock_kalshi_client.place_order.return_value = {
-            'order': {'order_id': 'test_order_123'}
+            'order': {
+                'order_id': 'test_order_123',
+                'status': 'filled',
+                'fill_count_fp': '1',
+                'yes_price_dollars': '0.4500',
+            }
+        }
+        self.mock_kalshi_client.get_fills.return_value = {
+            "fills": [
+                {
+                    "ticker": "TEST-MARKET",
+                    "order_id": "test_order_123",
+                    "count_fp": "1",
+                    "yes_price_dollars": "0.4500",
+                    "purchased_side": "yes",
+                }
+            ]
         }
         
         # Create test position
@@ -162,10 +180,12 @@ class TestIssue9PriceFieldFix(unittest.TestCase):
         
         self.assertEqual(len(present_price_fields), 1, 
                         f"Expected exactly 1 price field, found: {present_price_fields}")
-        self.assertIn('yes_price', call_kwargs, 
-                     "YES position should have yes_price field")
-        self.assertEqual(call_kwargs['yes_price'], 45, 
-                        "yes_price should be the market ask price")
+        self.assertIn('yes_price_dollars', call_kwargs, 
+                     "YES position should have yes_price_dollars field")
+        self.assertEqual(call_kwargs['yes_price_dollars'], "0.4500", 
+                        "yes_price_dollars should be the market ask price")
+        self.assertEqual(call_kwargs['type_'], "limit")
+        self.assertEqual(call_kwargs['time_in_force'], "fill_or_kill")
 
 
 if __name__ == "__main__":

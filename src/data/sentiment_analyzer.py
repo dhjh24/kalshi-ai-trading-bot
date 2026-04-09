@@ -11,11 +11,29 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from openai import AsyncOpenAI
-
+from src.clients.openrouter_client import OpenRouterClient
 from src.config.settings import settings
 from src.data.news_aggregator import NewsAggregator, NewsArticle
 from src.utils.logging_setup import TradingLoggerMixin
+
+
+SENTIMENT_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "sentiment_result",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "score": {"type": "number"},
+                "confidence": {"type": "number"},
+                "reasoning": {"type": "string"},
+            },
+            "required": ["score", "confidence", "reasoning"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -58,13 +76,12 @@ class SentimentAnalyzer(TradingLoggerMixin):
     caches results, and tracks API cost.
     """
 
-    def __init__(self, news_aggregator: Optional[NewsAggregator] = None) -> None:
-        self._client = AsyncOpenAI(
-            api_key=settings.api.openrouter_api_key,
-            base_url=settings.api.openrouter_base_url,
-            timeout=30.0,
-            max_retries=2,
-        )
+    def __init__(
+        self,
+        news_aggregator: Optional[NewsAggregator] = None,
+        openrouter_client: Optional[OpenRouterClient] = None,
+    ) -> None:
+        self._client = openrouter_client or OpenRouterClient()
         self._model = settings.sentiment.sentiment_model
         self._news = news_aggregator or NewsAggregator()
 
@@ -284,24 +301,31 @@ class SentimentAnalyzer(TradingLoggerMixin):
 
         try:
             start = time.monotonic()
-            response = await self._client.chat.completions.create(
-                model=self._model,
+            content = await self._client.get_completion(
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
                 ],
+                model=self._model,
+                strategy="sentiment",
+                query_type="sentiment_analysis",
                 temperature=0.0,
                 max_tokens=256,
+                response_format=SENTIMENT_RESPONSE_FORMAT,
+                provider={"require_parameters": True},
+                metadata={"market_context": market_context[:120] if market_context else ""},
             )
             elapsed = time.monotonic() - start
 
-            content = response.choices[0].message.content.strip()
+            if not content:
+                raise ValueError("OpenRouter returned no sentiment content")
+            content = content.strip()
 
             # Track cost
-            input_tokens = response.usage.prompt_tokens if response.usage else 0
-            output_tokens = response.usage.completion_tokens if response.usage else 0
-            # Gemini Flash via OpenRouter is very cheap; approximate pricing
-            cost = (input_tokens * 0.0000001) + (output_tokens * 0.0000004)
+            response_meta = self._client.last_request_metadata
+            input_tokens = response_meta.input_tokens
+            output_tokens = response_meta.output_tokens
+            cost = response_meta.cost
             self.total_cost += cost
             self.request_count += 1
 

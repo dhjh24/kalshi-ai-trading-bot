@@ -76,7 +76,7 @@ class TestAgentProperties:
         agent = ForecasterAgent()
         assert agent.name == "forecaster"
         assert agent.role == "forecaster"
-        assert agent.model_name == "grok-4-1-fast-reasoning"
+        assert agent.model_name == "google/gemini-3.1-pro-preview"
 
     def test_news_analyst_properties(self):
         agent = NewsAnalystAgent()
@@ -88,25 +88,25 @@ class TestAgentProperties:
         agent = BullResearcher()
         assert agent.name == "bull_researcher"
         assert agent.role == "bull_researcher"
-        assert "o3" in agent.model_name or "openai" in agent.model_name
+        assert "deepseek-v3.2" in agent.model_name or "deepseek" in agent.model_name
 
     def test_bear_researcher_properties(self):
         agent = BearResearcher()
         assert agent.name == "bear_researcher"
         assert agent.role == "bear_researcher"
-        assert "gemini-3" in agent.model_name or "google" in agent.model_name
+        assert "grok-4.1-fast" in agent.model_name or "x-ai" in agent.model_name
 
     def test_risk_manager_properties(self):
         agent = RiskManagerAgent()
         assert agent.name == "risk_manager"
         assert agent.role == "risk_manager"
-        assert "deepseek-v3.2" in agent.model_name or "deepseek" in agent.model_name
+        assert "gpt-5.4" in agent.model_name or "openai" in agent.model_name
 
     def test_trader_properties(self):
         agent = TraderAgent()
         assert agent.name == "trader"
         assert agent.role == "trader"
-        assert agent.model_name == "grok-4-1-fast-reasoning"
+        assert agent.model_name == "x-ai/grok-4.1-fast"
 
 
 class TestAgentAnalyze:
@@ -157,6 +157,25 @@ class TestAgentAnalyze:
         assert "error" not in result
         assert result["probability"] == 0.30
         assert result["_agent"] == "bear_researcher"
+
+    @pytest.mark.asyncio
+    async def test_agent_passes_structured_output_hints_when_supported(self):
+        """Agents should request strict JSON schemas from compatible completion callables."""
+        agent = TraderAgent()
+        captured = {}
+
+        async def completion(prompt, response_format=None, provider_preferences=None):
+            captured["response_format"] = response_format
+            captured["provider_preferences"] = provider_preferences
+            return (
+                '{"action":"BUY","side":"YES","limit_price":52,'
+                '"confidence":0.7,"position_size_pct":2.0,"reasoning":"good"}'
+            )
+
+        result = await agent.analyze(SAMPLE_MARKET, {}, completion)
+        assert "error" not in result
+        assert captured["response_format"]["type"] == "json_schema"
+        assert captured["provider_preferences"]["require_parameters"] is True
 
     @pytest.mark.asyncio
     async def test_risk_manager_analyze(self):

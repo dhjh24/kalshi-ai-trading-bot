@@ -29,6 +29,17 @@ import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
+from src.utils.kalshi_normalization import (
+    build_limit_order_price_fields,
+    get_balance_dollars,
+    get_fill_count,
+    get_fill_price_dollars,
+    get_last_price,
+    get_market_volume,
+    get_order_fill_count,
+    get_portfolio_value_dollars,
+    get_position_size,
+)
 import aiosqlite
 
 logger = logging.getLogger(__name__)
@@ -282,8 +293,8 @@ class SafeCompounder:
 
         # Get portfolio state
         bal = await self.client.get_balance()
-        portfolio = bal.get("portfolio_value", 0)
-        cash = bal.get("balance", 0)
+        portfolio = int(round(get_portfolio_value_dollars(bal) * 100))
+        cash = int(round(get_balance_dollars(bal) * 100))
 
         print(f"\n💰 Cash: ${cash/100:.2f} | Portfolio: ${portfolio/100:.2f} | "
               f"Total: ${(cash+portfolio)/100:.2f}\n", flush=True)
@@ -341,8 +352,8 @@ class SafeCompounder:
         print(f"  Capital deployed:     ${stats['total_deployed']/100:.2f}", flush=True)
         print(f"  Potential profit:     ${stats['total_potential_profit']/100:.2f}", flush=True)
         print(f"  YES orders cancelled: {cancelled}", flush=True)
-        print(f"  Cash:                 ${bal.get('balance', 0)/100:.2f}", flush=True)
-        print(f"  Portfolio:            ${bal.get('portfolio_value', 0)/100:.2f}", flush=True)
+        print(f"  Cash:                 ${get_balance_dollars(bal):.2f}", flush=True)
+        print(f"  Portfolio:            ${get_portfolio_value_dollars(bal):.2f}", flush=True)
         print(f"  Elapsed:              {elapsed:.0f}s", flush=True)
         print(f"{'='*70}\n", flush=True)
 
@@ -364,12 +375,11 @@ class SafeCompounder:
         page = 0
         try:
             while True:
-                params = {"status": "open", "limit": 100, "with_nested_markets": "true"}
-                if cursor:
-                    params["cursor"] = cursor
-                
-                resp = await self.client._make_authenticated_request(
-                    "GET", "/trade-api/v2/events", params=params
+                resp = await self.client.get_events(
+                    status="open",
+                    limit=100,
+                    cursor=cursor,
+                    with_nested_markets=True,
                 )
                 events = resp.get("events", [])
                 if not events:
@@ -446,13 +456,10 @@ class SafeCompounder:
             if any(phrase in title_lower for phrase in SKIP_TITLE_PHRASES):
                 continue
 
-            if int(float(m.get("volume_fp", 0) or m.get("volume", 0) or 0)) < MIN_VOLUME:
+            if get_market_volume(m) < MIN_VOLUME:
                 continue
 
-            yes_last = float(m.get("last_price_dollars", 0) or m.get("last_price", 0) or 0)
-            # Convert old cent format to dollar format if needed
-            if yes_last > 1.0:
-                yes_last = yes_last / 100.0
+            yes_last = get_last_price(m, "YES")
             if yes_last > 0.20:  # Only consider markets with YES ≤ $0.20
                 continue
 
@@ -485,7 +492,7 @@ class SafeCompounder:
         if len(candidates) > MAX_ORDERBOOK_CHECKS:
             candidates.sort(key=lambda c: (
                 -c["_true_no_prob"],  # Highest estimated NO probability first
-                -float(c.get("volume_fp", 0) or c.get("volume", 0) or 0),  # Highest volume
+                -get_market_volume(c),  # Highest volume
                 c["_hours_to_expiry"],  # Soonest expiry
             ))
             logger.info("Capping to top %d candidates (from %d) for orderbook checks",
@@ -567,10 +574,7 @@ class SafeCompounder:
             days = m["_days_to_expiry"] if m["_days_to_expiry"] > 0 else 1
             annualized_roi = (profit_per_contract / our_price) * (365 / days) * 100
 
-            yes_last_val = float(m.get("last_price_dollars", 0) or m.get("last_price", 0) or 0)
-            # Convert cents to dollars if needed
-            if yes_last_val > 1.0:
-                yes_last_val = yes_last_val / 100.0
+            yes_last_val = get_last_price(m, "YES")
             
             opportunities.append({
                 "ticker": ticker,
@@ -584,7 +588,7 @@ class SafeCompounder:
                 "profit": profit_per_contract,
                 "roi_pct": roi_pct,
                 "annualized_roi": annualized_roi,
-                "volume": int(float(m.get("volume_fp", 0) or m.get("volume", 0) or 0)),
+                "volume": get_market_volume(m),
                 "days_to_expiry": m["_days_to_expiry"],
                 "close_time": m.get("close_time", "")[:10],
                 "best_no_bid": best_no_bid,
@@ -610,7 +614,7 @@ class SafeCompounder:
             positions_resp = await self.client.get_positions()
             positions = positions_resp.get("market_positions", [])
             pos_tickers = {
-                p["ticker"] for p in positions if abs(p.get("position", 0)) > 0
+                p["ticker"] for p in positions if abs(get_position_size(p)) > 0
             }
         except Exception:
             pos_tickers = set()
@@ -678,8 +682,6 @@ class SafeCompounder:
                 continue
 
             try:
-                # Convert dollar price to cents for API call
-                price_cents = int(price * 100)
                 client_order_id = str(uuid.uuid4())
                 r = await self.client.place_order(
                     ticker=ticker,
@@ -687,11 +689,14 @@ class SafeCompounder:
                     side="no",
                     action="buy",
                     count=contracts,
-                    no_price=price_cents,
+                    type_="limit",
+                    time_in_force="good_till_canceled",
+                    post_only=True,
+                    **build_limit_order_price_fields("NO", price),
                 )
                 order = r.get("order", {})
                 status = order.get("status", "?")
-                filled = order.get("fill_count", 0)
+                filled = int(get_order_fill_count(order))
 
                 if filled > 0:
                     stats["filled"] += filled
@@ -751,13 +756,9 @@ class SafeCompounder:
             for o in yes_orders:
                 try:
                     await self.client.cancel_order(o["order_id"])
-                    yes_price = o.get('yes_price', 0)
+                    yes_price = o.get("yes_price_dollars", o.get("yes_price", 0))
                     if isinstance(yes_price, (int, float)) and yes_price > 0:
-                        # Convert cents to dollars if needed for display
-                        if yes_price > 1.0:
-                            price_display = f"${yes_price/100:.2f}"
-                        else:
-                            price_display = f"${yes_price:.2f}"
+                        price_display = f"${yes_price/100:.2f}" if yes_price > 1.0 else f"${yes_price:.2f}"
                     else:
                         price_display = "?"
                     print(
@@ -778,8 +779,8 @@ class SafeCompounder:
     async def check_fills(self) -> None:
         """Check recent fills and resting orders."""
         bal = await self.client.get_balance()
-        portfolio = bal.get("portfolio_value", 0)
-        cash = bal.get("balance", 0)
+        portfolio = int(round(get_portfolio_value_dollars(bal) * 100))
+        cash = int(round(get_balance_dollars(bal) * 100))
         print(
             f"💰 Cash: ${cash/100:.2f} | Portfolio: ${portfolio/100:.2f} | "
             f"Total: ${(cash+portfolio)/100:.2f}",
@@ -804,9 +805,9 @@ class SafeCompounder:
             print(f"\n📊 Last 20 fills:", flush=True)
             for f in fill_list:
                 ticker = f.get("ticker", "")
-                side = f.get("side", "")
-                count = f.get("count", 0)
-                price = f.get("yes_price", f.get("no_price", 0))
+                side = f.get("side", f.get("purchased_side", ""))
+                count = get_fill_count(f)
+                price = get_fill_price_dollars(f)
                 created = f.get("created_time", "")[:16]
                 # Convert cents to dollars if needed for display
                 if isinstance(price, (int, float)) and price > 1.0:

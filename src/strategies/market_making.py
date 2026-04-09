@@ -25,6 +25,7 @@ from src.clients.kalshi_client import KalshiClient
 from src.clients.xai_client import XAIClient
 from src.utils.database import DatabaseManager, Market
 from src.config.settings import settings
+from src.utils.kalshi_normalization import build_limit_order_price_fields, get_mid_price
 from src.utils.logging_setup import get_trading_logger
 
 
@@ -126,18 +127,12 @@ class AdvancedMarketMaker:
             try:
                 # Get current market data
                 market_data = await self.kalshi_client.get_market(market.market_id)
-                if not market_data:
+                market_info = market_data.get("market", {}) if isinstance(market_data, dict) else {}
+                if not market_info:
                     continue
-                    
-                # Handle both new and old field formats
-                current_yes_price = float(market_data.get('yes_bid_dollars', 0) or market_data.get('yes_price', 0) or 0)
-                current_no_price = float(market_data.get('no_bid_dollars', 0) or market_data.get('no_price', 0) or 0)
-                
-                # Convert cents to dollars if needed
-                if current_yes_price > 1.0:
-                    current_yes_price = current_yes_price / 100.0
-                if current_no_price > 1.0:
-                    current_no_price = current_no_price / 100.0
+
+                current_yes_price = get_mid_price(market_info, "YES")
+                current_no_price = get_mid_price(market_info, "NO")
                 
                 # Skip if prices are extreme (hard to make markets) - relaxed thresholds
                 if current_yes_price < 0.02 or current_yes_price > 0.98:
@@ -374,7 +369,7 @@ class AdvancedMarketMaker:
         yes_bid_order = LimitOrder(
             market_id=opportunity.market_id,
             side="YES",
-            price=opportunity.optimal_yes_bid * 100,  # Convert to cents
+            price=opportunity.optimal_yes_bid,
             quantity=opportunity.optimal_yes_size,
             expected_profit=opportunity.yes_spread_profit
         )
@@ -383,7 +378,7 @@ class AdvancedMarketMaker:
         no_bid_order = LimitOrder(
             market_id=opportunity.market_id,
             side="NO", 
-            price=opportunity.optimal_no_bid * 100,
+            price=opportunity.optimal_no_bid,
             quantity=opportunity.optimal_no_size,
             expected_profit=opportunity.no_spread_profit
         )
@@ -422,14 +417,10 @@ class AdvancedMarketMaker:
                     "side": side,
                     "action": "buy",  # Market making involves buying at our bid prices
                     "count": order.quantity,
-                    "type_": "limit"
+                    "type_": "limit",
+                    "time_in_force": "good_till_canceled",
+                    **build_limit_order_price_fields(order.side, order.price),
                 }
-                
-                # Add the appropriate price parameter
-                if side == "yes":
-                    order_params["yes_price"] = int(order.price)  # Price in cents
-                else:
-                    order_params["no_price"] = int(order.price)
                 
                 # Place the order
                 response = await self.kalshi_client.place_order(**order_params)
@@ -438,11 +429,8 @@ class AdvancedMarketMaker:
                     order.status = "placed"
                     order.placed_at = datetime.now()
                     order.order_id = response['order'].get('order_id', client_order_id)
-                    
-                    # Convert cents back to dollars for display
-                    display_price = order.price / 100 if order.price > 1.0 else order.price
                     self.logger.info(
-                        f"✅ LIVE limit order placed: {order.side} {order.quantity} at ${display_price:.2f} "
+                        f"✅ LIVE limit order placed: {order.side} {order.quantity} at ${order.price:.4f} "
                         f"for market {order.market_id} (Order ID: {order.order_id})"
                     )
                 else:
@@ -455,7 +443,7 @@ class AdvancedMarketMaker:
                 order.order_id = f"sim_{order.market_id}_{order.side}_{int(datetime.now().timestamp())}"
                 
                 self.logger.info(
-                    f"📝 SIMULATED limit order placed: {order.side} {order.quantity} at {order.price:.1f}¢ "
+                    f"📝 SIMULATED limit order placed: {order.side} {order.quantity} at ${order.price:.4f} "
                     f"for market {order.market_id}"
                 )
             
@@ -488,7 +476,7 @@ class AdvancedMarketMaker:
             # Use AI analysis for market making - higher tokens for reasoning models
             response = await self.xai_client.get_completion(
                 prompt, 
-                max_tokens=3000,  # Higher for reasoning models like grok-4
+                max_tokens=3000,  # Higher budget for reasoning-oriented models
                 temperature=0.1   # Lower for consistency
             )
             
@@ -569,11 +557,12 @@ class AdvancedMarketMaker:
         try:
             # Get current market data
             market_data = await self.kalshi_client.get_market(order.market_id)
-            if not market_data:
+            market_info = market_data.get("market", {}) if isinstance(market_data, dict) else {}
+            if not market_info:
                 return False
             
-            current_yes_price = market_data.get('yes_price', 0) / 100
-            order_price = order.price / 100
+            current_yes_price = get_mid_price(market_info, "YES")
+            order_price = order.price
             
             # Update if market has moved significantly
             price_diff = abs(current_yes_price - order_price)
@@ -667,4 +656,4 @@ async def run_market_making_strategy(
         
     except Exception as e:
         logger.error(f"Error in market making strategy: {e}")
-        return {'error': str(e)} 
+        return {'error': str(e)}

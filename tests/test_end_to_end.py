@@ -12,8 +12,8 @@ from src.clients.kalshi_client import KalshiClient
 from src.config.settings import settings
 from tests.test_helpers import find_suitable_test_market
 
-# Mark all tests in this file as async
-pytestmark = pytest.mark.asyncio
+# Real-network integration test: requires live Kalshi auth and model access.
+pytestmark = [pytest.mark.asyncio, pytest.mark.live_kalshi]
 
 E2E_TEST_DB = "e2e_test_trading_system.db"
 

@@ -21,6 +21,11 @@ from datetime import datetime, timedelta
 
 from src.utils.database import DatabaseManager, Position
 from src.clients.kalshi_client import KalshiClient
+from src.utils.kalshi_normalization import (
+    get_balance_dollars,
+    get_portfolio_value_dollars,
+    get_position_exposure_dollars,
+)
 from src.utils.logging_setup import get_trading_logger
 from src.config.settings import settings
 
@@ -248,21 +253,21 @@ class PositionLimitsManager:
         try:
             # Get available cash
             balance_response = await self.kalshi_client.get_balance()
-            available_cash = balance_response.get('balance', 0) / 100
+            available_cash = get_balance_dollars(balance_response)
+
+            marked_portfolio_value = get_portfolio_value_dollars(balance_response)
+            if marked_portfolio_value > 0:
+                return available_cash + marked_portfolio_value
             
             # Get current positions value
             positions_response = await self.kalshi_client.get_positions()
-            positions = positions_response.get('positions', []) if isinstance(positions_response, dict) else []
+            positions = positions_response.get('event_positions', []) if isinstance(positions_response, dict) else []
             total_position_value = 0
             
             for position in positions:
                 if not isinstance(position, dict):
                     continue
-                quantity = position.get('quantity', 0)
-                if quantity != 0:
-                    # Estimate position value (could be improved with real-time pricing)
-                    position_value = abs(quantity) * 0.50  # Conservative estimate
-                    total_position_value += position_value
+                total_position_value += get_position_exposure_dollars(position)
             
             return available_cash + total_position_value
             
@@ -274,7 +279,7 @@ class PositionLimitsManager:
         """Get available cash balance."""
         try:
             balance_response = await self.kalshi_client.get_balance()
-            return balance_response.get('balance', 0) / 100
+            return get_balance_dollars(balance_response)
         except Exception as e:
             self.logger.error(f"Error getting available cash: {e}")
             return 0.0

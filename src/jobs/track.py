@@ -16,6 +16,11 @@ from src.utils.database import DatabaseManager, Position, TradeLog
 from src.config.settings import settings
 from src.utils.logging_setup import setup_logging, get_trading_logger
 from src.clients.kalshi_client import KalshiClient
+from src.utils.kalshi_normalization import (
+    get_market_result,
+    get_market_status,
+    get_mid_price,
+)
 
 async def should_exit_position(
     position: Position, 
@@ -33,10 +38,10 @@ async def should_exit_position(
     current_price = current_yes_price if position.side == "YES" else current_no_price
     
     # 1. Market resolution (original logic)
-    if market_status == 'closed':
+    if market_status in {'closed', 'settled', 'finalized'}:
         # If market resolved, use the result to determine exit price
         if market_result:
-            exit_price = 1.0 if market_result == position.side else 0.0
+            exit_price = 1.0 if str(market_result).upper() == position.side.upper() else 0.0
         else:
             # Fallback to current price if no result available
             exit_price = current_price
@@ -185,10 +190,10 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                     continue
 
                 # Get current prices
-                current_yes_price = market_data.get('yes_price', 0) / 100  # Convert cents to dollars
-                current_no_price = market_data.get('no_price', 0) / 100
-                market_status = market_data.get('status', 'unknown')
-                market_result = market_data.get('result')  # Market resolution result
+                current_yes_price = get_mid_price(market_data, "YES")
+                current_no_price = get_mid_price(market_data, "NO")
+                market_status = get_market_status(market_data)
+                market_result = get_market_result(market_data)
                 
                 # If position doesn't have exit strategy set, calculate defaults
                 if not position.stop_loss_price and not position.take_profit_price:

@@ -25,16 +25,16 @@ from src.utils.logging_setup import TradingLoggerMixin
 CAPABILITY_MAP: Dict[str, List[Tuple[str, str]]] = {
     "fast": [
         ("x-ai/grok-4.1-fast", "openrouter"),
-        ("google/gemini-3.1-pro", "openrouter"),
+        ("google/gemini-3.1-pro-preview", "openrouter"),
     ],
     "cheap": [
         ("deepseek/deepseek-v3.2", "openrouter"),
-        ("google/gemini-3.1-pro", "openrouter"),
+        ("google/gemini-3.1-pro-preview", "openrouter"),
     ],
     "reasoning": [
         ("anthropic/claude-sonnet-4.5", "openrouter"),
         ("openai/gpt-5.4", "openrouter"),
-        ("google/gemini-3.1-pro", "openrouter"),
+        ("google/gemini-3.1-pro-preview", "openrouter"),
     ],
     "balanced": [
         ("anthropic/claude-sonnet-4.5", "openrouter"),
@@ -46,7 +46,7 @@ CAPABILITY_MAP: Dict[str, List[Tuple[str, str]]] = {
 # Full fleet: ordered by quality/priority for fallback chains.
 FULL_FLEET: List[Tuple[str, str]] = [
     ("anthropic/claude-sonnet-4.5", "openrouter"),
-    ("google/gemini-3.1-pro", "openrouter"),
+    ("google/gemini-3.1-pro-preview", "openrouter"),
     ("openai/gpt-5.4", "openrouter"),
     ("deepseek/deepseek-v3.2", "openrouter"),
     ("x-ai/grok-4.1-fast", "openrouter"),
@@ -310,14 +310,18 @@ class ModelRouter(TradingLoggerMixin):
     def _record_success(self, model: str, provider: str, latency: float) -> None:
         key = self._model_key(model, provider)
         health = self.model_health.get(key)
-        if health:
-            health.record_success(latency)
+        if health is None:
+            health = ModelHealth(model=model, provider=provider)
+            self.model_health[key] = health
+        health.record_success(latency)
 
     def _record_failure(self, model: str, provider: str) -> None:
         key = self._model_key(model, provider)
         health = self.model_health.get(key)
-        if health:
-            health.record_failure()
+        if health is None:
+            health = ModelHealth(model=model, provider=provider)
+            self.model_health[key] = health
+        health.record_failure()
 
     # ------------------------------------------------------------------
     # Dispatch helpers — all through OpenRouter
@@ -328,27 +332,37 @@ class ModelRouter(TradingLoggerMixin):
         prompt: str,
         model: str,
         provider: str,
+        fallback_models: Optional[List[str]] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         strategy: str = "unknown",
         query_type: str = "completion",
         market_id: Optional[str] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        provider_preferences: Optional[Dict[str, Any]] = None,
+        plugins: Optional[List[Dict[str, Any]]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+        trace: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """Send a completion request through OpenRouter."""
         client = self._ensure_openrouter()
-        result = await client.get_completion(
+        return await client.get_completion(
             prompt=prompt,
             model=model,
+            fallback_models=fallback_models,
             max_tokens=max_tokens,
             temperature=temperature,
             strategy=strategy,
             query_type=query_type,
             market_id=market_id,
+            response_format=response_format,
+            provider=provider_preferences,
+            plugins=plugins,
+            metadata=metadata,
+            session_id=session_id,
+            trace=trace,
         )
-        # Update router-level daily tracker from openrouter client's last cost
-        if result is not None and hasattr(client, "_last_request_cost"):
-            self._update_daily_cost(client._last_request_cost)
-        return result
 
     async def _dispatch_trading_decision(
         self,
@@ -357,18 +371,29 @@ class ModelRouter(TradingLoggerMixin):
         news_summary: str,
         model: str,
         provider: str,
+        fallback_models: Optional[List[str]] = None,
+        provider_preferences: Optional[Dict[str, Any]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        plugins: Optional[List[Dict[str, Any]]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+        trace: Optional[Dict[str, Any]] = None,
     ) -> Optional[TradingDecision]:
         """Request a trading decision through OpenRouter."""
         client = self._ensure_openrouter()
-        decision = await client.get_trading_decision(
+        return await client.get_trading_decision(
             market_data=market_data,
             portfolio_data=portfolio_data,
             news_summary=news_summary,
             model=model,
+            fallback_models=fallback_models,
+            provider=provider_preferences,
+            response_format=response_format,
+            plugins=plugins,
+            metadata=metadata,
+            session_id=session_id,
+            trace=trace,
         )
-        if decision is not None and hasattr(client, "_last_request_cost"):
-            self._update_daily_cost(client._last_request_cost)
-        return decision
 
     # ------------------------------------------------------------------
     # Public API: get_completion
@@ -384,6 +409,12 @@ class ModelRouter(TradingLoggerMixin):
         strategy: str = "unknown",
         query_type: str = "completion",
         market_id: Optional[str] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        provider_preferences: Optional[Dict[str, Any]] = None,
+        plugins: Optional[List[Dict[str, Any]]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+        trace: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """
         Get a completion routed to the best available model via OpenRouter.
@@ -403,53 +434,60 @@ class ModelRouter(TradingLoggerMixin):
             Response text, or ``None`` if all models fail.
         """
         targets = self._resolve_targets(model=model, capability=capability)
+        primary_model, primary_provider = targets[0]
+        fallback_models = [target_model for target_model, _ in targets[1:]]
+        start = time.time()
 
-        for target_model, provider in targets:
-            start = time.time()
-            try:
-                result = await self._dispatch_completion(
-                    prompt=prompt,
-                    model=target_model,
-                    provider=provider,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    strategy=strategy,
-                    query_type=query_type,
-                    market_id=market_id,
+        try:
+            result = await self._dispatch_completion(
+                prompt=prompt,
+                model=primary_model,
+                provider=primary_provider,
+                fallback_models=fallback_models,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                strategy=strategy,
+                query_type=query_type,
+                market_id=market_id,
+                response_format=response_format,
+                provider_preferences=provider_preferences,
+                plugins=plugins,
+                metadata=metadata,
+                session_id=session_id,
+                trace=trace,
+            )
+
+            if result is not None:
+                client = self._ensure_openrouter()
+                actual_model = client.last_request_metadata.actual_model or primary_model
+                actual_provider = self._infer_provider(actual_model)
+                self._record_success(actual_model, actual_provider, time.time() - start)
+                self.logger.debug(
+                    "Completion routed successfully",
+                    requested_model=primary_model,
+                    actual_model=actual_model,
+                    fallback_models=fallback_models,
+                    latency=round(time.time() - start, 2),
                 )
+                return result
 
-                if result is not None:
-                    self._record_success(target_model, provider, time.time() - start)
-                    self.logger.debug(
-                        "Completion routed successfully",
-                        model=target_model,
-                        provider=provider,
-                        latency=round(time.time() - start, 2),
-                    )
-                    return result
+            self._record_failure(primary_model, primary_provider)
+            self.logger.warning(
+                "OpenRouter returned no completion after fallbacks",
+                requested_model=primary_model,
+                fallback_models=fallback_models,
+            )
+            return None
 
-                self._record_failure(target_model, provider)
-                self.logger.warning(
-                    "Model returned None, trying next",
-                    model=target_model,
-                    provider=provider,
-                )
-
-            except Exception as exc:
-                self._record_failure(target_model, provider)
-                self.logger.warning(
-                    "Model failed during completion routing",
-                    model=target_model,
-                    provider=provider,
-                    error=str(exc),
-                )
-                continue
-
-        self.logger.error(
-            "All models exhausted for get_completion",
-            targets_tried=[(m, p) for m, p in targets],
-        )
-        return None
+        except Exception as exc:
+            self._record_failure(primary_model, primary_provider)
+            self.logger.warning(
+                "Completion routing failed",
+                requested_model=primary_model,
+                fallback_models=fallback_models,
+                error=str(exc),
+            )
+            return None
 
     # ------------------------------------------------------------------
     # Public API: get_trading_decision
@@ -462,6 +500,12 @@ class ModelRouter(TradingLoggerMixin):
         news_summary: str = "",
         model: Optional[str] = None,
         capability: Optional[str] = None,
+        provider_preferences: Optional[Dict[str, Any]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        plugins: Optional[List[Dict[str, Any]]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+        trace: Optional[Dict[str, Any]] = None,
     ) -> Optional[TradingDecision]:
         """
         Get a trading decision from the best available model via OpenRouter.
@@ -477,52 +521,58 @@ class ModelRouter(TradingLoggerMixin):
             A ``TradingDecision`` or ``None`` if all models fail.
         """
         targets = self._resolve_targets(model=model, capability=capability)
+        primary_model, primary_provider = targets[0]
+        fallback_models = [target_model for target_model, _ in targets[1:]]
+        start = time.time()
 
-        for target_model, provider in targets:
-            start = time.time()
-            try:
-                decision = await self._dispatch_trading_decision(
-                    market_data=market_data,
-                    portfolio_data=portfolio_data,
-                    news_summary=news_summary,
-                    model=target_model,
-                    provider=provider,
+        try:
+            decision = await self._dispatch_trading_decision(
+                market_data=market_data,
+                portfolio_data=portfolio_data,
+                news_summary=news_summary,
+                model=primary_model,
+                provider=primary_provider,
+                fallback_models=fallback_models,
+                provider_preferences=provider_preferences,
+                response_format=response_format,
+                plugins=plugins,
+                metadata=metadata,
+                session_id=session_id,
+                trace=trace,
+            )
+
+            if decision is not None:
+                client = self._ensure_openrouter()
+                actual_model = client.last_request_metadata.actual_model or primary_model
+                actual_provider = self._infer_provider(actual_model)
+                self._record_success(actual_model, actual_provider, time.time() - start)
+                self.logger.info(
+                    "Trading decision routed successfully",
+                    requested_model=primary_model,
+                    actual_model=actual_model,
+                    action=decision.action,
+                    confidence=decision.confidence,
+                    latency=round(time.time() - start, 2),
                 )
+                return decision
 
-                if decision is not None:
-                    self._record_success(target_model, provider, time.time() - start)
-                    self.logger.info(
-                        "Trading decision routed successfully",
-                        model=target_model,
-                        provider=provider,
-                        action=decision.action,
-                        confidence=decision.confidence,
-                        latency=round(time.time() - start, 2),
-                    )
-                    return decision
+            self._record_failure(primary_model, primary_provider)
+            self.logger.warning(
+                "OpenRouter returned no trading decision after fallbacks",
+                requested_model=primary_model,
+                fallback_models=fallback_models,
+            )
+            return None
 
-                self._record_failure(target_model, provider)
-                self.logger.warning(
-                    "Model returned no decision, trying next",
-                    model=target_model,
-                    provider=provider,
-                )
-
-            except Exception as exc:
-                self._record_failure(target_model, provider)
-                self.logger.warning(
-                    "Model failed during trading decision routing",
-                    model=target_model,
-                    provider=provider,
-                    error=str(exc),
-                )
-                continue
-
-        self.logger.error(
-            "All models exhausted for get_trading_decision",
-            targets_tried=[(m, p) for m, p in targets],
-        )
-        return None
+        except Exception as exc:
+            self._record_failure(primary_model, primary_provider)
+            self.logger.warning(
+                "Trading decision routing failed",
+                requested_model=primary_model,
+                fallback_models=fallback_models,
+                error=str(exc),
+            )
+            return None
 
     # ------------------------------------------------------------------
     # Aggregate cost tracking
@@ -546,6 +596,7 @@ class ModelRouter(TradingLoggerMixin):
         """
         Return a comprehensive cost and health summary.
         """
+        self.daily_tracker = self._load_daily_tracker()
         summary: Dict[str, Any] = {
             "total_cost": round(self.get_total_cost(), 6),
             "total_requests": self.get_total_requests(),

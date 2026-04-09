@@ -31,6 +31,13 @@ from src.clients.kalshi_client import KalshiClient
 from src.clients.xai_client import XAIClient
 from src.utils.database import DatabaseManager, Market, Position
 from src.config.settings import settings
+from src.utils.kalshi_normalization import (
+    get_balance_dollars,
+    get_mid_price,
+    get_portfolio_value_dollars,
+    get_position_exposure_dollars,
+    get_position_ticker,
+)
 from src.utils.logging_setup import get_trading_logger
 
 from src.strategies.market_making import (
@@ -155,21 +162,21 @@ class UnifiedAdvancedTradingSystem:
         try:
             # Get total portfolio value (cash + current positions)
             balance_response = await self.kalshi_client.get_balance()
-            available_cash = balance_response.get('balance', 0) / 100  # Convert cents to dollars
+            available_cash = get_balance_dollars(balance_response)
 
             # Get current positions to calculate total portfolio value
             # Kalshi API v2 returns portfolio_value in balance response (in cents)
-            total_position_value = balance_response.get('portfolio_value', 0) / 100  # Convert cents to dollars
+            total_position_value = get_portfolio_value_dollars(balance_response)
 
             # Also log active positions for visibility
             positions_response = await self.kalshi_client.get_positions()
             event_positions = positions_response.get('event_positions', []) if isinstance(positions_response, dict) else []
-            active_positions = [p for p in event_positions if float(p.get('event_exposure_dollars', '0')) > 0]
+            active_positions = [p for p in event_positions if get_position_exposure_dollars(p) > 0]
             if active_positions:
                 self.logger.info(f"📊 Active positions: {len(active_positions)}")
                 for pos in active_positions:
-                    ticker = pos.get('event_ticker', '?')
-                    exposure = float(pos.get('event_exposure_dollars', '0'))
+                    ticker = get_position_ticker(pos) or '?'
+                    exposure = get_position_exposure_dollars(pos)
                     pnl = float(pos.get('realized_pnl_dollars', '0'))
                     self.logger.info(f"  📌 {ticker}: exposure=${exposure:.2f}, realized_pnl=${pnl:.2f}")
 
@@ -489,10 +496,11 @@ class UnifiedAdvancedTradingSystem:
                     market_info = market_data.get('market', {})
                     
                     # Get price for the intended side (already determined above)
-                    if intended_side == "YES":
-                        price = market_info.get('yes_price', 50) / 100
-                    else:
-                        price = market_info.get('no_price', 50) / 100
+                    price = get_mid_price(market_info, intended_side)
+                    if price <= 0:
+                        self.logger.warning(f"Could not derive a valid price for {market_id} {intended_side}")
+                        results['failed_executions'] += 1
+                        continue
                     
                     # Calculate quantity
                     quantity = max(1, int(position_value / price))

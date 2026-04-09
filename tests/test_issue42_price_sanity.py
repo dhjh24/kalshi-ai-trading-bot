@@ -20,9 +20,6 @@ from unittest.mock import AsyncMock, Mock
 from src.utils.market_prices import is_tradeable_market, get_market_prices
 from src.utils.database import Position
 
-pytestmark = pytest.mark.asyncio
-
-
 # ---------------------------------------------------------------------------
 # is_tradeable_market() unit tests
 # ---------------------------------------------------------------------------
@@ -123,10 +120,21 @@ def _mock_clients(market_prices: dict):
 
     kalshi_mock = Mock()
     kalshi_mock.get_market = AsyncMock(return_value={"market": market_prices})
-    kalshi_mock.place_order = AsyncMock(return_value={"order": {"order_id": "ord-test-42"}})
+    kalshi_mock.place_order = AsyncMock(
+        return_value={
+            "order": {
+                "order_id": "ord-test-42",
+                "status": "filled",
+                "fill_count_fp": "5",
+                "yes_price_dollars": "0.5200",
+                "no_price_dollars": "0.5000",
+            }
+        }
+    )
     return db_mock, kalshi_mock
 
 
+@pytest.mark.asyncio
 async def test_execute_skips_collection_ticker_yes_side():
     """execute_position returns False and does NOT place an order for a collection ticker."""
     from src.jobs.execute import execute_position
@@ -151,6 +159,7 @@ async def test_execute_skips_collection_ticker_yes_side():
     kalshi_mock.place_order.assert_not_called()
 
 
+@pytest.mark.asyncio
 async def test_execute_skips_collection_ticker_no_side():
     """execute_position returns False for NO-side collection ticker too."""
     from src.jobs.execute import execute_position
@@ -175,6 +184,7 @@ async def test_execute_skips_collection_ticker_no_side():
     kalshi_mock.place_order.assert_not_called()
 
 
+@pytest.mark.asyncio
 async def test_execute_skips_zero_price():
     """execute_position returns False when ask converts to 0¢."""
     from src.jobs.execute import execute_position
@@ -199,6 +209,7 @@ async def test_execute_skips_zero_price():
     kalshi_mock.place_order.assert_not_called()
 
 
+@pytest.mark.asyncio
 async def test_execute_skips_100_cent_price():
     """execute_position returns False when ask converts to 100¢ for one side."""
     from src.jobs.execute import execute_position
@@ -225,6 +236,7 @@ async def test_execute_skips_100_cent_price():
     kalshi_mock.place_order.assert_not_called()
 
 
+@pytest.mark.asyncio
 async def test_execute_allows_normal_market():
     """execute_position proceeds normally for a healthy 50/50 market."""
     from src.jobs.execute import execute_position
@@ -247,3 +259,7 @@ async def test_execute_allows_normal_market():
 
     assert result is True, "Should succeed for a normal tradeable market"
     kalshi_mock.place_order.assert_called_once()
+    kwargs = kalshi_mock.place_order.call_args.kwargs
+    assert kwargs["type_"] == "limit"
+    assert kwargs["time_in_force"] == "fill_or_kill"
+    assert "yes_price_dollars" in kwargs

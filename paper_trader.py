@@ -1,69 +1,64 @@
 #!/usr/bin/env python3
 """
-Paper Trader — Signal-only mode for the Kalshi AI Trading Bot.
+Paper Trader - signal-only mode for the Kalshi AI Trading Bot.
 
-Uses the same market scanning and AI analysis as the live bot, but instead of
-placing real orders it logs every signal to SQLite.  A companion HTML dashboard
-shows cumulative P&L, win rate, and individual signals.
-
-Usage:
-    python paper_trader.py                # Scan once, log signals, generate dashboard
-    python paper_trader.py --settle       # Check settled markets and update outcomes
-    python paper_trader.py --dashboard    # Regenerate the HTML dashboard only
-    python paper_trader.py --loop         # Continuous scanning (Ctrl-C to stop)
-    python paper_trader.py --stats        # Print stats to terminal
+Uses the same ingest and decision pipeline as the live bot, but stores
+hypothetical trades locally instead of placing real orders.
 """
 
-import asyncio
-import argparse
-import sys
-import os
-from datetime import datetime, timezone
+from __future__ import annotations
 
+import argparse
+import asyncio
+import os
+from datetime import datetime
+
+from src.config.settings import settings
+from src.paper.dashboard import generate_html
 from src.paper.tracker import (
+    get_pending_signals,
+    get_stats,
     log_signal,
     settle_signal,
-    get_pending_signals,
-    get_all_signals,
-    get_stats,
 )
-from src.paper.dashboard import generate_html
-from src.config.settings import settings
-from src.utils.logging_setup import setup_logging, get_trading_logger
+from src.utils.logging_setup import get_trading_logger, setup_logging
 
 logger = get_trading_logger("paper_trader")
 
 DASHBOARD_OUT = os.path.join(os.path.dirname(__file__), "docs", "paper_dashboard.html")
 
 
-# ---------------------------------------------------------------------------
-# Scanning: reuse the existing ingestion + decision pipeline
-# ---------------------------------------------------------------------------
+def _parse_iso(value: str) -> datetime | None:
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value)
+        except (OSError, OverflowError, ValueError):
+            return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
 
-async def scan_and_log():
-    """
-    Scan markets via the existing ingest pipeline, run ensemble decisions,
-    and log any actionable signals to the paper-trading database.
-    """
+
+async def scan_and_log() -> int:
+    """Scan markets, run decisions, and log actionable paper signals."""
     from src.clients.kalshi_client import KalshiClient
     from src.clients.xai_client import XAIClient
-    from src.utils.database import DatabaseManager
-    from src.jobs.ingest import run_ingestion
     from src.jobs.decide import make_decision_for_market
+    from src.jobs.ingest import run_ingestion
+    from src.utils.database import DatabaseManager
 
-    logger.info("📡 Scanning markets for paper trading signals…")
+    logger.info("Scanning markets for paper trading signals...")
 
     kalshi = KalshiClient()
     db = DatabaseManager()
-    await db.initialize()  # Ensure all tables exist before any DB operations
+    await db.initialize()
     xai = XAIClient(db_manager=db)
 
-    # 1. Ingest fresh market data
     try:
         market_queue: asyncio.Queue = asyncio.Queue()
         await run_ingestion(db, market_queue)
 
-        # Drain the queue to collect ingested markets
         markets = []
         while not market_queue.empty():
             markets.append(market_queue.get_nowait())
@@ -71,71 +66,49 @@ async def scan_and_log():
         if not markets:
             logger.info("No markets returned from ingestion.")
             return 0
-    except Exception as e:
-        logger.error(f"Ingestion failed: {e}")
-        return 0
 
-    signals_logged = 0
+        signals_logged = 0
+        for market in markets:
+            try:
+                position = await make_decision_for_market(
+                    market=market,
+                    db_manager=db,
+                    xai_client=xai,
+                    kalshi_client=kalshi,
+                )
+                if position is None:
+                    continue
 
-    # 2. Run decision on each market
-    for market in markets:
-        try:
-            market_id = market.get("ticker") or market.get("market_id", "")
-            title = market.get("title", market_id)
+                if (position.confidence or 0) < 0.55:
+                    continue
 
-            decision = await make_decision_for_market(
-                market_data=market,
-                kalshi_client=kalshi,
-                xai_client=xai,
-                db_manager=db,
-            )
+                signal_id = log_signal(
+                    market_id=position.market_id,
+                    market_title=market.title,
+                    side=position.side,
+                    entry_price=position.entry_price,
+                    confidence=position.confidence or 0.0,
+                    reasoning=position.rationale or "",
+                    strategy=position.strategy or "directional",
+                )
+                signals_logged += 1
+                logger.info(
+                    f"Signal #{signal_id}: {position.side} {market.title} @ {position.entry_price:.0%} "
+                    f"(conf={position.confidence or 0:.0%})"
+                )
+            except Exception as exc:
+                logger.warning(f"Decision failed for {market.market_id}: {exc}")
 
-            if decision is None:
-                continue
-
-            action = decision.get("action", "skip")
-            if action in ("skip", "hold", None):
-                continue
-
-            side = decision.get("side", "NO")
-            confidence = decision.get("confidence", 0)
-            limit_price = decision.get("limit_price", market.get("no_ask", 0))
-            reasoning = decision.get("reasoning", "")
-
-            # Only log signals with meaningful confidence edge
-            if confidence < 0.55:
-                continue
-
-            signal_id = log_signal(
-                market_id=market_id,
-                market_title=title,
-                side=side,
-                entry_price=limit_price,
-                confidence=confidence,
-                reasoning=reasoning,
-                strategy=decision.get("strategy", "directional"),
-            )
-            signals_logged += 1
-            logger.info(
-                f"📝 Signal #{signal_id}: {side} {title} @ {limit_price:.0%} "
-                f"(conf={confidence:.0%}) — {reasoning[:60]}"
-            )
-
-        except Exception as e:
-            logger.warning(f"Decision failed for market: {e}")
-            continue
-
-    logger.info(f"✅ Logged {signals_logged} paper signals")
-    return signals_logged
+        logger.info(f"Logged {signals_logged} paper signals")
+        return signals_logged
+    finally:
+        await kalshi.close()
 
 
-# ---------------------------------------------------------------------------
-# Settlement: check outcomes for pending signals
-# ---------------------------------------------------------------------------
-
-async def check_settlements():
-    """Check Kalshi for settled markets and update signal outcomes."""
+async def check_settlements() -> int:
+    """Check Kalshi for settled markets and update pending paper signals."""
     from src.clients.kalshi_client import KalshiClient
+    from src.utils.kalshi_normalization import get_market_result, get_market_status
 
     pending = get_pending_signals()
     if not pending:
@@ -143,45 +116,64 @@ async def check_settlements():
         return 0
 
     kalshi = KalshiClient()
-    settled_count = 0
+    try:
+        cutoff_response = await kalshi.get_historical_cutoff()
+        market_cutoff = _parse_iso(
+            cutoff_response.get("market_settled_ts")
+            or cutoff_response.get("market_data_cutoff")
+            or cutoff_response.get("market_data_cutoff_ts")
+            or ""
+        )
 
-    for sig in pending:
-        try:
-            market = await kalshi.get_market(sig["market_id"])
-            if not market:
-                continue
+        settled_count = 0
+        for sig in pending:
+            try:
+                signal_ts = _parse_iso(sig.get("timestamp", ""))
+                use_historical = bool(market_cutoff and signal_ts and signal_ts <= market_cutoff)
 
-            status = market.get("status", "")
-            result = market.get("result", "")
+                if use_historical:
+                    market_response = await kalshi.get_historical_market(sig["market_id"])
+                else:
+                    market_response = await kalshi.get_market(sig["market_id"])
 
-            if status not in ("settled", "finalized", "closed"):
-                continue
+                market = market_response.get("market", {}) if isinstance(market_response, dict) else {}
+                if not market and not use_historical:
+                    if market_cutoff and signal_ts and signal_ts <= market_cutoff:
+                        historical_market = await kalshi.get_historical_market(sig["market_id"])
+                        market = historical_market.get("market", {}) if isinstance(historical_market, dict) else {}
+                if not market:
+                    continue
 
-            # result is typically "yes" or "no"
-            settlement_price = 1.0 if result.lower() == "yes" else 0.0
+                status = get_market_status(market)
+                result = get_market_result(market)
+                if status not in {"settled", "finalized", "closed"} or result not in {"yes", "no"}:
+                    continue
 
-            settle_signal(sig["id"], settlement_price)
-            outcome = "WIN" if (
-                (sig["side"] == "NO" and settlement_price <= 0.5) or
-                (sig["side"] == "YES" and settlement_price >= 0.5)
-            ) else "LOSS"
-            logger.info(f"🏁 Signal #{sig['id']} settled: {outcome} — {sig['market_title']}")
-            settled_count += 1
+                settlement_price = 1.0 if result == "yes" else 0.0
+                settle_signal(sig["id"], settlement_price)
+                outcome = (
+                    "WIN"
+                    if (
+                        (sig["side"] == "NO" and settlement_price <= 0.5)
+                        or (sig["side"] == "YES" and settlement_price >= 0.5)
+                    )
+                    else "LOSS"
+                )
+                logger.info(f"Signal #{sig['id']} settled: {outcome} - {sig['market_title']}")
+                settled_count += 1
+            except Exception as exc:
+                logger.warning(f"Settlement check failed for {sig['market_id']}: {exc}")
 
-        except Exception as e:
-            logger.warning(f"Settlement check failed for {sig['market_id']}: {e}")
+        logger.info(f"Settled {settled_count}/{len(pending)} pending signals")
+        return settled_count
+    finally:
+        await kalshi.close()
 
-    logger.info(f"✅ Settled {settled_count}/{len(pending)} pending signals")
-    return settled_count
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-def print_stats():
+def print_stats() -> None:
+    """Print paper-trading stats to stdout."""
     stats = get_stats()
-    print("\n📊 Paper Trading Stats")
+    print("\nPaper Trading Stats")
     print("=" * 40)
     print(f"  Total signals:  {stats['total_signals']}")
     print(f"  Settled:        {stats['settled']}")
@@ -196,13 +188,13 @@ def print_stats():
     print()
 
 
-async def main():
-    parser = argparse.ArgumentParser(description="Paper Trader — Kalshi AI signal logger")
+async def main() -> None:
+    parser = argparse.ArgumentParser(description="Paper Trader - Kalshi AI signal logger")
     parser.add_argument("--settle", action="store_true", help="Check settled markets")
     parser.add_argument("--dashboard", action="store_true", help="Regenerate HTML dashboard only")
     parser.add_argument("--stats", action="store_true", help="Print stats to terminal")
     parser.add_argument("--loop", action="store_true", help="Continuous scanning")
-    parser.add_argument("--interval", type=int, default=900, help="Loop interval in seconds (default 15min)")
+    parser.add_argument("--interval", type=int, default=900, help="Loop interval in seconds")
     args = parser.parse_args()
 
     setup_logging()
@@ -213,26 +205,25 @@ async def main():
 
     if args.dashboard:
         generate_html(DASHBOARD_OUT)
-        print(f"✅ Dashboard generated: {DASHBOARD_OUT}")
+        print(f"Dashboard generated: {DASHBOARD_OUT}")
         return
 
     if args.settle:
         await check_settlements()
         generate_html(DASHBOARD_OUT)
-        print(f"✅ Dashboard updated: {DASHBOARD_OUT}")
+        print(f"Dashboard updated: {DASHBOARD_OUT}")
         return
 
-    # Default: scan once (or loop)
     while True:
         await scan_and_log()
         await check_settlements()
         generate_html(DASHBOARD_OUT)
-        logger.info(f"📊 Dashboard updated: {DASHBOARD_OUT}")
+        logger.info(f"Dashboard updated: {DASHBOARD_OUT}")
 
         if not args.loop:
             break
 
-        logger.info(f"💤 Sleeping {args.interval}s until next scan…")
+        logger.info(f"Sleeping {args.interval}s until next scan...")
         await asyncio.sleep(args.interval)
 
 

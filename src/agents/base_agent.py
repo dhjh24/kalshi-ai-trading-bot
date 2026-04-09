@@ -9,6 +9,7 @@ risk manager, trader) inherit from this base class which provides:
 - Logging integration
 """
 
+import inspect
 import json
 import re
 import time
@@ -41,6 +42,7 @@ class BaseAgent(ABC):
     AGENT_ROLE: str = "base"
     SYSTEM_PROMPT: str = ""
     DEFAULT_MODEL: str = ""
+    RESPONSE_SCHEMA: Dict[str, Any] = {}
 
     def __init__(self, model_name: Optional[str] = None):
         """
@@ -108,7 +110,7 @@ class BaseAgent(ABC):
                 prompt_length=len(prompt),
             )
 
-            raw_response = await get_completion(prompt)
+            raw_response = await self._call_completion(get_completion, prompt)
 
             if raw_response is None:
                 return self._error_result("Model returned None (API limit or failure)")
@@ -160,6 +162,52 @@ class BaseAgent(ABC):
         if self.SYSTEM_PROMPT:
             return f"{self.SYSTEM_PROMPT}\n\n{user_section}"
         return user_section
+
+    def get_response_format(self) -> Optional[dict]:
+        """Return a strict JSON schema response format for structured outputs."""
+        if not self.RESPONSE_SCHEMA:
+            return None
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": self.AGENT_NAME,
+                "strict": True,
+                "schema": self.RESPONSE_SCHEMA,
+            },
+        }
+
+    async def _call_completion(self, get_completion: Callable, prompt: str) -> Any:
+        """Call the supplied completion function, passing structured-output hints when supported."""
+        kwargs = {
+            "response_format": self.get_response_format(),
+            "provider_preferences": {"require_parameters": True},
+        }
+        kwargs = {key: value for key, value in kwargs.items() if value is not None}
+
+        if not kwargs:
+            return await get_completion(prompt)
+
+        try:
+            signature = inspect.signature(get_completion)
+        except (TypeError, ValueError):
+            signature = None
+
+        if signature is None:
+            return await get_completion(prompt)
+
+        accepts_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+        supported_kwargs = kwargs if accepts_kwargs else {
+            key: value
+            for key, value in kwargs.items()
+            if key in signature.parameters
+        }
+
+        if supported_kwargs:
+            return await get_completion(prompt, **supported_kwargs)
+        return await get_completion(prompt)
 
     @abstractmethod
     def _build_prompt(self, market_data: dict, context: dict) -> str:
