@@ -1,0 +1,22 @@
+{
+  "name": "kalshi-ai-trading-bot-dashboard",
+  "private": true,
+  "engines": {
+    "node": ">=24"
+  },
+  "workspaces": [
+    "web",
+    "server"
+  ],
+  "scripts": {
+    "dashboard": "npm run dev",
+    "dev": "concurrently -k -n bridge,server,web -c green,blue,magenta \"python -m uvicorn python_bridge.app.main:app --host 127.0.0.1 --port 8001 --reload\" \"npm run dev --workspace server\" \"npm run dev --workspace web\"",
+    "build": "npm run build --workspace server && npm run build --workspace web",
+    "start": "concurrently -k -n bridge,server,web -c green,blue,magenta \"python -m uvicorn python_bridge.app.main:app --host 127.0.0.1 --port 8001\" \"npm run start --workspace server\" \"npm run start --workspace web\"",
+    "test": "npm run test --workspace server && npm run test --workspace web",
+    "lint": "npm run lint --workspace server && npm run lint --workspace web"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

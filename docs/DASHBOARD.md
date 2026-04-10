@@ -1,6 +1,19 @@
 # Trading System Dashboard 📊
 
-A comprehensive Streamlit-based dashboard for monitoring and analyzing all aspects of your automated trading system.
+The main dashboard entrypoint is now the Node stack:
+
+- `web/` — Next.js route-based frontend
+- `server/` — Fastify API + SSE streams
+- `python_bridge/` — FastAPI bridge for manual LLM analysis
+
+Run it with:
+
+```bash
+npm install
+npm run dashboard
+```
+
+The legacy Streamlit implementation is still in the repo during migration, but the primary dashboard path is now the Node site.
 
 ## 🚀 Features
 

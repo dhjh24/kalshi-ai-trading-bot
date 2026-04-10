@@ -54,6 +54,12 @@ Then open the live dashboard in another terminal:
 python cli.py dashboard
 ```
 
+This launches the Node dashboard stack:
+
+- `http://127.0.0.1:3000` — Next.js web UI
+- `http://127.0.0.1:4000` — Fastify API with SSE
+- `http://127.0.0.1:8001` — Python analysis bridge
+
 > **Need API keys?**
 > - Kalshi key + private key → [kalshi.com/account/settings](https://kalshi.com/account/settings) ([API docs](https://docs.kalshi.com/welcome))
 > - OpenAI API key → [platform.openai.com/api-keys](https://platform.openai.com/api-keys) (default provider when configured)
@@ -91,7 +97,7 @@ python cli.py dashboard
 - ✅ Volatility-adjusted thresholds
 
 ### Observability
-- ✅ **Real-time Streamlit dashboard** — portfolio value, positions, P&L, AI decision logs
+- ✅ **Node dashboard stack** — route-based Next.js UI, Fastify API, SSE live updates, and manual analysis requests
 - ✅ **Paper trading mode** — simulate trades without real orders; track outcomes on settled markets
 - ✅ **SQLite telemetry** — every trade, AI decision, and cost metric logged locally
 - ✅ **Unified CLI** — `run`, `dashboard`, `status`, `health`, `scores`, `history` commands

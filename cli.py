@@ -224,14 +224,26 @@ def _run_safe_compounder(
 
 
 def cmd_dashboard(args: argparse.Namespace) -> None:
-    """Launch the Streamlit monitoring dashboard."""
+    """Launch the Node dashboard stack (web + API + Python bridge)."""
     import subprocess
+    import shutil
 
-    # Prefer the dedicated dashboard launch script if it exists.
-    dashboard_script = Path(__file__).parent / "scripts" / "launch_dashboard.py"
-    beast_dashboard = Path(__file__).parent / "scripts" / "beast_mode_dashboard.py"
+    repo_root = Path(__file__).parent
+    npm_executable = shutil.which("npm") or shutil.which("npm.cmd")
+    root_package = repo_root / "package.json"
+
+    if npm_executable and root_package.exists():
+        print("Launching Node dashboard stack...")
+        print("This starts the Python analysis bridge, Fastify API, and Next.js web app.")
+        subprocess.run([npm_executable, "run", "dashboard"], check=False, cwd=repo_root)
+        return
+
+    # Legacy fallback only when the Node dashboard workspace is unavailable.
+    dashboard_script = repo_root / "scripts" / "launch_dashboard.py"
+    beast_dashboard = repo_root / "scripts" / "beast_mode_dashboard.py"
 
     if dashboard_script.exists():
+        print("Node dashboard workspace not available; falling back to legacy Streamlit launcher.")
         subprocess.run([sys.executable, str(dashboard_script)], check=False)
     elif beast_dashboard.exists():
         # Fall back to running the dashboard module directly.

@@ -201,6 +201,13 @@ dashboard_*.json
 *.temp
 *~
 
+# Node.js
+node_modules/
+web/.next/
+web/out/
+server/dist/
+*.tsbuildinfo
+
 # API keys and credentials
 api_keys.txt
 credentials.json

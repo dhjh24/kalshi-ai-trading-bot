@@ -62,5 +62,6 @@ pytest-asyncio==0.21.1
 # Development tools
 black==23.12.1
 isort==5.13.2
+fastapi
 uvicorn
 json-repair
