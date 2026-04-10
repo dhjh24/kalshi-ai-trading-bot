@@ -134,6 +134,13 @@ GENERAL_SEARCH_DOMAINS = [
     "reuters.com",
     "apnews.com",
 ]
+LIVE_CRYPTO_SERIES_TICKERS = (
+    "KXBTCD",
+    "KXETHD",
+    "KXSOLD",
+    "KXXRPD",
+    "KXDOGED",
+)
 
 LIVE_TRADE_TITLE_HINTS = (
     "live",
@@ -180,6 +187,36 @@ def _hours_to_expiry(expiration_ts: Optional[int], now: datetime) -> Optional[fl
         return None
     seconds = int(expiration_ts) - int(now.timestamp())
     return round(seconds / 3600.0, 2)
+
+
+def _parse_ts_value(value: Any) -> Optional[int]:
+    """Parse ISO strings or raw epoch values into epoch seconds."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            return None
+    return None
+
+
+def _get_live_trade_deadline_ts(market_info: Dict[str, Any]) -> Optional[int]:
+    """
+    Return the trading cutoff used by the live dashboard.
+
+    For some Kalshi crypto contracts, ``expiration_time`` can represent a later
+    settlement/admin window while ``close_time`` reflects when the market
+    actually stops trading. The live dashboard should rank by the tradeable
+    cutoff, so prefer close-time style fields first.
+    """
+    for field in ("close_time", "close_ts", "expiration_time", "latest_expiration_time", "settlement_time", "expiration_ts"):
+        parsed = _parse_ts_value(market_info.get(field))
+        if parsed is not None:
+            return parsed
+    return get_market_expiration_ts(market_info)
 
 
 class LiveTradeResearchService(TradingLoggerMixin):
@@ -236,18 +273,36 @@ class LiveTradeResearchService(TradingLoggerMixin):
         by the website calendar, so the ranking here leans on active status,
         category, recency to expiry, title hints, and recent volume.
         """
-        normalized_filters = {
+        ordered_filters = [
             normalize_market_category(item).casefold()
             for item in (category_filters or [])
             if item
-        }
+        ]
+        normalized_filters = set(ordered_filters)
 
-        async def _collect(hours_cap: int) -> List[Dict[str, Any]]:
+        def _sort_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            return sorted(
+                events,
+                key=lambda item: (
+                    -item["live_score"],
+                    item["hours_to_expiry"] if item["hours_to_expiry"] is not None else 1_000_000,
+                    -item["volume_24h"],
+                ),
+            )
+
+        async def _collect(
+            hours_cap: int,
+            *,
+            page_cap: Optional[int] = None,
+            category_subset: Optional[set[str]] = None,
+            result_limit: Optional[int] = None,
+        ) -> List[Dict[str, Any]]:
             now = datetime.now(timezone.utc)
             events: List[Dict[str, Any]] = []
             cursor: Optional[str] = None
+            effective_filters = category_subset if category_subset is not None else normalized_filters
 
-            for page in range(max_pages):
+            for page in range(page_cap or max_pages):
                 response = await self.kalshi_client.get_events(
                     limit=100,
                     cursor=cursor,
@@ -262,7 +317,7 @@ class LiveTradeResearchService(TradingLoggerMixin):
                     snapshot = self._build_event_snapshot(
                         raw_event,
                         now=now,
-                        normalized_filters=normalized_filters,
+                        normalized_filters=effective_filters,
                         max_hours_to_expiry=hours_cap,
                     )
                     if snapshot:
@@ -272,26 +327,230 @@ class LiveTradeResearchService(TradingLoggerMixin):
                 if not cursor:
                     break
 
-                if len(events) >= limit * 4 and page >= 2:
+                if (
+                    category_subset is None
+                    and len(events) >= limit * 4
+                    and page >= 2
+                ):
                     break
 
-            events.sort(
-                key=lambda item: (
-                    -item["live_score"],
-                    item["hours_to_expiry"] if item["hours_to_expiry"] is not None else 1_000_000,
-                    -item["volume_24h"],
-                )
-            )
-            return events[:limit]
+            events = _sort_events(events)
+            return events[: (result_limit or limit)]
 
         events = await _collect(max_hours_to_expiry)
+        if events and not normalized_filters:
+            return events
+
+        if normalized_filters:
+            present_categories = {event.get("category", "").casefold() for event in events}
+            missing_categories = [
+                category for category in ordered_filters if category not in present_categories
+            ]
+            if missing_categories:
+                supplemental = await _collect(
+                    24 * 365 * 20,
+                    page_cap=max(max_pages, 20),
+                    category_subset=set(missing_categories),
+                    result_limit=max(limit * max(2, len(missing_categories)), limit),
+                )
+                existing_tickers = {event["event_ticker"] for event in events}
+                guaranteed: List[Dict[str, Any]] = []
+                for category in missing_categories:
+                    category_events = [
+                        event
+                        for event in supplemental
+                        if event.get("category", "").casefold() == category
+                        and event["event_ticker"] not in existing_tickers
+                    ]
+                    guaranteed.extend(category_events[:3])
+                    existing_tickers.update(
+                        event["event_ticker"] for event in category_events[:3]
+                    )
+
+                if guaranteed:
+                    merged = guaranteed + events
+                    supplemental_tail = [
+                        event
+                        for event in supplemental
+                        if event["event_ticker"] not in existing_tickers
+                    ]
+                    merged.extend(supplemental_tail)
+                    deduped: List[Dict[str, Any]] = []
+                    seen_tickers: set[str] = set()
+                    for event in merged:
+                        if event["event_ticker"] in seen_tickers:
+                            continue
+                        seen_tickers.add(event["event_ticker"])
+                        deduped.append(event)
+                    events = deduped[:limit]
+
+        if "crypto" in normalized_filters:
+            targeted_crypto = await self._collect_targeted_crypto_series_events(
+                max_hours_to_expiry=max_hours_to_expiry,
+            )
+            if targeted_crypto:
+                existing_tickers = {event["event_ticker"] for event in events}
+                merged = [
+                    event
+                    for event in targeted_crypto
+                    if event["event_ticker"] not in existing_tickers
+                ] + events
+                events = _sort_events(merged)[:limit]
+
+            market_level_crypto = await self._collect_crypto_market_level_candidates(
+                max_hours_to_expiry=max_hours_to_expiry,
+                max_pages=max(max_pages, 12),
+                target_count=limit,
+            )
+            if market_level_crypto:
+                existing_tickers = {event["event_ticker"] for event in events}
+                merged = [
+                    event
+                    for event in market_level_crypto
+                    if event["event_ticker"] not in existing_tickers
+                ] + events
+                events = _sort_events(merged)[:limit]
+
         if events:
             return events
 
         # Fallback: when the requested categories simply have no short-dated
         # events right now, return the best open events anyway instead of
         # leaving the dashboard empty.
-        return await _collect(24 * 365 * 20)
+        return await _collect(24 * 365 * 20, page_cap=max(max_pages, 20))
+
+    async def _collect_targeted_crypto_series_events(
+        self,
+        *,
+        max_hours_to_expiry: int,
+    ) -> List[Dict[str, Any]]:
+        """Fetch known short-dated crypto series that do not surface in the broad event feed."""
+        now = datetime.now(timezone.utc)
+
+        async def _fetch_series(series_ticker: str) -> List[Dict[str, Any]]:
+            response = await self.kalshi_client.get_events(
+                limit=10,
+                series_ticker=series_ticker,
+                status="open",
+                with_nested_markets=True,
+            )
+            snapshots: List[Dict[str, Any]] = []
+            for raw_event in response.get("events", []):
+                snapshot = self._build_event_snapshot(
+                    raw_event,
+                    now=now,
+                    normalized_filters={"crypto"},
+                    max_hours_to_expiry=max_hours_to_expiry,
+                )
+                if snapshot:
+                    snapshots.append(snapshot)
+            return snapshots
+
+        results = await asyncio.gather(
+            *[_fetch_series(series_ticker) for series_ticker in LIVE_CRYPTO_SERIES_TICKERS],
+            return_exceptions=True,
+        )
+
+        deduped: List[Dict[str, Any]] = []
+        seen_tickers: set[str] = set()
+        for result in results:
+            if isinstance(result, Exception):
+                self.logger.warning(
+                    "Targeted crypto series fetch failed",
+                    error=str(result),
+                )
+                continue
+            for event in result:
+                if event["event_ticker"] in seen_tickers:
+                    continue
+                seen_tickers.add(event["event_ticker"])
+                deduped.append(event)
+        return deduped
+
+    async def _collect_crypto_market_level_candidates(
+        self,
+        *,
+        max_hours_to_expiry: int,
+        max_pages: int = 12,
+        target_count: int = 36,
+    ) -> List[Dict[str, Any]]:
+        """
+        Build crypto candidates directly from open markets.
+
+        Some short-dated crypto contracts appear to be thinner or grouped
+        differently than the broader event feed, so this market-level pass
+        gives the dashboard a chance to surface them when the event scan does
+        not.
+        """
+        now = datetime.now(timezone.utc)
+        cursor: Optional[str] = None
+        grouped_markets: Dict[str, List[Dict[str, Any]]] = {}
+
+        for page in range(max_pages):
+            response = await self.kalshi_client.get_markets(
+                limit=200,
+                cursor=cursor,
+                status="open",
+            )
+            raw_markets = response.get("markets", [])
+            if not raw_markets:
+                break
+
+            for raw_market in raw_markets:
+                if not self._is_crypto_market(raw_market):
+                    continue
+                if not is_active_market_status(get_market_status(raw_market)):
+                    continue
+                if not is_tradeable_market(raw_market):
+                    continue
+
+                expiration_ts = get_market_expiration_ts(raw_market)
+                hours_to_expiry = _hours_to_expiry(expiration_ts, now)
+                if (
+                    hours_to_expiry is None
+                    or hours_to_expiry < 0
+                    or hours_to_expiry > max_hours_to_expiry
+                ):
+                    continue
+
+                group_key = str(
+                    raw_market.get("event_ticker")
+                    or raw_market.get("series_ticker")
+                    or raw_market.get("ticker")
+                    or ""
+                ).strip()
+                if not group_key:
+                    continue
+                grouped_markets.setdefault(group_key, []).append(raw_market)
+
+            cursor = response.get("cursor")
+            if not cursor:
+                break
+
+            if len(grouped_markets) >= max(6, target_count // 2) and page >= 2:
+                break
+
+        candidates = [
+            snapshot
+            for snapshot in (
+                self._build_synthetic_market_event_snapshot(
+                    group_key,
+                    raw_markets,
+                    now=now,
+                    max_hours_to_expiry=max_hours_to_expiry,
+                )
+                for group_key, raw_markets in grouped_markets.items()
+            )
+            if snapshot is not None
+        ]
+        return sorted(
+            candidates,
+            key=lambda item: (
+                -item["live_score"],
+                item["hours_to_expiry"] if item["hours_to_expiry"] is not None else 1_000_000,
+                -item["volume_24h"],
+            ),
+        )[:target_count]
 
     async def fetch_bitcoin_context(self) -> Dict[str, Any]:
         """Fetch live bitcoin pricing and intraday chart data."""
@@ -345,7 +604,7 @@ class LiveTradeResearchService(TradingLoggerMixin):
             sports_task = asyncio.create_task(self._load_sports_context(event))
 
         bitcoin_task: Optional[asyncio.Task] = None
-        if event.get("focus_type") == "bitcoin":
+        if event.get("focus_type") in {"bitcoin", "crypto"}:
             bitcoin_task = asyncio.create_task(self.fetch_bitcoin_context())
 
         microstructure = await microstructure_task
@@ -489,7 +748,7 @@ class LiveTradeResearchService(TradingLoggerMixin):
         if (
             hours_to_expiry is not None
             and hours_to_expiry > max_hours_to_expiry
-            and focus_type != "bitcoin"
+            and focus_type not in {"bitcoin", "crypto"}
         ):
             return None
 
@@ -527,7 +786,7 @@ class LiveTradeResearchService(TradingLoggerMixin):
         yes_bid, yes_ask, no_bid, no_ask = get_market_prices(raw_market)
         last_yes = get_last_price(raw_market, "YES")
         yes_midpoint = _market_midpoint(yes_bid, yes_ask, last_yes)
-        expiration_ts = get_market_expiration_ts(raw_market)
+        expiration_ts = _get_live_trade_deadline_ts(raw_market)
 
         yes_spread = None
         if yes_bid > 0 and yes_ask > 0 and yes_ask >= yes_bid:
@@ -555,6 +814,104 @@ class LiveTradeResearchService(TradingLoggerMixin):
             "hours_to_expiry": _hours_to_expiry(expiration_ts, now),
             "rules_primary": raw_market.get("rules_primary", ""),
         }
+
+    def _build_synthetic_market_event_snapshot(
+        self,
+        group_key: str,
+        raw_markets: Sequence[Dict[str, Any]],
+        *,
+        now: datetime,
+        max_hours_to_expiry: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Build a synthetic event snapshot from a market-level crypto group."""
+        markets = [
+            self._build_market_snapshot(raw_market, now=now)
+            for raw_market in raw_markets
+            if is_active_market_status(get_market_status(raw_market)) and is_tradeable_market(raw_market)
+        ]
+        markets = [market for market in markets if market is not None]
+        if not markets:
+            return None
+
+        earliest_expiration = min(
+            (market["expiration_ts"] for market in markets if market["expiration_ts"] is not None),
+            default=None,
+        )
+        hours_to_expiry = _hours_to_expiry(earliest_expiration, now)
+        if (
+            hours_to_expiry is None
+            or hours_to_expiry < 0
+            or hours_to_expiry > max_hours_to_expiry
+        ):
+            return None
+
+        sample_market = raw_markets[0]
+        event_title = str(sample_market.get("title") or sample_market.get("ticker") or group_key)
+        event_sub_title = str(
+            sample_market.get("subtitle")
+            or sample_market.get("yes_sub_title")
+            or ""
+        )
+        synthetic_event = {
+            "event_ticker": str(sample_market.get("event_ticker") or group_key),
+            "title": event_title,
+            "sub_title": event_sub_title,
+        }
+        focus_type = self._infer_focus_type(synthetic_event, "Crypto", markets)
+
+        volume_24h = sum(market["volume_24h"] for market in markets)
+        total_volume = sum(market["volume"] for market in markets)
+        spreads = [market["yes_spread"] for market in markets if market["yes_spread"] is not None]
+        avg_spread = sum(spreads) / len(spreads) if spreads else None
+
+        snapshot = {
+            "event_ticker": synthetic_event["event_ticker"],
+            "series_ticker": str(sample_market.get("series_ticker") or ""),
+            "title": event_title,
+            "sub_title": event_sub_title,
+            "category": "Crypto",
+            "focus_type": focus_type,
+            "markets": sorted(markets, key=lambda market: (-market["volume_24h"], -market["volume"])),
+            "market_count": len(markets),
+            "hours_to_expiry": hours_to_expiry,
+            "earliest_expiration_ts": earliest_expiration,
+            "volume_24h": volume_24h,
+            "volume_total": total_volume,
+            "avg_yes_spread": round(avg_spread, 4) if avg_spread is not None else None,
+        }
+        snapshot["live_score"] = self._score_event(snapshot)
+        snapshot["is_live_candidate"] = snapshot["live_score"] >= 35
+        return snapshot
+
+    @staticmethod
+    def _is_crypto_market(raw_market: Dict[str, Any]) -> bool:
+        """Return True when a raw market looks crypto-related."""
+        ticker = str(raw_market.get("ticker", "")).strip()
+        event_ticker = str(raw_market.get("event_ticker", "")).strip()
+        raw_blob = " ".join(
+            [
+                ticker,
+                event_ticker,
+                str(raw_market.get("title", "")),
+                str(raw_market.get("subtitle", "")),
+                str(raw_market.get("yes_sub_title", "")),
+            ]
+        ).lower()
+        normalized_category = normalize_market_category(
+            raw_market.get("category"),
+            ticker=ticker or event_ticker,
+            title=raw_blob,
+        )
+        if normalized_category.casefold() == "crypto":
+            return True
+        if re.search(r"\bkx(?:btc|eth|sol|xrp|doge|crypto)", raw_blob):
+            return True
+        return bool(
+            re.search(
+                r"\b(bitcoin|btc|ethereum|eth|solana|ripple|xrp|dogecoin|doge|crypto)\b",
+                raw_blob,
+            )
+        )
 
     def _score_event(self, event: Dict[str, Any]) -> float:
         """Compute a ranking score for a live-trade event."""
@@ -608,19 +965,26 @@ class LiveTradeResearchService(TradingLoggerMixin):
         category: str,
         markets: Sequence[Dict[str, Any]],
     ) -> str:
-        """Infer whether the event needs sports, bitcoin, or generic research."""
-        title_blob = _normalize_text(
-            " ".join(
-                [
-                    raw_event.get("title", ""),
-                    raw_event.get("sub_title", ""),
-                    " ".join(market.get("title", "") for market in markets[:5]),
-                    " ".join(market.get("ticker", "") for market in markets[:5]),
-                ]
-            )
-        )
-        if any(term in title_blob for term in ("bitcoin", "btc")):
+        """Infer whether the event needs sports, crypto, or generic research."""
+        raw_blob = " ".join(
+            [
+                str(raw_event.get("title", "")),
+                str(raw_event.get("sub_title", "")),
+                " ".join(str(market.get("title", "")) for market in markets[:5]),
+                " ".join(str(market.get("ticker", "")) for market in markets[:5]),
+            ]
+        ).lower()
+        title_blob = _normalize_text(raw_blob)
+        if re.search(r"\b(bitcoin|btc)\b", title_blob) or re.search(r"\bkxbtc", raw_blob):
             return "bitcoin"
+        if re.search(
+            r"\b(ethereum|eth|solana|ripple|xrp|dogecoin|doge|crypto)\b",
+            title_blob,
+        ) or re.search(
+            r"\bkx(?:eth|xrp|doge|crypto)",
+            raw_blob,
+        ):
+            return "crypto"
         if category == "Sports":
             return "sports"
         return "general"
@@ -975,7 +1339,7 @@ class LiveTradeResearchService(TradingLoggerMixin):
         """Choose a domain allowlist for OpenAI web research."""
         if event.get("focus_type") == "sports":
             return SPORTS_SEARCH_DOMAINS
-        if event.get("focus_type") == "bitcoin":
+        if event.get("focus_type") in {"bitcoin", "crypto"}:
             return BITCOIN_SEARCH_DOMAINS
         return GENERAL_SEARCH_DOMAINS
 

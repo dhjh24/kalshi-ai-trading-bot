@@ -47,6 +47,7 @@ API_REFRESH_INTERVAL_SECONDS = 30
 LLM_SNAPSHOT_HOURS = 168
 LLM_SNAPSHOT_LIMIT = 5000
 LLM_PAGE_SIZE_OPTIONS = [10, 20, 50, 100]
+LIVE_TRADE_DATA_VERSION = 2
 
 LLM_QUERY_SNAPSHOT_KEY = "llm_query_snapshot"
 LLM_STATS_SNAPSHOT_KEY = "llm_stats_snapshot"
@@ -241,9 +242,16 @@ def load_manual_llm_snapshot(hours_back=LLM_SNAPSHOT_HOURS, limit=LLM_SNAPSHOT_L
 
 
 @st.cache_data(ttl=API_REFRESH_INTERVAL_SECONDS, show_spinner=False)
-def load_live_trade_snapshot(limit=36, category_filters=None, max_hours_to_expiry=72):
+def load_live_trade_snapshot(
+    limit=36,
+    category_filters=None,
+    max_hours_to_expiry=72,
+    data_version=LIVE_TRADE_DATA_VERSION,
+):
     """Load event-level live trade candidates for the dashboard."""
     try:
+        del data_version
+
         async def get_data():
             service = LiveTradeResearchService()
             try:
@@ -278,13 +286,32 @@ def load_live_bitcoin_context():
         return {}
 
 
-def refresh_live_trade_snapshot(limit=36, category_filters=None, max_hours_to_expiry=72):
+def refresh_live_trade_snapshot(
+    limit=36,
+    category_filters=None,
+    max_hours_to_expiry=72,
+    data_version=LIVE_TRADE_DATA_VERSION,
+):
     """Refresh the manually reviewed live trade snapshot."""
     snapshot = load_live_trade_snapshot(
         limit=limit,
         category_filters=category_filters,
         max_hours_to_expiry=max_hours_to_expiry,
+        data_version=data_version,
     )
+    normalized_filters = {
+        normalize_market_category(item).casefold()
+        for item in (category_filters or [])
+        if item
+    }
+    if not snapshot and "crypto" in normalized_filters:
+        load_live_trade_snapshot.clear()
+        snapshot = load_live_trade_snapshot(
+            limit=limit,
+            category_filters=category_filters,
+            max_hours_to_expiry=max_hours_to_expiry,
+            data_version=data_version,
+        )
     st.session_state[LIVE_TRADE_SNAPSHOT_KEY] = snapshot
     st.session_state[LIVE_TRADE_LAST_REFRESH_KEY] = datetime.now()
     st.session_state[LIVE_TRADE_ANALYSIS_KEY] = {}
@@ -1175,13 +1202,19 @@ def show_live_trade():
             help="Direct OpenAI mode can verify fresh sports/news context with web search. Other providers fall back to structured prompts without web search.",
         )
 
-    current_signature = (event_limit, max_hours, tuple(selected_categories))
+    current_signature = (
+        LIVE_TRADE_DATA_VERSION,
+        event_limit,
+        max_hours,
+        tuple(selected_categories),
+    )
     if st.session_state.get(LIVE_TRADE_FILTER_SIGNATURE_KEY) != current_signature:
         st.session_state[LIVE_TRADE_FILTER_SIGNATURE_KEY] = current_signature
         refresh_live_trade_snapshot(
             limit=event_limit,
             category_filters=selected_categories,
             max_hours_to_expiry=max_hours,
+            data_version=LIVE_TRADE_DATA_VERSION,
         )
 
     if refresh_snapshot:
@@ -1191,6 +1224,7 @@ def show_live_trade():
             limit=event_limit,
             category_filters=selected_categories,
             max_hours_to_expiry=max_hours,
+            data_version=LIVE_TRADE_DATA_VERSION,
         )
 
     snapshot = st.session_state.get(LIVE_TRADE_SNAPSHOT_KEY, [])
