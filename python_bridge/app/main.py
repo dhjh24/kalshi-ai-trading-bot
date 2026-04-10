@@ -5,18 +5,25 @@ for the new Node dashboard while reusing the existing Python trading stack.
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from time import monotonic
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from src.clients.kalshi_client import KalshiClient
 from src.clients.model_router import ModelRouter
 from src.data.live_trade_research import LiveTradeResearchService
 from src.utils.database import DatabaseManager
+
+
+LIVE_TRADE_CACHE_TTL_SECONDS = 30.0
+_live_trade_cache: Dict[str, tuple[float, Dict[str, Any]]] = {}
+_live_trade_inflight: Dict[str, asyncio.Task[Dict[str, Any]]] = {}
 
 
 class EventAnalysisRequest(BaseModel):
@@ -47,6 +54,69 @@ class BridgeState:
     async def close(self) -> None:
         await self.research_service.close()
         await self.db_manager.close()
+
+
+def _live_trade_cache_key(
+    *,
+    limit: int,
+    max_hours_to_expiry: int,
+    category_filters: List[str],
+) -> str:
+    normalized_categories = [item.strip() for item in category_filters if item and item.strip()]
+    return "|".join(
+        [
+            str(limit),
+            str(max_hours_to_expiry),
+            ",".join(normalized_categories),
+        ]
+    )
+
+
+async def _get_cached_live_trade_events(
+    state: BridgeState,
+    *,
+    limit: int,
+    max_hours_to_expiry: int,
+    category_filters: List[str],
+) -> Dict[str, Any]:
+    cache_key = _live_trade_cache_key(
+        limit=limit,
+        max_hours_to_expiry=max_hours_to_expiry,
+        category_filters=category_filters,
+    )
+    cached = _live_trade_cache.get(cache_key)
+    now = monotonic()
+    if cached and now - cached[0] < LIVE_TRADE_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    inflight = _live_trade_inflight.get(cache_key)
+    if inflight is not None:
+        return await inflight
+
+    async def _load() -> Dict[str, Any]:
+        events = await state.research_service.get_live_trade_events(
+            limit=limit,
+            category_filters=category_filters or None,
+            max_hours_to_expiry=max_hours_to_expiry,
+        )
+        payload = {
+            "events": events,
+            "filters": {
+                "limit": limit,
+                "max_hours_to_expiry": max_hours_to_expiry,
+                "category_filters": category_filters,
+            },
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _live_trade_cache[cache_key] = (monotonic(), payload)
+        return payload
+
+    task = asyncio.create_task(_load())
+    _live_trade_inflight[cache_key] = task
+    try:
+        return await task
+    finally:
+        _live_trade_inflight.pop(cache_key, None)
 
 
 def _extract_router_metadata(model_router: ModelRouter) -> Dict[str, Any]:
@@ -239,6 +309,22 @@ async def health() -> Dict[str, Any]:
         "provider": state.model_router.default_provider,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
+
+@app.get("/live-trade/events")
+async def live_trade_events(
+    limit: int = Query(default=36, ge=1, le=96),
+    max_hours_to_expiry: int = Query(default=72, ge=1, le=24 * 365 * 20),
+    category_filters: List[str] = Query(default_factory=list),
+) -> Dict[str, Any]:
+    """Return Streamlit-style live-trade event candidates for the Node dashboard."""
+    state: BridgeState = app.state.bridge
+    return await _get_cached_live_trade_events(
+        state,
+        limit=limit,
+        max_hours_to_expiry=max_hours_to_expiry,
+        category_filters=category_filters,
+    )
 
 
 @app.post("/analysis/event")

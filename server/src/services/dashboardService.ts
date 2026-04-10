@@ -1,3 +1,4 @@
+import { serverConfig } from "../config.js";
 import {
   getDailyAiCost,
   getLatestAnalysisForTarget,
@@ -14,12 +15,15 @@ import {
 import type {
   AnalysisRequestRow,
   KalshiEvent,
+  LiveTradeEventSnapshot,
+  LiveTradePayload,
   MarketRow,
   OverviewPayload,
   SportsContext
 } from "../types.js";
 import { parseJson } from "../utils/helpers.js";
 import { eventToSearchText, inferFocusType } from "../utils/marketFocus.js";
+import { TTLCache } from "../utils/ttlCache.js";
 import { getBitcoinSnapshot } from "./external/cryptoService.js";
 import {
   getKalshiEvent,
@@ -30,6 +34,40 @@ import {
 } from "./external/kalshiPublicService.js";
 import { getRelevantNews } from "./external/newsService.js";
 import { resolveSportsContext } from "./external/sportsDataService.js";
+
+const liveTradeBridgeCache = new TTLCache<{
+  events?: LiveTradeEventSnapshot[];
+  generated_at?: string;
+}>(serverConfig.dataRefreshMs);
+const liveTradeBridgeInflight = new Map<
+  string,
+  Promise<{
+    events?: LiveTradeEventSnapshot[];
+    generated_at?: string;
+  }>
+>();
+
+function normalizeLiveTradeCategories(categories: string[]): string[] {
+  return Array.from(
+    new Set(
+      categories
+        .map((category) => category.trim())
+        .filter(Boolean)
+    )
+  );
+}
+
+function buildLiveTradeBridgeCacheKey(options: {
+  limit: number;
+  maxHoursToExpiry: number;
+  categories: string[];
+}) {
+  return JSON.stringify({
+    limit: options.limit,
+    maxHoursToExpiry: options.maxHoursToExpiry,
+    categories: normalizeLiveTradeCategories(options.categories)
+  });
+}
 
 function mapRecentAnalysis(rows: AnalysisRequestRow[]) {
   return rows.map((row) => ({
@@ -106,6 +144,8 @@ function mapLatestAnalysis(row: AnalysisRequestRow | null) {
 
   return {
     requestId: row.request_id,
+    targetType: row.target_type,
+    targetId: row.target_id,
     status: row.status,
     requestedAt: row.requested_at,
     completedAt: row.completed_at,
@@ -113,6 +153,7 @@ function mapLatestAnalysis(row: AnalysisRequestRow | null) {
     model: row.model,
     costUsd: row.cost_usd,
     sources: parseJson<string[]>(row.sources_json, []),
+    context: parseJson<Record<string, unknown> | null>(row.context_json, null),
     response: parseJson<Record<string, unknown> | null>(row.response_json, null),
     error: row.error
   };
@@ -120,6 +161,57 @@ function mapLatestAnalysis(row: AnalysisRequestRow | null) {
 
 function buildSearchQuery(event: KalshiEvent): string {
   return eventToSearchText(event).slice(0, 180);
+}
+
+async function getBridgeLiveTradeEvents(options: {
+  limit: number;
+  maxHoursToExpiry: number;
+  categories: string[];
+}) {
+  const cacheKey = buildLiveTradeBridgeCacheKey(options);
+  const cached = liveTradeBridgeCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  const inflight = liveTradeBridgeInflight.get(cacheKey);
+  if (inflight) {
+    return inflight;
+  }
+
+  const requestPromise = (async () => {
+    const url = new URL("/live-trade/events", serverConfig.analysisBridgeUrl);
+    url.searchParams.set("limit", String(options.limit));
+    url.searchParams.set("max_hours_to_expiry", String(options.maxHoursToExpiry));
+    options.categories.forEach((category) => {
+      url.searchParams.append("category_filters", category);
+    });
+
+    const response = await fetch(url, {
+      headers: {
+        accept: "application/json"
+      },
+      cache: "no-store"
+    });
+
+    if (!response.ok) {
+      throw new Error(`Live-trade bridge failed: ${response.status} ${response.statusText}`);
+    }
+
+    const payload = (await response.json()) as {
+      events?: LiveTradeEventSnapshot[];
+      generated_at?: string;
+    };
+    return liveTradeBridgeCache.set(cacheKey, payload);
+  })();
+
+  liveTradeBridgeInflight.set(cacheKey, requestPromise);
+
+  try {
+    return await requestPromise;
+  } finally {
+    liveTradeBridgeInflight.delete(cacheKey);
+  }
 }
 
 export async function getMarketDetailPayload(ticker: string) {
@@ -293,9 +385,77 @@ export function getAnalysisHistoryPayload() {
     model: row.model,
     costUsd: row.cost_usd,
     sources: parseJson<string[]>(row.sources_json, []),
+    context: parseJson<Record<string, unknown> | null>(row.context_json, null),
     response: parseJson<Record<string, unknown> | null>(row.response_json, null),
     error: row.error
   }));
+}
+
+export async function getLiveTradePayload(query?: {
+  limit?: number;
+  maxHoursToExpiry?: number;
+  categories?: string[];
+}): Promise<LiveTradePayload> {
+  const filters = {
+    limit: query?.limit ?? 36,
+    maxHoursToExpiry: query?.maxHoursToExpiry ?? 72,
+    categories: normalizeLiveTradeCategories(
+      query?.categories && query.categories.length > 0
+        ? query.categories
+        : ["Sports", "Financials", "Crypto", "Economics"]
+    )
+  };
+
+  const bridgePayload = await getBridgeLiveTradeEvents(filters);
+  const events = bridgePayload.events ?? [];
+  const latestAnalysisByEvent = new Map(
+    events.map((event) => [
+      event.event_ticker,
+      mapLatestAnalysis(getLatestAnalysisForTarget("event", event.event_ticker))
+    ])
+  );
+  const averageHoursToExpiryCandidates = events
+    .map((event) => event.hours_to_expiry)
+    .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+  const shouldLoadBitcoin =
+    filters.categories.includes("Crypto") ||
+    events.some((event) => event.focus_type === "bitcoin" || event.focus_type === "crypto");
+
+  return {
+    generatedAt: bridgePayload.generated_at || new Date().toISOString(),
+    latestAnalysisUpdatedAt: events.reduce<string | null>((latest, event) => {
+      const completedAt = latestAnalysisByEvent.get(event.event_ticker)?.completedAt;
+      if (!completedAt) {
+        return latest;
+      }
+
+      if (!latest || completedAt > latest) {
+        return completedAt;
+      }
+
+      return latest;
+    }, null),
+    filters,
+    metrics: {
+      eventsLoaded: events.length,
+      marketsVisible: events.reduce((sum, event) => sum + event.market_count, 0),
+      liveCandidates: events.filter((event) => event.is_live_candidate).length,
+      averageHoursToExpiry:
+        averageHoursToExpiryCandidates.length > 0
+          ? Number(
+              (
+                averageHoursToExpiryCandidates.reduce((sum, value) => sum + value, 0) /
+                averageHoursToExpiryCandidates.length
+              ).toFixed(1)
+            )
+          : null
+    },
+    liveBtc: shouldLoadBitcoin ? await getBitcoinSnapshot().catch(() => null) : null,
+    events: events.map((event) => ({
+      ...event,
+      latestAnalysis: latestAnalysisByEvent.get(event.event_ticker) ?? null
+    }))
+  };
 }
 
 export function getMarketsPayload(query?: {

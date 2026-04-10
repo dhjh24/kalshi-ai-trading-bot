@@ -17,6 +17,7 @@ export function AppFrame({ children }: { children: ReactNode }) {
           </div>
           <nav className="flex flex-wrap gap-2 text-sm font-medium text-slate-600">
             <NavLink href="/">Overview</NavLink>
+            <NavLink href="/live-trade">Live Trade</NavLink>
             <NavLink href="/markets">Markets</NavLink>
             <NavLink href="/portfolio">Portfolio</NavLink>
             <NavLink href="/analysis">Analysis</NavLink>

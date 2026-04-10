@@ -10,11 +10,30 @@ import { createRequestId } from "../utils/helpers.js";
 import { liveStreamHub } from "./liveStreamHub.js";
 
 interface BridgeResponse {
+  event_ticker?: string;
+  focus_ticker?: string | null;
   provider?: string;
   model?: string;
   cost_usd?: number;
   sources?: string[];
   response?: Record<string, unknown>;
+}
+
+function buildStoredResponse(payload: BridgeResponse): Record<string, unknown> {
+  const response =
+    payload.response && typeof payload.response === "object"
+      ? { ...payload.response }
+      : {};
+
+  if (payload.event_ticker) {
+    response.event_ticker = payload.event_ticker;
+  }
+
+  if (payload.focus_ticker) {
+    response.focus_ticker = payload.focus_ticker;
+  }
+
+  return response;
 }
 
 async function callBridge(
@@ -59,7 +78,7 @@ async function processAnalysisRequest(
       model: payload.model ?? null,
       costUsd: payload.cost_usd ?? null,
       sources: payload.sources ?? [],
-      response: payload.response ?? payload
+      response: buildStoredResponse(payload)
     });
   } catch (error) {
     failAnalysisRequest(

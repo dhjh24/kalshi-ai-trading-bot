@@ -76,3 +76,64 @@ def test_event_analysis_contract(monkeypatch):
     assert payload["event_ticker"] == "KXTEST-EVENT"
     assert payload["provider"] == "openai"
     assert "response" in payload
+
+
+def test_live_trade_events_contract(monkeypatch):
+    async def fake_initialize(self):
+        return None
+
+    async def fake_close(self):
+        return None
+
+    async def fake_get_live_trade_events(
+        self,
+        *,
+        limit,
+        category_filters,
+        max_hours_to_expiry,
+    ):
+        assert limit == 24
+        assert category_filters == ["Sports", "Crypto"]
+        assert max_hours_to_expiry == 48
+        return [
+            {
+                "event_ticker": "KXSPORTS-TEST",
+                "title": "Test live event",
+                "category": "Sports",
+                "focus_type": "sports",
+                "market_count": 2,
+                "hours_to_expiry": 4.5,
+                "volume_24h": 1234,
+                "volume_total": 4567,
+                "avg_yes_spread": 0.03,
+                "live_score": 42,
+                "is_live_candidate": True,
+                "markets": [],
+            }
+        ]
+
+    monkeypatch.setattr(bridge_main.BridgeState, "initialize", fake_initialize)
+    monkeypatch.setattr(bridge_main.BridgeState, "close", fake_close)
+    monkeypatch.setattr(
+        bridge_main.LiveTradeResearchService,
+        "get_live_trade_events",
+        fake_get_live_trade_events,
+    )
+
+    with TestClient(bridge_main.app) as client:
+        response = client.get(
+            "/live-trade/events",
+            params=[
+                ("limit", "24"),
+                ("max_hours_to_expiry", "48"),
+                ("category_filters", "Sports"),
+                ("category_filters", "Crypto"),
+            ],
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["filters"]["limit"] == 24
+    assert payload["filters"]["max_hours_to_expiry"] == 48
+    assert payload["filters"]["category_filters"] == ["Sports", "Crypto"]
+    assert payload["events"][0]["event_ticker"] == "KXSPORTS-TEST"

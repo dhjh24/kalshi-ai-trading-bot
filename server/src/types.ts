@@ -157,6 +157,47 @@ export interface CryptoSnapshot {
   candles: Array<[number, number, number, number, number]>;
 }
 
+export interface LiveTradeMarketSnapshot {
+  ticker: string;
+  title: string;
+  yes_sub_title: string;
+  no_sub_title: string;
+  yes_bid: number;
+  yes_ask: number;
+  no_bid: number;
+  no_ask: number;
+  yes_midpoint: number;
+  last_yes_price: number;
+  yes_spread: number | null;
+  volume: number;
+  volume_24h: number;
+  open_interest: number;
+  liquidity_dollars: number;
+  yes_bid_size: number;
+  yes_ask_size: number;
+  expiration_ts: number | null;
+  hours_to_expiry: number | null;
+  rules_primary: string;
+}
+
+export interface LiveTradeEventSnapshot {
+  event_ticker: string;
+  series_ticker: string;
+  title: string;
+  sub_title: string;
+  category: MarketCategory;
+  focus_type: FocusType;
+  markets: LiveTradeMarketSnapshot[];
+  market_count: number;
+  hours_to_expiry: number | null;
+  earliest_expiration_ts: number | null;
+  volume_24h: number;
+  volume_total: number;
+  avg_yes_spread: number | null;
+  live_score: number;
+  is_live_candidate: boolean;
+}
+
 export interface TeamInfo {
   id: string;
   displayName: string;
@@ -228,6 +269,42 @@ export interface OverviewPayload {
     requestedAt: string;
     completedAt: string | null;
   }>;
+}
+
+export interface LiveTradePayload {
+  generatedAt: string;
+  latestAnalysisUpdatedAt: string | null;
+  filters: {
+    limit: number;
+    maxHoursToExpiry: number;
+    categories: string[];
+  };
+  metrics: {
+    eventsLoaded: number;
+    marketsVisible: number;
+    liveCandidates: number;
+    averageHoursToExpiry: number | null;
+  };
+  liveBtc: CryptoSnapshot | null;
+  events: Array<
+    LiveTradeEventSnapshot & {
+      latestAnalysis: {
+        requestId: string;
+        targetType: AnalysisTargetType;
+        targetId: string;
+        status: AnalysisRequestStatus;
+        requestedAt: string;
+        completedAt: string | null;
+        provider: string | null;
+        model: string | null;
+        costUsd: number | null;
+        sources: string[];
+        context: Record<string, unknown> | null;
+        response: Record<string, unknown> | null;
+        error: string | null;
+      } | null;
+    }
+  >;
 }
 
 export interface StreamEnvelope<T> {

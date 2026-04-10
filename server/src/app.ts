@@ -5,6 +5,7 @@ import { serverConfig } from "./config.js";
 import {
   getAnalysisHistoryPayload,
   getEventDetailPayload,
+  getLiveTradePayload,
   getMarketDetailPayload,
   getMarketsPayload,
   getOverviewPayload,
@@ -67,6 +68,28 @@ export async function buildServer() {
 
   app.get("/api/portfolio", async () => getPortfolioPayload());
   app.get("/api/analysis/requests", async () => getAnalysisHistoryPayload());
+  app.get("/api/live-trade", async (request) => {
+    const query = z
+      .object({
+        limit: z.coerce.number().min(1).max(96).optional(),
+        maxHoursToExpiry: z.coerce.number().min(1).max(24 * 365 * 20).optional(),
+        category: z.union([z.string(), z.array(z.string())]).optional()
+      })
+      .parse(request.query);
+
+    const categories =
+      typeof query.category === "string"
+        ? [query.category]
+        : Array.isArray(query.category)
+          ? query.category
+          : undefined;
+
+    return getLiveTradePayload({
+      limit: query.limit,
+      maxHoursToExpiry: query.maxHoursToExpiry,
+      categories
+    });
+  });
 
   app.post("/api/analysis/markets/:ticker", async (request, reply) => {
     const params = z.object({ ticker: z.string().min(1) }).parse(request.params);

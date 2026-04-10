@@ -20,8 +20,14 @@ export default async function HomePage() {
           </p>
           <div className="mt-6 flex flex-wrap gap-3">
             <Link
-              href="/markets"
+              href="/live-trade"
               className="rounded-full bg-steel px-5 py-3 text-sm font-semibold text-white hover:bg-signal"
+            >
+              Open Live Trade Feed
+            </Link>
+            <Link
+              href="/markets"
+              className="rounded-full border border-slate-200 bg-white px-5 py-3 text-sm font-semibold text-steel hover:border-signal hover:text-signal"
             >
               Browse Markets
             </Link>
