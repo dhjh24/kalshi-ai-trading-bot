@@ -553,6 +553,78 @@ class ModelRouter(TradingLoggerMixin):
             )
             return None
 
+    async def get_researched_completion(
+        self,
+        *,
+        prompt: str,
+        instructions: Optional[str] = None,
+        model: Optional[str] = None,
+        capability: Optional[str] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+        text_format: Optional[Dict[str, Any]] = None,
+        search_allowed_domains: Optional[List[str]] = None,
+        search_context_size: str = "medium",
+        strategy: str = "unknown",
+        query_type: str = "researched_completion",
+        market_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        use_web_research: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get a researched completion.
+
+        Direct OpenAI mode can use native web search via the Responses API.
+        Other provider modes fall back to a standard completion on the same
+        structured prompt, preserving the response shape without web search.
+        """
+        if self.default_provider == "openai":
+            openai_client = self._ensure_openai()
+            start = time.time()
+            result = await openai_client.get_researched_completion(
+                prompt=prompt,
+                instructions=instructions,
+                model=model,
+                text_format=text_format,
+                search_allowed_domains=search_allowed_domains,
+                search_context_size=search_context_size,
+                strategy=strategy,
+                query_type=query_type,
+                market_id=market_id,
+                metadata=metadata,
+                use_web_search=use_web_research,
+            )
+
+            if result is not None:
+                actual_model = openai_client.last_request_metadata.actual_model or model or openai_client.default_model
+                self._record_success(actual_model, "openai", time.time() - start)
+                return result
+
+            self._record_failure(model or openai_client.default_model, "openai")
+            return None
+
+        combined_prompt = prompt
+        if instructions:
+            combined_prompt = f"{instructions}\n\n{prompt}"
+
+        content = await self.get_completion(
+            prompt=combined_prompt,
+            model=model,
+            capability=capability or "reasoning",
+            strategy=strategy,
+            query_type=query_type,
+            market_id=market_id,
+            response_format=response_format,
+            metadata=metadata,
+        )
+        if content is None:
+            return None
+
+        return {
+            "content": content,
+            "sources": [],
+            "used_web_research": False,
+        }
+
     # ------------------------------------------------------------------
     # Public API: get_trading_decision
     # ------------------------------------------------------------------

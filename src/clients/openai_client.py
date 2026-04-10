@@ -490,6 +490,205 @@ class OpenAIClient(TradingLoggerMixin):
 
         raise last_exc  # type: ignore[misc]
 
+    @staticmethod
+    def _build_request_metadata(metadata: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+        """Build string metadata for Responses API calls."""
+        merged: Dict[str, str] = {}
+        for key, value in (metadata or {}).items():
+            if value is None:
+                continue
+            merged[str(key)] = str(value)[:512]
+        return merged or None
+
+    def _extract_responses_metadata(
+        self,
+        response: Any,
+        *,
+        requested_model: str,
+        fallback_models: List[str],
+    ) -> OpenAIResponseMetadata:
+        """Extract normalized metadata from an OpenAI Responses API result."""
+        usage = getattr(response, "usage", None)
+        output_details = getattr(usage, "output_tokens_details", None) if usage is not None else None
+
+        input_tokens = getattr(usage, "input_tokens", 0) if usage is not None else 0
+        output_tokens = getattr(usage, "output_tokens", 0) if usage is not None else 0
+        total_tokens = getattr(usage, "total_tokens", input_tokens + output_tokens)
+        reasoning_tokens = (
+            getattr(output_details, "reasoning_tokens", 0) if output_details is not None else 0
+        )
+
+        actual_model = self._coerce_openai_model(
+            getattr(response, "model", None) or requested_model
+        )
+        cost = self._calculate_cost(actual_model, int(input_tokens or 0), int(output_tokens or 0))
+
+        return OpenAIResponseMetadata(
+            request_id=getattr(response, "id", None),
+            requested_model=requested_model,
+            actual_model=actual_model,
+            fallback_models=list(fallback_models),
+            input_tokens=int(input_tokens or 0),
+            output_tokens=int(output_tokens or 0),
+            total_tokens=int(total_tokens or (input_tokens + output_tokens)),
+            reasoning_tokens=int(reasoning_tokens or 0),
+            cost=float(cost or 0.0),
+            finish_reason=getattr(response, "status", None),
+        )
+
+    @staticmethod
+    def _extract_researched_output(response: Any) -> Tuple[str, List[str]]:
+        """Extract output text and cited URLs from a Responses API payload."""
+        text = str(getattr(response, "output_text", "") or "").strip()
+        urls: List[str] = []
+        seen = set()
+
+        for item in getattr(response, "output", []) or []:
+            item_type = getattr(item, "type", "")
+            if item_type == "web_search_call":
+                action = getattr(item, "action", None)
+                for source in getattr(action, "sources", []) or []:
+                    url = getattr(source, "url", None)
+                    if url and url not in seen:
+                        seen.add(url)
+                        urls.append(url)
+                continue
+
+            if item_type != "message":
+                continue
+
+            for content_item in getattr(item, "content", []) or []:
+                for annotation in getattr(content_item, "annotations", []) or []:
+                    url = getattr(annotation, "url", None)
+                    if url and url not in seen:
+                        seen.add(url)
+                        urls.append(url)
+
+        return text, urls
+
+    async def _request_researched_response(
+        self,
+        *,
+        prompt: str,
+        instructions: Optional[str] = None,
+        model: str,
+        max_output_tokens: Optional[int] = None,
+        text_format: Optional[Dict[str, Any]] = None,
+        search_allowed_domains: Optional[List[str]] = None,
+        search_context_size: str = "medium",
+        fallback_models: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, str]] = None,
+        use_web_search: bool = True,
+    ) -> Tuple[str, List[str], OpenAIResponseMetadata]:
+        """Make a Responses API request with optional web-search research."""
+        selected_model = self._coerce_openai_model(model)
+        normalized_fallbacks = []
+        for fallback_model in (fallback_models or self._build_fallback_chain(selected_model)[1:]):
+            coerced = self._coerce_openai_model(fallback_model)
+            if coerced not in normalized_fallbacks and coerced != selected_model:
+                normalized_fallbacks.append(coerced)
+
+        candidates = [selected_model] + normalized_fallbacks
+        last_exc: Optional[Exception] = None
+
+        for candidate in candidates:
+            request_kwargs: Dict[str, Any] = {
+                "model": self._sdk_model_name(candidate),
+                "input": prompt,
+            }
+            if instructions:
+                request_kwargs["instructions"] = instructions
+            if max_output_tokens is not None:
+                request_kwargs["max_output_tokens"] = max_output_tokens
+            if text_format is not None:
+                request_kwargs["text"] = {
+                    "format": text_format,
+                    "verbosity": "medium",
+                }
+            if metadata:
+                request_kwargs["metadata"] = metadata
+
+            if use_web_search:
+                web_tool: Dict[str, Any] = {
+                    "type": "web_search",
+                    "search_context_size": search_context_size,
+                    "user_location": {
+                        "type": "approximate",
+                        "country": "US",
+                        "timezone": "America/Los_Angeles",
+                    },
+                }
+                if search_allowed_domains:
+                    web_tool["filters"] = {"allowed_domains": list(search_allowed_domains)}
+                request_kwargs["tools"] = [web_tool]
+                request_kwargs["include"] = ["web_search_call.action.sources"]
+
+            for attempt in range(self.MAX_RETRIES_PER_MODEL):
+                try:
+                    start = time.time()
+                    response = await self.client.responses.create(**request_kwargs)
+                    elapsed = time.time() - start
+
+                    content, sources = self._extract_researched_output(response)
+                    if not content:
+                        raise ValueError(
+                            f"Missing response output text from {candidate} on attempt {attempt + 1}"
+                        )
+
+                    metadata_obj = self._extract_responses_metadata(
+                        response,
+                        requested_model=selected_model,
+                        fallback_models=normalized_fallbacks,
+                    )
+
+                    self._last_request_cost = metadata_obj.cost
+                    self._last_request_metadata = metadata_obj
+
+                    self.logger.debug(
+                        "OpenAI researched response succeeded",
+                        requested_model=selected_model,
+                        actual_model=metadata_obj.actual_model,
+                        fallback_models=normalized_fallbacks,
+                        input_tokens=metadata_obj.input_tokens,
+                        output_tokens=metadata_obj.output_tokens,
+                        reasoning_tokens=metadata_obj.reasoning_tokens,
+                        cost=round(metadata_obj.cost, 6),
+                        source_count=len(sources),
+                        processing_time=round(elapsed, 2),
+                        attempt=attempt + 1,
+                        used_web_search=use_web_search,
+                    )
+
+                    return content, sources, metadata_obj
+
+                except Exception as exc:
+                    last_exc = exc
+
+                    tracker = self.model_costs.get(candidate)
+                    if tracker:
+                        tracker.error_count += 1
+
+                    is_retryable = self._is_retryable_error(exc)
+                    self.logger.warning(
+                        "OpenAI researched request failed",
+                        requested_model=selected_model,
+                        attempted_model=candidate,
+                        attempt=attempt + 1,
+                        max_retries=self.MAX_RETRIES_PER_MODEL,
+                        retryable=is_retryable,
+                        error=str(exc),
+                    )
+
+                    if is_retryable and attempt < self.MAX_RETRIES_PER_MODEL - 1:
+                        delay = self._backoff_delay(attempt)
+                        if self._is_rate_limit_error(exc):
+                            delay *= 2
+                        await asyncio.sleep(delay)
+                    else:
+                        break
+
+        raise last_exc  # type: ignore[misc]
+
     def _record_request_metrics(self, metadata: OpenAIResponseMetadata) -> None:
         """Update aggregate and per-model cost tracking for a completed request."""
         self._track_model_cost(
@@ -572,6 +771,88 @@ class OpenAIClient(TradingLoggerMixin):
                     "query_type": query_type,
                 },
                 "openai_completion_failed",
+            )
+            return None
+
+    async def get_researched_completion(
+        self,
+        prompt: str,
+        *,
+        instructions: Optional[str] = None,
+        model: Optional[str] = None,
+        max_output_tokens: Optional[int] = None,
+        text_format: Optional[Dict[str, Any]] = None,
+        search_allowed_domains: Optional[List[str]] = None,
+        search_context_size: str = "medium",
+        strategy: str = "unknown",
+        query_type: str = "researched_completion",
+        market_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        use_web_search: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """Get a researched completion from the Responses API with optional web search."""
+        if not await self._check_daily_limits():
+            return None
+
+        selected_model = self._coerce_openai_model(model or self.default_model)
+        request_metadata = self._build_request_metadata(
+            {
+                **(metadata or {}),
+                "strategy": strategy,
+                "query_type": query_type,
+                "market_id": market_id or "",
+            }
+        )
+
+        try:
+            content, sources, response_metadata = await self._request_researched_response(
+                prompt=prompt,
+                instructions=instructions,
+                model=selected_model,
+                max_output_tokens=max_output_tokens or self.max_tokens,
+                text_format=text_format,
+                search_allowed_domains=search_allowed_domains,
+                search_context_size=search_context_size,
+                metadata=request_metadata,
+                use_web_search=use_web_search,
+            )
+
+            self._record_request_metrics(response_metadata)
+
+            logged_response = content
+            if sources:
+                logged_response = (
+                    f"{content}\n\nSources:\n" + "\n".join(f"- {url}" for url in sources[:10])
+                )
+
+            await self._log_query(
+                strategy=strategy,
+                query_type=query_type,
+                prompt=(instructions or "")[:600] + ("\n\n" if instructions else "") + prompt[:1800],
+                response=logged_response,
+                market_id=market_id,
+                tokens_used=response_metadata.total_tokens,
+                cost_usd=response_metadata.cost,
+            )
+
+            return {
+                "content": content,
+                "sources": sources,
+                "used_web_research": bool(use_web_search),
+            }
+
+        except Exception as exc:
+            log_error_with_context(
+                exc,
+                {
+                    "model": selected_model,
+                    "search_allowed_domains": search_allowed_domains or [],
+                    "search_context_size": search_context_size,
+                    "strategy": strategy,
+                    "query_type": query_type,
+                    "used_web_search": use_web_search,
+                },
+                "openai_researched_completion_failed",
             )
             return None
 

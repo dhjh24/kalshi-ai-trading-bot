@@ -28,6 +28,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.utils.database import DatabaseManager
 from src.clients.kalshi_client import KalshiClient
 from src.config.settings import settings
+from src.data.live_trade_research import LiveTradeResearchService
 from src.utils.market_preferences import (
     is_live_wagering_market,
     normalize_market_category,
@@ -52,6 +53,11 @@ LLM_STATS_SNAPSHOT_KEY = "llm_stats_snapshot"
 LLM_LAST_REFRESH_KEY = "llm_last_refresh"
 LLM_PAGE_NUMBER_KEY = "llm_query_page_number"
 LLM_FILTER_SIGNATURE_KEY = "llm_query_filter_signature"
+LIVE_TRADE_SNAPSHOT_KEY = "live_trade_snapshot"
+LIVE_TRADE_ANALYSIS_KEY = "live_trade_analysis"
+LIVE_TRADE_LAST_REFRESH_KEY = "live_trade_last_refresh"
+LIVE_TRADE_LAST_ANALYSIS_KEY = "live_trade_last_analysis"
+LIVE_TRADE_FILTER_SIGNATURE_KEY = "live_trade_filter_signature"
 
 
 def _run_dashboard_async(coroutine):
@@ -90,6 +96,11 @@ def initialize_dashboard_state():
         LLM_LAST_REFRESH_KEY: None,
         LLM_PAGE_NUMBER_KEY: 1,
         LLM_FILTER_SIGNATURE_KEY: None,
+        LIVE_TRADE_SNAPSHOT_KEY: [],
+        LIVE_TRADE_ANALYSIS_KEY: {},
+        LIVE_TRADE_LAST_REFRESH_KEY: None,
+        LIVE_TRADE_LAST_ANALYSIS_KEY: None,
+        LIVE_TRADE_FILTER_SIGNATURE_KEY: None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -227,6 +238,80 @@ def load_manual_llm_snapshot(hours_back=LLM_SNAPSHOT_HOURS, limit=LLM_SNAPSHOT_L
     except Exception as e:
         st.error(f"Error loading LLM data: {e}")
         return [], {}
+
+
+@st.cache_data(ttl=API_REFRESH_INTERVAL_SECONDS, show_spinner=False)
+def load_live_trade_snapshot(limit=36, category_filters=None, max_hours_to_expiry=72):
+    """Load event-level live trade candidates for the dashboard."""
+    try:
+        async def get_data():
+            service = LiveTradeResearchService()
+            try:
+                return await service.get_live_trade_events(
+                    limit=limit,
+                    category_filters=category_filters,
+                    max_hours_to_expiry=max_hours_to_expiry,
+                )
+            finally:
+                await service.close()
+
+        return _run_dashboard_async(get_data())
+    except Exception as e:
+        st.error(f"Error loading live trade data: {e}")
+        return []
+
+
+@st.cache_data(ttl=API_REFRESH_INTERVAL_SECONDS, show_spinner=False)
+def load_live_bitcoin_context():
+    """Load live bitcoin context and chart data for the dashboard."""
+    try:
+        async def get_data():
+            service = LiveTradeResearchService()
+            try:
+                return await service.fetch_bitcoin_context()
+            finally:
+                await service.close()
+
+        return _run_dashboard_async(get_data())
+    except Exception as e:
+        st.error(f"Error loading bitcoin data: {e}")
+        return {}
+
+
+def refresh_live_trade_snapshot(limit=36, category_filters=None, max_hours_to_expiry=72):
+    """Refresh the manually reviewed live trade snapshot."""
+    snapshot = load_live_trade_snapshot(
+        limit=limit,
+        category_filters=category_filters,
+        max_hours_to_expiry=max_hours_to_expiry,
+    )
+    st.session_state[LIVE_TRADE_SNAPSHOT_KEY] = snapshot
+    st.session_state[LIVE_TRADE_LAST_REFRESH_KEY] = datetime.now()
+    st.session_state[LIVE_TRADE_ANALYSIS_KEY] = {}
+    st.session_state[LIVE_TRADE_LAST_ANALYSIS_KEY] = None
+
+
+def analyze_live_trade_snapshot(snapshot, max_events=12, use_web_research=True):
+    """Run LLM analysis for the selected live trade events."""
+    try:
+        async def get_data():
+            service = LiveTradeResearchService()
+            try:
+                return await service.analyze_events(
+                    snapshot,
+                    max_events=max_events,
+                    use_web_research=use_web_research,
+                )
+            finally:
+                await service.close()
+
+        analysis = _run_dashboard_async(get_data())
+        st.session_state[LIVE_TRADE_ANALYSIS_KEY] = analysis
+        st.session_state[LIVE_TRADE_LAST_ANALYSIS_KEY] = datetime.now()
+        return analysis
+    except Exception as e:
+        st.error(f"Error running live trade analysis: {e}")
+        return {}
 
 
 @st.cache_data(ttl=API_REFRESH_INTERVAL_SECONDS, show_spinner=False)
@@ -379,6 +464,7 @@ def main():
         [
             "Overview",
             "Strategy Performance",
+            "Live Trade",
             "LLM Analysis",
             "Positions & Trades",
             "Risk Management",
@@ -393,6 +479,8 @@ def main():
         render_overview_page()
     elif page == "Strategy Performance":
         render_strategy_performance_page()
+    elif page == "Live Trade":
+        show_live_trade()
     elif page == "LLM Analysis":
         show_llm_analysis(
             st.session_state.get(LLM_QUERY_SNAPSHOT_KEY, []),
@@ -1047,6 +1135,243 @@ def show_positions_trades(positions):
                 labels={'x': 'Side', 'y': 'Count'}
             )
             st.plotly_chart(fig_sides, width='stretch')
+
+
+def show_live_trade():
+    """Show live trade candidates, bitcoin context, and structured recommendations."""
+
+    st.header("Live Trade")
+    st.caption(
+        "Event-level candidates ranked from active Kalshi markets. "
+        "Because Kalshi's public API does not expose the website's calendar-live flag, "
+        "this view ranks open events using expiry, volume, spread, and title heuristics."
+    )
+
+    category_options = ["Sports", "Financials", "Crypto", "Economics"]
+    control_col1, control_col2, control_col3, control_col4 = st.columns(4)
+
+    with control_col1:
+        event_limit = st.selectbox("Visible Events", [12, 24, 36, 48], index=2)
+    with control_col2:
+        max_hours = st.selectbox("Max Hours to Expiry", [12, 24, 48, 72, 168], index=3)
+    with control_col3:
+        selected_categories = st.multiselect(
+            "Categories",
+            category_options,
+            default=category_options,
+        )
+    with control_col4:
+        analysis_limit = st.selectbox("Analyze Top Events", [4, 8, 12, 24, 36], index=2)
+
+    action_col1, action_col2, action_col3 = st.columns([1, 1, 2])
+    with action_col1:
+        refresh_snapshot = st.button("Refresh Live Feed")
+    with action_col2:
+        run_analysis = st.button("Run Live Analysis")
+    with action_col3:
+        use_web_research = st.toggle(
+            "Use OpenAI web research when available",
+            value=True,
+            help="Direct OpenAI mode can verify fresh sports/news context with web search. Other providers fall back to structured prompts without web search.",
+        )
+
+    current_signature = (event_limit, max_hours, tuple(selected_categories))
+    if st.session_state.get(LIVE_TRADE_FILTER_SIGNATURE_KEY) != current_signature:
+        st.session_state[LIVE_TRADE_FILTER_SIGNATURE_KEY] = current_signature
+        refresh_live_trade_snapshot(
+            limit=event_limit,
+            category_filters=selected_categories,
+            max_hours_to_expiry=max_hours,
+        )
+
+    if refresh_snapshot:
+        load_live_trade_snapshot.clear()
+        load_live_bitcoin_context.clear()
+        refresh_live_trade_snapshot(
+            limit=event_limit,
+            category_filters=selected_categories,
+            max_hours_to_expiry=max_hours,
+        )
+
+    snapshot = st.session_state.get(LIVE_TRADE_SNAPSHOT_KEY, [])
+    if run_analysis and snapshot:
+        with st.spinner("Running live trade analysis..."):
+            analyze_live_trade_snapshot(
+                snapshot,
+                max_events=min(analysis_limit, len(snapshot)),
+                use_web_research=use_web_research,
+            )
+
+    analysis_map = st.session_state.get(LIVE_TRADE_ANALYSIS_KEY, {})
+    last_refresh = st.session_state.get(LIVE_TRADE_LAST_REFRESH_KEY)
+    last_analysis = st.session_state.get(LIVE_TRADE_LAST_ANALYSIS_KEY)
+
+    bitcoin_context = load_live_bitcoin_context()
+    if bitcoin_context:
+        btc_col1, btc_col2, btc_col3, btc_col4 = st.columns(4)
+        with btc_col1:
+            st.metric("BTC Spot", f"${bitcoin_context.get('price_usd', 0):,.0f}")
+        with btc_col2:
+            st.metric("24h Change", f"{bitcoin_context.get('change_24h_pct', 0):+.2f}%")
+        with btc_col3:
+            st.metric("24h Volume", f"${bitcoin_context.get('volume_24h_usd', 0):,.0f}")
+        with btc_col4:
+            st.metric("Market Cap", f"${bitcoin_context.get('market_cap_usd', 0):,.0f}")
+
+        chart_points = bitcoin_context.get("chart_points", [])
+        if chart_points:
+            btc_df = pd.DataFrame(chart_points)
+            btc_df["timestamp"] = pd.to_datetime(
+                btc_df["timestamp"],
+                format="ISO8601",
+                utc=True,
+                errors="coerce",
+            )
+            btc_df = btc_df.dropna(subset=["timestamp"]).sort_values("timestamp")
+
+            if not btc_df.empty:
+                fig_btc = go.Figure(
+                    data=[
+                        go.Scatter(
+                            x=btc_df["timestamp"],
+                            y=btc_df["price_usd"],
+                            mode="lines",
+                            name="BTC/USD",
+                            line={"color": "#f7931a", "width": 3},
+                        )
+                    ]
+                )
+                fig_btc.update_layout(
+                    title="Bitcoin Intraday Price",
+                    xaxis_title="Time (UTC)",
+                    yaxis_title="Price (USD)",
+                    height=320,
+                    margin={"l": 20, "r": 20, "t": 60, "b": 20},
+                )
+                st.plotly_chart(fig_btc, width='stretch')
+
+    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+    with metric_col1:
+        st.metric("Events Loaded", len(snapshot))
+    with metric_col2:
+        total_markets = sum(event.get("market_count", 0) for event in snapshot)
+        st.metric("Markets Visible", total_markets)
+    with metric_col3:
+        st.metric(
+            "Snapshot Refreshed",
+            last_refresh.strftime("%H:%M:%S") if last_refresh else "Not yet",
+        )
+    with metric_col4:
+        st.metric(
+            "Analysis Updated",
+            last_analysis.strftime("%H:%M:%S") if last_analysis else "Not yet",
+        )
+
+    if not snapshot:
+        st.info("No live trade events found for the selected filters.")
+        return
+
+    if all(
+        event.get("hours_to_expiry") is None or event.get("hours_to_expiry", 0) > max_hours
+        for event in snapshot
+    ):
+        st.info(
+            "No events matched the strict expiry window, so the feed fell back to the best-ranked open events in your selected categories."
+        )
+
+    for index, event in enumerate(snapshot):
+        analysis_result = analysis_map.get(event["event_ticker"], {})
+        analysis = analysis_result.get("analysis")
+        summary_parts = [
+            event.get("category", "Unknown"),
+            event.get("focus_type", "general").title(),
+            f"{event.get('market_count', 0)} markets",
+        ]
+        if event.get("hours_to_expiry") is not None:
+            summary_parts.append(f"{event['hours_to_expiry']:.1f}h to expiry")
+        with st.expander(
+            f"{event['title']} | {' | '.join(summary_parts)}",
+            expanded=(index < 3),
+        ):
+            meta_col1, meta_col2, meta_col3, meta_col4 = st.columns(4)
+            with meta_col1:
+                st.write(f"**Event Ticker:** {event.get('event_ticker')}")
+            with meta_col2:
+                st.write(f"**Volume 24h:** {event.get('volume_24h', 0):,.0f}")
+            with meta_col3:
+                st.write(f"**Avg Spread:** {event.get('avg_yes_spread') or 0:.3f}")
+            with meta_col4:
+                st.write(f"**Live Score:** {event.get('live_score', 0):.1f}")
+
+            if event.get("sub_title"):
+                st.write(f"**Subtitle:** {event['sub_title']}")
+
+            market_rows = []
+            recommendations_by_ticker = {}
+            if analysis:
+                recommendations_by_ticker = {
+                    item["ticker"]: item for item in analysis.get("recommended_markets", [])
+                }
+
+            for market in event.get("markets", []):
+                recommendation = recommendations_by_ticker.get(market["ticker"], {})
+                market_rows.append(
+                    {
+                        "Ticker": market["ticker"],
+                        "Label": market.get("yes_sub_title") or market.get("title"),
+                        "YES Mid": f"{market.get('yes_midpoint', 0):.3f}",
+                        "YES Bid": f"{market.get('yes_bid', 0):.3f}",
+                        "YES Ask": f"{market.get('yes_ask', 0):.3f}",
+                        "24h Vol": f"{market.get('volume_24h', 0):,.0f}",
+                        "Total Vol": f"{market.get('volume', 0):,}",
+                        "Reco": recommendation.get("action", ""),
+                        "Edge %": (
+                            f"{recommendation.get('edge_pct', 0) * 100:.1f}%"
+                            if recommendation
+                            else ""
+                        ),
+                    }
+                )
+
+            st.dataframe(pd.DataFrame(market_rows), width='stretch', hide_index=True)
+
+            if analysis:
+                st.markdown("**LLM Recommendation**")
+                st.write(analysis.get("summary", ""))
+
+                analysis_col1, analysis_col2 = st.columns(2)
+                with analysis_col1:
+                    st.write(
+                        f"**Confidence:** {analysis.get('confidence', 0):.0%}"
+                    )
+                    if analysis.get("key_drivers"):
+                        st.write("**Key Drivers:**")
+                        for item in analysis.get("key_drivers", []):
+                            st.write(f"- {item}")
+                with analysis_col2:
+                    if analysis.get("risk_flags"):
+                        st.write("**Risk Flags:**")
+                        for item in analysis.get("risk_flags", []):
+                            st.write(f"- {item}")
+
+                if analysis.get("recommended_markets"):
+                    st.write("**Top Opportunities:**")
+                    for item in analysis.get("recommended_markets", []):
+                        st.write(
+                            f"- `{item['ticker']}` {item['action']} | "
+                            f"fair YES {item['fair_yes_probability']:.1%} vs market {item['market_yes_midpoint']:.1%} | "
+                            f"confidence {item['confidence']:.0%}"
+                        )
+                        st.caption(item.get("reasoning", ""))
+
+                if analysis_result.get("sources"):
+                    st.write("**Research Sources:**")
+                    for url in analysis_result.get("sources", [])[:8]:
+                        st.write(f"- {url}")
+            else:
+                st.info(
+                    "No analysis stored for this event yet. Use `Run Live Analysis` to generate recommendations."
+                )
 
 def show_risk_management(performance_data, positions, system_balance):
     """Show risk management dashboard."""

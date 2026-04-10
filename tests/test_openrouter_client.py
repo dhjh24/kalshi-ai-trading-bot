@@ -348,6 +348,36 @@ class TestModelRouter:
         openai_client.get_completion.assert_awaited()
         openrouter_client.get_completion.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_router_researched_completion_falls_back_to_standard_completion(self):
+        """Non-OpenAI providers should fall back to standard completions without web search."""
+        from src.clients.model_router import ModelRouter
+
+        openrouter_client = MagicMock()
+        openrouter_client.get_completion = AsyncMock(return_value='{"ok": true}')
+
+        with patch("src.clients.model_router.settings") as mock_settings:
+            mock_settings.api.resolve_llm_provider.return_value = "openrouter"
+            mock_settings.trading.daily_ai_cost_limit = 50.0
+
+            router = ModelRouter(openrouter_client=openrouter_client)
+
+        result = await router.get_researched_completion(
+            prompt="Market payload",
+            instructions="Analyze carefully",
+            response_format={"type": "json_schema", "json_schema": {"name": "test", "strict": True, "schema": {"type": "object"}}},
+            strategy="unit_test",
+            query_type="researched_completion",
+        )
+
+        assert result == {
+            "content": '{"ok": true}',
+            "sources": [],
+            "used_web_research": False,
+        }
+        kwargs = openrouter_client.get_completion.await_args.kwargs
+        assert "Analyze carefully" in kwargs["prompt"]
+
     def test_cost_summary_contains_provider_and_health(self):
         """Aggregate summaries should keep provider and health sections."""
         from src.clients.model_router import ModelRouter
