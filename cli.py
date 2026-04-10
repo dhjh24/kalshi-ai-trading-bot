@@ -38,6 +38,49 @@ _ensure_utf8_console()
 # Subcommand implementations
 # ---------------------------------------------------------------------------
 
+async def _run_with_runtime_guard(
+    operation,
+    *,
+    label: str,
+    max_runtime_seconds: int | None = None,
+    on_timeout=None,
+):
+    """Run an async operation with an optional hard runtime cap."""
+    try:
+        if max_runtime_seconds and max_runtime_seconds > 0:
+            return await asyncio.wait_for(operation(), timeout=max_runtime_seconds)
+        return await operation()
+    except asyncio.TimeoutError:
+        if callable(on_timeout):
+            on_timeout()
+        print(
+            f"\nReached the {label} runtime limit "
+            f"({max_runtime_seconds} seconds). Shutting down cleanly."
+        )
+        return None
+
+
+async def _run_bot_entrypoint(
+    bot,
+    *,
+    once: bool = False,
+    smoke: bool = False,
+    max_runtime_seconds: int | None = None,
+):
+    """Run a bot entrypoint with optional safety modes and timeout guard."""
+    if smoke:
+        operation = bot.run_smoke_test
+    elif once:
+        operation = bot.run_single_cycle
+    else:
+        operation = bot.run
+    return await _run_with_runtime_guard(
+        operation,
+        label="bot",
+        max_runtime_seconds=max_runtime_seconds,
+        on_timeout=getattr(bot, "request_shutdown", None),
+    )
+
 def cmd_run(args: argparse.Namespace) -> None:
     """Start the trading bot (disciplined mode by default)."""
     from src.utils.logging_setup import setup_logging
@@ -50,12 +93,25 @@ def cmd_run(args: argparse.Namespace) -> None:
     beast = getattr(args, "beast", False)
     disciplined = getattr(args, "disciplined", False)
     safe_compounder = getattr(args, "safe_compounder", False)
+    once = getattr(args, "once", False)
+    smoke = getattr(args, "smoke", False)
+    max_runtime_seconds = getattr(args, "max_runtime_seconds", None)
 
     if live and paper:
         print("Error: --live and --paper are mutually exclusive.")
         sys.exit(1)
 
+    if smoke and live:
+        print("Error: --smoke cannot be combined with --live.")
+        sys.exit(1)
+
+    if max_runtime_seconds is not None and max_runtime_seconds <= 0:
+        print("Error: --max-runtime-seconds must be greater than 0.")
+        sys.exit(1)
+
     live_mode = live and not paper
+    if smoke:
+        once = True
 
     if live_mode:
         print("⚠️  WARNING: LIVE TRADING MODE ENABLED")
@@ -63,17 +119,31 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     # --safe-compounder mode: edge-based NO-side only
     if safe_compounder:
-        _run_safe_compounder(live_mode=live_mode)
+        _run_safe_compounder(
+            live_mode=live_mode,
+            max_runtime_seconds=max_runtime_seconds,
+        )
         return
 
     # --beast mode: original aggressive settings (NOT default)
     if beast:
         print("⚠️  BEAST MODE: Aggressive settings enabled.")
         print("   WARNING: Aggressive settings with no guardrails. Use at your own risk.")
+        if smoke:
+            print("   Smoke safety mode enabled: startup + ingestion only, no OpenRouter calls.")
+        elif once:
+            print("   Single-pass safety mode enabled: one cycle, then exit.")
         from beast_mode_bot import BeastModeBot
         bot = BeastModeBot(live_mode=live_mode)
         try:
-            asyncio.run(bot.run())
+            asyncio.run(
+                _run_bot_entrypoint(
+                    bot,
+                    once=once,
+                    smoke=smoke,
+                    max_runtime_seconds=max_runtime_seconds,
+                )
+            )
         except KeyboardInterrupt:
             print("\nTrading bot stopped by user.")
         return
@@ -84,6 +154,10 @@ def cmd_run(args: argparse.Namespace) -> None:
     print("   Category scoring + portfolio guardrails active.")
     print("   Use --safe-compounder for conservative math-only mode.")
     print("   Use --beast to run without guardrails (not recommended).")
+    if smoke:
+        print("   Smoke safety mode enabled: startup + ingestion only, no OpenRouter calls.")
+    elif once:
+        print("   Single-pass safety mode enabled: one cycle, then exit.")
 
     from beast_mode_bot import BeastModeBot
     from src.strategies.category_scorer import CategoryScorer
@@ -99,12 +173,22 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     bot = BeastModeBot(live_mode=live_mode)
     try:
-        asyncio.run(bot.run())
+        asyncio.run(
+            _run_bot_entrypoint(
+                bot,
+                once=once,
+                smoke=smoke,
+                max_runtime_seconds=max_runtime_seconds,
+            )
+        )
     except KeyboardInterrupt:
         print("\nTrading bot stopped by user.")
 
 
-def _run_safe_compounder(live_mode: bool = False) -> None:
+def _run_safe_compounder(
+    live_mode: bool = False,
+    max_runtime_seconds: int | None = None,
+) -> None:
     """Run the Safe Compounder strategy."""
     from src.clients.kalshi_client import KalshiClient
     from src.strategies.safe_compounder import SafeCompounder
@@ -126,8 +210,15 @@ def _run_safe_compounder(live_mode: bool = False) -> None:
         finally:
             await client.close()
 
+    async def _guarded_run():
+        return await _run_with_runtime_guard(
+            _run,
+            label="safe compounder",
+            max_runtime_seconds=max_runtime_seconds,
+        )
+
     try:
-        asyncio.run(_run())
+        asyncio.run(_guarded_run())
     except KeyboardInterrupt:
         print("\nSafe Compounder stopped by user.")
 
@@ -340,6 +431,29 @@ def cmd_history(args: argparse.Namespace) -> None:
                         f"{t['quantity']:>4} ${t['pnl']:>7.2f}  {cat}"
                     )
 
+            cursor2 = await db.execute("""
+                SELECT 1
+                FROM sqlite_master
+                WHERE type = 'table' AND name = 'blocked_trades'
+                LIMIT 1
+            """)
+            if await cursor2.fetchone():
+                cursor3 = await db.execute("""
+                    SELECT COUNT(*) FROM blocked_trades
+                """)
+                blocked_summary = await cursor3.fetchone()
+                blocked_count = blocked_summary[0] if blocked_summary else 0
+                if blocked_count:
+                    print(
+                        f"\n  [BLOCKED] {blocked_count} trades blocked by portfolio enforcer "
+                        "(use 'python cli.py health' for details)"
+                    )
+                if False:
+                    print(f"\n  â›” {r2[0]} trades blocked by portfolio enforcer (use 'python cli.py health' for details)")
+
+            print("=" * 70)
+            return
+
             # Blocked trades summary
             cursor2 = await db.execute("""
                 SELECT COUNT(*) FROM blocked_trades
@@ -493,6 +607,9 @@ def build_parser() -> argparse.ArgumentParser:
             "  python cli.py run --live               AI Ensemble with real capital\n"
             "  python cli.py run --safe-compounder    Safe Compounder: conservative, math-only\n"
             "  python cli.py run --safe-compounder --live  Safe Compounder live\n"
+            "  python cli.py run --once               Run one ingest/trade cycle and exit\n"
+            "  python cli.py run --smoke              Run a no-LLM smoke test and exit\n"
+            "  python cli.py run --once --max-runtime-seconds 120  Hard-stop a smoke run\n"
             "  python cli.py run --beast              Beast mode (aggressive, not recommended)\n"
             "  python cli.py scores                   Show category scores\n"
             "  python cli.py history                  Show trade history + category breakdown\n"
@@ -549,6 +666,21 @@ def build_parser() -> argparse.ArgumentParser:
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Set logging verbosity (default: INFO)",
+    )
+    p_run.add_argument(
+        "--once",
+        action="store_true",
+        help="Run one bounded ingest/trading pass and exit cleanly",
+    )
+    p_run.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Run a no-LLM startup smoke test (startup + ingestion only)",
+    )
+    p_run.add_argument(
+        "--max-runtime-seconds",
+        type=int,
+        help="Force a clean shutdown after this many seconds",
     )
     p_run.set_defaults(func=cmd_run)
 

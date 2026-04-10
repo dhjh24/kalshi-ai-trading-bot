@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 COLLECTION_TICKER_THRESHOLD = 0.99
 _PRICE_SCALE = Decimal("0.0001")
+_COUNT_SCALE = Decimal("0.01")
 
 
 def _as_decimal(value: Any, default: str = "0") -> Decimal:
@@ -56,6 +57,12 @@ def format_price_dollars(value: float | Decimal) -> str:
     """Format a dollar-denominated Kalshi price with docs-native precision."""
     decimal_value = _as_decimal(value)
     return str(decimal_value.quantize(_PRICE_SCALE, rounding=ROUND_HALF_UP))
+
+
+def format_count_fp(value: float | Decimal) -> str:
+    """Format a contract count using Kalshi's fixed-point quantity shape."""
+    decimal_value = _as_decimal(value)
+    return str(decimal_value.quantize(_COUNT_SCALE, rounding=ROUND_HALF_UP))
 
 
 def dollars_to_cents(value: float | Decimal) -> int:
@@ -184,24 +191,44 @@ def get_market_expiration_ts(market_info: Dict[str, Any]) -> Optional[int]:
 
 def get_market_tick_size(market_info: Dict[str, Any], price: Optional[float] = None) -> float:
     """Return the valid tick size at the given price, defaulting to one cent."""
-    ranges = market_info.get("price_ranges") or market_info.get("price_level_structure") or []
+    ranges = market_info.get("price_ranges") or []
     normalized_price = price if price is not None else get_mid_price(market_info, "YES")
 
-    for item in ranges:
+    for index, item in enumerate(ranges):
         if not isinstance(item, dict):
             continue
         lower = _as_float(
-            item.get("from_price_dollars", item.get("from_price", item.get("min_price_dollars", 0)))
+            item.get(
+                "from_price_dollars",
+                item.get(
+                    "from_price",
+                    item.get(
+                        "min_price_dollars",
+                        item.get("start", item.get("min_price", 0)),
+                    ),
+                ),
+            )
         )
-        upper_raw = item.get("to_price_dollars", item.get("to_price", item.get("max_price_dollars")))
+        upper_raw = item.get(
+            "to_price_dollars",
+            item.get(
+                "to_price",
+                item.get(
+                    "max_price_dollars",
+                    item.get("end", item.get("max_price")),
+                ),
+            ),
+        )
         upper = _as_float(upper_raw, default=1.0) if upper_raw is not None else 1.0
-        tick = item.get("tick_size_dollars", item.get("tick_size"))
+        tick = item.get("tick_size_dollars", item.get("tick_size", item.get("step")))
         if tick is None:
             continue
         tick_value = _as_float(tick)
         if tick_value > 1.0:
             tick_value = tick_value / 100.0
-        if lower <= normalized_price <= upper:
+        is_last_range = index == len(ranges) - 1
+        upper_bound_matches = normalized_price < upper or (is_last_range and normalized_price <= upper)
+        if lower <= normalized_price and upper_bound_matches:
             return tick_value
 
     return 0.01

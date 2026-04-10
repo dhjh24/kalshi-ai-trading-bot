@@ -14,20 +14,25 @@ trading system including:
 
 import streamlit as st
 import asyncio
+import aiosqlite
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import sys
 import os
 from datetime import datetime, timedelta
-import json
 
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.utils.database import DatabaseManager
 from src.clients.kalshi_client import KalshiClient
+from src.config.settings import settings
+from src.utils.market_preferences import (
+    is_live_wagering_market,
+    normalize_market_category,
+)
+
 
 # Configure Streamlit page
 st.set_page_config(
@@ -37,293 +42,368 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for better styling
-st.markdown("""
-<style>
-    .metric-card {
-        background-color: #f0f2f6;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        margin: 0.5rem 0;
-    }
-    
-    .success-metric {
-        background-color: #d4edda;
-        border-left: 4px solid #28a745;
-    }
-    
-    .warning-metric {
-        background-color: #fff3cd;
-        border-left: 4px solid #ffc107;
-    }
-    
-    .danger-metric {
-        background-color: #f8d7da;
-        border-left: 4px solid #dc3545;
-    }
-    
-    .llm-query {
-        background-color: #f8f9fa;
-        border: 1px solid #dee2e6;
-        border-radius: 0.5rem;
-        padding: 1rem;
-        margin: 0.5rem 0;
-    }
-</style>
-""", unsafe_allow_html=True)
+API_REFRESH_INTERVAL_SECONDS = 30
+LLM_SNAPSHOT_HOURS = 168
+LLM_SNAPSHOT_LIMIT = 5000
+LLM_PAGE_SIZE_OPTIONS = [10, 20, 50, 100]
 
-# @st.cache_data(ttl=60)  # Cache for 1 minute - temporarily disabled
-def load_performance_data():
-    """Load performance data from database."""
+LLM_QUERY_SNAPSHOT_KEY = "llm_query_snapshot"
+LLM_STATS_SNAPSHOT_KEY = "llm_stats_snapshot"
+LLM_LAST_REFRESH_KEY = "llm_last_refresh"
+LLM_PAGE_NUMBER_KEY = "llm_query_page_number"
+LLM_FILTER_SIGNATURE_KEY = "llm_query_filter_signature"
+
+
+def _run_dashboard_async(coroutine):
+    """Run short-lived async dashboard work in its own event loop."""
+    loop = asyncio.new_event_loop()
     try:
-        loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        
-        db_manager = DatabaseManager()
-        kalshi_client = KalshiClient()
-        
+        return loop.run_until_complete(coroutine)
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)
+
+
+def _hydrate_llm_stats(stats, query_rows):
+    """Estimate token counts when provider metadata is missing."""
+    for strategy, strategy_stats in stats.items():
+        if strategy_stats.get('total_tokens', 0) == 0:
+            strategy_queries = [row['query'] for row in query_rows if row['query'].strategy == strategy]
+            estimated_tokens = 0
+            for query in strategy_queries:
+                prompt_tokens = len(query.prompt) // 4 if query.prompt else 0
+                response_tokens = len(query.response) // 4 if query.response else 0
+                estimated_tokens += prompt_tokens + response_tokens
+
+            strategy_stats['total_tokens'] = estimated_tokens
+            strategy_stats['estimated'] = True
+
+    return stats
+
+
+def initialize_dashboard_state():
+    """Seed session state used by manual LLM pulls and pagination."""
+    defaults = {
+        LLM_QUERY_SNAPSHOT_KEY: [],
+        LLM_STATS_SNAPSHOT_KEY: {},
+        LLM_LAST_REFRESH_KEY: None,
+        LLM_PAGE_NUMBER_KEY: 1,
+        LLM_FILTER_SIGNATURE_KEY: None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+@st.cache_data(ttl=API_REFRESH_INTERVAL_SECONDS, show_spinner=False)
+def load_api_performance_data():
+    """Load performance and live position data for auto-refreshing pages."""
+    try:
         async def get_data():
-            await db_manager.initialize()
-            
-            # Get performance by strategy - ensure it's serializable
-            performance_raw = await db_manager.get_performance_by_strategy()
-            
-            # Convert performance data to ensure serializability
-            performance = {}
-            if performance_raw:
-                for strategy, stats in performance_raw.items():
-                    performance[str(strategy)] = {
-                        str(k): float(v) if isinstance(v, (int, float)) else str(v) 
-                        for k, v in stats.items()
-                    }
-            
-            # Get LIVE positions from Kalshi API (not just database)
-            positions_response = await kalshi_client.get_positions()
-            kalshi_positions = positions_response.get('market_positions', [])
-            
-            # Convert Kalshi positions to simple dictionaries for caching
-            positions = []
-            for pos in kalshi_positions:
-                if pos.get('position', 0) != 0:  # Only active positions
+            db_manager = DatabaseManager()
+            kalshi_client = KalshiClient()
+            try:
+                await db_manager.initialize()
+
+                performance_raw = await db_manager.get_performance_by_strategy()
+                performance = {}
+                if performance_raw:
+                    for strategy, stats in performance_raw.items():
+                        performance[str(strategy)] = {
+                            str(key): float(value) if isinstance(value, (int, float)) else str(value)
+                            for key, value in stats.items()
+                        }
+
+                positions_response = await kalshi_client.get_positions()
+                kalshi_positions = positions_response.get('market_positions', [])
+
+                positions = []
+                for pos in kalshi_positions:
+                    if pos.get('position', 0) == 0:
+                        continue
+
                     ticker = pos.get('ticker')
                     position_count = pos.get('position', 0)
-                    
-                    # Create a simple dictionary with only serializable types
                     position_dict = {
                         'market_id': str(ticker),
                         'side': 'YES' if position_count > 0 else 'NO',
                         'quantity': int(abs(position_count)),
-                        'entry_price': 0.50,  # Will be updated below
+                        'entry_price': 0.50,
                         'timestamp': datetime.now().isoformat(),
                         'strategy': 'live_sync',
                         'status': 'open',
                         'stop_loss_price': None,
-                        'take_profit_price': None
+                        'take_profit_price': None,
                     }
-                    
-                    # Try to get current market price for better accuracy
+
                     try:
                         market_data = await kalshi_client.get_market(ticker)
                         if market_data and 'market' in market_data:
                             market_info = market_data['market']
-                            if position_count > 0:  # YES position
-                                position_dict['entry_price'] = float((market_info.get('yes_bid', 0) + market_info.get('yes_ask', 100)) / 2 / 100)
-                            else:  # NO position
-                                position_dict['entry_price'] = float((market_info.get('no_bid', 0) + market_info.get('no_ask', 100)) / 2 / 100)
-                    except:
-                        position_dict['entry_price'] = 0.50  # Keep default price as float
-                    
+                            if position_count > 0:
+                                position_dict['entry_price'] = float(
+                                    (market_info.get('yes_bid', 0) + market_info.get('yes_ask', 100)) / 2 / 100
+                                )
+                            else:
+                                position_dict['entry_price'] = float(
+                                    (market_info.get('no_bid', 0) + market_info.get('no_ask', 100)) / 2 / 100
+                                )
+                    except Exception:
+                        position_dict['entry_price'] = 0.50
+
                     positions.append(position_dict)
-            
-            await db_manager.close()
-            
-            return performance, positions
-        
-        performance, positions = loop.run_until_complete(get_data())
-        loop.close()
-        
-        return performance, positions
-        
+
+                return performance, positions
+            finally:
+                await db_manager.close()
+                await kalshi_client.close()
+
+        return _run_dashboard_async(get_data())
     except Exception as e:
         st.error(f"Error loading performance data: {e}")
         return {}, []
 
-# @st.cache_data(ttl=30)  # Cache for 30 seconds - temporarily disabled
-def load_llm_data():
-    """Load LLM query data from database."""
+
+def load_manual_llm_snapshot(hours_back=LLM_SNAPSHOT_HOURS, limit=LLM_SNAPSHOT_LIMIT):
+    """Load an LLM snapshot for manual review, filtering, and pagination."""
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        db_manager = DatabaseManager()
-        
         async def get_data():
-            await db_manager.initialize()
-            
-            # Get recent LLM queries
-            queries = await db_manager.get_llm_queries(hours_back=24, limit=100)
-            
-            # Get LLM stats by strategy with improved token calculation
-            stats = await db_manager.get_llm_stats_by_strategy()
-            
-            # Fix token count issues by recalculating from response lengths if needed
-            for strategy, strategy_stats in stats.items():
-                if strategy_stats.get('total_tokens', 0) == 0:
-                    # Recalculate tokens from query responses for this strategy
-                    strategy_queries = [q for q in queries if q.strategy == strategy]
-                    estimated_tokens = 0
-                    for query in strategy_queries:
-                        # Estimate tokens: ~4 characters per token
-                        prompt_tokens = len(query.prompt) // 4 if query.prompt else 0
-                        response_tokens = len(query.response) // 4 if query.response else 0
-                        estimated_tokens += prompt_tokens + response_tokens
-                    
-                    strategy_stats['total_tokens'] = estimated_tokens
-                    strategy_stats['estimated'] = True
-            
-            await db_manager.close()
-            
-            return queries, stats
-        
-        queries, stats = loop.run_until_complete(get_data())
-        loop.close()
-        
-        return queries, stats
-        
+            db_manager = DatabaseManager()
+            try:
+                await db_manager.initialize()
+
+                queries = await db_manager.get_llm_queries(hours_back=hours_back, limit=limit)
+                stats = await db_manager.get_llm_stats_by_strategy()
+
+                market_ids = sorted({query.market_id for query in queries if query.market_id})
+                market_lookup = {}
+                if market_ids:
+                    placeholders = ",".join("?" for _ in market_ids)
+                    async with aiosqlite.connect(db_manager.db_path) as db:
+                        db.row_factory = aiosqlite.Row
+                        cursor = await db.execute(
+                            f"""
+                            SELECT market_id, title, category, expiration_ts
+                            FROM markets
+                            WHERE market_id IN ({placeholders})
+                            """,
+                            market_ids,
+                        )
+                        rows = await cursor.fetchall()
+                        market_lookup = {row['market_id']: dict(row) for row in rows}
+
+                query_rows = []
+                for query in queries:
+                    market_meta = market_lookup.get(query.market_id or "", {})
+                    market_title = market_meta.get('title')
+                    category = normalize_market_category(
+                        market_meta.get('category'),
+                        ticker=query.market_id or "",
+                        title=market_title or "",
+                    )
+                    expiration_ts = market_meta.get('expiration_ts')
+                    query_rows.append(
+                        {
+                            'query': query,
+                            'market_title': market_title,
+                            'category': category,
+                            'expiration_ts': expiration_ts,
+                            'is_live_wagering': is_live_wagering_market(
+                                category,
+                                expiration_ts,
+                                ticker=query.market_id or "",
+                                title=market_title or "",
+                                max_hours_to_expiry=settings.trading.live_wagering_max_hours_to_expiry,
+                            ),
+                        }
+                    )
+
+                return query_rows, _hydrate_llm_stats(stats, query_rows)
+            finally:
+                await db_manager.close()
+
+        return _run_dashboard_async(get_data())
     except Exception as e:
         st.error(f"Error loading LLM data: {e}")
         return [], {}
 
-@st.cache_data(ttl=300)  # Cache for 5 minutes
-def load_system_health():
-    """Load system health metrics including both available cash and total portfolio value."""
+
+@st.cache_data(ttl=API_REFRESH_INTERVAL_SECONDS, show_spinner=False)
+def load_api_system_health():
+    """Load account health metrics for auto-refreshing pages."""
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        kalshi_client = KalshiClient()
-        
         async def get_health():
-            # Get available cash
-            balance_response = await kalshi_client.get_balance()
-            available_cash = balance_response.get('balance', 0) / 100
-            
-            # Get current positions to calculate total portfolio value
-            positions_response = await kalshi_client.get_positions()
-            market_positions = positions_response.get('market_positions', [])
-            
-            total_position_value = 0
-            positions_count = len(market_positions)
-            
-            # Calculate current value of all positions
-            for position in market_positions:
-                try:
+            kalshi_client = KalshiClient()
+            try:
+                balance_response = await kalshi_client.get_balance()
+                available_cash = balance_response.get('balance', 0) / 100
+
+                positions_response = await kalshi_client.get_positions()
+                market_positions = positions_response.get('market_positions', [])
+
+                total_position_value = 0
+                positions_count = len(market_positions)
+
+                for position in market_positions:
                     ticker = position.get('ticker')
                     position_count = position.get('position', 0)
-                    
-                    if ticker and position_count != 0:
-                        # Get current market data
+                    if not ticker or position_count == 0:
+                        continue
+
+                    try:
                         market_data = await kalshi_client.get_market(ticker)
                         if market_data and 'market' in market_data:
                             market_info = market_data['market']
-                            
-                            # Determine if this is a YES or NO position and get current price
-                            # For Kalshi, positive position = YES, negative = NO
-                            if position_count > 0:  # YES position
+                            if position_count > 0:
                                 current_price = (market_info.get('yes_bid', 0) + market_info.get('yes_ask', 100)) / 2 / 100
-                            else:  # NO position  
+                            else:
                                 current_price = (market_info.get('no_bid', 0) + market_info.get('no_ask', 100)) / 2 / 100
-                            
-                            position_value = abs(position_count) * current_price
-                            total_position_value += position_value
-                            
-                except Exception as e:
-                    # If we can't get market data for a position, skip it
-                    print(f"Warning: Could not value position {ticker}: {e}")
-                    continue
-            
-            # Total portfolio value = cash + position values
-            total_portfolio_value = available_cash + total_position_value
-            
-            return available_cash, total_portfolio_value, positions_count, total_position_value
-        
-        available_cash, total_portfolio_value, positions_count, position_value = loop.run_until_complete(get_health())
-        loop.close()
-        
-        return {
-            'available_cash': available_cash,
-            'total_portfolio_value': total_portfolio_value, 
-            'positions_count': positions_count,
-            'position_value': position_value
-        }
-        
+
+                            total_position_value += abs(position_count) * current_price
+                    except Exception as exc:
+                        print(f"Warning: Could not value position {ticker}: {exc}")
+                        continue
+
+                return {
+                    'available_cash': available_cash,
+                    'total_portfolio_value': available_cash + total_position_value,
+                    'positions_count': positions_count,
+                    'position_value': total_position_value,
+                }
+            finally:
+                await kalshi_client.close()
+
+        return _run_dashboard_async(get_health())
     except Exception as e:
         st.error(f"Error loading system health: {e}")
         return {
             'available_cash': 0.0,
             'total_portfolio_value': 0.0,
             'positions_count': 0,
-            'position_value': 0.0
+            'position_value': 0.0,
         }
+
+
+def refresh_llm_snapshot():
+    """Refresh the manual LLM snapshot displayed by the dashboard."""
+    query_rows, llm_stats = load_manual_llm_snapshot()
+    st.session_state[LLM_QUERY_SNAPSHOT_KEY] = query_rows
+    st.session_state[LLM_STATS_SNAPSHOT_KEY] = llm_stats
+    st.session_state[LLM_LAST_REFRESH_KEY] = datetime.now()
+    st.session_state[LLM_PAGE_NUMBER_KEY] = 1
+    st.session_state[LLM_FILTER_SIGNATURE_KEY] = None
+
+
+@st.fragment(run_every=f"{API_REFRESH_INTERVAL_SECONDS}s")
+def render_sidebar_status():
+    """Auto-refresh the sidebar metrics that depend on API data."""
+    _, positions = load_api_performance_data()
+    system_health_data = load_api_system_health()
+    llm_queries = st.session_state.get(LLM_QUERY_SNAPSHOT_KEY, [])
+    llm_last_refresh = st.session_state.get(LLM_LAST_REFRESH_KEY)
+
+    st.markdown("---")
+    st.markdown("**Data Status:**")
+    st.metric("Active Positions", len(positions) if positions else 0)
+    st.metric(
+        "LLM Queries",
+        len(llm_queries) if llm_last_refresh else "Manual pull",
+        help=(
+            f"Snapshot from {llm_last_refresh.strftime('%Y-%m-%d %H:%M:%S')}"
+            if llm_last_refresh
+            else "LLM queries only refresh when you click Pull Queries."
+        ),
+    )
+    st.metric("Portfolio Balance", f"${system_health_data.get('total_portfolio_value', 0):.2f}")
+    st.caption(f"API sections auto-refresh every {API_REFRESH_INTERVAL_SECONDS} seconds.")
+
+
+@st.fragment(run_every=f"{API_REFRESH_INTERVAL_SECONDS}s")
+def render_overview_page():
+    performance_data, positions = load_api_performance_data()
+    system_health_data = load_api_system_health()
+    show_overview(performance_data, positions, system_health_data)
+
+
+@st.fragment(run_every=f"{API_REFRESH_INTERVAL_SECONDS}s")
+def render_strategy_performance_page():
+    performance_data, _ = load_api_performance_data()
+    show_strategy_performance(performance_data)
+
+
+@st.fragment(run_every=f"{API_REFRESH_INTERVAL_SECONDS}s")
+def render_positions_trades_page():
+    _, positions = load_api_performance_data()
+    show_positions_trades(positions)
+
+
+@st.fragment(run_every=f"{API_REFRESH_INTERVAL_SECONDS}s")
+def render_risk_management_page():
+    performance_data, positions = load_api_performance_data()
+    system_health_data = load_api_system_health()
+    show_risk_management(performance_data, positions, system_health_data['total_portfolio_value'])
+
+
+@st.fragment(run_every=f"{API_REFRESH_INTERVAL_SECONDS}s")
+def render_system_health_page():
+    system_health_data = load_api_system_health()
+    llm_stats = st.session_state.get(LLM_STATS_SNAPSHOT_KEY, {})
+    show_system_health(
+        system_health_data['available_cash'],
+        system_health_data['positions_count'],
+        llm_stats,
+    )
+
 
 def main():
     """Main dashboard function."""
-    
-    st.title("🚀 Trading System Dashboard")
+    initialize_dashboard_state()
+
+    st.title("Trading System Dashboard")
     st.markdown("**Real-time monitoring and analysis of your automated trading system**")
-    
-    # Add refresh button to clear cache
+    st.caption(
+        f"API-backed pages auto-refresh every {API_REFRESH_INTERVAL_SECONDS} seconds. "
+        "LLM queries refresh only when you pull a new snapshot."
+    )
+
     col1, col2 = st.columns([4, 1])
     with col2:
-        if st.button("🔄 Refresh Data", help="Clear cache and reload all data"):
+        if st.button("Refresh API Data", help="Clear cached API data and rerun the dashboard"):
             st.cache_data.clear()
             st.rerun()
-    
-    # Sidebar for navigation
-    st.sidebar.title("📊 Dashboard")
-    
+
+    st.sidebar.title("Dashboard")
     page = st.sidebar.selectbox(
         "Select View",
         [
-            "📈 Overview",
-            "🎯 Strategy Performance", 
-            "🤖 LLM Analysis",
-            "💼 Positions & Trades",
-            "⚠️ Risk Management",
-            "🔧 System Health"
+            "Overview",
+            "Strategy Performance",
+            "LLM Analysis",
+            "Positions & Trades",
+            "Risk Management",
+            "System Health"
         ]
     )
-    
-    # Load data with error handling
-    try:
-        performance_data, positions = load_performance_data()
-        llm_queries, llm_stats = load_llm_data()
-        system_health_data = load_system_health()
-    except Exception as e:
-        st.error(f"Error loading dashboard data: {e}")
-        st.info("Please check your system connections and try refreshing.")
-        return
-    
-    # Show data status in sidebar
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("**📊 Data Status:**")
-    st.sidebar.metric("Active Positions", len(positions) if positions else 0)
-    st.sidebar.metric("LLM Queries (24h)", len(llm_queries) if llm_queries else 0)
-    st.sidebar.metric("Portfolio Balance", f"${system_health_data.get('total_portfolio_value', 0):.2f}")
-    
-    # Page routing
-    if page == "📈 Overview":
-        show_overview(performance_data, positions, system_health_data)
-    elif page == "🎯 Strategy Performance":
-        show_strategy_performance(performance_data)
-    elif page == "🤖 LLM Analysis":
-        show_llm_analysis(llm_queries, llm_stats)
-    elif page == "💼 Positions & Trades":
-        show_positions_trades(positions)
-    elif page == "⚠️ Risk Management":
-        show_risk_management(performance_data, positions, system_health_data['total_portfolio_value'])
-    elif page == "🔧 System Health":
-        show_system_health(system_health_data['available_cash'], system_health_data['positions_count'], llm_stats)
+
+    with st.sidebar:
+        render_sidebar_status()
+
+    if page == "Overview":
+        render_overview_page()
+    elif page == "Strategy Performance":
+        render_strategy_performance_page()
+    elif page == "LLM Analysis":
+        show_llm_analysis(
+            st.session_state.get(LLM_QUERY_SNAPSHOT_KEY, []),
+            st.session_state.get(LLM_STATS_SNAPSHOT_KEY, {}),
+        )
+    elif page == "Positions & Trades":
+        render_positions_trades_page()
+    elif page == "Risk Management":
+        render_risk_management_page()
+    elif page == "System Health":
+        render_system_health_page()
 
 def show_overview(performance_data, positions, system_health_data):
     """Show overview dashboard."""
@@ -366,29 +446,12 @@ def show_overview(performance_data, positions, system_health_data):
         )
     
     with col3:
-        # Calculate both realized and unrealized P&L
         realized_pnl = sum(stats.get('total_pnl', 0) for stats in performance_data.values()) if performance_data else 0
-        
-        # Calculate unrealized P&L from current positions
-        unrealized_pnl = 0
-        if positions:
-            # This is a rough estimate - in practice you'd get current market prices
-            for pos in positions:
-                # Position is now a dictionary
-                if 'entry_price' in pos and 'quantity' in pos:
-                    # Estimate current value vs entry value
-                    # For demo purposes, we'll use a simple calculation
-                    position_value = pos['entry_price'] * pos['quantity']
-                    # Assume current value is similar to entry (this would be calculated with live prices)
-                    unrealized_pnl += 0  # Placeholder - would need current market prices
-        
-        total_pnl = realized_pnl + unrealized_pnl
-        
+
         st.metric(
-            label="💹 Total P&L",
-            value=f"${total_pnl:.2f}",
-            delta=f"Realized: ${realized_pnl:.2f}, Unrealized: ${unrealized_pnl:.2f}",
-            help="Total profit/loss: realized from completed trades + unrealized from open positions"
+            label="💹 Realized P&L",
+            value=f"${realized_pnl:.2f}",
+            help="Total realized profit/loss from completed trades"
         )
     
     with col4:
@@ -452,7 +515,7 @@ def show_overview(performance_data, positions, system_health_data):
                 color_continuous_scale='RdYlGn'
             )
             fig_pnl.update_layout(showlegend=False, height=400)
-            st.plotly_chart(fig_pnl, use_container_width=True)
+            st.plotly_chart(fig_pnl, width='stretch')
         
         with col2:
             # Win rate by strategy
@@ -465,7 +528,7 @@ def show_overview(performance_data, positions, system_health_data):
                 color_continuous_scale='Blues'
             )
             fig_winrate.update_layout(showlegend=False, height=400)
-            st.plotly_chart(fig_winrate, use_container_width=True)
+            st.plotly_chart(fig_winrate, width='stretch')
     else:
         st.info("📊 **No strategy data yet** - Run the trading system to start collecting performance data")
     
@@ -482,7 +545,7 @@ def show_overview(performance_data, positions, system_health_data):
             try:
                 timestamp = datetime.fromisoformat(pos['timestamp'])
                 time_str = timestamp.strftime('%m/%d %H:%M')
-            except:
+            except (ValueError, TypeError, KeyError):
                 time_str = 'Unknown'
             
             position_data.append({
@@ -497,7 +560,7 @@ def show_overview(performance_data, positions, system_health_data):
         
         if position_data:
             df = pd.DataFrame(position_data)
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(df, width='stretch', hide_index=True)
     else:
         st.info("No active positions currently.")
 
@@ -537,7 +600,7 @@ def show_strategy_performance(performance_data):
             })
         
         df = pd.DataFrame(comparison_data)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, width='stretch', hide_index=True)
         
         # Performance charts
         col1, col2 = st.columns(2)
@@ -569,7 +632,7 @@ def show_strategy_performance(performance_data):
                 yaxis_title="Win Rate (%)",
                 height=500
             )
-            st.plotly_chart(fig_risk, use_container_width=True)
+            st.plotly_chart(fig_risk, width='stretch')
         
         with col2:
             # Capital deployment
@@ -579,7 +642,7 @@ def show_strategy_performance(performance_data):
                 title="Capital Deployment by Strategy"
             )
             fig_capital.update_layout(height=500)
-            st.plotly_chart(fig_capital, use_container_width=True)
+            st.plotly_chart(fig_capital, width='stretch')
     
     else:
         # Show individual strategy details
@@ -621,49 +684,107 @@ def show_strategy_performance(performance_data):
                     avg_position_size = stats['capital_deployed'] / max(stats['open_positions'], 1)
                     st.write(f"- Avg Position Size: ${avg_position_size:.2f}")
 
-def show_llm_analysis(llm_queries, llm_stats):
-    """Show LLM query analysis and review."""
-    
-    st.header("🤖 LLM Analysis & Review")
-    st.markdown("**Review all AI queries and responses for insights and improvements**")
-    
-    if not llm_queries and not llm_stats:
-        st.warning("No LLM query data available yet. LLM logging will start with new queries.")
-        st.info("💡 **Tip:** The system will automatically log all future Grok queries for analysis.")
+@st.fragment(run_every=f"{API_REFRESH_INTERVAL_SECONDS}s")
+def _render_live_positions_summary():
+    """Auto-refreshing compact summary of live Kalshi positions."""
+    _, positions = load_api_performance_data()
+    st.subheader(f"Live Positions ({len(positions)})")
+    if not positions:
+        st.caption("No active positions.")
         return
-    
-    # LLM usage stats
+
+    rows = []
+    for pos in positions:
+        ticker = pos['market_id']
+        side = pos['side']
+        qty = pos['quantity']
+        entry = pos['entry_price']
+        rows.append({
+            'Ticker': ticker,
+            'Side': side,
+            'Qty': qty,
+            'Entry': f"${entry:.3f}",
+            'Value': f"${qty * entry:.2f}",
+        })
+
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+
+def show_llm_analysis(llm_query_rows, llm_stats):
+    """Show LLM query analysis and review."""
+
+    st.header("LLM Analysis & Review")
+    st.markdown("**Review all AI queries and responses for insights and improvements**")
+
+    # --- Live Positions summary (auto-refreshes) ---
+    _render_live_positions_summary()
+
+    st.markdown("---")
+
+    pull_col, status_col = st.columns([1, 3])
+    with pull_col:
+        if st.button("Pull Queries", key="pull_llm_queries", help="Refresh the manual LLM query snapshot"):
+            with st.spinner("Loading LLM query snapshot..."):
+                refresh_llm_snapshot()
+            llm_query_rows = st.session_state.get(LLM_QUERY_SNAPSHOT_KEY, [])
+            llm_stats = st.session_state.get(LLM_STATS_SNAPSHOT_KEY, {})
+
+    with status_col:
+        last_refresh = st.session_state.get(LLM_LAST_REFRESH_KEY)
+        if last_refresh:
+            st.caption(
+                f"Snapshot pulled at {last_refresh.strftime('%Y-%m-%d %H:%M:%S')}. "
+                "This page stays fixed until you pull again."
+            )
+        else:
+            st.info(
+                "LLM query data is manual now. Use Pull Queries to load a snapshot while "
+                "portfolio and account data continue auto-refreshing."
+            )
+
+    if settings.trading.prefer_live_wagering:
+        st.caption(
+            f"Trading focus: live wagering prioritized for Sports markets closing within "
+            f"{settings.trading.live_wagering_max_hours_to_expiry} hours."
+        )
+
+    if not st.session_state.get(LLM_LAST_REFRESH_KEY):
+        return
+
+    if not llm_query_rows and not llm_stats:
+        st.warning("No LLM query data available yet. LLM logging will start with new queries.")
+        st.info("Tip: once new model calls are logged, pull a fresh snapshot to review them here.")
+        return
+
     if llm_stats:
-        st.subheader("📊 LLM Usage Statistics (Last 7 Days)")
-        
-        # Create stats summary
+        st.subheader("LLM Usage Statistics (Last 7 Days)")
+
         total_queries = sum(stats['query_count'] for stats in llm_stats.values())
         total_cost = sum(stats['total_cost'] for stats in llm_stats.values())
         total_tokens = sum(stats['total_tokens'] for stats in llm_stats.values())
         has_estimated_tokens = any(stats.get('estimated', False) for stats in llm_stats.values())
-        
+
         col1, col2, col3, col4 = st.columns(4)
-        
+
         with col1:
             st.metric("Total Queries", total_queries)
         with col2:
             st.metric("Total Cost", f"${total_cost:.2f}")
         with col3:
             token_label = "Total Tokens*" if has_estimated_tokens else "Total Tokens"
-            token_help = "Estimated from response lengths (some token data missing)" if has_estimated_tokens else "Actual token usage"
-            st.metric(
-                token_label, 
-                f"{total_tokens:,}",
-                help=token_help
+            token_help = (
+                "Estimated from response lengths (some token data missing)"
+                if has_estimated_tokens
+                else "Actual token usage"
             )
+            st.metric(token_label, f"{total_tokens:,}", help=token_help)
         with col4:
             avg_cost_per_query = total_cost / max(total_queries, 1)
             st.metric("Avg Cost/Query", f"${avg_cost_per_query:.3f}")
-        
+
         if has_estimated_tokens:
-            st.caption("*Token counts marked with * are estimated from response text length due to missing usage data")
-        
-        # Usage by strategy
+            st.caption("*Token counts marked with * are estimated from response text length due to missing usage data.")
+
         if len(llm_stats) > 1:
             fig_usage = px.bar(
                 x=list(llm_stats.keys()),
@@ -673,89 +794,163 @@ def show_llm_analysis(llm_queries, llm_stats):
                 color=[stats['total_cost'] for stats in llm_stats.values()],
                 color_continuous_scale='Blues'
             )
-            st.plotly_chart(fig_usage, use_container_width=True)
-    
-    # Query filters
-    st.subheader("🔍 Query Analysis")
-    
-    col1, col2, col3 = st.columns(3)
-    
+            st.plotly_chart(fig_usage, width='stretch')
+
+    st.subheader("Query Analysis")
+
+    strategies = sorted({row['query'].strategy for row in llm_query_rows if row['query'].strategy})
+    query_types = sorted({row['query'].query_type for row in llm_query_rows if row['query'].query_type})
+    categories = sorted({row['category'] for row in llm_query_rows if row['category']})
+
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
-        strategies = list(set(query.strategy for query in llm_queries)) if llm_queries else []
-        selected_strategy = st.selectbox(
-            "Filter by Strategy",
-            ["All"] + strategies
-        )
-    
+        selected_strategy = st.selectbox("Strategy", ["All"] + strategies, key="llm_strategy_filter")
     with col2:
-        query_types = list(set(query.query_type for query in llm_queries)) if llm_queries else []
-        selected_type = st.selectbox(
-            "Filter by Query Type",
-            ["All"] + query_types
-        )
-    
+        selected_type = st.selectbox("Query Type", ["All"] + query_types, key="llm_type_filter")
     with col3:
+        selected_category = st.selectbox("Kalshi Category", ["All"] + categories, key="llm_category_filter")
+    with col4:
         hours_back = st.selectbox(
             "Time Range",
-            [6, 12, 24, 48, 168],  # Last 6h, 12h, 24h, 48h, 7 days
-            index=2,  # Default to 24h
-            format_func=lambda x: f"Last {x} hours" if x < 168 else "Last 7 days"
+            [6, 12, 24, 48, 168],
+            index=4,
+            format_func=lambda value: f"Last {value} hours" if value < 168 else "Last 7 days",
+            key="llm_hours_back_filter",
         )
-    
-    # Filter queries
-    filtered_queries = llm_queries
-    
-    if llm_queries:
-        cutoff_time = datetime.now() - timedelta(hours=hours_back)
-        filtered_queries = [
-            q for q in llm_queries 
-            if q.timestamp >= cutoff_time
-        ]
-        
-        if selected_strategy != "All":
-            filtered_queries = [q for q in filtered_queries if q.strategy == selected_strategy]
-        
-        if selected_type != "All":
-            filtered_queries = [q for q in filtered_queries if q.query_type == selected_type]
-        
-        st.write(f"**Showing {len(filtered_queries)} queries**")
-        
-        # Display queries
-        for i, query in enumerate(filtered_queries[:20]):  # Show latest 20
-            with st.expander(
-                f"🤖 {query.strategy} | {query.query_type} | {query.timestamp.strftime('%H:%M:%S')}",
-                expanded=(i < 3)  # Expand first 3
-            ):
-                
-                # Query metadata
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.write(f"**Strategy:** {query.strategy}")
-                with col2:
-                    st.write(f"**Type:** {query.query_type}")
-                with col3:
-                    if query.market_id:
-                        st.write(f"**Market:** {query.market_id[:20]}...")
-                
-                if query.cost_usd:
-                    st.write(f"**Cost:** ${query.cost_usd:.4f}")
-                
-                # Prompt and response
-                st.markdown("**🔤 Prompt:**")
-                st.code(query.prompt, language="text")
-                
-                st.markdown("**🤖 Response:**")
-                st.code(query.response, language="text")
-                
-                # Extracted data
-                if query.confidence_extracted:
-                    st.write(f"**Confidence Extracted:** {query.confidence_extracted:.2%}")
-                
-                if query.decision_extracted:
-                    st.write(f"**Decision Extracted:** {query.decision_extracted}")
-    
-    else:
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        live_wagering_only = st.toggle("Live Wagering Only", value=False, key="llm_live_wagering_filter")
+    with col2:
+        sort_by = st.selectbox(
+            "Sort By",
+            ["Timestamp", "Cost", "Confidence", "Strategy", "Query Type", "Kalshi Category"],
+            key="llm_sort_by",
+        )
+    with col3:
+        default_direction = "Descending" if sort_by in {"Timestamp", "Cost", "Confidence"} else "Ascending"
+        selected_direction = st.selectbox(
+            "Sort Direction",
+            ["Descending", "Ascending"],
+            index=0 if default_direction == "Descending" else 1,
+            key="llm_sort_direction",
+        )
+    with col4:
+        per_page = st.selectbox("Number Per Page", LLM_PAGE_SIZE_OPTIONS, index=1, key="llm_per_page")
+
+    filter_signature = (
+        selected_strategy,
+        selected_type,
+        selected_category,
+        hours_back,
+        live_wagering_only,
+        sort_by,
+        selected_direction,
+        per_page,
+    )
+    if st.session_state.get(LLM_FILTER_SIGNATURE_KEY) != filter_signature:
+        st.session_state[LLM_FILTER_SIGNATURE_KEY] = filter_signature
+        st.session_state[LLM_PAGE_NUMBER_KEY] = 1
+
+    cutoff_time = datetime.now() - timedelta(hours=hours_back)
+    filtered_rows = [
+        row for row in llm_query_rows
+        if row['query'].timestamp >= cutoff_time
+    ]
+
+    if selected_strategy != "All":
+        filtered_rows = [row for row in filtered_rows if row['query'].strategy == selected_strategy]
+    if selected_type != "All":
+        filtered_rows = [row for row in filtered_rows if row['query'].query_type == selected_type]
+    if selected_category != "All":
+        filtered_rows = [row for row in filtered_rows if row['category'] == selected_category]
+    if live_wagering_only:
+        filtered_rows = [row for row in filtered_rows if row['is_live_wagering']]
+
+    sort_map = {
+        "Timestamp": lambda row: row['query'].timestamp,
+        "Cost": lambda row: row['query'].cost_usd or 0,
+        "Confidence": lambda row: row['query'].confidence_extracted if row['query'].confidence_extracted is not None else -1,
+        "Strategy": lambda row: row['query'].strategy or "",
+        "Query Type": lambda row: row['query'].query_type or "",
+        "Kalshi Category": lambda row: row['category'] or "",
+    }
+    filtered_rows = sorted(
+        filtered_rows,
+        key=sort_map[sort_by],
+        reverse=(selected_direction == "Descending"),
+    )
+
+    total_queries = len(filtered_rows)
+    if total_queries == 0:
         st.info("No LLM queries found for the selected filters.")
+        return
+
+    total_pages = max(1, (total_queries + per_page - 1) // per_page)
+    current_page = min(st.session_state.get(LLM_PAGE_NUMBER_KEY, 1), total_pages)
+    st.session_state[LLM_PAGE_NUMBER_KEY] = current_page
+
+    start_index = (current_page - 1) * per_page
+    end_index = min(start_index + per_page, total_queries)
+    page_rows = filtered_rows[start_index:end_index]
+
+    def render_pager(location_key):
+        pager_col1, pager_col2, pager_col3 = st.columns([1, 2, 1])
+        with pager_col1:
+            if st.button("Previous Page", key=f"llm_prev_{location_key}", disabled=current_page <= 1):
+                st.session_state[LLM_PAGE_NUMBER_KEY] = current_page - 1
+                st.rerun()
+        with pager_col2:
+            st.markdown(
+                f"**Showing {start_index + 1}-{end_index} of {total_queries} queries**  \n"
+                f"**Page {current_page} of {total_pages}**"
+            )
+        with pager_col3:
+            if st.button("Next Page", key=f"llm_next_{location_key}", disabled=current_page >= total_pages):
+                st.session_state[LLM_PAGE_NUMBER_KEY] = current_page + 1
+                st.rerun()
+
+    render_pager("top")
+
+    for index, row in enumerate(page_rows):
+        query = row['query']
+        live_label = " | Live Wagering" if row['is_live_wagering'] else ""
+        title_parts = [
+            query.strategy,
+            row['category'],
+            query.query_type,
+            query.timestamp.strftime('%m/%d %H:%M:%S'),
+        ]
+        with st.expander(" | ".join(title_parts) + live_label, expanded=(index < 2)):
+            meta_col1, meta_col2, meta_col3, meta_col4 = st.columns(4)
+            with meta_col1:
+                st.write(f"**Strategy:** {query.strategy}")
+            with meta_col2:
+                st.write(f"**Type:** {query.query_type}")
+            with meta_col3:
+                st.write(f"**Category:** {row['category']}")
+            with meta_col4:
+                st.write(f"**Live Wagering:** {'Yes' if row['is_live_wagering'] else 'No'}")
+
+            if query.market_id:
+                st.write(f"**Market ID:** {query.market_id}")
+            if row['market_title']:
+                st.write(f"**Market Title:** {row['market_title']}")
+            if query.cost_usd is not None:
+                st.write(f"**Cost:** ${query.cost_usd:.4f}")
+            if query.confidence_extracted is not None:
+                st.write(f"**Confidence Extracted:** {query.confidence_extracted:.2%}")
+            if query.decision_extracted is not None:
+                st.write(f"**Decision Extracted:** {query.decision_extracted}")
+
+            st.markdown("**Prompt:**")
+            st.code(query.prompt, language="text")
+
+            st.markdown("**Response:**")
+            st.code(query.response, language="text")
+
+    render_pager("bottom")
+
 
 def show_positions_trades(positions):
     """Show detailed positions and trades analysis."""
@@ -776,9 +971,9 @@ def show_positions_trades(positions):
         try:
             timestamp = datetime.fromisoformat(pos['timestamp'])
             time_str = timestamp.strftime('%m/%d %H:%M')
-        except:
+        except (ValueError, TypeError, KeyError):
             time_str = 'Unknown'
-        
+
         position_data.append({
             'Market ID': pos['market_id'],
             'Strategy': pos['strategy'] or 'Unknown',
@@ -820,7 +1015,7 @@ def show_positions_trades(positions):
     ]
     
     # Display filtered positions
-    st.dataframe(filtered_df, use_container_width=True, hide_index=True)
+    st.dataframe(filtered_df, width='stretch', hide_index=True)
     
     # Position analytics
     if not filtered_df.empty:
@@ -839,7 +1034,7 @@ def show_positions_trades(positions):
                 names=strategy_values.index,
                 title="Position Value by Strategy"
             )
-            st.plotly_chart(fig_strategy, use_container_width=True)
+            st.plotly_chart(fig_strategy, width='stretch')
         
         with col2:
             # Side distribution
@@ -851,7 +1046,7 @@ def show_positions_trades(positions):
                 title="Positions by Side",
                 labels={'x': 'Side', 'y': 'Count'}
             )
-            st.plotly_chart(fig_sides, use_container_width=True)
+            st.plotly_chart(fig_sides, width='stretch')
 
 def show_risk_management(performance_data, positions, system_balance):
     """Show risk management dashboard."""
@@ -970,7 +1165,7 @@ def show_risk_management(performance_data, positions, system_balance):
                     }
                     for strategy, data in strategy_risk.items()
                 ])
-                st.dataframe(strategy_df, use_container_width=True, hide_index=True)
+                st.dataframe(strategy_df, width='stretch', hide_index=True)
         
     except Exception as e:
         st.error(f"Error calculating risk metrics: {e}")
@@ -988,84 +1183,90 @@ def show_risk_management(performance_data, positions, system_balance):
 
 def show_system_health(available_cash, positions_count, llm_stats):
     """Show system health and monitoring."""
-    
-    st.header("🔧 System Health")
-    
-    # System status
-    st.subheader("🟢 System Status")
-    
+
+    st.header("System Health")
+
+    st.subheader("System Status")
+
     col1, col2, col3 = st.columns(3)
-    
+
     with col1:
-        st.success("✅ **Kalshi Connection**: Active")
+        st.success("Kalshi Connection: Active")
         st.write(f"Available Cash: ${available_cash:.2f}")
         st.write(f"Positions: {positions_count}")
-    
+
     with col2:
         if llm_stats:
-            st.success("✅ **LLM Integration**: Active")
+            st.success("LLM Snapshot: Loaded")
             total_queries = sum(stats['query_count'] for stats in llm_stats.values())
             st.write(f"Queries (7d): {total_queries}")
         else:
-            st.warning("⚠️ **LLM Logging**: No data")
-    
+            st.warning("LLM Snapshot: Not loaded")
+            st.write("Use Pull Queries in the LLM Analysis tab.")
+
     with col3:
-        st.success("✅ **Database**: Connected")
+        st.success("Database: Connected")
         st.write("All tables operational")
-    
-    # Recent activity timeline
-    st.subheader("📅 System Activity")
-    
+
+    st.subheader("System Activity")
+
     if llm_stats:
         st.write("**Recent LLM Activity:**")
         for strategy, stats in llm_stats.items():
-            if stats['last_query']:
-                last_query_time = datetime.fromisoformat(stats['last_query'])
-                time_ago = datetime.now() - last_query_time
-                
-                if time_ago.days > 0:
-                    time_str = f"{time_ago.days} days ago"
-                elif time_ago.seconds > 3600:
-                    time_str = f"{time_ago.seconds // 3600} hours ago"
-                else:
-                    time_str = f"{time_ago.seconds // 60} minutes ago"
-                
-                st.write(f"- **{strategy}**: Last query {time_str}")
-    
-    # Configuration summary
-    st.subheader("⚙️ Configuration")
-    
+            if not stats.get('last_query'):
+                continue
+
+            last_query_time = datetime.fromisoformat(stats['last_query'])
+            total_seconds = int((datetime.now() - last_query_time).total_seconds())
+
+            if total_seconds >= 86400:
+                time_str = f"{total_seconds // 86400} days ago"
+            elif total_seconds >= 3600:
+                time_str = f"{total_seconds // 3600} hours ago"
+            else:
+                time_str = f"{max(total_seconds // 60, 1)} minutes ago"
+
+            st.write(f"- **{strategy}**: Last query {time_str}")
+    else:
+        st.info("LLM activity is hidden until you pull a query snapshot.")
+
+    st.subheader("Configuration")
+
     config_info = {
         "Database Path": "trading_system.db",
-        "Dashboard Refresh": "Auto (1 min cache)",
-        "LLM Logging": "Enabled" if llm_stats else "Pending first query",
+        "API Refresh": f"Auto every {API_REFRESH_INTERVAL_SECONDS} seconds",
+        "LLM Query Refresh": "Manual (Pull Queries button)",
+        "Preferred Categories": ", ".join(settings.trading.preferred_categories) or "All categories",
+        "Live Wagering Preference": (
+            f"Enabled ({settings.trading.live_wagering_max_hours_to_expiry}h Sports window)"
+            if settings.trading.prefer_live_wagering
+            else "Disabled"
+        ),
         "Strategy Tracking": "Enabled",
-        "Risk Management": "Active"
+        "Risk Management": "Active",
     }
-    
+
     for key, value in config_info.items():
         st.write(f"**{key}:** {value}")
-    
-    # System recommendations
-    st.subheader("💡 Recommendations")
-    
+
+    st.subheader("Recommendations")
+
     recommendations = []
-    
     if available_cash < 100:
-        recommendations.append("💰 Consider increasing account balance for more trading opportunities")
-    
+        recommendations.append("Consider increasing account balance for more trading opportunities.")
     if not llm_stats:
-        recommendations.append("🤖 LLM query logging will begin with next trading cycle")
-    
+        recommendations.append("Pull a manual LLM snapshot when you want to review query history.")
+
     total_queries = sum(stats['query_count'] for stats in llm_stats.values()) if llm_stats else 0
     if total_queries > 1000:
-        recommendations.append("📊 High LLM usage - consider optimizing query frequency")
-    
+        recommendations.append("High LLM usage detected. Review query frequency and prompt efficiency.")
+
     if recommendations:
-        for rec in recommendations:
-            st.info(rec)
+        for recommendation in recommendations:
+            st.info(recommendation)
     else:
-        st.success("✅ System running optimally - no recommendations at this time")
+        st.success("System running optimally.")
+
 
 if __name__ == "__main__":
-    main() 
+    main()

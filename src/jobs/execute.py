@@ -5,15 +5,17 @@ Trade execution helpers for live and paper positions.
 from __future__ import annotations
 
 import uuid
-from typing import Dict
+from typing import Dict, Optional
 
 from src.clients.kalshi_client import KalshiAPIError, KalshiClient
+from src.config.settings import settings
 from src.utils.database import DatabaseManager, Position
 from src.utils.kalshi_normalization import (
     build_limit_order_price_fields,
     dollars_to_cents,
     find_fill_price_for_order,
     get_best_ask_price,
+    get_fill_count,
     get_mid_price,
     get_order_average_fill_price,
     get_order_fill_count,
@@ -63,6 +65,43 @@ async def _reconcile_fill_price(
     return fallback_price
 
 
+async def _reconcile_fill_quantity(
+    *,
+    kalshi_client: KalshiClient,
+    ticker: str,
+    client_order_id: str,
+    order_response: Dict,
+    fallback_quantity: float,
+) -> float:
+    """Resolve the executed quantity from order payload or recent fills."""
+    logger = get_trading_logger("trade_execution")
+    order = order_response.get("order", {}) if isinstance(order_response, dict) else {}
+
+    order_fill_count = get_order_fill_count(order)
+    if order_fill_count > 0:
+        return order_fill_count
+
+    try:
+        fills_response = await kalshi_client.get_fills(ticker=ticker, limit=20)
+        fills = fills_response.get("fills", []) if isinstance(fills_response, dict) else []
+        order_id = order.get("order_id")
+        matched_quantity = sum(
+            get_fill_count(fill)
+            for fill in fills
+            if (order_id and fill.get("order_id") == order_id)
+            or (not order_id and client_order_id and fill.get("client_order_id") == client_order_id)
+        )
+        if matched_quantity > 0:
+            return matched_quantity
+    except Exception as exc:
+        logger.warning(
+            f"Could not reconcile fill quantity for {ticker}; falling back to requested size",
+            error=str(exc),
+        )
+
+    return fallback_quantity
+
+
 async def execute_position(
     position: Position,
     live_mode: bool,
@@ -80,7 +119,12 @@ async def execute_position(
     logger.info(f"Live mode: {live_mode}")
 
     if not live_mode:
-        await db_manager.update_position_to_live(position.id, position.entry_price)
+        await db_manager.update_position_execution_details(
+            position.id,
+            entry_price=position.entry_price,
+            quantity=position.quantity,
+            live=False,
+        )
         logger.info(f"PAPER TRADE SIMULATED for {position.market_id} - no real money used")
         logger.info(f"Would have used: ${position.quantity * position.entry_price:.2f}")
         return True
@@ -139,12 +183,27 @@ async def execute_position(
             order_response=order_response,
             fallback_price=ask_dollars,
         )
+        fill_quantity = await _reconcile_fill_quantity(
+            kalshi_client=kalshi_client,
+            ticker=position.market_id,
+            client_order_id=client_order_id,
+            order_response=order_response,
+            fallback_quantity=position.quantity,
+        )
 
-        await db_manager.update_position_to_live(position.id, fill_price)
+        position.entry_price = fill_price
+        position.quantity = fill_quantity
+        position.live = True
+        await db_manager.update_position_execution_details(
+            position.id,
+            entry_price=fill_price,
+            quantity=fill_quantity,
+            live=True,
+        )
         logger.info(
             f"LIVE ORDER PLACED for {position.market_id}. Order ID: {order_response.get('order', {}).get('order_id')}"
         )
-        logger.info(f"Real money used: ${position.quantity * fill_price:.2f}")
+        logger.info(f"Real money used: ${fill_quantity * fill_price:.2f}")
         return True
 
     except KalshiAPIError as exc:
@@ -157,13 +216,23 @@ async def place_sell_limit_order(
     limit_price: float,
     db_manager: DatabaseManager,
     kalshi_client: KalshiClient,
+    *,
+    live_mode: Optional[bool] = None,
+    reduce_only: bool = False,
 ) -> bool:
     """
-    Place a resting reduce-only limit order to close an existing position.
+    Place a limit order to close an existing position.
+
+    In paper mode, simulate the exit order locally without hitting Kalshi.
+    In live mode, use a resting GTC limit by default. Kalshi currently rejects
+    `reduce_only=True` on non-IoC orders, so callers should only enable
+    `reduce_only` for immediate-or-cancel / fill-or-kill exit flows.
     """
     del db_manager
 
     logger = get_trading_logger("sell_limit_order")
+    if live_mode is None:
+        live_mode = getattr(settings.trading, "live_trading_enabled", False)
 
     try:
         side = position.side.lower()
@@ -176,9 +245,20 @@ async def place_sell_limit_order(
             "count": position.quantity,
             "type_": "limit",
             "time_in_force": "good_till_canceled",
-            "reduce_only": True,
             **build_limit_order_price_fields(position.side, limit_price),
         }
+        if reduce_only:
+            order_params["reduce_only"] = True
+
+        if not live_mode:
+            logger.info(
+                f"SIMULATED SELL LIMIT order: {position.quantity} {side.upper()} "
+                f"at ${limit_price:.4f} for {position.market_id}"
+            )
+            logger.info(
+                f"Expected Proceeds: ${limit_price * position.quantity:.2f}"
+            )
+            return True
 
         logger.info(
             f"Placing SELL LIMIT order: {position.quantity} {side.upper()} at ${limit_price:.4f} for {position.market_id}"
@@ -219,6 +299,8 @@ async def place_profit_taking_orders(
         logger.info(f"Checking {len(positions)} positions for profit-taking opportunities")
         for position in positions:
             try:
+                if position.strategy == "quick_flip_scalping":
+                    continue
                 results["positions_processed"] += 1
                 market_response = await kalshi_client.get_market(position.market_id)
                 market_data = market_response.get("market", {})
@@ -283,6 +365,8 @@ async def place_stop_loss_orders(
         logger.info(f"Checking {len(positions)} positions for stop-loss protection")
         for position in positions:
             try:
+                if position.strategy == "quick_flip_scalping":
+                    continue
                 results["positions_processed"] += 1
                 market_response = await kalshi_client.get_market(position.market_id)
                 market_data = market_response.get("market", {})

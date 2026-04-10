@@ -75,9 +75,9 @@ Use the sidebar to navigate between different sections:
 - **🔧 System Health**: System status and diagnostics
 
 ### Data Refresh
-- **Auto-refresh**: Data updates automatically (1-5 minute cache)
-- **Real-time**: Most metrics update in real-time
-- **Manual refresh**: Use browser refresh for instant updates
+- **API auto-refresh**: Portfolio, positions, risk, and system-health pages refresh automatically every 30 seconds
+- **Manual LLM pulls**: The LLM Analysis page only updates when you click `Pull Queries`
+- **API reset button**: Use `Refresh API Data` to clear cached API responses immediately without changing the LLM snapshot
 
 ## 🤖 LLM Query Tracking
 
@@ -88,8 +88,15 @@ The dashboard automatically tracks and displays:
 - **Strategy attribution**: Which strategy made the query
 - **Query type**: Movement prediction, market analysis, etc.
 - **Market context**: Which market was being analyzed
+- **Kalshi category**: Query rows now show the market category with a live-wagering tag for short-dated sports markets
 - **Costs**: Token usage and monetary cost
 - **Extracted data**: Confidence levels, decisions, etc.
+
+### Query Browser
+- **Manual snapshot**: Pull the latest LLM query history only when you want it
+- **Pagination**: Choose `Number Per Page` and move through results with `Previous Page` and `Next Page`
+- **Filtering**: Filter by strategy, query type, Kalshi category, time range, and live wagering
+- **Sorting**: Sort by timestamp, cost, confidence, strategy, query type, or Kalshi category
 
 ### Benefits
 - **Review AI reasoning**: See exactly what Grok is thinking

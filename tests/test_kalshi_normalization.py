@@ -31,6 +31,25 @@ def test_market_normalization_prefers_fixed_point_fields():
     assert get_market_tick_size(market, price=0.4175) == 0.0001
 
 
+def test_market_tick_size_supports_docs_native_start_end_step_ranges():
+    market = {
+        "yes_bid_dollars": "0.9050",
+        "yes_ask_dollars": "0.9300",
+        "no_bid_dollars": "0.0700",
+        "no_ask_dollars": "0.0950",
+        "price_ranges": [
+            {"start": "0.0000", "end": "0.1000", "step": "0.0010"},
+            {"start": "0.1000", "end": "0.9000", "step": "0.0100"},
+            {"start": "0.9000", "end": "1.0000", "step": "0.0010"},
+        ],
+    }
+
+    assert get_market_tick_size(market, price=0.095) == 0.001
+    assert get_market_tick_size(market, price=0.1) == 0.01
+    assert get_market_tick_size(market, price=0.5) == 0.01
+    assert get_market_tick_size(market, price=0.905) == 0.001
+
+
 def test_position_normalization_handles_fp_and_exposure_fields():
     position = {
         "ticker": "TEST-1",

@@ -82,3 +82,26 @@ async def test_historical_helpers_use_documented_paths(client, monkeypatch):
     assert request_mock.await_args_list[1].args == ("GET", "/trade-api/v2/historical/markets/TEST-1")
     assert request_mock.await_args_list[2].args == ("GET", "/trade-api/v2/historical/orders")
     assert request_mock.await_args_list[3].args == ("GET", "/trade-api/v2/historical/fills")
+
+
+@pytest.mark.asyncio
+async def test_place_order_uses_count_fp_for_fractional_quantity(client, monkeypatch):
+    request_mock = AsyncMock(return_value={"order": {"order_id": "test-order"}})
+    monkeypatch.setattr(client, "_make_authenticated_request", request_mock)
+
+    await client.place_order(
+        ticker="TEST-1",
+        client_order_id="abc",
+        side="yes",
+        action="sell",
+        count=10.95,
+        type_="limit",
+        yes_price_dollars="0.5600",
+    )
+
+    request_mock.assert_awaited_once()
+    _, endpoint = request_mock.await_args.args
+    assert endpoint == "/trade-api/v2/portfolio/orders"
+    payload = request_mock.await_args.kwargs["json_data"]
+    assert "count" not in payload
+    assert payload["count_fp"] == "10.95"

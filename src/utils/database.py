@@ -5,7 +5,7 @@ Database manager for the Kalshi trading system.
 import aiosqlite
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict
+from typing import Any, Optional, List, Dict
 
 from src.utils.logging_setup import TradingLoggerMixin
 
@@ -30,7 +30,7 @@ class Position:
     market_id: str
     side: str  # "YES" or "NO"
     entry_price: float
-    quantity: int
+    quantity: float
     timestamp: datetime
     rationale: Optional[str] = None
     confidence: Optional[float] = None
@@ -52,7 +52,7 @@ class TradeLog:
     side: str
     entry_price: float
     exit_price: float
-    quantity: int
+    quantity: float
     pnl: float
     entry_timestamp: datetime
     exit_timestamp: datetime
@@ -98,53 +98,229 @@ class DatabaseManager(TradingLoggerMixin):
         self.logger.info("Database initialized successfully")
 
     async def _run_migrations(self, db: aiosqlite.Connection) -> None:
-        """Run database migrations for schema updates."""
+        """Run database migrations to keep legacy databases compatible."""
         try:
-            # Migration 1: Add strategy column to positions table
             cursor = await db.execute("PRAGMA table_info(positions)")
-            columns = await cursor.fetchall()
-            column_names = [col[1] for col in columns]
-            
-            if 'strategy' not in column_names:
-                self.logger.info("Adding strategy column to positions table")
-                await db.execute("ALTER TABLE positions ADD COLUMN strategy TEXT")
-            
-            # Migration 2: Add strategy column to trade_logs table
-            cursor = await db.execute("PRAGMA table_info(trade_logs)")
-            columns = await cursor.fetchall()
-            column_names = [col[1] for col in columns]
-            
-            if 'strategy' not in column_names:
-                self.logger.info("Adding strategy column to trade_logs table")
-                await db.execute("ALTER TABLE trade_logs ADD COLUMN strategy TEXT")
-            
-            # Migration 3: Add LLM queries table if it doesn't exist
-            cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='llm_queries'")
-            table_exists = await cursor.fetchone()
-            
-            if not table_exists:
-                self.logger.info("Creating llm_queries table")
-                await db.execute("""
-                    CREATE TABLE llm_queries (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        timestamp TEXT NOT NULL,
-                        strategy TEXT NOT NULL,
-                        query_type TEXT NOT NULL,
-                        market_id TEXT,
-                        prompt TEXT NOT NULL,
-                        response TEXT NOT NULL,
-                        tokens_used INTEGER,
-                        cost_usd REAL,
-                        confidence_extracted REAL,
-                        decision_extracted TEXT
+            position_info = await cursor.fetchall()
+            position_columns = {col[1] for col in position_info}
+            required_position_columns = {
+                "strategy": "TEXT",
+                "stop_loss_price": "REAL",
+                "take_profit_price": "REAL",
+                "max_hold_hours": "INTEGER",
+                "target_confidence_change": "REAL",
+            }
+            for column_name, column_type in required_position_columns.items():
+                if column_name not in position_columns:
+                    await db.execute(
+                        f"ALTER TABLE positions ADD COLUMN {column_name} {column_type}"
                     )
-                """)
-                
-                            # Migration 4: Update existing positions with strategy based on rationale
+                    self.logger.info(
+                        f"Added {column_name} column to positions table"
+                    )
+
+            position_quantity_type = next(
+                (str(col[2]).upper() for col in position_info if col[1] == "quantity"),
+                "",
+            )
+            if position_quantity_type != "REAL":
+                await self._rebuild_positions_quantity_as_real(db)
+                self.logger.info("Migrated positions.quantity column to REAL")
+
+            cursor = await db.execute("PRAGMA table_info(trade_logs)")
+            trade_log_info = await cursor.fetchall()
+            trade_log_columns = {col[1] for col in trade_log_info}
+            if "strategy" not in trade_log_columns:
+                await db.execute("ALTER TABLE trade_logs ADD COLUMN strategy TEXT")
+                self.logger.info("Added strategy column to trade_logs table")
+
+            trade_log_quantity_type = next(
+                (str(col[2]).upper() for col in trade_log_info if col[1] == "quantity"),
+                "",
+            )
+            if trade_log_quantity_type != "REAL":
+                await self._rebuild_trade_logs_quantity_as_real(db)
+                self.logger.info("Migrated trade_logs.quantity column to REAL")
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS llm_queries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    strategy TEXT NOT NULL,
+                    query_type TEXT NOT NULL,
+                    market_id TEXT,
+                    prompt TEXT NOT NULL,
+                    response TEXT NOT NULL,
+                    tokens_used INTEGER,
+                    cost_usd REAL,
+                    confidence_extracted REAL,
+                    decision_extracted TEXT
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS blocked_trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    reason TEXT NOT NULL,
+                    score REAL,
+                    blocked_at TEXT NOT NULL
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS analysis_reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    health_score REAL NOT NULL,
+                    critical_issues INTEGER DEFAULT 0,
+                    warnings INTEGER DEFAULT 0,
+                    action_items INTEGER DEFAULT 0,
+                    report_file TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
             await self._migrate_existing_strategy_data(db)
-            
+            await db.commit()
         except Exception as e:
             self.logger.error(f"Error running migrations: {e}")
+
+    async def _rebuild_positions_quantity_as_real(self, db: aiosqlite.Connection) -> None:
+        """Recreate the positions table so quantity can store fractional fills."""
+        await db.execute("ALTER TABLE positions RENAME TO positions_legacy_quantity")
+        await db.execute("""
+            CREATE TABLE positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_id TEXT NOT NULL,
+                side TEXT NOT NULL,
+                entry_price REAL NOT NULL,
+                quantity REAL NOT NULL,
+                timestamp TEXT NOT NULL,
+                rationale TEXT,
+                confidence REAL,
+                live BOOLEAN NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'open',
+                strategy TEXT,
+                stop_loss_price REAL,
+                take_profit_price REAL,
+                max_hold_hours INTEGER,
+                target_confidence_change REAL,
+                UNIQUE(market_id, side)
+            )
+        """)
+        await db.execute("""
+            INSERT INTO positions (
+                id,
+                market_id,
+                side,
+                entry_price,
+                quantity,
+                timestamp,
+                rationale,
+                confidence,
+                live,
+                status,
+                strategy,
+                stop_loss_price,
+                take_profit_price,
+                max_hold_hours,
+                target_confidence_change
+            )
+            SELECT
+                id,
+                market_id,
+                side,
+                entry_price,
+                CAST(quantity AS REAL),
+                timestamp,
+                rationale,
+                confidence,
+                live,
+                status,
+                strategy,
+                stop_loss_price,
+                take_profit_price,
+                max_hold_hours,
+                target_confidence_change
+            FROM positions_legacy_quantity
+        """)
+        await db.execute("DROP TABLE positions_legacy_quantity")
+
+    async def _rebuild_trade_logs_quantity_as_real(self, db: aiosqlite.Connection) -> None:
+        """Recreate the trade_logs table so quantity can store fractional fills."""
+        await db.execute("ALTER TABLE trade_logs RENAME TO trade_logs_legacy_quantity")
+        await db.execute("""
+            CREATE TABLE trade_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_id TEXT NOT NULL,
+                side TEXT NOT NULL,
+                entry_price REAL NOT NULL,
+                exit_price REAL NOT NULL,
+                quantity REAL NOT NULL,
+                pnl REAL NOT NULL,
+                entry_timestamp TEXT NOT NULL,
+                exit_timestamp TEXT NOT NULL,
+                rationale TEXT,
+                strategy TEXT
+            )
+        """)
+        await db.execute("""
+            INSERT INTO trade_logs (
+                id,
+                market_id,
+                side,
+                entry_price,
+                exit_price,
+                quantity,
+                pnl,
+                entry_timestamp,
+                exit_timestamp,
+                rationale,
+                strategy
+            )
+            SELECT
+                id,
+                market_id,
+                side,
+                entry_price,
+                exit_price,
+                CAST(quantity AS REAL),
+                pnl,
+                entry_timestamp,
+                exit_timestamp,
+                rationale,
+                strategy
+            FROM trade_logs_legacy_quantity
+        """)
+        await db.execute("DROP TABLE trade_logs_legacy_quantity")
+
+    @staticmethod
+    def _normalize_quantity(value: Any) -> float:
+        """Normalize stored contract counts into floats."""
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _hydrate_position(self, row: aiosqlite.Row) -> Position:
+        """Convert a database row into a Position dataclass."""
+        position_dict = dict(row)
+        position_dict["quantity"] = self._normalize_quantity(position_dict.get("quantity"))
+        position_dict["timestamp"] = datetime.fromisoformat(position_dict["timestamp"])
+        position_dict["live"] = bool(position_dict.get("live", False))
+        return Position(**position_dict)
+
+    def _hydrate_trade_log(self, row: aiosqlite.Row) -> TradeLog:
+        """Convert a database row into a TradeLog dataclass."""
+        trade_log_dict = dict(row)
+        trade_log_dict["quantity"] = self._normalize_quantity(trade_log_dict.get("quantity"))
+        trade_log_dict["entry_timestamp"] = datetime.fromisoformat(trade_log_dict["entry_timestamp"])
+        trade_log_dict["exit_timestamp"] = datetime.fromisoformat(trade_log_dict["exit_timestamp"])
+        return TradeLog(**trade_log_dict)
 
     async def _migrate_existing_strategy_data(self, db: aiosqlite.Connection) -> None:
         """Migrate existing position data to include strategy information."""
@@ -242,7 +418,7 @@ class DatabaseManager(TradingLoggerMixin):
                 market_id TEXT NOT NULL,
                 side TEXT NOT NULL,
                 entry_price REAL NOT NULL,
-                quantity INTEGER NOT NULL,
+                quantity REAL NOT NULL,
                 timestamp TEXT NOT NULL,
                 rationale TEXT,
                 confidence REAL,
@@ -264,7 +440,7 @@ class DatabaseManager(TradingLoggerMixin):
                 side TEXT NOT NULL,
                 entry_price REAL NOT NULL,
                 exit_price REAL NOT NULL,
-                quantity INTEGER NOT NULL,
+                quantity REAL NOT NULL,
                 pnl REAL NOT NULL,
                 entry_timestamp TEXT NOT NULL,
                 exit_timestamp TEXT NOT NULL,
@@ -324,45 +500,25 @@ class DatabaseManager(TradingLoggerMixin):
             )
         """)
 
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS blocked_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker TEXT NOT NULL,
+                category TEXT NOT NULL,
+                side TEXT NOT NULL,
+                amount REAL NOT NULL,
+                reason TEXT NOT NULL,
+                score REAL,
+                blocked_at TEXT NOT NULL
+            )
+        """)
+
         # Create indices for performance
         await db.execute("CREATE INDEX IF NOT EXISTS idx_market_analyses_market_id ON market_analyses(market_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_market_analyses_timestamp ON market_analyses(analysis_timestamp)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_daily_cost_date ON daily_cost_tracking(date)")
-        
-        # Run migrations to ensure schema is up to date
-        await self._run_migrations(db)
-        
-        self.logger.info("Tables created or already exist.")
 
-    async def _run_migrations(self, db: aiosqlite.Connection) -> None:
-        """Run database migrations to ensure schema is up to date."""
-        try:
-            # Check if positions table has the new columns
-            cursor = await db.execute("PRAGMA table_info(positions)")
-            columns = await cursor.fetchall()
-            column_names = [col[1] for col in columns]
-            
-            # Add missing columns for enhanced exit strategy
-            if 'stop_loss_price' not in column_names:
-                await db.execute("ALTER TABLE positions ADD COLUMN stop_loss_price REAL")
-                self.logger.info("Added stop_loss_price column to positions table")
-                
-            if 'take_profit_price' not in column_names:
-                await db.execute("ALTER TABLE positions ADD COLUMN take_profit_price REAL")
-                self.logger.info("Added take_profit_price column to positions table")
-                
-            if 'max_hold_hours' not in column_names:
-                await db.execute("ALTER TABLE positions ADD COLUMN max_hold_hours INTEGER")
-                self.logger.info("Added max_hold_hours column to positions table")
-                
-            if 'target_confidence_change' not in column_names:
-                await db.execute("ALTER TABLE positions ADD COLUMN target_confidence_change REAL")
-                self.logger.info("Added target_confidence_change column to positions table")
-                
-            await db.commit()
-            
-        except Exception as e:
-            self.logger.error(f"Error running migrations: {e}")
+        self.logger.info("Tables created or already exist.")
 
     async def upsert_markets(self, markets: List[Market]):
         """
@@ -471,9 +627,7 @@ class DatabaseManager(TradingLoggerMixin):
             
             positions = []
             for row in rows:
-                position_dict = dict(row)
-                position_dict['timestamp'] = datetime.fromisoformat(position_dict['timestamp'])
-                positions.append(Position(**position_dict))
+                positions.append(self._hydrate_position(row))
             return positions
 
     async def get_open_live_positions(self) -> List[Position]:
@@ -490,23 +644,83 @@ class DatabaseManager(TradingLoggerMixin):
             
             positions = []
             for row in rows:
-                position_dict = dict(row)
-                position_dict['timestamp'] = datetime.fromisoformat(position_dict['timestamp'])
-                positions.append(Position(**position_dict))
+                positions.append(self._hydrate_position(row))
             return positions
 
-    async def update_position_status(self, position_id: int, status: str):
+    async def update_position_status(
+        self,
+        position_id: int,
+        status: str,
+        *,
+        rationale_suffix: Optional[str] = None,
+    ):
         """
         Updates the status of a position.
 
         Args:
             position_id: The id of the position to update.
             status: The new status ('closed', 'voided').
+            rationale_suffix: Optional note appended to the existing rationale.
         """
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                UPDATE positions SET status = ? WHERE id = ?
-            """, (status, position_id))
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT market_id, rationale FROM positions WHERE id = ?",
+                (position_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                self.logger.warning(f"Position {position_id} not found for status update.")
+                return
+
+            params: tuple[Any, ...]
+            if rationale_suffix:
+                existing_rationale = str(row["rationale"] or "").strip()
+                updated_rationale = (
+                    f"{existing_rationale} | {rationale_suffix}"
+                    if existing_rationale
+                    else rationale_suffix
+                )
+                await db.execute(
+                    """
+                    UPDATE positions
+                    SET status = ?, rationale = ?
+                    WHERE id = ?
+                    """,
+                    (status, updated_rationale, position_id),
+                )
+            else:
+                await db.execute(
+                    """
+                    UPDATE positions SET status = ? WHERE id = ?
+                    """,
+                    (status, position_id),
+                )
+
+            market_id = str(row["market_id"] or "")
+            if market_id:
+                if status in {"open", "pending"}:
+                    await db.execute(
+                        "UPDATE markets SET has_position = 1 WHERE market_id = ?",
+                        (market_id,),
+                    )
+                else:
+                    cursor = await db.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM positions
+                        WHERE market_id = ?
+                          AND id != ?
+                          AND status IN ('open', 'pending')
+                        """,
+                        (market_id, position_id),
+                    )
+                    remaining_open = int((await cursor.fetchone())[0] or 0)
+                    if remaining_open == 0:
+                        await db.execute(
+                            "UPDATE markets SET has_position = 0 WHERE market_id = ?",
+                            (market_id,),
+                        )
             await db.commit()
             self.logger.info(f"Updated position {position_id} status to {status}.")
 
@@ -525,9 +739,7 @@ class DatabaseManager(TradingLoggerMixin):
             cursor = await db.execute("SELECT * FROM positions WHERE market_id = ? AND status = 'open' LIMIT 1", (market_id,))
             row = await cursor.fetchone()
             if row:
-                position_dict = dict(row)
-                position_dict['timestamp'] = datetime.fromisoformat(position_dict['timestamp'])
-                return Position(**position_dict)
+                return self._hydrate_position(row)
             return None
 
     async def get_position_by_market_and_side(self, market_id: str, side: str) -> Optional[Position]:
@@ -549,9 +761,7 @@ class DatabaseManager(TradingLoggerMixin):
             )
             row = await cursor.fetchone()
             if row:
-                position_dict = dict(row)
-                position_dict['timestamp'] = datetime.fromisoformat(position_dict['timestamp'])
-                return Position(**position_dict)
+                return self._hydrate_position(row)
             return None
 
     async def add_trade_log(self, trade_log: TradeLog) -> None:
@@ -935,10 +1145,7 @@ class DatabaseManager(TradingLoggerMixin):
             
             logs = []
             for row in rows:
-                log_dict = dict(row)
-                log_dict['entry_timestamp'] = datetime.fromisoformat(log_dict['entry_timestamp'])
-                log_dict['exit_timestamp'] = datetime.fromisoformat(log_dict['exit_timestamp'])
-                logs.append(TradeLog(**log_dict))
+                logs.append(self._hydrate_trade_log(row))
             return logs
 
     async def update_position_to_live(self, position_id: int, entry_price: float):
@@ -957,6 +1164,43 @@ class DatabaseManager(TradingLoggerMixin):
             """, (entry_price, position_id))
             await db.commit()
         self.logger.info(f"Updated position {position_id} to live.")
+
+    async def update_position_execution_details(
+        self,
+        position_id: int,
+        *,
+        entry_price: float,
+        quantity: float,
+        live: bool = True,
+        stop_loss_price: Optional[float] = None,
+        take_profit_price: Optional[float] = None,
+        max_hold_hours: Optional[int] = None,
+    ) -> None:
+        """Update the executed fill and persisted exit plan for a position."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                UPDATE positions
+                SET live = ?,
+                    entry_price = ?,
+                    quantity = ?,
+                    stop_loss_price = ?,
+                    take_profit_price = ?,
+                    max_hold_hours = ?
+                WHERE id = ?
+                """,
+                (
+                    int(bool(live)),
+                    entry_price,
+                    quantity,
+                    stop_loss_price,
+                    take_profit_price,
+                    max_hold_hours,
+                    position_id,
+                ),
+            )
+            await db.commit()
+        self.logger.info(f"Updated execution details for position {position_id}.")
 
     async def add_position(self, position: Position) -> Optional[int]:
         """
@@ -994,6 +1238,7 @@ class DatabaseManager(TradingLoggerMixin):
     async def get_open_positions(self) -> List[Position]:
         """Get all open positions."""
         async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 "SELECT * FROM positions WHERE status = 'open'"
             )
@@ -1001,24 +1246,7 @@ class DatabaseManager(TradingLoggerMixin):
             
             positions = []
             for row in rows:
-                # Convert database row to Position object
-                position = Position(
-                    market_id=row[1],
-                    side=row[2],
-                    entry_price=row[3],
-                    quantity=row[4],
-                    timestamp=datetime.fromisoformat(row[5]),
-                    rationale=row[6],
-                    confidence=row[7],
-                    live=bool(row[8]),
-                    status=row[9],
-                    id=row[0],
-                    stop_loss_price=row[10],
-                    take_profit_price=row[11],
-                    max_hold_hours=row[12],
-                    target_confidence_change=row[13]
-                )
-                positions.append(position)
+                positions.append(self._hydrate_position(row))
             
             return positions
 
@@ -1031,6 +1259,6 @@ if __name__ == "__main__":
         manager = DatabaseManager(db_path=db_path)
         await manager.initialize()
         print(f"✅ Database initialized at {os.path.abspath(db_path)}")
-        print("   Tables: markets, positions, trade_logs, market_analyses, daily_cost_tracking, llm_queries, analysis_reports")
+        print("   Tables: markets, positions, trade_logs, market_analyses, daily_cost_tracking, llm_queries, analysis_reports, blocked_trades")
 
     asyncio.run(_init())

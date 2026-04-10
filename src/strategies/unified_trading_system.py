@@ -52,6 +52,7 @@ from src.strategies.portfolio_optimization import (
     run_portfolio_optimization,
     create_market_opportunities_from_markets
 )
+from src.strategies.quick_flip_scalping import QuickFlipConfig, run_quick_flip_strategy
 @dataclass
 class TradingSystemConfig:
     """Configuration for the unified trading system."""
@@ -60,6 +61,8 @@ class TradingSystemConfig:
     # Reallocated to directional (ensemble-driven) trading.
     market_making_allocation: float = 0.30  # 30% for market making
     directional_trading_allocation: float = 0.70  # 70% for directional positions (AI ensemble)
+    quick_flip_enabled: bool = False
+    quick_flip_allocation: float = 0.00    # Disabled by default; enable explicitly
     arbitrage_allocation: float = 0.00      # 0% for arbitrage opportunities
     
     # Risk management
@@ -90,6 +93,11 @@ class TradingSystemResults:
     directional_positions: int = 0
     directional_exposure: float = 0.0
     directional_expected_return: float = 0.0
+
+    # Quick flip results
+    quick_flip_positions: int = 0
+    quick_flip_exposure: float = 0.0
+    quick_flip_expected_profit: float = 0.0
     
     # Portfolio metrics
     total_capital_used: float = 0.0
@@ -196,13 +204,22 @@ class UnifiedAdvancedTradingSystem:
         # Update capital allocation based on actual balance
         self.market_making_capital = self.total_capital * self.config.market_making_allocation
         self.directional_capital = self.total_capital * self.config.directional_trading_allocation
+        self.quick_flip_capital = (
+            self.total_capital * self.config.quick_flip_allocation
+            if self.config.quick_flip_enabled
+            else 0.0
+        )
         self.arbitrage_capital = self.total_capital * self.config.arbitrage_allocation
 
         # Initialize strategy modules with actual capital
         self.market_maker = AdvancedMarketMaker(self.db_manager, self.kalshi_client, self.xai_client)
         self.portfolio_optimizer = AdvancedPortfolioOptimizer(self.db_manager, self.kalshi_client, self.xai_client)
 
-        self.logger.info(f"🎯 CAPITAL ALLOCATION: Market Making=${self.market_making_capital:.2f}, Directional=${self.directional_capital:.2f}, Arbitrage=${self.arbitrage_capital:.2f}")
+        self.logger.info(
+            f"🎯 CAPITAL ALLOCATION: Market Making=${self.market_making_capital:.2f}, "
+            f"Directional=${self.directional_capital:.2f}, Quick Flip=${self.quick_flip_capital:.2f}, "
+            f"Arbitrage=${self.arbitrage_capital:.2f}"
+        )
 
     async def execute_unified_trading_strategy(self) -> TradingSystemResults:
         """
@@ -263,9 +280,10 @@ class UnifiedAdvancedTradingSystem:
             self.logger.info(f"Analyzing {len(markets)} markets across all strategies")
             
             # Step 2: Parallel strategy analysis (ensemble-driven only)
-            market_making_results, portfolio_allocation = await asyncio.gather(
+            market_making_results, portfolio_allocation, quick_flip_results = await asyncio.gather(
                 self._execute_market_making_strategy(markets),
                 self._execute_directional_trading_strategy(markets),
+                self._execute_quick_flip_strategy(),
             )
             
             # Step 3: Execute arbitrage opportunities
@@ -273,7 +291,7 @@ class UnifiedAdvancedTradingSystem:
             
             # Step 4: Compile results
             results = self._compile_unified_results(
-                market_making_results, portfolio_allocation, arbitrage_results
+                market_making_results, portfolio_allocation, quick_flip_results, arbitrage_results
             )
             
             # Step 4.5: Log if no positions were created (removed emergency fallback)
@@ -380,8 +398,62 @@ class UnifiedAdvancedTradingSystem:
             self.logger.error(f"Error in directional trading strategy: {e}")
             return self.portfolio_optimizer._empty_allocation()
 
-    # Quick flip strategy REMOVED — 0% win rate, -$208 across 12 trades.
-    # All capital now routed to AI ensemble directional trading.
+    async def _execute_quick_flip_strategy(self) -> Dict:
+        """Optionally execute quick flip scalping when enabled in config."""
+        if not self.config.quick_flip_enabled or self.quick_flip_capital <= 0:
+            return {
+                "positions_created": 0,
+                "sell_orders_placed": 0,
+                "total_capital_used": 0.0,
+                "expected_profit": 0.0,
+            }
+
+        try:
+            self.logger.info(
+                f"🎯 Executing Quick Flip Strategy with ${self.quick_flip_capital:.2f}"
+            )
+            quick_flip_config = QuickFlipConfig(
+                min_entry_price=settings.trading.quick_flip_min_entry_price,
+                max_entry_price=settings.trading.quick_flip_max_entry_price,
+                min_profit_margin=settings.trading.quick_flip_min_profit_margin,
+                max_position_size=settings.trading.quick_flip_max_position_size,
+                max_concurrent_positions=settings.trading.quick_flip_max_concurrent_positions,
+                capital_per_trade=settings.trading.quick_flip_capital_per_trade,
+                confidence_threshold=settings.trading.quick_flip_confidence_threshold,
+                max_hold_minutes=settings.trading.quick_flip_max_hold_minutes,
+                min_market_volume=settings.trading.quick_flip_min_market_volume,
+                max_hours_to_expiry=settings.trading.quick_flip_max_hours_to_expiry,
+                max_bid_ask_spread=settings.trading.quick_flip_max_bid_ask_spread,
+                min_orderbook_depth_contracts=settings.trading.quick_flip_min_top_of_book_size,
+                min_net_profit_per_trade=settings.trading.quick_flip_min_net_profit,
+                min_net_roi=settings.trading.quick_flip_min_net_roi,
+                recent_trade_window_seconds=settings.trading.quick_flip_recent_trade_window_seconds,
+                min_recent_trade_count=settings.trading.quick_flip_min_recent_trade_count,
+                max_target_vs_recent_trade_gap=settings.trading.quick_flip_max_target_vs_recent_trade_gap,
+                maker_entry_timeout_seconds=settings.trading.quick_flip_maker_entry_timeout_seconds,
+                maker_entry_poll_seconds=settings.trading.quick_flip_maker_entry_poll_seconds,
+                maker_entry_reprice_seconds=settings.trading.quick_flip_maker_entry_reprice_seconds,
+                dynamic_exit_reprice_seconds=settings.trading.quick_flip_dynamic_exit_reprice_seconds,
+                stop_loss_pct=settings.trading.quick_flip_stop_loss_pct,
+            )
+            results = await run_quick_flip_strategy(
+                db_manager=self.db_manager,
+                kalshi_client=self.kalshi_client,
+                xai_client=self.xai_client,
+                available_capital=self.quick_flip_capital,
+                config=quick_flip_config,
+            )
+            if results.get("error"):
+                self.logger.warning(f"Quick flip returned error: {results['error']}")
+            return results
+        except Exception as e:
+            self.logger.error(f"Error in quick flip strategy: {e}")
+            return {
+                "positions_created": 0,
+                "sell_orders_placed": 0,
+                "total_capital_used": 0.0,
+                "expected_profit": 0.0,
+            }
 
     async def _execute_portfolio_allocations(
         self, 
@@ -610,29 +682,32 @@ class UnifiedAdvancedTradingSystem:
         self, 
         market_making_results: Dict, 
         portfolio_allocation: PortfolioAllocation,
+        quick_flip_results: Dict,
         arbitrage_results: Dict
     ) -> TradingSystemResults:
         """
         Compile results from all strategies into unified metrics.
-        Quick flip strategy removed — 0% win rate across 12 trades.
         """
         try:
             # Calculate total metrics
             total_capital_used = (
                 market_making_results.get('total_exposure', 0) +
                 portfolio_allocation.total_capital_used +
+                quick_flip_results.get('total_capital_used', 0) +
                 arbitrage_results.get('arbitrage_exposure', 0)
             )
             
             # Weight expected returns by capital allocation
             mm_weight = market_making_results.get('total_exposure', 0) / (total_capital_used + 1e-8)
             dir_weight = portfolio_allocation.total_capital_used / (total_capital_used + 1e-8)
+            qf_weight = quick_flip_results.get('total_capital_used', 0) / (total_capital_used + 1e-8)
             arb_weight = arbitrage_results.get('arbitrage_exposure', 0) / (total_capital_used + 1e-8)
             
             # Portfolio expected return (weighted average)
             portfolio_expected_return = (
                 mm_weight * market_making_results.get('expected_profit', 0) +
                 dir_weight * portfolio_allocation.expected_portfolio_return +
+                qf_weight * quick_flip_results.get('expected_profit', 0) +
                 arb_weight * arbitrage_results.get('arbitrage_profit', 0)
             )
             
@@ -646,6 +721,7 @@ class UnifiedAdvancedTradingSystem:
             total_positions = (
                 market_making_results.get('orders_placed', 0) // 2 +  # 2 orders per position
                 len(portfolio_allocation.allocations) +
+                quick_flip_results.get('positions_created', 0) +
                 arbitrage_results.get('arbitrage_trades', 0)
             )
             
@@ -659,6 +735,11 @@ class UnifiedAdvancedTradingSystem:
                 directional_positions=len(portfolio_allocation.allocations),
                 directional_exposure=portfolio_allocation.total_capital_used,
                 directional_expected_return=portfolio_allocation.expected_portfolio_return,
+
+                # Quick flip
+                quick_flip_positions=quick_flip_results.get('positions_created', 0),
+                quick_flip_exposure=quick_flip_results.get('total_capital_used', 0.0),
+                quick_flip_expected_profit=quick_flip_results.get('expected_profit', 0.0),
                 
                 # Portfolio metrics
                 total_capital_used=total_capital_used,
@@ -736,6 +817,7 @@ class UnifiedAdvancedTradingSystem:
 
             market_making_allocation = getattr(self.config, 'market_making_allocation', 0.0)
             directional_trading_allocation = getattr(self.config, 'directional_trading_allocation', 0.0)
+            quick_flip_allocation = getattr(self.config, 'quick_flip_allocation', 0.0)
             arbitrage_allocation = getattr(self.config, 'arbitrage_allocation', 0.0)
 
             return {
@@ -745,6 +827,7 @@ class UnifiedAdvancedTradingSystem:
                     # Use the allocation from the config, not the dynamic capital attributes
                     'market_making': market_making_allocation,
                     'directional': directional_trading_allocation,
+                    'quick_flip': quick_flip_allocation,
                     'arbitrage': arbitrage_allocation
                 },
                 'market_making_performance': mm_performance,

@@ -421,6 +421,14 @@ def infer_category(ticker: str, title: str = "") -> str:
         return "UFC"
     if any(ticker_upper.startswith(p) for p in ["KXPGA", "PGA"]):
         return "GOLF"
+    if any(ticker_upper.startswith(p) for p in ["KXSOCCER", "KXMLS", "MLS"]):
+        return "SOCCER"
+    if any(ticker_upper.startswith(p) for p in ["KXWNBA", "WNBA"]):
+        return "WNBA"
+    if any(ticker_upper.startswith(p) for p in ["KXTENNIS", "KXATP", "KXWTA"]):
+        return "TENNIS"
+    if any(ticker_upper.startswith(p) for p in ["KXF1", "KXNASCAR"]):
+        return "F1"
 
     # Economics
     if any(x in ticker_upper for x in ["CPI", "INFLATION"]):
@@ -439,7 +447,7 @@ def infer_category(ticker: str, title: str = "") -> str:
     # Politics / Elections
     if any(x in ticker_upper for x in ["PRES", "SENATE", "HOUSE", "ELECT", "TRUMP", "BIDEN"]):
         return "POLITICS"
-    if any(x in title_lower for x in ["election", "president", "senate", "congress"]):
+    if any(x in title_lower for x in ["election", "president", "senate", "congress", "governor", "political", "legislation", "bill pass"]):
         return "POLITICS"
 
     # Crypto
@@ -451,12 +459,46 @@ def infer_category(ticker: str, title: str = "") -> str:
         return "MARKETS"
 
     # Weather / Climate
-    if any(x in ticker_upper for x in ["TEMP", "SNOW", "RAIN", "WEATHER"]):
+    if any(x in ticker_upper for x in ["TEMP", "SNOW", "RAIN", "WEATHER", "HURRICANE"]):
+        return "WEATHER"
+    if any(x in title_lower for x in ["temperature", "hurricane", "snowfall", "rainfall", "weather"]):
         return "WEATHER"
 
     # Entertainment
-    if any(x in ticker_upper for x in ["OSCAR", "GRAMMY", "AWARD", "MOVIE", "ALBUM", "SONG"]):
+    if any(x in ticker_upper for x in ["OSCAR", "GRAMMY", "AWARD", "MOVIE", "ALBUM", "SONG", "EMMY", "GOLDEN"]):
         return "ENTERTAINMENT"
+    if any(x in title_lower for x in ["box office", "grammy", "oscar", "emmy", "golden globe", "billboard", "streaming"]):
+        return "ENTERTAINMENT"
+
+    # Tech & Science
+    if any(x in ticker_upper for x in ["KXAI", "KXTECH"]):
+        return "TECH"
+    if any(x in title_lower for x in ["artificial intelligence", " ai ", "openai", "spacex", "launch", "nasa", "tech", "iphone", "apple", "google", "microsoft", "tesla earnings"]):
+        return "TECH"
+
+    # Companies
+    if any(x in title_lower for x in ["earnings", "revenue", "ipo", "stock price", "market cap", "layoff"]):
+        return "COMPANIES"
+
+    # Health
+    if any(x in title_lower for x in ["covid", "vaccine", "fda approval", "pandemic", "virus", "health", "cdc"]):
+        return "HEALTH"
+
+    # Culture
+    if any(x in title_lower for x in ["social media", "tiktok", "twitter", "viral", "celebrity", "reality tv"]):
+        return "CULTURE"
+
+    # Transportation
+    if any(x in title_lower for x in ["airline", "flight", "faa", "boeing", "aviation"]):
+        return "TRANSPORTATION"
+
+    # World / Geopolitics
+    if any(x in title_lower for x in ["ukraine", "russia", "china", "nato", "war", "conflict", "sanctions", "tariff", "trade war"]):
+        return "WORLD"
+
+    # Legal
+    if any(x in title_lower for x in ["supreme court", "indictment", "trial", "lawsuit", "ruling", "verdict"]):
+        return "LEGAL"
 
     # Default
     return "OTHER"

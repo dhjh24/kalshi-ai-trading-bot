@@ -38,6 +38,22 @@ from src.jobs.decide import make_decision_for_market
 from src.jobs.execute import execute_position
 
 
+def _resolve_quick_flip_runtime_config() -> tuple[bool, float, str | None]:
+    """Resolve whether quick flip should run in the current runtime."""
+    enabled = getattr(settings.trading, "enable_quick_flip", False)
+    allocation = float(getattr(settings.trading, "quick_flip_allocation", 0.0) or 0.0)
+    live_mode = bool(getattr(settings.trading, "live_trading_enabled", False))
+    live_opt_in = bool(getattr(settings.trading, "enable_live_quick_flip", False))
+
+    if not enabled or allocation <= 0:
+        return False, 0.0, None
+
+    if live_mode and not live_opt_in:
+        return False, 0.0, "live quick flip requires explicit opt-in"
+
+    return True, allocation, None
+
+
 async def run_trading_job() -> Optional[TradingSystemResults]:
     """
     Enhanced trading job using the Unified Advanced Trading System.
@@ -53,7 +69,9 @@ async def run_trading_job() -> Optional[TradingSystemResults]:
     5. Real-time performance monitoring
     """
     logger = get_trading_logger("trading_job")
-    
+    kalshi_client: Optional[KalshiClient] = None
+    xai_client: Optional[XAIClient] = None
+
     try:
         logger.info("🚀 Starting Enhanced Trading Job - Beast Mode Activated!")
         
@@ -61,13 +79,20 @@ async def run_trading_job() -> Optional[TradingSystemResults]:
         db_manager = DatabaseManager()
         kalshi_client = KalshiClient()
         xai_client = XAIClient(db_manager=db_manager)  # Pass db_manager for LLM logging
-        
+        quick_flip_enabled, quick_flip_allocation, quick_flip_skip_reason = (
+            _resolve_quick_flip_runtime_config()
+        )
+        if quick_flip_skip_reason:
+            logger.warning(f"Quick flip disabled for this run: {quick_flip_skip_reason}")
+
         # Configure the unified system
         # Use default settings unless overridden
         config = TradingSystemConfig(
             # Capital allocation (can be adjusted based on market conditions)
             market_making_allocation=getattr(settings.trading, 'market_making_allocation', 0.40),
             directional_trading_allocation=getattr(settings.trading, 'directional_allocation', 0.50),
+            quick_flip_enabled=quick_flip_enabled,
+            quick_flip_allocation=quick_flip_allocation,
             arbitrage_allocation=getattr(settings.trading, 'arbitrage_allocation', 0.10),
             
             # Risk management
@@ -106,6 +131,7 @@ async def run_trading_job() -> Optional[TradingSystemResults]:
                 f"💰 STRATEGIES:\n"
                 f"  • Market Making: {results.market_making_orders} orders, ${results.market_making_expected_profit:.2f} profit\n"
                 f"  • Directional: {results.directional_positions} positions, ${results.directional_expected_return:.2f} return\n"
+                f"  • Quick Flip: {results.quick_flip_positions} positions, ${results.quick_flip_expected_profit:.2f} expected profit\n"
                 f"\n"
                 f"⚡ SYSTEM STATUS: MAXIMUM CAPITAL EFFICIENCY ACHIEVED!"
             )
@@ -122,6 +148,11 @@ async def run_trading_job() -> Optional[TradingSystemResults]:
         # Fallback to legacy system if unified system fails
         logger.warning("🔄 Falling back to legacy decision-making system")
         return await _fallback_legacy_trading()
+    finally:
+        if xai_client is not None:
+            await xai_client.close()
+        if kalshi_client is not None:
+            await kalshi_client.close()
 
 
 async def _fallback_legacy_trading() -> Optional[TradingSystemResults]:
@@ -129,7 +160,9 @@ async def _fallback_legacy_trading() -> Optional[TradingSystemResults]:
     Fallback to the original sequential decision-making if unified system fails.
     """
     logger = get_trading_logger("trading_job_fallback")
-    
+    kalshi_client: Optional[KalshiClient] = None
+    xai_client: Optional[XAIClient] = None
+
     try:
         logger.info("🔄 Executing fallback legacy trading system")
         
@@ -182,6 +215,11 @@ async def _fallback_legacy_trading() -> Optional[TradingSystemResults]:
     except Exception as e:
         logger.error(f"Error in fallback trading system: {e}")
         return TradingSystemResults()
+    finally:
+        if xai_client is not None:
+            await xai_client.close()
+        if kalshi_client is not None:
+            await kalshi_client.close()
 
 
 # For backwards compatibility

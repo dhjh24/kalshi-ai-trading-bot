@@ -12,6 +12,20 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _get_bool_env(name: str, default: bool = False) -> bool:
+    """Return a boolean environment variable value."""
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _get_csv_env_list(name: str) -> List[str]:
+    """Return a comma-separated environment variable as a cleaned list."""
+    raw_value = os.getenv(name, "")
+    return [item.strip() for item in raw_value.split(",") if item.strip()]
+
+
 def _get_kalshi_env() -> str:
     """Return the configured Kalshi environment."""
     return os.getenv("KALSHI_ENV", "prod").strip().lower() or "prod"
@@ -264,8 +278,8 @@ class TradingConfig:
     max_single_position: float = 0.03       # SANE: 3% max position cap (was 0.05 beast mode)
     
     # Live trading mode control
-    live_trading_enabled: bool = field(default_factory=lambda: os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true")
-    paper_trading_mode: bool = field(default_factory=lambda: os.getenv("LIVE_TRADING_ENABLED", "false").lower() != "true")
+    live_trading_enabled: bool = field(default_factory=lambda: _get_bool_env("LIVE_TRADING_ENABLED"))
+    paper_trading_mode: bool = field(default_factory=lambda: not _get_bool_env("LIVE_TRADING_ENABLED"))
     
     # Trading frequency - MORE FREQUENT
     market_scan_interval: int = 30          # DECREASED: Scan every 30 seconds (was 60)
@@ -273,10 +287,25 @@ class TradingConfig:
     max_trades_per_hour: int = 20           # INCREASED: Allow more trades per hour (was 10, now 20)
     run_interval_minutes: int = 10          # DECREASED: Run more frequently (was 15, now 10)
     num_processor_workers: int = 5      # Number of concurrent market processor workers
+
+    # Unified strategy capital allocation
+    market_making_allocation: float = field(
+        default_factory=lambda: float(os.getenv("MARKET_MAKING_ALLOCATION", "0.40"))
+    )
+    directional_allocation: float = field(
+        default_factory=lambda: float(os.getenv("DIRECTIONAL_ALLOCATION", "0.50"))
+    )
+    arbitrage_allocation: float = field(
+        default_factory=lambda: float(os.getenv("ARBITRAGE_ALLOCATION", "0.10"))
+    )
     
     # Market selection preferences
-    preferred_categories: List[str] = field(default_factory=lambda: [])
-    excluded_categories: List[str] = field(default_factory=lambda: [])
+    preferred_categories: List[str] = field(default_factory=lambda: _get_csv_env_list("PREFERRED_CATEGORIES"))
+    excluded_categories: List[str] = field(default_factory=lambda: _get_csv_env_list("EXCLUDED_CATEGORIES"))
+    prefer_live_wagering: bool = field(default_factory=lambda: _get_bool_env("PREFER_LIVE_WAGERING"))
+    live_wagering_max_hours_to_expiry: int = field(
+        default_factory=lambda: int(os.getenv("LIVE_WAGERING_MAX_HOURS_TO_EXPIRY", "12"))
+    )
     
     # High-confidence, near-expiry strategy
     enable_high_confidence_strategy: bool = True
@@ -287,6 +316,81 @@ class TradingConfig:
     # AI trading criteria - MORE PERMISSIVE
     max_analysis_cost_per_decision: float = 0.15  # INCREASED: Allow higher cost per decision (was 0.10, now 0.15)
     min_confidence_threshold: float = 0.45  # DECREASED: Lower confidence threshold (was 0.55, now 0.45)
+
+    # Quick flip strategy
+    enable_quick_flip: bool = field(default_factory=lambda: _get_bool_env("ENABLE_QUICK_FLIP"))
+    enable_live_quick_flip: bool = field(
+        default_factory=lambda: _get_bool_env("ENABLE_LIVE_QUICK_FLIP")
+    )
+    quick_flip_allocation: float = field(
+        default_factory=lambda: float(os.getenv("QUICK_FLIP_ALLOCATION", "0.0"))
+    )
+    quick_flip_min_entry_price: float = field(
+        default_factory=lambda: float(os.getenv("QUICK_FLIP_MIN_ENTRY_PRICE", "0.01"))
+    )
+    quick_flip_max_entry_price: float = field(
+        default_factory=lambda: float(os.getenv("QUICK_FLIP_MAX_ENTRY_PRICE", "0.20"))
+    )
+    quick_flip_min_profit_margin: float = field(
+        default_factory=lambda: float(os.getenv("QUICK_FLIP_MIN_PROFIT_MARGIN", "0.10"))
+    )
+    quick_flip_max_position_size: int = field(
+        default_factory=lambda: int(os.getenv("QUICK_FLIP_MAX_POSITION_SIZE", "100"))
+    )
+    quick_flip_max_concurrent_positions: int = field(
+        default_factory=lambda: int(os.getenv("QUICK_FLIP_MAX_CONCURRENT_POSITIONS", "50"))
+    )
+    quick_flip_capital_per_trade: float = field(
+        default_factory=lambda: float(os.getenv("QUICK_FLIP_CAPITAL_PER_TRADE", "50.0"))
+    )
+    quick_flip_confidence_threshold: float = field(
+        default_factory=lambda: float(os.getenv("QUICK_FLIP_CONFIDENCE_THRESHOLD", "0.6"))
+    )
+    quick_flip_max_hold_minutes: int = field(
+        default_factory=lambda: int(os.getenv("QUICK_FLIP_MAX_HOLD_MINUTES", "30"))
+    )
+    quick_flip_min_market_volume: int = field(
+        default_factory=lambda: int(os.getenv("QUICK_FLIP_MIN_MARKET_VOLUME", "2000"))
+    )
+    quick_flip_max_hours_to_expiry: int = field(
+        default_factory=lambda: int(os.getenv("QUICK_FLIP_MAX_HOURS_TO_EXPIRY", "72"))
+    )
+    quick_flip_max_bid_ask_spread: float = field(
+        default_factory=lambda: float(os.getenv("QUICK_FLIP_MAX_BID_ASK_SPREAD", "0.03"))
+    )
+    quick_flip_min_top_of_book_size: int = field(
+        default_factory=lambda: int(os.getenv("QUICK_FLIP_MIN_TOP_OF_BOOK_SIZE", "25"))
+    )
+    quick_flip_min_net_profit: float = field(
+        default_factory=lambda: float(os.getenv("QUICK_FLIP_MIN_NET_PROFIT", "0.10"))
+    )
+    quick_flip_min_net_roi: float = field(
+        default_factory=lambda: float(os.getenv("QUICK_FLIP_MIN_NET_ROI", "0.03"))
+    )
+    quick_flip_recent_trade_window_seconds: int = field(
+        default_factory=lambda: int(os.getenv("QUICK_FLIP_RECENT_TRADE_WINDOW_SECONDS", "3600"))
+    )
+    quick_flip_min_recent_trade_count: int = field(
+        default_factory=lambda: int(os.getenv("QUICK_FLIP_MIN_RECENT_TRADE_COUNT", "5"))
+    )
+    quick_flip_max_target_vs_recent_trade_gap: float = field(
+        default_factory=lambda: float(os.getenv("QUICK_FLIP_MAX_TARGET_VS_RECENT_TRADE_GAP", "0.01"))
+    )
+    quick_flip_maker_entry_timeout_seconds: int = field(
+        default_factory=lambda: int(os.getenv("QUICK_FLIP_MAKER_ENTRY_TIMEOUT_SECONDS", "180"))
+    )
+    quick_flip_maker_entry_poll_seconds: int = field(
+        default_factory=lambda: int(os.getenv("QUICK_FLIP_MAKER_ENTRY_POLL_SECONDS", "5"))
+    )
+    quick_flip_maker_entry_reprice_seconds: int = field(
+        default_factory=lambda: int(os.getenv("QUICK_FLIP_MAKER_ENTRY_REPRICE_SECONDS", "30"))
+    )
+    quick_flip_dynamic_exit_reprice_seconds: int = field(
+        default_factory=lambda: int(os.getenv("QUICK_FLIP_DYNAMIC_EXIT_REPRICE_SECONDS", "60"))
+    )
+    quick_flip_stop_loss_pct: float = field(
+        default_factory=lambda: float(os.getenv("QUICK_FLIP_STOP_LOSS_PCT", "0.08"))
+    )
 
     # Cost control and market analysis frequency - MORE PERMISSIVE
     daily_ai_budget: float = 10.0  # INCREASED: Higher daily budget (was 5.0, now 10.0)
@@ -440,6 +544,78 @@ class Settings:
 
         if self.trading.min_confidence_to_trade <= 0 or self.trading.min_confidence_to_trade > 1:
             raise ValueError("min_confidence_to_trade must be between 0 and 1")
+
+        if self.trading.quick_flip_allocation < 0 or self.trading.quick_flip_allocation > 1:
+            raise ValueError("quick_flip_allocation must be between 0 and 1")
+
+        if self.trading.quick_flip_confidence_threshold <= 0 or self.trading.quick_flip_confidence_threshold > 1:
+            raise ValueError("quick_flip_confidence_threshold must be between 0 and 1")
+
+        if self.trading.quick_flip_min_market_volume < 0:
+            raise ValueError("quick_flip_min_market_volume must be non-negative")
+
+        if self.trading.quick_flip_max_hours_to_expiry <= 0:
+            raise ValueError("quick_flip_max_hours_to_expiry must be positive")
+
+        if self.trading.quick_flip_max_bid_ask_spread <= 0 or self.trading.quick_flip_max_bid_ask_spread >= 1:
+            raise ValueError("quick_flip_max_bid_ask_spread must be between 0 and 1")
+
+        if self.trading.quick_flip_min_top_of_book_size <= 0:
+            raise ValueError("quick_flip_min_top_of_book_size must be positive")
+
+        if self.trading.quick_flip_min_net_profit < 0:
+            raise ValueError("quick_flip_min_net_profit must be non-negative")
+
+        if self.trading.quick_flip_min_net_roi < 0 or self.trading.quick_flip_min_net_roi >= 1:
+            raise ValueError("quick_flip_min_net_roi must be between 0 and 1")
+
+        if self.trading.quick_flip_recent_trade_window_seconds <= 0:
+            raise ValueError("quick_flip_recent_trade_window_seconds must be positive")
+
+        if self.trading.quick_flip_min_recent_trade_count < 0:
+            raise ValueError("quick_flip_min_recent_trade_count must be non-negative")
+
+        if (
+            self.trading.quick_flip_max_target_vs_recent_trade_gap < 0
+            or self.trading.quick_flip_max_target_vs_recent_trade_gap >= 1
+        ):
+            raise ValueError("quick_flip_max_target_vs_recent_trade_gap must be between 0 and 1")
+
+        if self.trading.quick_flip_maker_entry_timeout_seconds <= 0:
+            raise ValueError("quick_flip_maker_entry_timeout_seconds must be positive")
+
+        if self.trading.quick_flip_maker_entry_poll_seconds <= 0:
+            raise ValueError("quick_flip_maker_entry_poll_seconds must be positive")
+
+        if self.trading.quick_flip_maker_entry_reprice_seconds <= 0:
+            raise ValueError("quick_flip_maker_entry_reprice_seconds must be positive")
+
+        if self.trading.quick_flip_dynamic_exit_reprice_seconds <= 0:
+            raise ValueError("quick_flip_dynamic_exit_reprice_seconds must be positive")
+
+        if self.trading.quick_flip_stop_loss_pct <= 0 or self.trading.quick_flip_stop_loss_pct >= 1:
+            raise ValueError("quick_flip_stop_loss_pct must be between 0 and 1")
+
+        for allocation_name in (
+            "market_making_allocation",
+            "directional_allocation",
+            "arbitrage_allocation",
+        ):
+            allocation_value = getattr(self.trading, allocation_name)
+            if allocation_value < 0 or allocation_value > 1:
+                raise ValueError(f"{allocation_name} must be between 0 and 1")
+
+        total_allocation = (
+            self.trading.market_making_allocation +
+            self.trading.directional_allocation +
+            self.trading.arbitrage_allocation +
+            self.trading.quick_flip_allocation
+        )
+        if total_allocation > 1.0:
+            raise ValueError("strategy allocations must sum to 1.0 or less")
+
+        if self.trading.live_wagering_max_hours_to_expiry <= 0:
+            raise ValueError("live_wagering_max_hours_to_expiry must be positive")
 
         required_roles = {
             "news_analyst",

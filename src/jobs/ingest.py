@@ -14,6 +14,10 @@ from typing import List, Optional
 from src.clients.kalshi_client import KalshiClient
 from src.config.settings import settings
 from src.utils.database import DatabaseManager, Market
+from src.utils.market_preferences import (
+    is_live_wagering_market,
+    normalize_market_category,
+)
 from src.utils.kalshi_normalization import (
     get_market_expiration_ts,
     get_market_prices,
@@ -33,6 +37,17 @@ async def process_and_queue_markets(
     logger,
 ) -> None:
     """Normalize, upsert, and queue eligible markets."""
+    preferred_categories = {
+        normalize_market_category(category).casefold()
+        for category in settings.trading.preferred_categories
+        if category
+    }
+    excluded_categories = {
+        normalize_market_category(category).casefold()
+        for category in settings.trading.excluded_categories
+        if category
+    }
+
     markets_to_upsert = []
     for market_data in markets_data:
         yes_bid, yes_ask, no_bid, no_ask = get_market_prices(market_data)
@@ -52,6 +67,11 @@ async def process_and_queue_markets(
             logger.debug(f"Skipping {market_data.get('ticker', '')}: no expiration time available")
             continue
 
+        category = normalize_market_category(
+            market_data.get("category"),
+            ticker=market_data.get("ticker", ""),
+            title=market_data.get("title", ""),
+        )
         market = Market(
             market_id=market_data["ticker"],
             title=market_data["title"],
@@ -59,7 +79,7 @@ async def process_and_queue_markets(
             no_price=no_price,
             volume=volume,
             expiration_ts=expiration_ts,
-            category=market_data.get("category", "unknown"),
+            category=category,
             status=get_market_status(market_data) or "unknown",
             last_updated=datetime.now(),
             has_position=market_data["ticker"] in existing_position_market_ids,
@@ -78,11 +98,26 @@ async def process_and_queue_markets(
         for market in markets_to_upsert
         if market.volume >= settings.trading.min_volume
         and (
-            not settings.trading.preferred_categories
-            or market.category in settings.trading.preferred_categories
+            not preferred_categories
+            or market.category.casefold() in preferred_categories
         )
-        and market.category not in settings.trading.excluded_categories
+        and market.category.casefold() not in excluded_categories
     ]
+
+    if settings.trading.prefer_live_wagering:
+        eligible_markets.sort(
+            key=lambda market: (
+                not is_live_wagering_market(
+                    market.category,
+                    market.expiration_ts,
+                    ticker=market.market_id,
+                    title=market.title,
+                    max_hours_to_expiry=settings.trading.live_wagering_max_hours_to_expiry,
+                ),
+                market.expiration_ts,
+                -market.volume,
+            )
+        )
 
     logger.info(f"Found {len(eligible_markets)} eligible markets to process in this batch.")
     for market in eligible_markets:
@@ -136,6 +171,7 @@ async def run_ingestion(
 
                 batch = []
                 for event in events:
+                    event_category = event.get("category")
                     for market in event.get("markets", []):
                         ticker = market.get("ticker", "")
                         if (
@@ -144,7 +180,12 @@ async def run_ingestion(
                             and is_active_market_status(market.get("status"))
                         ):
                             seen_tickers.add(ticker)
-                            batch.append(market)
+                            batch.append(
+                                {
+                                    **market,
+                                    "category": market.get("category") or event_category,
+                                }
+                            )
 
                 if batch:
                     logger.info(f"Fetched {len(batch)} active markets from events page {events_page}.")

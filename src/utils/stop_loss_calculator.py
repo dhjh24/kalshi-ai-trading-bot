@@ -172,7 +172,7 @@ class StopLossCalculator:
         cls,
         entry_price: float,
         stop_loss_price: float,
-        quantity: int,
+        quantity: float,
         side: str
     ) -> float:
         """

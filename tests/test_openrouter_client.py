@@ -136,6 +136,18 @@ class TestOpenRouterClient:
             "deepseek/deepseek-v3.2",
         ]
 
+    def test_extract_affordable_max_tokens_from_credit_error(self):
+        """Credit errors should expose a smaller retryable max_tokens value."""
+        exc = Exception(
+            "Error code: 402 - This request requires more credits, but can only afford 2349."
+        )
+
+        affordable = OpenRouterClient._extract_affordable_max_tokens(exc)
+
+        assert affordable is not None
+        assert 0 < affordable < 2349
+        assert OpenRouterClient._is_retryable_error(exc) is True
+
     @pytest.mark.asyncio
     async def test_get_completion_passes_openrouter_request_shape(self):
         """Request payload should include fallback models and OpenRouter-specific fields."""
@@ -181,6 +193,43 @@ class TestOpenRouterClient:
         assert kwargs["metadata"]["request_kind"] == "unit_test"
         assert kwargs["metadata"]["query_type"] == "completion"
         assert client.last_request_metadata.actual_model == "deepseek/deepseek-v3.2"
+
+    @pytest.mark.asyncio
+    async def test_request_chat_completion_retries_credit_errors_with_lower_max_tokens(self):
+        """OpenRouter credit errors should retry with a reduced token cap."""
+        response = _mock_response(content='{"status":"ok"}')
+        credit_error = Exception(
+            "Error code: 402 - This request requires more credits, or fewer max_tokens. "
+            "You requested up to 3000 tokens, but can only afford 2349."
+        )
+        async_client = MagicMock()
+        async_client.chat.completions.create = AsyncMock(
+            side_effect=[credit_error, response]
+        )
+
+        with patch("src.clients.openrouter_client.AsyncOpenAI", return_value=async_client):
+            with patch("src.clients.openrouter_client.settings") as mock_settings:
+                mock_settings.api.openrouter_api_key = "test-key"
+                mock_settings.api.openrouter_base_url = "https://openrouter.ai/api/v1"
+                mock_settings.api.get_openrouter_headers.return_value = {}
+                mock_settings.trading.ai_temperature = 0
+                mock_settings.trading.ai_max_tokens = 8000
+                mock_settings.trading.daily_ai_cost_limit = 50.0
+
+                client = OpenRouterClient()
+
+        with patch("src.clients.openrouter_client.asyncio.sleep", AsyncMock()):
+            content, _metadata = await client._request_chat_completion(
+                messages=[{"role": "user", "content": "hello"}],
+                model="anthropic/claude-sonnet-4.5",
+                max_tokens=3000,
+            )
+
+        assert content == '{"status":"ok"}'
+        first_call = async_client.chat.completions.create.await_args_list[0].kwargs
+        second_call = async_client.chat.completions.create.await_args_list[1].kwargs
+        assert first_call["max_tokens"] == 3000
+        assert 0 < second_call["max_tokens"] < 2349
 
     @pytest.mark.asyncio
     async def test_get_trading_decision_uses_structured_outputs(self):

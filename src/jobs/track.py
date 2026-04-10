@@ -16,6 +16,10 @@ from src.utils.database import DatabaseManager, Position, TradeLog
 from src.config.settings import settings
 from src.utils.logging_setup import setup_logging, get_trading_logger
 from src.clients.kalshi_client import KalshiClient
+from src.strategies.quick_flip_scalping import (
+    QuickFlipConfig,
+    manage_live_quick_flip_positions,
+)
 from src.utils.kalshi_normalization import (
     get_market_result,
     get_market_status,
@@ -146,6 +150,40 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
     kalshi_client = KalshiClient()
 
     try:
+        quick_flip_results = await manage_live_quick_flip_positions(
+            db_manager=db_manager,
+            kalshi_client=kalshi_client,
+            config=QuickFlipConfig(
+                min_entry_price=settings.trading.quick_flip_min_entry_price,
+                max_entry_price=settings.trading.quick_flip_max_entry_price,
+                min_profit_margin=settings.trading.quick_flip_min_profit_margin,
+                max_position_size=settings.trading.quick_flip_max_position_size,
+                max_concurrent_positions=settings.trading.quick_flip_max_concurrent_positions,
+                capital_per_trade=settings.trading.quick_flip_capital_per_trade,
+                confidence_threshold=settings.trading.quick_flip_confidence_threshold,
+                max_hold_minutes=settings.trading.quick_flip_max_hold_minutes,
+                min_market_volume=settings.trading.quick_flip_min_market_volume,
+                max_hours_to_expiry=settings.trading.quick_flip_max_hours_to_expiry,
+                max_bid_ask_spread=settings.trading.quick_flip_max_bid_ask_spread,
+                min_orderbook_depth_contracts=settings.trading.quick_flip_min_top_of_book_size,
+                min_net_profit_per_trade=settings.trading.quick_flip_min_net_profit,
+                min_net_roi=settings.trading.quick_flip_min_net_roi,
+                recent_trade_window_seconds=settings.trading.quick_flip_recent_trade_window_seconds,
+                min_recent_trade_count=settings.trading.quick_flip_min_recent_trade_count,
+                max_target_vs_recent_trade_gap=settings.trading.quick_flip_max_target_vs_recent_trade_gap,
+                maker_entry_timeout_seconds=settings.trading.quick_flip_maker_entry_timeout_seconds,
+                maker_entry_poll_seconds=settings.trading.quick_flip_maker_entry_poll_seconds,
+                maker_entry_reprice_seconds=settings.trading.quick_flip_maker_entry_reprice_seconds,
+                dynamic_exit_reprice_seconds=settings.trading.quick_flip_dynamic_exit_reprice_seconds,
+                stop_loss_pct=settings.trading.quick_flip_stop_loss_pct,
+            ),
+        )
+        logger.info(
+            "Quick flip dynamic exit management complete",
+            orders_adjusted=quick_flip_results.get("orders_adjusted", 0),
+            losses_cut=quick_flip_results.get("losses_cut", 0),
+        )
+
         # Step 1: Place sell limit orders for profit-taking and stop-loss
         from src.jobs.execute import place_profit_taking_orders, place_stop_loss_orders
         
@@ -181,6 +219,9 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
         exits_executed = 0
         for position in open_positions:
             try:
+                if position.strategy == "quick_flip_scalping":
+                    continue
+
                 # Get current market data
                 market_response = await kalshi_client.get_market(position.market_id)
                 market_data = market_response.get('market', {})

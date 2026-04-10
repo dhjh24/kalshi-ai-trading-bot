@@ -66,6 +66,8 @@ class BeastModeBot:
         self.dashboard_mode = dashboard_mode
         self.logger = get_trading_logger("beast_mode_bot")
         self.shutdown_event = asyncio.Event()
+        self.background_tasks: list[asyncio.Task] = []
+        self.model_router: Optional[ModelRouter] = None
         
         # Set live trading in settings
         settings.trading.live_trading_enabled = live_mode
@@ -86,6 +88,56 @@ class BeastModeBot:
         else:
             self.logger.info("📝 Paper trading mode - orders will be simulated")
 
+    def request_shutdown(self) -> None:
+        """Request a clean shutdown for any in-flight runtime."""
+        if not self.shutdown_event.is_set():
+            self.logger.info("Shutdown requested")
+            self.shutdown_event.set()
+        for task in list(self.background_tasks):
+            if not task.done():
+                task.cancel()
+
+    async def _cleanup_runtime(self, kalshi_client: Optional[KalshiClient] = None) -> None:
+        """Cancel background tasks and close shared clients."""
+        self.request_shutdown()
+        if self.background_tasks:
+            await asyncio.gather(*self.background_tasks, return_exceptions=True)
+            self.background_tasks = []
+
+        if self.model_router is not None:
+            await self.model_router.close()
+            self.model_router = None
+
+        if kalshi_client is not None:
+            await kalshi_client.close()
+
+    async def run_single_cycle(self):
+        """Run one ingestion plus one trading pass, then exit."""
+        self.logger.info("ðŸ§ª Starting single-cycle safety run")
+        db_manager = DatabaseManager()
+        await self._ensure_database_ready(db_manager)
+
+        market_queue = asyncio.Queue()
+        self.logger.info("ðŸ“¥ Running single ingestion pass before trading")
+        await run_ingestion(db_manager, market_queue)
+
+        results = await run_trading_job()
+        self.logger.info("âœ… Single-cycle safety run complete")
+        return results
+
+    async def run_smoke_test(self):
+        """Run a no-LLM smoke test to validate startup and shutdown paths."""
+        self.logger.info("Starting no-LLM smoke test")
+        db_manager = DatabaseManager()
+        await self._ensure_database_ready(db_manager)
+
+        market_queue = asyncio.Queue()
+        self.logger.info("Running single ingestion pass for smoke test")
+        await run_ingestion(db_manager, market_queue)
+
+        self.logger.info("Smoke test complete without entering AI trading")
+        return {"ingestion_completed": True}
+
     async def run_dashboard_mode(self):
         """Run in live dashboard mode with real-time updates."""
         try:
@@ -101,6 +153,7 @@ class BeastModeBot:
 
     async def run_trading_mode(self):
         """Run the Beast Mode trading system with all strategies."""
+        kalshi_client: Optional[KalshiClient] = None
         try:
             self.logger.info("🚀 BEAST MODE TRADING BOT STARTED")
             self.logger.info(f"📊 Trading Mode: {'LIVE' if self.live_mode else 'PAPER'}")
@@ -140,7 +193,7 @@ class BeastModeBot:
             
             # Run remaining background tasks
             self.logger.info("🚀 Starting trading and monitoring tasks...")
-            tasks = [
+            self.background_tasks = [
                 ingestion_task,  # Already started
                 asyncio.create_task(self._run_trading_cycles(db_manager, kalshi_client)),
                 asyncio.create_task(self._run_position_tracking(db_manager, kalshi_client)),
@@ -150,25 +203,26 @@ class BeastModeBot:
             # Setup shutdown handler
             def signal_handler():
                 self.logger.info("🛑 Shutdown signal received")
-                self.shutdown_event.set()
-                for task in tasks:
-                    task.cancel()
+                self.request_shutdown()
             
             # Handle Ctrl+C gracefully
             for sig in [signal.SIGINT, signal.SIGTERM]:
                 signal.signal(sig, lambda s, f: signal_handler())
             
             # Wait for shutdown or completion
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*self.background_tasks, return_exceptions=True)
             
-            await self.model_router.close()
-            await kalshi_client.close()
             
             self.logger.info("🏁 Beast Mode Bot shut down gracefully")
             
+        except asyncio.CancelledError:
+            self.logger.info("Trading mode cancelled")
+            raise
         except Exception as e:
             self.logger.error(f"Error in Beast Mode Bot: {e}")
             raise
+        finally:
+            await self._cleanup_runtime(kalshi_client)
 
     async def _ensure_database_ready(self, db_manager: DatabaseManager):
         """Ensure database is fully initialized before starting any tasks."""

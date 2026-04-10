@@ -295,6 +295,7 @@ class SafeCompounder:
         bal = await self.client.get_balance()
         portfolio = int(round(get_portfolio_value_dollars(bal) * 100))
         cash = int(round(get_balance_dollars(bal) * 100))
+        account_value = portfolio + cash
 
         print(f"\n💰 Cash: ${cash/100:.2f} | Portfolio: ${portfolio/100:.2f} | "
               f"Total: ${(cash+portfolio)/100:.2f}\n", flush=True)
@@ -334,7 +335,7 @@ class SafeCompounder:
 
         # Step 4: Place orders
         print(f"\n🚀 Step 4: Placing maker orders (ask - $0.01)...", flush=True)
-        stats = await self._place_resting_orders(sorted_opps, portfolio, cash)
+        stats = await self._place_resting_orders(sorted_opps, account_value, cash)
 
         elapsed = time.time() - start
         bal = await self.client.get_balance()
@@ -606,7 +607,7 @@ class SafeCompounder:
         return opportunities
 
     async def _place_resting_orders(
-        self, opportunities: List[Dict], portfolio: int, cash: int
+        self, opportunities: List[Dict], account_value: int, cash: int
     ) -> Dict:
         """Place NO-side resting orders at lowest_ask - 1¢."""
         # Get existing positions and orders
@@ -630,12 +631,13 @@ class SafeCompounder:
             "placed": 0,
             "skipped_existing": 0,
             "skipped_size": 0,
-            "filled": 0,
+            "filled": 0.0,
             "errors": 0,
             "total_potential_profit": 0,
             "total_deployed": 0,
         }
 
+        portfolio = account_value
         print(
             f"\n{'='*70}\nPLACING MAKER ORDERS — Portfolio: ${portfolio/100:.2f} | "
             f"Cash: ${cash/100:.2f} | {'DRY RUN' if self.dry_run else 'LIVE'}\n"
@@ -651,7 +653,7 @@ class SafeCompounder:
                 stats["skipped_existing"] += 1
                 continue
 
-            contracts = self._calculate_position_size(opp, portfolio, cash)
+            contracts = self._calculate_position_size(opp, account_value, cash)
             if contracts < 1:
                 stats["skipped_size"] += 1
                 continue
@@ -696,7 +698,7 @@ class SafeCompounder:
                 )
                 order = r.get("order", {})
                 status = order.get("status", "?")
-                filled = int(get_order_fill_count(order))
+                filled = get_order_fill_count(order)
 
                 if filled > 0:
                     stats["filled"] += filled
@@ -725,24 +727,32 @@ class SafeCompounder:
 
         return stats
 
-    def _calculate_position_size(self, opp: Dict, portfolio: int, cash: int) -> int:
-        """Size each position using Kelly or fixed fraction."""
-        max_position_value = int(portfolio * self.max_position_pct)
+    def _calculate_position_size(self, opp: Dict, account_value: int, cash: int) -> int:
+        """Size each position using total account equity, capped by available cash."""
+        max_position_value = int(account_value * self.max_position_pct)
+        if max_position_value <= 0 or cash <= 0:
+            return 0
+
         price = opp["our_price"]  # Already in dollar format
+        price_cents = int(round(price * 100))
+        if price_cents <= 0:
+            return 0
 
         if self.use_kelly:
             true_prob = opp["true_no_prob"]  # Already in 0-1 format
             odds = (1.0 - price) / price  # Dollar format
             kf = kelly_fraction(true_prob, odds)
             half_kelly_f = kf * 0.5
-            kelly_position = int(portfolio * half_kelly_f)
+            kelly_position = int(account_value * half_kelly_f)
             position_value = min(kelly_position, max_position_value)
         else:
             position_value = max_position_value
 
-        # Convert price to cents for position calculation
-        price_cents = int(price * 100)
-        contracts = max(1, position_value // price_cents)
+        position_value = min(position_value, cash)
+        if position_value < price_cents:
+            return 0
+
+        contracts = position_value // price_cents
         contracts = min(contracts, 200)
         return contracts
 

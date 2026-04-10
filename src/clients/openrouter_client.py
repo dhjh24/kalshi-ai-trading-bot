@@ -293,6 +293,8 @@ class OpenRouterClient(TradingLoggerMixin):
     @staticmethod
     def _is_retryable_error(exc: Exception) -> bool:
         error_str = str(exc).lower()
+        if OpenRouterClient._extract_affordable_max_tokens(exc) is not None:
+            return True
         return any(
             indicator in error_str
             for indicator in [
@@ -309,6 +311,21 @@ class OpenRouterClient(TradingLoggerMixin):
                 "connection reset",
             ]
         )
+
+    @staticmethod
+    def _extract_affordable_max_tokens(exc: Exception) -> Optional[int]:
+        """Parse OpenRouter credit errors that indicate a smaller token cap will work."""
+        match = re.search(r"can only afford\s+(\d+)", str(exc), re.IGNORECASE)
+        if not match:
+            return None
+
+        affordable_tokens = int(match.group(1))
+        if affordable_tokens <= 0:
+            return None
+
+        safety_margin = max(16, min(128, affordable_tokens // 20))
+        reduced_tokens = affordable_tokens - safety_margin
+        return reduced_tokens if reduced_tokens > 0 else None
 
     def _backoff_delay(self, attempt: int) -> float:
         """Compute exponential backoff delay for *attempt* (0-based)."""
@@ -574,6 +591,7 @@ class OpenRouterClient(TradingLoggerMixin):
                     tracker.error_count += 1
 
                 is_retryable = self._is_retryable_error(exc)
+                affordable_max_tokens = self._extract_affordable_max_tokens(exc)
                 self.logger.warning(
                     "OpenRouter request failed",
                     model=model,
@@ -582,6 +600,26 @@ class OpenRouterClient(TradingLoggerMixin):
                     retryable=is_retryable,
                     error=str(exc),
                 )
+
+                if (
+                    affordable_max_tokens is not None
+                    and attempt < self.MAX_RETRIES_PER_REQUEST - 1
+                ):
+                    requested_max_tokens = request_kwargs.get("max_tokens")
+                    if (
+                        isinstance(requested_max_tokens, int)
+                        and affordable_max_tokens < requested_max_tokens
+                    ):
+                        request_kwargs["max_tokens"] = affordable_max_tokens
+                        self.logger.info(
+                            "Retrying OpenRouter request with reduced max_tokens",
+                            model=model,
+                            attempt=attempt + 1,
+                            requested_max_tokens=requested_max_tokens,
+                            affordable_max_tokens=affordable_max_tokens,
+                        )
+                        await asyncio.sleep(self._backoff_delay(attempt))
+                        continue
 
                 if is_retryable and attempt < self.MAX_RETRIES_PER_REQUEST - 1:
                     delay = self._backoff_delay(attempt)

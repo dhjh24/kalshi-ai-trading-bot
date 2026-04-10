@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 from src.config.settings import settings
-from src.utils.kalshi_normalization import format_price_dollars
+from src.utils.kalshi_normalization import format_count_fp, format_price_dollars
 from src.utils.logging_setup import TradingLoggerMixin
 
 
@@ -307,6 +307,30 @@ class KalshiClient(TradingLoggerMixin):
             require_auth=False,
         )
 
+    async def get_market_trades(
+        self,
+        ticker: str,
+        limit: int = 100,
+        min_ts: Optional[int] = None,
+        max_ts: Optional[int] = None,
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get recent public trades for a specific market."""
+        params: Dict[str, Any] = {"ticker": ticker, "limit": limit}
+        if min_ts is not None:
+            params["min_ts"] = int(min_ts)
+        if max_ts is not None:
+            params["max_ts"] = int(max_ts)
+        if cursor:
+            params["cursor"] = cursor
+
+        return await self._make_authenticated_request(
+            "GET",
+            "/trade-api/v2/markets/trades",
+            params=params,
+            require_auth=False,
+        )
+
     async def get_historical_cutoff(self) -> Dict[str, Any]:
         """Get the Kalshi live/historical data cutoff."""
         return await self._make_authenticated_request(
@@ -363,7 +387,7 @@ class KalshiClient(TradingLoggerMixin):
         client_order_id: str,
         side: str,
         action: str,
-        count: int,
+        count: float,
         type_: str = "limit",
         yes_price: Optional[int] = None,
         no_price: Optional[int] = None,
@@ -377,14 +401,18 @@ class KalshiClient(TradingLoggerMixin):
         sell_position_floor: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Place a docs-compatible limit order."""
+        normalized_count = format_count_fp(count)
         order_data: Dict[str, Any] = {
             "ticker": ticker,
             "client_order_id": client_order_id,
             "side": side,
             "action": action,
-            "count": int(count),
             "type": type_,
         }
+        if normalized_count.endswith(".00"):
+            order_data["count"] = int(float(normalized_count))
+        else:
+            order_data["count_fp"] = normalized_count
 
         if yes_price_dollars is not None:
             order_data["yes_price_dollars"] = format_price_dollars(yes_price_dollars)

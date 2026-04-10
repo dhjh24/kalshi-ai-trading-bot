@@ -26,7 +26,7 @@ async def test_execute_position_places_live_order():
         market_id="LIVE-TEST-1",
         side="YES",
         entry_price=0.60,
-        quantity=10,
+        quantity=11,
         timestamp=datetime.now(),
         rationale="Test rationale",
         confidence=0.80,
@@ -54,7 +54,7 @@ async def test_execute_position_places_live_order():
             "order": {
                 "order_id": "test-order-123",
                 "status": "filled",
-                "fill_count_fp": "10",
+                "fill_count_fp": "10.95",
                 "yes_price_dollars": "0.6000",
             }
         }
@@ -66,7 +66,7 @@ async def test_execute_position_places_live_order():
                     "ticker": "LIVE-TEST-1",
                     "client_order_id": "ignored",
                     "order_id": "test-order-123",
-                    "count_fp": "10",
+                    "count_fp": "10.95",
                     "yes_price_dollars": "0.6000",
                     "purchased_side": "yes",
                 }
@@ -94,7 +94,7 @@ async def test_execute_position_places_live_order():
         call_args = mock_kalshi_client.place_order.call_args
         assert call_args.kwargs['ticker'] == "LIVE-TEST-1"
         assert call_args.kwargs['side'] == "yes"
-        assert call_args.kwargs['count'] == 10
+        assert call_args.kwargs['count'] == 11
         assert call_args.kwargs['time_in_force'] == "fill_or_kill"
         assert call_args.kwargs['type_'] == "limit"
         assert 'yes_price_dollars' in call_args.kwargs
@@ -104,11 +104,52 @@ async def test_execute_position_places_live_order():
         assert updated_position is not None, "Position should still exist."
         assert updated_position.live == True, "Position should be marked as live."
         assert updated_position.id == position_id
+        assert updated_position.quantity == pytest.approx(10.95)
 
     finally:
         # Teardown
         if os.path.exists(db_path):
             os.remove(db_path) 
+
+
+async def test_execute_position_paper_mode_keeps_position_non_live():
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+
+    test_position = Position(
+        market_id="PAPER-TEST-1",
+        side="YES",
+        entry_price=0.25,
+        quantity=4,
+        timestamp=datetime.now(),
+        rationale="Paper trade",
+        confidence=0.70,
+        live=False,
+    )
+    position_id = await db_manager.add_position(test_position)
+    test_position.id = position_id
+
+    try:
+        result = await execute_position(
+            position=test_position,
+            live_mode=False,
+            db_manager=db_manager,
+            kalshi_client=AsyncMock(),
+        )
+
+        assert result is True
+        updated_position = await db_manager.get_position_by_market_id("PAPER-TEST-1")
+        assert updated_position is not None
+        assert updated_position.live is False
+        assert updated_position.quantity == pytest.approx(4)
+        assert updated_position.entry_price == pytest.approx(0.25)
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
 
 
 async def test_sell_limit_order_functionality():
