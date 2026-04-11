@@ -13,7 +13,7 @@ from time import monotonic
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from src.clients.kalshi_client import KalshiClient
 from src.clients.model_router import ModelRouter
@@ -27,13 +27,17 @@ _live_trade_inflight: Dict[str, asyncio.Task[Dict[str, Any]]] = {}
 
 
 class EventAnalysisRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     event_ticker: str = Field(min_length=1)
-    use_web_research: bool = True
+    use_web_research: bool = Field(default=True, alias="useWebResearch")
 
 
 class MarketAnalysisRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     ticker: str = Field(min_length=1)
-    use_web_research: bool = True
+    use_web_research: bool = Field(default=True, alias="useWebResearch")
 
 
 class BridgeState:
@@ -180,6 +184,37 @@ async def _event_snapshot_from_event_ticker(
     event_ticker: str,
 ) -> Dict[str, Any]:
     """Build a dashboard-style event snapshot from a Kalshi event ticker."""
+    now = datetime.now(timezone.utc)
+
+    markets_response = await state.kalshi_client.get_markets(
+        event_ticker=event_ticker,
+        status="open",
+        limit=200,
+    )
+    raw_markets = markets_response.get("markets") or []
+    if raw_markets:
+        sample_market = raw_markets[0]
+        synthetic_event = {
+            "event_ticker": event_ticker,
+            "series_ticker": str(sample_market.get("series_ticker") or ""),
+            "title": str(sample_market.get("title") or event_ticker),
+            "sub_title": str(
+                sample_market.get("subtitle")
+                or sample_market.get("yes_sub_title")
+                or ""
+            ),
+            "category": sample_market.get("category"),
+            "markets": raw_markets,
+        }
+        snapshot = state.research_service._build_event_snapshot(
+            synthetic_event,
+            now=now,
+            normalized_filters=set(),
+            max_hours_to_expiry=24 * 365,
+        )
+        if snapshot is not None:
+            return snapshot
+
     response = await state.kalshi_client.get_events(
         event_ticker=event_ticker,
         with_nested_markets=True,
@@ -192,7 +227,7 @@ async def _event_snapshot_from_event_ticker(
 
     snapshot = state.research_service._build_event_snapshot(
         raw_event,
-        now=datetime.now(timezone.utc),
+        now=now,
         normalized_filters=set(),
         max_hours_to_expiry=24 * 365,
     )

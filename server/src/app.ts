@@ -15,6 +15,10 @@ import { queueAnalysisRequest } from "./services/analysisService.js";
 import { liveStreamHub } from "./services/liveStreamHub.js";
 
 const streamTopicSchema = z.enum(["markets", "btc", "scores", "analysis"]);
+const dashboardOrigins = new Set([
+  "http://127.0.0.1:3000",
+  "http://localhost:3000"
+]);
 
 export async function buildServer() {
   const app = Fastify({
@@ -22,10 +26,7 @@ export async function buildServer() {
   });
 
   await app.register(cors, {
-    origin: [
-      "http://127.0.0.1:3000",
-      "http://localhost:3000"
-    ]
+    origin: Array.from(dashboardOrigins)
   });
 
   app.get("/health", async () => ({
@@ -121,10 +122,15 @@ export async function buildServer() {
     const { topic } = z
       .object({ topic: streamTopicSchema })
       .parse(request.params);
+    const origin = typeof request.headers.origin === "string" ? request.headers.origin : null;
 
     reply.raw.setHeader("Content-Type", "text/event-stream");
     reply.raw.setHeader("Cache-Control", "no-cache, no-transform");
     reply.raw.setHeader("Connection", "keep-alive");
+    if (origin && dashboardOrigins.has(origin)) {
+      reply.raw.setHeader("Access-Control-Allow-Origin", origin);
+      reply.raw.setHeader("Vary", "Origin");
+    }
     reply.raw.flushHeaders?.();
     reply.hijack();
 

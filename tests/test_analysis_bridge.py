@@ -78,6 +78,55 @@ def test_event_analysis_contract(monkeypatch):
     assert "response" in payload
 
 
+def test_event_analysis_accepts_camel_case_web_research(monkeypatch):
+    async def fake_initialize(self):
+        return None
+
+    async def fake_close(self):
+        return None
+
+    async def fake_snapshot(_state, event_ticker):
+        return {"event_ticker": event_ticker, "title": "Test event"}
+
+    async def fake_analysis(_state, snapshot, use_web_research, target_ticker=None):
+        assert use_web_research is False
+        return {
+            "event_ticker": snapshot["event_ticker"],
+            "focus_ticker": target_ticker,
+            "provider": "openai",
+            "model": "openai/gpt-5.4",
+            "cost_usd": 0.0,
+            "sources": [],
+            "response": {
+                "analysis": None,
+                "used_web_research": use_web_research,
+            },
+        }
+
+    monkeypatch.setattr(bridge_main.BridgeState, "initialize", fake_initialize)
+    monkeypatch.setattr(bridge_main.BridgeState, "close", fake_close)
+    monkeypatch.setattr(
+        bridge_main,
+        "_event_snapshot_from_event_ticker",
+        fake_snapshot,
+    )
+    monkeypatch.setattr(
+        bridge_main,
+        "_run_analysis_for_event_snapshot",
+        fake_analysis,
+    )
+
+    with TestClient(bridge_main.app) as client:
+        response = client.post(
+            "/analysis/event",
+            json={"event_ticker": "KXTEST-EVENT", "useWebResearch": False},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["response"]["used_web_research"] is False
+
+
 def test_live_trade_events_contract(monkeypatch):
     async def fake_initialize(self):
         return None

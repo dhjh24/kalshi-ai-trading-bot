@@ -21,6 +21,16 @@ interface TeamDirectoryItem {
   aliases: string[];
 }
 
+const LEAGUE_HINTS: Record<LeagueKey, string[]> = {
+  MLB: ["baseball", "mlb", "world series"],
+  NBA: ["basketball", "nba", "finals"],
+  WNBA: ["basketball", "wnba"],
+  NFL: ["football", "nfl", "pro football", "super bowl", "championship game"],
+  NHL: ["hockey", "nhl", "stanley cup"],
+  NCAAB: ["college basketball", "ncaab", "march madness"],
+  NCAAF: ["college football", "ncaaf", "bowl game"]
+};
+
 const teamDirectoryCache = new TTLCache<TeamDirectoryItem[]>(1000 * 60 * 60);
 const scoreboardCache = new TTLCache<Record<string, unknown>>(20000);
 const scheduleCache = new TTLCache<Record<string, unknown>>(60000);
@@ -57,23 +67,47 @@ async function fetchTeamDirectory(leagueKey: LeagueKey): Promise<TeamDirectoryIt
     const displayName = String(team.displayName || "");
     const shortDisplayName = String(team.shortDisplayName || "");
     const abbreviation = String(team.abbreviation || "");
-    const aliases = Array.from(
-      new Set(
-        [displayName, shortDisplayName, abbreviation, String(team.name || "")]
-          .map(normalizeText)
-          .filter(Boolean)
-      )
-    );
 
     return {
       id: String(team.id || ""),
       displayName,
       abbreviation,
-      aliases
+      aliases: Array.from(
+        new Set(
+          [
+            displayName,
+            shortDisplayName,
+            abbreviation,
+            String(team.name || ""),
+            String(team.location || "")
+          ]
+            .map(normalizeText)
+            .filter(Boolean)
+        )
+      )
     };
   });
 
-  return teamDirectoryCache.set(leagueKey, normalized);
+  const aliasCounts = new Map<string, number>();
+  normalized.forEach((team) => {
+    team.aliases.forEach((alias) => {
+      aliasCounts.set(alias, (aliasCounts.get(alias) || 0) + 1);
+    });
+  });
+
+  const dedupedAliases = normalized.map((team) => ({
+    ...team,
+    aliases: team.aliases.filter((alias) => {
+      if (!alias.includes(" ")) {
+        return true;
+      }
+
+      // Keep city/location aliases only when they identify exactly one team.
+      return (aliasCounts.get(alias) || 0) === 1 || alias === normalizeText(team.displayName);
+    })
+  }));
+
+  return teamDirectoryCache.set(leagueKey, dedupedAliases);
 }
 
 async function fetchScoreboard(leagueKey: LeagueKey): Promise<Record<string, unknown>> {
@@ -130,23 +164,39 @@ async function matchTeamsFromTitle(
   title: string
 ): Promise<{ league: LeagueKey; teams: TeamDirectoryItem[] } | null> {
   const normalizedTitle = normalizeText(title);
+  const titleTokens = normalizedTitle.split(" ").filter(Boolean);
   let bestMatch: { league: LeagueKey; teams: TeamDirectoryItem[]; score: number } | null =
     null;
 
   for (const leagueKey of Object.keys(SPORTS_LEAGUE_ENDPOINTS) as LeagueKey[]) {
     const directory = await fetchTeamDirectory(leagueKey);
-    const matched = directory.filter((team) =>
-      team.aliases.some((alias) => alias && normalizedTitle.includes(alias))
+    const matched = directory
+      .map((team) => ({
+        team,
+        score: team.aliases.reduce<number>((bestScore, alias) => {
+          const aliasScore = scoreAliasMatch(titleTokens, alias);
+          return aliasScore === null ? bestScore : Math.max(bestScore, aliasScore);
+        }, 0)
+      }))
+      .filter((item) => item.score > 0)
+      .sort((left, right) => right.score - left.score);
+    const deduped = Array.from(
+      new Map(matched.map((item) => [item.team.id, item])).values()
     );
-    const deduped = Array.from(new Map(matched.map((team) => [team.id, team])).values());
 
     if (deduped.length < 2) {
       continue;
     }
 
-    const score = deduped.length * 10;
+    const hintBonus = LEAGUE_HINTS[leagueKey].reduce(
+      (sum, hint) => sum + (normalizedTitle.includes(hint) ? 25 : 0),
+      0
+    );
+    const score =
+      hintBonus + deduped.slice(0, 2).reduce((sum, item) => sum + item.score, 0);
+
     if (!bestMatch || score > bestMatch.score) {
-      bestMatch = { league: leagueKey, teams: deduped.slice(0, 2), score };
+      bestMatch = { league: leagueKey, teams: deduped.slice(0, 2).map((item) => item.team), score };
     }
   }
 
@@ -158,6 +208,45 @@ async function matchTeamsFromTitle(
     league: bestMatch.league,
     teams: bestMatch.teams
   };
+}
+
+function scoreAliasMatch(titleTokens: string[], alias: string): number | null {
+  const aliasTokens = normalizeText(alias).split(" ").filter(Boolean);
+  if (aliasTokens.length === 0 || titleTokens.length < aliasTokens.length) {
+    return null;
+  }
+
+  for (let start = 0; start <= titleTokens.length - aliasTokens.length; start += 1) {
+    let matched = true;
+
+    for (let index = 0; index < aliasTokens.length; index += 1) {
+      const titleToken = titleTokens[start + index];
+      const aliasToken = aliasTokens[index];
+
+      if (titleToken === aliasToken) {
+        continue;
+      }
+
+      const isLastToken = index === aliasTokens.length - 1;
+      if (
+        isLastToken &&
+        aliasTokens.length > 1 &&
+        titleToken.length > 0 &&
+        aliasToken.startsWith(titleToken)
+      ) {
+        continue;
+      }
+
+      matched = false;
+      break;
+    }
+
+    if (matched) {
+      return aliasTokens.length === 1 ? 6 : 10 + aliasTokens.length;
+    }
+  }
+
+  return null;
 }
 
 function findRelevantEvent(
@@ -204,10 +293,32 @@ function extractRecentResults(
       opponent: String(
         (opponent?.team as Record<string, unknown> | undefined)?.displayName || "TBD"
       ),
-      result: String(teamEntry?.winner ? "W" : "L"),
-      score: `${teamEntry?.score || "-"}-${opponent?.score || "-"}`
+      result:
+        typeof teamEntry?.winner === "boolean" ? (teamEntry.winner ? "W" : "L") : "TBD",
+      score: `${extractCompetitorScore(teamEntry)}-${extractCompetitorScore(opponent)}`
     };
   });
+}
+
+function extractCompetitorScore(competitor: Record<string, unknown> | undefined): string {
+  const score = competitor?.score;
+
+  if (typeof score === "string" || typeof score === "number") {
+    return String(score);
+  }
+
+  if (score && typeof score === "object") {
+    const scoreRecord = score as Record<string, unknown>;
+    if (scoreRecord.displayValue !== undefined && scoreRecord.displayValue !== null) {
+      return String(scoreRecord.displayValue);
+    }
+
+    if (scoreRecord.value !== undefined && scoreRecord.value !== null) {
+      return String(scoreRecord.value);
+    }
+  }
+
+  return "-";
 }
 
 function extractLeaders(summaryPayload: Record<string, unknown>): SportsContext["leaders"] {
@@ -340,8 +451,8 @@ export async function resolveSportsContext(title: string): Promise<SportsContext
             : null,
           clock: statusBlock.displayClock ? String(statusBlock.displayClock) : null,
           period: typeBlock.shortDetail ? String(typeBlock.shortDetail) : null,
-          homeScore: home?.score ? String(home.score) : null,
-          awayScore: away?.score ? String(away.score) : null
+          homeScore: extractCompetitorScore(home),
+          awayScore: extractCompetitorScore(away)
         }
       : null,
     playByPlay: extractPlayByPlay(summaryPayload),
