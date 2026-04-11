@@ -29,17 +29,23 @@ Choose direct OpenAI, OpenRouter, or auto-selection. Swap models with one config
 
 ## 🚀 Quick Start
 
-**Three steps to get running in paper-trading mode (no real money):**
+**Paper-trading plus the new dashboard in a few minutes:**
 
 ```bash
-# 1. Clone and set up
+# 1. Clone the repo
 git clone https://github.com/ryanfrigo/kalshi-ai-trading-bot.git
 cd kalshi-ai-trading-bot
-python setup.py        # creates .venv, installs deps, checks config
+python -m venv .venv
+source .venv/bin/activate        # macOS / Linux
+# .venv\Scripts\activate         # Windows
+pip install -r requirements.txt
+npm install
 
 # 2. Add your API keys
-cp env.template .env   # then open .env and fill in KALSHI_API_KEY
-                       # and OPENROUTER_API_KEY
+cp env.template .env   # then open .env and fill in:
+                       # - KALSHI_API_KEY
+                       # - KALSHI_PRIVATE_KEY_PATH
+                       # - OPENAI_API_KEY and/or OPENROUTER_API_KEY
 
 # 3. Run the AI ensemble (default — 5-model debate on every trade)
 python cli.py run --paper
@@ -54,7 +60,7 @@ Then open the live dashboard in another terminal:
 python cli.py dashboard
 ```
 
-This launches the Node dashboard stack:
+This launches the current dashboard stack:
 
 - `http://127.0.0.1:3000` — Next.js web UI
 - `http://127.0.0.1:4000` — Fastify API with SSE
@@ -62,7 +68,7 @@ This launches the Node dashboard stack:
 
 > **Need API keys?**
 > - Kalshi key + private key → [kalshi.com/account/settings](https://kalshi.com/account/settings) ([API docs](https://docs.kalshi.com/welcome))
-> - OpenAI API key → [platform.openai.com/api-keys](https://platform.openai.com/api-keys) (default provider when configured)
+> - OpenAI API key → [platform.openai.com/api-keys](https://platform.openai.com/api-keys) (used directly when `LLM_PROVIDER=openai`, or preferred by `auto` when present)
 > - Optional OpenRouter key → [openrouter.ai](https://openrouter.ai/) (for Anthropic, Gemini, DeepSeek, Grok, or mixed-provider ensembles)
 
 ---
@@ -98,6 +104,8 @@ This launches the Node dashboard stack:
 
 ### Observability
 - ✅ **Node dashboard stack** — route-based Next.js UI, Fastify API, SSE live updates, and manual analysis requests
+- ✅ **Live trade route** — ranked short-dated events with category filters, BTC context, sports context, and batch analysis controls
+- ✅ **Market and event detail pages** — microstructure, sibling contracts, related news, and one-click manual analysis
 - ✅ **Paper trading mode** — simulate trades without real orders; track outcomes on settled markets
 - ✅ **SQLite telemetry** — every trade, AI decision, and cost metric logged locally
 - ✅ **Unified CLI** — `run`, `dashboard`, `status`, `health`, `scores`, `history` commands
@@ -157,25 +165,13 @@ Every decision is written to a local SQLite database. The dashboard and CLI comm
 ### Prerequisites
 
 - Python 3.12 or later
+- Node.js 24 or later for the dashboard workspace
 - A [Kalshi](https://kalshi.com) account with API access ([API docs](https://docs.kalshi.com/welcome))
-- An [OpenRouter](https://openrouter.ai/) API key — provides all five models (Claude Sonnet 4.5, GPT-5.4, Gemini 3.1 Pro Preview, DeepSeek V3.2, Grok 4.1 Fast) via a single key
+- At least one LLM credential:
+  - `OPENAI_API_KEY` for direct OpenAI routing
+  - `OPENROUTER_API_KEY` for the full multi-provider model fleet
 
-### Automated Setup (Recommended)
-
-```bash
-git clone https://github.com/ryanfrigo/kalshi-ai-trading-bot.git
-cd kalshi-ai-trading-bot
-python setup.py
-```
-
-The setup script will:
-- ✅ Check Python version compatibility
-- ✅ Create virtual environment
-- ✅ Install all dependencies (with Python 3.14 compatibility handling)
-- ✅ Test that the dashboard can run
-- ✅ Print troubleshooting guidance
-
-### Manual Installation
+### Manual Installation (Recommended)
 
 ```bash
 git clone https://github.com/ryanfrigo/kalshi-ai-trading-bot.git
@@ -189,7 +185,14 @@ source .venv/bin/activate        # macOS / Linux
 export PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
 
 pip install -r requirements.txt
+npm install
 ```
+
+### Legacy Python Helper
+
+`python setup.py` is still available as a Python-only environment check, but it does **not**
+install the Node dashboard workspace. For the current app, prefer the manual steps above so
+the CLI dashboard command can launch all three services successfully.
 
 ### Configuration
 
@@ -214,6 +217,13 @@ Place your Kalshi private key as `kalshi_private_key` in the project root, or po
 `LLM_PROVIDER=auto` prefers direct OpenAI access when `OPENAI_API_KEY` is present, and otherwise falls back to OpenRouter.
 ChatGPT/Codex plan access is separate from API-key billing, so this bot still uses API credentials rather than a ChatGPT web-session login.
 
+Common trading and dashboard env vars:
+
+- `PREFERRED_CATEGORIES=Sports` — default market focus for screening
+- `PREFER_LIVE_WAGERING=true` and `LIVE_WAGERING_MAX_HOURS_TO_EXPIRY=12` — bias toward short-dated live opportunities
+- `DAILY_AI_COST_LIMIT=10.0` — hard cap for daily model spend
+- `DB_PATH`, `DASHBOARD_SERVER_PORT`, `ANALYSIS_BRIDGE_URL`, `DASHBOARD_REFRESH_MS` — optional overrides for the dashboard stack
+
 The bot now uses Kalshi's docs-native fixed-point pricing fields (`*_dollars`, `*_fp`) internally and sends limit-only orders. Live entry orders are submitted as fill-or-kill limit orders at the current best ask; exit orders are resting reduce-only limits.
 
 ### Initialize the Database
@@ -235,6 +245,12 @@ python cli.py run --paper
 # AI Ensemble — live trading (real money)
 python cli.py run --live
 
+# Run one bounded cycle and exit
+python cli.py run --once
+
+# Startup + ingestion smoke test (no LLM calls)
+python cli.py run --smoke
+
 # Safe Compounder — conservative, math-only (dry run)
 python cli.py run --safe-compounder
 
@@ -252,15 +268,20 @@ python cli.py health
 
 # Show category scores (which markets are allowed)
 python cli.py scores
+
+# Review recent closed trades
+python cli.py history --limit 100
 ```
 
-Or invoke the bot script directly:
+Direct bot entrypoints still work:
 
 ```bash
 python beast_mode_bot.py              # Paper trading
 python beast_mode_bot.py --live       # Live trading
-python beast_mode_bot.py --dashboard  # Dashboard mode
 ```
+
+Use `python cli.py dashboard` for the current dashboard flow. That command owns the Next.js web app,
+Fastify API, and FastAPI analysis bridge.
 
 ---
 
@@ -314,6 +335,12 @@ kalshi-ai-trading-bot/
 ├── docs/                      # Additional documentation + paper dashboard HTML
 └── tests/                     # Pytest test suite
 ```
+
+Current 2.x additions not shown in the legacy tree above:
+
+- `web/` — Next.js App Router frontend
+- `server/` — Fastify API + SSE streams
+- `python_bridge/` — FastAPI bridge for manual market and event analysis
 
 `src/clients/openai_client.py`, `src/clients/openrouter_client.py`, and `src/clients/model_router.py` now share the active provider-routing path.
 
@@ -583,15 +610,26 @@ grep -i "live trading\|paper trading\|LIVE ORDER\|PAPER TRADE" logs/trading_syst
 <details>
 <summary><strong>Dashboard won't launch / import errors</strong></summary>
 
-Import errors in VS Code are IDE linter warnings, not runtime errors.
+The primary dashboard is now the three-process Node stack. Start from the project root:
 
 ```bash
-# Fix: activate venv, then run from project root
-source .venv/bin/activate
-python beast_mode_dashboard.py
+# install workspace deps if you have not already
+npm install
+
+# then launch the full stack
+python cli.py dashboard
+# or
+npm run dashboard
 ```
 
-Set VS Code Python interpreter to `.venv/bin/python` via `Cmd+Shift+P → Python: Select Interpreter`.
+If it still fails:
+
+- Confirm `node --version` is 24.x or newer
+- Make sure ports `3000`, `4000`, and `8001` are free
+- Activate your Python virtualenv before launching the bridge
+- Run `npm run lint --workspace server` and `npm run lint --workspace web` to surface workspace issues
+
+Legacy Streamlit files remain in the repo for reference, but they are not the primary dashboard path anymore.
 
 </details>
 

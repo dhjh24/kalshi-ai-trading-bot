@@ -1,255 +1,136 @@
-# Trading System Dashboard 📊
+# Trading System Dashboard
 
-The main dashboard entrypoint is now the Node stack:
+The dashboard has moved to a route-based local web stack:
 
-- `web/` — Next.js route-based frontend
-- `server/` — Fastify API + SSE streams
-- `python_bridge/` — FastAPI bridge for manual LLM analysis
+- `web/` - Next.js App Router frontend
+- `server/` - Fastify API plus SSE topics
+- `python_bridge/` - FastAPI bridge for manual market and event analysis
 
-Run it with:
+The old Streamlit dashboard files still exist in the repo, but they are no longer the primary dashboard path.
+
+## Run locally
+
+```bash
+pip install -r requirements.txt
+npm install
+python cli.py dashboard
+```
+
+This starts:
+
+- `http://127.0.0.1:3000` - web UI
+- `http://127.0.0.1:4000` - Fastify API
+- `http://127.0.0.1:8001/health` - analysis bridge health check
+
+You can also run `npm run dashboard` directly from the repo root.
+
+## Current routes
+
+### `/`
+- Portfolio metrics, open exposure, realized P&L, AI spend, ranked markets, latest manual analysis, BTC strip, and live sports scores
+
+### `/live-trade`
+- Ranked short-dated event feed sourced from the Python live-trade workflow
+- Category filters for `Sports`, `Financials`, `Crypto`, and `Economics`
+- Expiry-window filtering and fallback ranking when no events match the strict window
+- Batch queueing for manual event analysis, with optional web research
+
+### `/markets`
+- SQLite-backed market explorer
+- Search/category filtering through the API
+- Fast path into richer detail pages
+
+### `/markets/[ticker]`
+- Market rules, prices, liquidity, and order-flow microstructure
+- Related event links, sibling contracts, related news, and latest stored analysis
+- Sports panels or BTC panels when the market focus type supports them
+
+### `/events/[eventTicker]`
+- Event-level market list, news, sports or crypto context, and one-click event analysis
+
+### `/portfolio`
+- Open positions, recent closed trades, exposure, realized P&L, and AI spend
+
+### `/analysis`
+- Persisted analysis queue for manual market and event requests
+- Live SSE updates for pending, completed, and failed requests
+- Provider, model, cost, summary, and web-research usage visibility
+
+## API and streaming
+
+Key API routes:
+
+- `GET /api/dashboard/overview`
+- `GET /api/markets`
+- `GET /api/markets/:ticker`
+- `GET /api/events/:eventTicker`
+- `GET /api/portfolio`
+- `GET /api/analysis/requests`
+- `GET /api/live-trade`
+- `POST /api/analysis/markets/:ticker`
+- `POST /api/analysis/events/:eventTicker`
+
+SSE route:
+
+- `GET /api/stream/:topic`
+
+Supported stream topics:
+
+- `markets`
+- `btc`
+- `scores`
+- `analysis`
+
+## Analysis workflow
+
+- Page loads never auto-trigger LLM analysis
+- Users explicitly queue market or event analysis from the UI
+- The Fastify server stores the queued request in SQLite immediately
+- The Python bridge runs the analysis through the provider router
+- Results stream back into the UI over SSE and remain available in the analysis history
+
+This keeps the dashboard fast and predictable while still exposing richer AI review tools on demand.
+
+## Data sources
+
+- Kalshi market and event APIs for contracts, order books, and trade summaries
+- Local SQLite telemetry for positions, trades, and historical analysis
+- CoinGecko for BTC spot and OHLC context
+- Sports and news adapters for focus-type enrichment on relevant contracts
+
+## Helpful env vars
+
+- `DB_PATH` - override the SQLite database path
+- `DASHBOARD_SERVER_PORT` - change the Fastify port from `4000`
+- `ANALYSIS_BRIDGE_URL` - point the API at a different analysis bridge
+- `DASHBOARD_REFRESH_MS` - adjust server-side refresh caching
+- `DASHBOARD_NEWS_REFRESH_MS`, `DASHBOARD_SPORTS_REFRESH_MS`, `DASHBOARD_CRYPTO_REFRESH_MS` - tune adapter cache TTLs
+
+## Troubleshooting
+
+### Dashboard does not start
 
 ```bash
 npm install
-npm run dashboard
+python cli.py dashboard
 ```
 
-The legacy Streamlit implementation is still in the repo during migration, but the primary dashboard path is now the Node site.
+Then check:
 
-## 🚀 Features
+- Node.js is `24.x` or newer
+- The Python virtualenv is active
+- Ports `3000`, `4000`, and `8001` are available
+- `npm run lint --workspace server`
+- `npm run lint --workspace web`
 
-### 📈 Overview Page
-- **Real-time metrics**: Portfolio balance, total trades, P&L, active positions
-- **Strategy performance summary**: Visual charts comparing all strategies
-- **Recent activity**: Latest positions and trades
-- **Quick insights**: At-a-glance system health
+### No data appears
 
-### 🎯 Strategy Performance
-- **Detailed analytics**: P&L, win rates, trade counts by strategy
-- **Individual strategy drill-down**: Comprehensive metrics per strategy
-- **Risk-return analysis**: Bubble charts showing performance vs. risk
-- **Capital deployment**: How funds are allocated across strategies
+- Confirm the SQLite database path is correct
+- Run `python cli.py run --paper` once to generate baseline tables and telemetry
+- Verify Kalshi credentials with `python cli.py health`
 
-### 🤖 LLM Analysis & Review
-- **Query tracking**: Every Grok request and response logged
-- **Usage statistics**: Token consumption, costs, query frequency
-- **Strategy breakdown**: LLM usage by trading strategy
-- **Response analysis**: Review AI predictions and confidence levels
-- **Cost monitoring**: Track AI expenses over time
+### Analysis requests stay pending
 
-### 💼 Positions & Trades
-- **Active positions**: Real-time position tracking with filters
-- **Trade history**: Completed trades with performance metrics
-- **Position analytics**: Value distribution and risk analysis
-- **Strategy attribution**: See which strategy created each position
-
-### ⚠️ Risk Management
-- **Portfolio utilization**: How much capital is deployed
-- **Position sizing**: Average and maximum position sizes
-- **Risk alerts**: Automated warnings for high-risk situations
-- **Strategy risk**: Risk breakdown by trading approach
-
-### 🔧 System Health
-- **Connection status**: Kalshi API, database, LLM integration
-- **Activity timeline**: Recent system events and queries
-- **Configuration**: Current system settings
-- **Recommendations**: Automated system optimization suggestions
-
-## 🛠️ Setup & Installation
-
-### Prerequisites
-```bash
-# Install dashboard requirements
-pip install -r dashboard_requirements.txt
-
-# Or install individually
-pip install streamlit pandas plotly
-```
-
-### Quick Start
-```bash
-# Launch the dashboard
-python launch_dashboard.py
-
-# Or run directly with Streamlit
-streamlit run trading_dashboard.py
-```
-
-The dashboard will open automatically in your browser at `http://localhost:8501`
-
-## 📊 Dashboard Sections
-
-### Navigation
-Use the sidebar to navigate between different sections:
-- **📈 Overview**: System summary and key metrics
-- **🎯 Strategy Performance**: Detailed strategy analysis
-- **🤖 LLM Analysis**: AI query review and optimization
-- **💼 Positions & Trades**: Position tracking and history
-- **⚠️ Risk Management**: Risk monitoring and alerts
-- **🔧 System Health**: System status and diagnostics
-
-### Data Refresh
-- **API auto-refresh**: Portfolio, positions, risk, and system-health pages refresh automatically every 30 seconds
-- **Manual LLM pulls**: The LLM Analysis page only updates when you click `Pull Queries`
-- **API reset button**: Use `Refresh API Data` to clear cached API responses immediately without changing the LLM snapshot
-
-## 🤖 LLM Query Tracking
-
-The dashboard automatically tracks and displays:
-
-### What's Logged
-- **Every Grok query**: Complete prompt and response
-- **Strategy attribution**: Which strategy made the query
-- **Query type**: Movement prediction, market analysis, etc.
-- **Market context**: Which market was being analyzed
-- **Kalshi category**: Query rows now show the market category with a live-wagering tag for short-dated sports markets
-- **Costs**: Token usage and monetary cost
-- **Extracted data**: Confidence levels, decisions, etc.
-
-### Query Browser
-- **Manual snapshot**: Pull the latest LLM query history only when you want it
-- **Pagination**: Choose `Number Per Page` and move through results with `Previous Page` and `Next Page`
-- **Filtering**: Filter by strategy, query type, Kalshi category, time range, and live wagering
-- **Sorting**: Sort by timestamp, cost, confidence, strategy, query type, or Kalshi category
-
-### Benefits
-- **Review AI reasoning**: See exactly what Grok is thinking
-- **Optimize prompts**: Identify successful vs. failed queries
-- **Cost management**: Track and control AI expenses
-- **Strategy improvement**: Understand which strategies use AI effectively
-- **Debug issues**: Identify problematic queries or responses
-
-### Example Analysis
-```
-🤖 Quick Flip Scalping | Movement Prediction | 14:23:15
-
-Strategy: quick_flip_scalping
-Type: movement_prediction  
-Market: KXELECTION-2024-TRUMP
-
-Prompt: "QUICK SCALP ANALYSIS for Will Trump win 2024..."
-
-Response: "TARGET_PRICE: 7
-CONFIDENCE: 0.75
-REASON: Recent polling surge suggests upward momentum..."
-
-Cost: $0.0023
-```
-
-## 📈 Strategy Performance Analytics
-
-### Key Metrics Tracked
-- **Total P&L**: Profit/loss by strategy
-- **Win Rate**: Percentage of winning trades
-- **Average Trade Size**: Capital per position
-- **Risk Metrics**: Volatility, maximum drawdown
-- **Capital Efficiency**: Returns per dollar deployed
-
-### Performance Comparison
-- **Side-by-side**: Compare all strategies at once
-- **Risk-return plots**: Visualize performance vs. risk
-- **Capital allocation**: See resource distribution
-- **Trend analysis**: Performance over time
-
-### Strategy Insights
-- **Best performers**: Identify top-earning strategies
-- **Optimization opportunities**: Spot underperforming areas
-- **Resource allocation**: Guide capital distribution decisions
-- **Risk assessment**: Monitor strategy-specific risks
-
-## ⚠️ Risk Management Features
-
-### Automated Alerts
-- **High utilization**: >90% of capital deployed
-- **Large positions**: Single position >20% of portfolio
-- **Missing stops**: Positions without stop-loss protection
-- **Concentration risk**: Too many positions in similar markets
-
-### Risk Monitoring
-- **Real-time tracking**: Continuous risk assessment
-- **Portfolio level**: Overall portfolio risk metrics
-- **Strategy level**: Risk by trading approach
-- **Position level**: Individual trade risk analysis
-
-### Visual Indicators
-- **Color coding**: Green/yellow/red risk levels
-- **Progress bars**: Utilization and exposure metrics
-- **Charts**: Risk distribution and trends
-- **Alerts**: Pop-up warnings for critical issues
-
-## 🔧 Customization
-
-### Configuration
-The dashboard automatically adapts to your trading system configuration. No manual setup required for:
-- Database connections
-- Strategy detection
-- Risk parameters
-- Performance calculations
-
-### Extending the Dashboard
-To add new features:
-
-1. **New metrics**: Add to `load_performance_data()`
-2. **New visualizations**: Create charts in relevant sections
-3. **Custom alerts**: Modify risk management rules
-4. **Additional pages**: Add new sections to the sidebar
-
-## 📱 Mobile-Friendly
-
-The dashboard is responsive and works on:
-- **Desktop browsers**: Full functionality
-- **Tablets**: Optimized layout
-- **Mobile phones**: Essential metrics available
-
-## 🔒 Security
-
-- **Local only**: Dashboard runs locally on your machine
-- **No external data**: All data stays in your local database
-- **No cloud services**: Pure local analysis
-- **API keys**: Never exposed in the dashboard
-
-## 🚀 Performance
-
-- **Efficient caching**: Data cached for optimal performance
-- **Lazy loading**: Charts load as needed
-- **Minimal overhead**: Dashboard doesn't impact trading system
-- **Fast updates**: Sub-second refresh for most metrics
-
-## 💡 Tips & Best Practices
-
-### Optimization
-- **Regular review**: Check dashboard daily for insights
-- **Strategy comparison**: Use performance analytics to guide allocation
-- **LLM analysis**: Review AI queries weekly for optimization opportunities
-- **Risk monitoring**: Set up alerts for key risk thresholds
-
-### Troubleshooting
-- **Missing data**: Ensure trading system is running and database is accessible
-- **Slow loading**: Check database size and consider archiving old data
-- **Connection issues**: Verify Kalshi API credentials and connectivity
-- **LLM data**: New queries will appear after strategies run with updated clients
-
-## 🆘 Support
-
-### Common Issues
-1. **"No data available"**: System needs to run and collect data first
-2. **"LLM queries empty"**: Update XAI client instantiation with db_manager
-3. **"Dashboard won't start"**: Install requirements with `pip install -r dashboard_requirements.txt`
-4. **"Charts not loading"**: Refresh browser or check console for errors
-
-### Getting Help
-- Check the console output for detailed error messages
-- Ensure all dependencies are installed
-- Verify database file exists and is accessible
-- Review system logs for trading system issues
-
----
-
-## 🎯 Quick Start Summary
-
-1. **Install**: `pip install -r dashboard_requirements.txt`
-2. **Launch**: `python launch_dashboard.py`
-3. **Browse**: Navigate to different sections via sidebar
-4. **Analyze**: Review strategy performance and LLM usage
-5. **Optimize**: Use insights to improve trading strategies
-
-The dashboard provides everything you need to monitor, analyze, and optimize your automated trading system! 🚀 
+- Confirm the Python bridge is running on `http://127.0.0.1:8001`
+- Check the terminal where `python cli.py dashboard` is running for bridge errors
+- Verify `OPENAI_API_KEY` and/or `OPENROUTER_API_KEY` are configured in `.env`

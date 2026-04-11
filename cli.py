@@ -4,7 +4,7 @@ Kalshi AI Trading Bot -- Unified CLI
 
 Provides a single entry point for all bot operations:
     python cli.py run          Start the trading bot
-    python cli.py dashboard    Launch the Streamlit monitoring dashboard
+    python cli.py dashboard    Launch the Node dashboard stack
     python cli.py status       Show portfolio balance, positions, and P&L
     python cli.py backtest     Run backtests (placeholder)
     python cli.py health       Verify API connections, database, and configuration
@@ -150,7 +150,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     # DEFAULT: AI Ensemble mode (disciplined settings active)
     print("🤖  AI ENSEMBLE MODE (default)")
-    print("   5-model ensemble: Grok 4.1 · Claude Sonnet 4 · GPT-4.1 · Gemini 2.5 Pro · DeepSeek R1")
+    print("   5-model ensemble: Claude Sonnet 4.5 · Gemini 3.1 Pro Preview · GPT-5.4 · DeepSeek V3.2 · Grok 4.1 Fast")
     print("   Category scoring + portfolio guardrails active.")
     print("   Use --safe-compounder for conservative math-only mode.")
     print("   Use --beast to run without guardrails (not recommended).")
@@ -637,7 +637,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Start the trading bot (disciplined mode by default)",
         description=(
             "Launch the trading bot. Default is AI Ensemble mode: five frontier LLMs "
-            "(Grok 4.1, Claude Sonnet 4, GPT-4.1, Gemini 2.5 Pro, DeepSeek R1) debate "
+            "(Claude Sonnet 4.5, Gemini 3.1 Pro Preview, GPT-5.4, DeepSeek V3.2, Grok 4.1 Fast) debate "
             "every trade with category scoring and portfolio guardrails. "
             "Use --safe-compounder for conservative math-only mode. "
             "Use --beast for aggressive mode without guardrails (not recommended)."
@@ -721,8 +721,8 @@ def build_parser() -> argparse.ArgumentParser:
     # --- dashboard ---
     p_dash = subparsers.add_parser(
         "dashboard",
-        help="Launch the Streamlit monitoring dashboard",
-        description="Open a real-time web dashboard showing portfolio performance, positions, risk metrics, and AI decision logs.",
+        help="Launch the Node dashboard stack",
+        description="Open the Next.js web UI, Fastify API, and FastAPI analysis bridge for the current dashboard experience.",
     )
     p_dash.set_defaults(func=cmd_dashboard)
 

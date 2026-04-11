@@ -1,36 +1,64 @@
 # Node Dashboard
 
-The Streamlit dashboard has been replaced by a three-process Node dashboard stack:
+The current dashboard is a three-service local stack:
 
-- `web/` — Next.js App Router frontend
-- `server/` — Fastify API with SSE streams
-- `python_bridge/` — FastAPI bridge for manual LLM analysis
+- `web/` - Next.js App Router frontend
+- `server/` - Fastify API plus SSE streams
+- `python_bridge/` - FastAPI bridge for manual market and event analysis
 
 ## Run locally
 
 ```bash
+pip install -r requirements.txt
 npm install
+python cli.py dashboard
+```
+
+You can also launch it with:
+
+```bash
 npm run dashboard
 ```
 
-This launches:
+This starts:
 
-- `http://127.0.0.1:3000` — Next.js dashboard
-- `http://127.0.0.1:4000` — Fastify API
-- `http://127.0.0.1:8001/health` — Python analysis bridge
+- `http://127.0.0.1:3000` - Next.js dashboard
+- `http://127.0.0.1:4000` - Fastify API
+- `http://127.0.0.1:8001/health` - Python analysis bridge health endpoint
 
 ## Main routes
 
-- `/` overview
-- `/markets`
-- `/markets/[ticker]`
-- `/events/[eventTicker]`
-- `/portfolio`
-- `/analysis`
+- `/` - overview with portfolio metrics, ranked markets, latest analysis, BTC strip, and live scores
+- `/live-trade` - ranked short-dated event feed with category filters and batch manual analysis
+- `/markets` - SQLite-backed market explorer
+- `/markets/[ticker]` - market detail page with order flow, related event/news, and sports or crypto context
+- `/events/[eventTicker]` - event detail page with related markets, news, and one-click analysis
+- `/portfolio` - current positions, recent trades, exposure, realized P&L, and AI spend
+- `/analysis` - persisted manual analysis queue with live SSE updates
+
+## API surface
+
+- `GET /api/dashboard/overview`
+- `GET /api/markets`
+- `GET /api/markets/:ticker`
+- `GET /api/events/:eventTicker`
+- `GET /api/portfolio`
+- `GET /api/analysis/requests`
+- `GET /api/live-trade`
+- `POST /api/analysis/markets/:ticker`
+- `POST /api/analysis/events/:eventTicker`
+- `GET /api/stream/:topic`
+
+## SSE topics
+
+- `markets`
+- `btc`
+- `scores`
+- `analysis`
 
 ## Notes
 
-- Manual LLM analysis only. Pages never auto-trigger model calls.
-- Kalshi market data remains the source of truth for market contracts.
-- Sports, crypto, and news context are hydrated from replaceable free-first adapters.
-- Existing Python trading jobs continue to run separately in phase 1.
+- Manual LLM analysis only. Page loads never auto-trigger model calls.
+- Kalshi data remains the source of truth for markets and events.
+- Sports, crypto, and news context are hydrated on top of Kalshi data through replaceable service adapters.
+- Existing Python trading jobs still run independently; the dashboard is an observability and manual-analysis surface.
