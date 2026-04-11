@@ -5,7 +5,9 @@ This client mirrors the higher-level interface exposed by ``openrouter_client``
 so the rest of the trading system can switch providers cleanly.
 """
 
+import ast
 import asyncio
+import importlib
 import json
 import os
 import pickle
@@ -15,13 +17,45 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from json_repair import repair_json
 from openai import AsyncOpenAI
 
 from src.clients.xai_client import DailyUsageTracker, TradingDecision
 from src.config.settings import settings
 from src.utils.kalshi_normalization import get_market_prices, get_market_volume
 from src.utils.logging_setup import TradingLoggerMixin, log_error_with_context
+
+
+def repair_json(payload: str) -> str:
+    """Best-effort JSON repair with optional json_repair dependency."""
+    try:
+        module = importlib.import_module("json_repair")
+        external_repair = getattr(module, "repair_json", None)
+        if callable(external_repair):
+            repaired = external_repair(payload)
+            if isinstance(repaired, str):
+                return repaired
+    except Exception:
+        pass
+
+    text = (payload or "").strip()
+    if not text:
+        return ""
+
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
+    text = re.sub(r",\s*([}\]])", r"\1", text)
+
+    try:
+        json.loads(text)
+        return text
+    except Exception:
+        pass
+
+    try:
+        parsed = ast.literal_eval(text)
+        return json.dumps(parsed)
+    except Exception:
+        return ""
 
 
 OPENAI_MODEL_PRICING: Dict[str, Dict[str, float]] = {
