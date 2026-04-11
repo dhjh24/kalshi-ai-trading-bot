@@ -4,6 +4,11 @@ import dotenv from "dotenv";
 dotenv.config({ path: path.join(process.cwd(), "..", ".env") });
 
 const ROOT_DIR = path.resolve(process.cwd(), "..");
+const BRIDGE_HOST =
+  process.env.DASHBOARD_BRIDGE_HOST === "0.0.0.0"
+    ? "127.0.0.1"
+    : process.env.DASHBOARD_BRIDGE_HOST || "127.0.0.1";
+const BRIDGE_PORT = process.env.DASHBOARD_BRIDGE_PORT || 8101;
 
 function resolveDatabasePath(): string {
   const rawValue =
@@ -27,7 +32,7 @@ export const serverConfig = {
   host: process.env.DASHBOARD_SERVER_HOST || "127.0.0.1",
   port: Number(process.env.DASHBOARD_SERVER_PORT || 4000),
   analysisBridgeUrl:
-    process.env.ANALYSIS_BRIDGE_URL || "http://127.0.0.1:8001",
+    process.env.ANALYSIS_BRIDGE_URL || `http://${BRIDGE_HOST}:${BRIDGE_PORT}`,
   kalshiBaseUrl:
     process.env.KALSHI_API_BASE_URL || "https://api.elections.kalshi.com",
   databasePath: path.isAbsolute(resolveDatabasePath())

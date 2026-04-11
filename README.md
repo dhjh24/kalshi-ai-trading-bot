@@ -64,7 +64,7 @@ This launches the current dashboard stack:
 
 - `http://127.0.0.1:3000` — Next.js web UI
 - `http://127.0.0.1:4000` — Fastify API with SSE
-- `http://127.0.0.1:8001` — Python analysis bridge
+- `http://127.0.0.1:8101` — Python analysis bridge
 
 > **Need API keys?**
 > - Kalshi key + private key → [kalshi.com/account/settings](https://kalshi.com/account/settings) ([API docs](https://docs.kalshi.com/welcome))
@@ -222,7 +222,7 @@ Common trading and dashboard env vars:
 - `PREFERRED_CATEGORIES=Sports` — default market focus for screening
 - `PREFER_LIVE_WAGERING=true` and `LIVE_WAGERING_MAX_HOURS_TO_EXPIRY=12` — bias toward short-dated live opportunities
 - `DAILY_AI_COST_LIMIT=10.0` — hard cap for daily model spend
-- `DB_PATH`, `DASHBOARD_SERVER_PORT`, `ANALYSIS_BRIDGE_URL`, `DASHBOARD_REFRESH_MS` — optional overrides for the dashboard stack
+- `DB_PATH`, `DASHBOARD_BRIDGE_PORT`, `DASHBOARD_WEB_PORT`, `DASHBOARD_SERVER_PORT`, `ANALYSIS_BRIDGE_URL`, `DASHBOARD_REFRESH_MS` — optional overrides for the dashboard stack
 
 The bot now uses Kalshi's docs-native fixed-point pricing fields (`*_dollars`, `*_fp`) internally and sends limit-only orders. Live entry orders are submitted as fill-or-kill limit orders at the current best ask; exit orders are resting reduce-only limits.
 
@@ -625,7 +625,7 @@ npm run dashboard
 If it still fails:
 
 - Confirm `node --version` is 24.x or newer
-- Make sure ports `3000`, `4000`, and `8001` are free
+- Make sure ports `3000`, `4000`, and `8101` are free
 - Activate your Python virtualenv before launching the bridge
 - Run `npm run lint --workspace server` and `npm run lint --workspace web` to surface workspace issues
 

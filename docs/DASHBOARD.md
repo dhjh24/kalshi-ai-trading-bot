@@ -20,7 +20,7 @@ This starts:
 
 - `http://127.0.0.1:3000` - web UI
 - `http://127.0.0.1:4000` - Fastify API
-- `http://127.0.0.1:8001/health` - analysis bridge health check
+- `http://127.0.0.1:8101/health` - analysis bridge health check
 
 You can also run `npm run dashboard` directly from the repo root.
 
@@ -101,6 +101,8 @@ This keeps the dashboard fast and predictable while still exposing richer AI rev
 ## Helpful env vars
 
 - `DB_PATH` - override the SQLite database path
+- `DASHBOARD_BRIDGE_PORT` - change the Python bridge port from `8101`
+- `DASHBOARD_WEB_PORT` - change the Next.js web port from `3000`
 - `DASHBOARD_SERVER_PORT` - change the Fastify port from `4000`
 - `ANALYSIS_BRIDGE_URL` - point the API at a different analysis bridge
 - `DASHBOARD_REFRESH_MS` - adjust server-side refresh caching
@@ -119,7 +121,7 @@ Then check:
 
 - Node.js is `24.x` or newer
 - The Python virtualenv is active
-- Ports `3000`, `4000`, and `8001` are available
+- Ports `3000`, `4000`, and `8101` are available
 - `npm run lint --workspace server`
 - `npm run lint --workspace web`
 
@@ -131,6 +133,6 @@ Then check:
 
 ### Analysis requests stay pending
 
-- Confirm the Python bridge is running on `http://127.0.0.1:8001`
+- Confirm the Python bridge is running on `http://127.0.0.1:8101`
 - Check the terminal where `python cli.py dashboard` is running for bridge errors
 - Verify `OPENAI_API_KEY` and/or `OPENROUTER_API_KEY` are configured in `.env`

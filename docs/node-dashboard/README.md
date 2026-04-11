@@ -24,7 +24,7 @@ This starts:
 
 - `http://127.0.0.1:3000` - Next.js dashboard
 - `http://127.0.0.1:4000` - Fastify API
-- `http://127.0.0.1:8001/health` - Python analysis bridge health endpoint
+- `http://127.0.0.1:8101/health` - Python analysis bridge health endpoint
 
 ## Main routes
 
