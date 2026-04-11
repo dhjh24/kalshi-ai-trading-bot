@@ -544,7 +544,10 @@ def cmd_health(args: argparse.Namespace) -> None:
         else:
             fail(f"{var} is missing or placeholder")
 
-    private_key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH", "kalshi_private_key").strip() or "kalshi_private_key"
+    from src.utils.kalshi_auth import resolve_private_key_path
+
+    configured_key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH", "").strip() or "kalshi_private_key"
+    private_key_path = resolve_private_key_path(configured_key_path)
     if Path(private_key_path).exists():
         ok("KALSHI private key file exists", private_key_path)
     else:

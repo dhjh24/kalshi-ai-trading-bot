@@ -61,6 +61,26 @@ class TradeLog:
     id: Optional[int] = None
 
 @dataclass
+class SimulatedOrder:
+    """Represents a locally persisted paper order."""
+    strategy: str
+    market_id: str
+    side: str
+    action: str
+    price: float
+    quantity: float
+    status: str = "resting"
+    live: bool = False
+    order_id: Optional[str] = None
+    placed_at: Optional[datetime] = None
+    filled_at: Optional[datetime] = None
+    filled_price: Optional[float] = None
+    expected_profit: Optional[float] = None
+    target_price: Optional[float] = None
+    position_id: Optional[int] = None
+    id: Optional[int] = None
+
+@dataclass
 class LLMQuery:
     """Represents an LLM query and response for analysis."""
     timestamp: datetime
@@ -183,6 +203,35 @@ class DatabaseManager(TradingLoggerMixin):
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS simulated_orders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    strategy TEXT NOT NULL,
+                    market_id TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    quantity REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'resting',
+                    live BOOLEAN NOT NULL DEFAULT 0,
+                    order_id TEXT,
+                    placed_at TEXT NOT NULL,
+                    filled_at TEXT,
+                    filled_price REAL,
+                    expected_profit REAL,
+                    target_price REAL,
+                    position_id INTEGER
+                )
+            """)
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_simulated_orders_strategy_status "
+                "ON simulated_orders(strategy, status)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_simulated_orders_market "
+                "ON simulated_orders(market_id)"
+            )
 
             await self._migrate_existing_strategy_data(db)
             await db.commit()
@@ -321,6 +370,21 @@ class DatabaseManager(TradingLoggerMixin):
         trade_log_dict["entry_timestamp"] = datetime.fromisoformat(trade_log_dict["entry_timestamp"])
         trade_log_dict["exit_timestamp"] = datetime.fromisoformat(trade_log_dict["exit_timestamp"])
         return TradeLog(**trade_log_dict)
+
+    def _hydrate_simulated_order(self, row: aiosqlite.Row) -> SimulatedOrder:
+        """Convert a database row into a SimulatedOrder dataclass."""
+        order_dict = dict(row)
+        order_dict["quantity"] = self._normalize_quantity(order_dict.get("quantity"))
+        order_dict["live"] = bool(order_dict.get("live", False))
+        placed_at = order_dict.get("placed_at")
+        filled_at = order_dict.get("filled_at")
+        order_dict["placed_at"] = (
+            datetime.fromisoformat(placed_at) if placed_at else None
+        )
+        order_dict["filled_at"] = (
+            datetime.fromisoformat(filled_at) if filled_at else None
+        )
+        return SimulatedOrder(**order_dict)
 
     async def _migrate_existing_strategy_data(self, db: aiosqlite.Connection) -> None:
         """Migrate existing position data to include strategy information."""
@@ -513,10 +577,39 @@ class DatabaseManager(TradingLoggerMixin):
             )
         """)
 
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS simulated_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                strategy TEXT NOT NULL,
+                market_id TEXT NOT NULL,
+                side TEXT NOT NULL,
+                action TEXT NOT NULL,
+                price REAL NOT NULL,
+                quantity REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'resting',
+                live BOOLEAN NOT NULL DEFAULT 0,
+                order_id TEXT,
+                placed_at TEXT NOT NULL,
+                filled_at TEXT,
+                filled_price REAL,
+                expected_profit REAL,
+                target_price REAL,
+                position_id INTEGER
+            )
+        """)
+
         # Create indices for performance
         await db.execute("CREATE INDEX IF NOT EXISTS idx_market_analyses_market_id ON market_analyses(market_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_market_analyses_timestamp ON market_analyses(analysis_timestamp)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_daily_cost_date ON daily_cost_tracking(date)")
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_simulated_orders_strategy_status "
+            "ON simulated_orders(strategy, status)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_simulated_orders_market "
+            "ON simulated_orders(market_id)"
+        )
 
         self.logger.info("Tables created or already exist.")
 
@@ -782,6 +875,108 @@ class DatabaseManager(TradingLoggerMixin):
             """, trade_dict)
             await db.commit()
             self.logger.info(f"Added trade log for market {trade_log.market_id}.")
+
+    async def add_simulated_order(self, order: SimulatedOrder) -> int:
+        """Persist a simulated paper order and return its database id."""
+        order_dict = asdict(order)
+        order_dict["placed_at"] = (
+            order.placed_at.isoformat() if isinstance(order.placed_at, datetime) else datetime.now().isoformat()
+        )
+        order_dict["filled_at"] = (
+            order.filled_at.isoformat() if isinstance(order.filled_at, datetime) else None
+        )
+
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO simulated_orders (
+                    strategy, market_id, side, action, price, quantity, status, live,
+                    order_id, placed_at, filled_at, filled_price, expected_profit,
+                    target_price, position_id
+                ) VALUES (
+                    :strategy, :market_id, :side, :action, :price, :quantity, :status, :live,
+                    :order_id, :placed_at, :filled_at, :filled_price, :expected_profit,
+                    :target_price, :position_id
+                )
+                """,
+                order_dict,
+            )
+            await db.commit()
+            return int(cursor.lastrowid)
+
+    async def get_simulated_orders(
+        self,
+        *,
+        strategy: Optional[str] = None,
+        market_id: Optional[str] = None,
+        side: Optional[str] = None,
+        action: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[SimulatedOrder]:
+        """Return simulated orders filtered by the provided attributes."""
+        query = "SELECT * FROM simulated_orders WHERE 1=1"
+        params: List[Any] = []
+
+        if strategy is not None:
+            query += " AND strategy = ?"
+            params.append(strategy)
+        if market_id is not None:
+            query += " AND market_id = ?"
+            params.append(market_id)
+        if side is not None:
+            query += " AND side = ?"
+            params.append(side)
+        if action is not None:
+            query += " AND action = ?"
+            params.append(action)
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status)
+
+        query += " ORDER BY placed_at"
+
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(query, tuple(params))
+            rows = await cursor.fetchall()
+            return [self._hydrate_simulated_order(row) for row in rows]
+
+    async def update_simulated_order(
+        self,
+        order_id: int,
+        *,
+        status: Optional[str] = None,
+        filled_price: Optional[float] = None,
+        filled_at: Optional[datetime] = None,
+        position_id: Optional[int] = None,
+    ) -> None:
+        """Update a simulated paper order."""
+        updates: List[str] = []
+        params: List[Any] = []
+
+        if status is not None:
+            updates.append("status = ?")
+            params.append(status)
+        if filled_price is not None:
+            updates.append("filled_price = ?")
+            params.append(filled_price)
+        if filled_at is not None:
+            updates.append("filled_at = ?")
+            params.append(filled_at.isoformat())
+        if position_id is not None:
+            updates.append("position_id = ?")
+            params.append(position_id)
+
+        if not updates:
+            return
+
+        params.append(order_id)
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                f"UPDATE simulated_orders SET {', '.join(updates)} WHERE id = ?",
+                tuple(params),
+            )
+            await db.commit()
 
     async def get_performance_by_strategy(self) -> Dict[str, Dict]:
         """

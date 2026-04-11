@@ -3,8 +3,9 @@ import pytest
 from unittest.mock import AsyncMock
 from datetime import datetime
 
-from src.jobs.execute import execute_position
+from src.jobs.execute import execute_position, place_profit_taking_orders
 from src.utils.database import DatabaseManager, Position
+from src.utils.trade_pricing import estimate_kalshi_fee
 from tests.test_database import TEST_DB
 
 # Mark all tests in this file as async
@@ -133,12 +134,23 @@ async def test_execute_position_paper_mode_keeps_position_non_live():
     position_id = await db_manager.add_position(test_position)
     test_position.id = position_id
 
+    mock_kalshi_client = AsyncMock()
+    mock_kalshi_client.get_market.return_value = {
+        "market": {
+            "ticker": "PAPER-TEST-1",
+            "yes_bid_dollars": 0.24,
+            "yes_ask_dollars": 0.27,
+            "no_bid_dollars": 0.73,
+            "no_ask_dollars": 0.76,
+        }
+    }
+
     try:
         result = await execute_position(
             position=test_position,
             live_mode=False,
             db_manager=db_manager,
-            kalshi_client=AsyncMock(),
+            kalshi_client=mock_kalshi_client,
         )
 
         assert result is True
@@ -146,7 +158,63 @@ async def test_execute_position_paper_mode_keeps_position_non_live():
         assert updated_position is not None
         assert updated_position.live is False
         assert updated_position.quantity == pytest.approx(4)
-        assert updated_position.entry_price == pytest.approx(0.25)
+        assert updated_position.entry_price == pytest.approx(0.27)
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+async def test_place_profit_taking_orders_paper_mode_books_fee_aware_exit():
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+
+    test_position = Position(
+        market_id="PAPER-PROFIT-1",
+        side="YES",
+        entry_price=0.40,
+        quantity=10,
+        timestamp=datetime.now(),
+        rationale="Paper profit target",
+        confidence=0.75,
+        live=False,
+    )
+    position_id = await db_manager.add_position(test_position)
+    test_position.id = position_id
+
+    mock_kalshi_client = AsyncMock()
+    mock_kalshi_client.get_market.return_value = {
+        "market": {
+            "ticker": "PAPER-PROFIT-1",
+            "yes_bid_dollars": 0.52,
+            "yes_ask_dollars": 0.54,
+            "no_bid_dollars": 0.46,
+            "no_ask_dollars": 0.48,
+        }
+    }
+
+    try:
+        results = await place_profit_taking_orders(
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+            profit_threshold=0.20,
+            live_mode=False,
+        )
+
+        assert results["orders_placed"] == 0
+        assert results["positions_closed"] == 1
+        assert await db_manager.get_position_by_market_id("PAPER-PROFIT-1") is None
+
+        trade_logs = await db_manager.get_all_trade_logs()
+        assert len(trade_logs) == 1
+
+        expected_entry_fee = estimate_kalshi_fee(0.40, 10, maker=False)
+        expected_exit_fee = estimate_kalshi_fee(0.52, 10, maker=False)
+        expected_pnl = ((0.52 - 0.40) * 10) - expected_entry_fee - expected_exit_fee
+        assert trade_logs[0].pnl == pytest.approx(expected_pnl)
     finally:
         if os.path.exists(db_path):
             os.remove(db_path)

@@ -29,6 +29,7 @@ from src.events.event_bus import (
     EVENT_TRADE_EXECUTED,
     EventBus,
 )
+from src.utils.kalshi_auth import resolve_private_key_path
 from src.utils.logging_setup import TradingLoggerMixin
 
 
@@ -116,7 +117,7 @@ class KalshiWebSocket(TradingLoggerMixin):
                 published to the global :class:`EventBus`.
         """
         self.api_key: str = api_key or settings.api.kalshi_api_key
-        self.private_key_path: str = os.environ.get("KALSHI_PRIVATE_KEY_PATH", private_key_path)
+        self.private_key_path: str = resolve_private_key_path(private_key_path)
         self.publish_to_event_bus: bool = publish_to_event_bus
 
         self._private_key: Any = None

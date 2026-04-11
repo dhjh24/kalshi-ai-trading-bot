@@ -19,6 +19,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 from src.config.settings import settings
 from src.utils.kalshi_normalization import format_count_fp, format_price_dollars
+from src.utils.kalshi_auth import resolve_private_key_path
 from src.utils.logging_setup import TradingLoggerMixin
 
 
@@ -39,11 +40,7 @@ class KalshiClient(TradingLoggerMixin):
     ) -> None:
         self.api_key = api_key or settings.api.kalshi_api_key
         self.base_url = (base_url or settings.api.kalshi_base_url).rstrip("/")
-        self.private_key_path = (
-            private_key_path
-            or os.environ.get("KALSHI_PRIVATE_KEY_PATH")
-            or "kalshi_private_key"
-        )
+        self.private_key_path = resolve_private_key_path(private_key_path)
         self.max_retries = max_retries
         self.backoff_factor = backoff_factor
         self.private_key = None

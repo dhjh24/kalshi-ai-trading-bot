@@ -43,6 +43,7 @@ from src.utils.kalshi_normalization import (
     is_active_market_status,
 )
 from src.utils.logging_setup import get_trading_logger
+from src.utils.trade_pricing import estimate_kalshi_fee
 
 
 @dataclass
@@ -152,18 +153,8 @@ class QuickFlipScalpingStrategy:
 
     @staticmethod
     def _estimate_kalshi_fee(price: float, quantity: float, *, maker: bool) -> float:
-        """
-        Estimate Kalshi fees using the standard public fee schedule.
-
-        Inference from Kalshi's public fee schedule:
-        - taker fee rate: 0.07
-        - maker fee rate: 0.0175
-        - rounded up to the nearest cent
-        This ignores non-standard series overrides and fee-rounding rebates.
-        """
-        rate = 0.0175 if maker else 0.07
-        raw_fee = rate * quantity * price * (1.0 - price)
-        return math.ceil(raw_fee * 100.0) / 100.0
+        """Delegate to the shared fee model used across live and paper execution."""
+        return estimate_kalshi_fee(price, quantity, maker=maker)
 
     @staticmethod
     def _normalize_orderbook_levels(orderbook: Dict[str, Any], side: str) -> List[Tuple[float, float]]:

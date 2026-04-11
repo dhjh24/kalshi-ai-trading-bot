@@ -205,14 +205,14 @@ cp env.template .env   # fill in your keys
 | `KALSHI_API_KEY` | Your Kalshi API key ID |
 | `KALSHI_ENV` | `prod` for the live exchange or `demo` for the demo environment |
 | `KALSHI_API_BASE_URL` | Optional override for custom Kalshi API endpoints |
-| `KALSHI_PRIVATE_KEY_PATH` | Path to your PEM private key file (default: `kalshi_private_key`) |
+| `KALSHI_PRIVATE_KEY_PATH` | Path to your PEM private key file (default auto-detects `kalshi_private_key.pem` or `kalshi_private_key`) |
 | `LLM_PROVIDER` | `auto` (default), `openai`, or `openrouter` |
 | `OPENAI_API_KEY` | Direct OpenAI API key used when `LLM_PROVIDER` resolves to `openai` |
 | `OPENROUTER_API_KEY` | OpenRouter key used when `LLM_PROVIDER` resolves to `openrouter` |
 | `OPENROUTER_HTTP_REFERER` | Optional app/site URL for OpenRouter attribution headers |
 | `OPENROUTER_TITLE` | Optional app title for OpenRouter attribution headers |
 
-Place your Kalshi private key as `kalshi_private_key` in the project root, or point `KALSHI_PRIVATE_KEY_PATH` at your PEM file. Download it from [Kalshi Settings → API](https://kalshi.com/account/settings). This file is git-ignored.
+Place your Kalshi private key as `kalshi_private_key.pem` in the project root, or point `KALSHI_PRIVATE_KEY_PATH` at your PEM file. The runtime also supports the legacy `kalshi_private_key` name. Download it from [Kalshi Settings → API](https://kalshi.com/account/settings). This file is git-ignored.
 
 `LLM_PROVIDER=auto` prefers direct OpenAI access when `OPENAI_API_KEY` is present, and otherwise falls back to OpenRouter.
 ChatGPT/Codex plan access is separate from API-key billing, so this bot still uses API credentials rather than a ChatGPT web-session login.

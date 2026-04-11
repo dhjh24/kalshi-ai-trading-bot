@@ -4,24 +4,59 @@ Trade execution helpers for live and paper positions.
 
 from __future__ import annotations
 
+from datetime import datetime
 import uuid
 from typing import Dict, Optional
 
 from src.clients.kalshi_client import KalshiAPIError, KalshiClient
 from src.config.settings import settings
-from src.utils.database import DatabaseManager, Position
+from src.utils.database import DatabaseManager, Position, TradeLog
 from src.utils.kalshi_normalization import (
     build_limit_order_price_fields,
     dollars_to_cents,
     find_fill_price_for_order,
     get_best_ask_price,
+    get_best_bid_price,
     get_fill_count,
+    get_market_status,
     get_mid_price,
     get_order_average_fill_price,
     get_order_fill_count,
     is_tradeable_market,
 )
 from src.utils.logging_setup import get_trading_logger
+from src.utils.trade_pricing import calculate_entry_cost, calculate_position_pnl
+
+
+def _validate_executable_price(*, ticker: str, side: str, price: float) -> float:
+    """Validate a live-paper executable price and return it unchanged."""
+    price_cents = dollars_to_cents(price)
+    if price <= 0 or price >= 1 or price_cents <= 0 or price_cents >= 100:
+        raise ValueError(
+            f"Skipping {ticker}: {side.lower()} ask price {price:.4f} "
+            f"({price_cents}c rounded) is outside the valid range"
+        )
+    return price
+
+
+async def _get_current_executable_entry_price(
+    *,
+    kalshi_client: KalshiClient,
+    ticker: str,
+    side: str,
+) -> float:
+    """Fetch the best currently executable buy price for the requested side."""
+    market_data = await kalshi_client.get_market(ticker)
+    market = market_data.get("market", {})
+
+    if not market:
+        raise ValueError(f"Skipping {ticker}: no market data returned")
+
+    if not is_tradeable_market(market):
+        raise ValueError(f"Skipping {ticker}: collection/aggregate ticker")
+
+    ask_dollars = get_best_ask_price(market, side)
+    return _validate_executable_price(ticker=ticker, side=side, price=ask_dollars)
 
 
 async def _reconcile_fill_price(
@@ -102,6 +137,55 @@ async def _reconcile_fill_quantity(
     return fallback_quantity
 
 
+async def record_simulated_position_exit(
+    *,
+    position: Position,
+    exit_price: float,
+    db_manager: DatabaseManager,
+    rationale_suffix: str,
+    entry_maker: bool = False,
+    exit_maker: bool = False,
+    charge_entry_fee: bool = True,
+    charge_exit_fee: bool = True,
+) -> Dict[str, float | bool]:
+    """Persist a paper exit using the shared fee-aware PnL model."""
+    pnl_details = calculate_position_pnl(
+        entry_price=position.entry_price,
+        exit_price=exit_price,
+        quantity=position.quantity,
+        entry_maker=entry_maker,
+        exit_maker=exit_maker,
+        charge_entry_fee=charge_entry_fee,
+        charge_exit_fee=charge_exit_fee,
+    )
+
+    trade_log = TradeLog(
+        market_id=position.market_id,
+        side=position.side,
+        entry_price=position.entry_price,
+        exit_price=exit_price,
+        quantity=position.quantity,
+        pnl=pnl_details["net_pnl"],
+        entry_timestamp=position.timestamp,
+        exit_timestamp=datetime.now(),
+        rationale=f"{position.rationale} | {rationale_suffix}",
+        strategy=position.strategy,
+    )
+    await db_manager.add_trade_log(trade_log)
+    await db_manager.update_position_status(position.id, "closed")
+
+    return {
+        "success": True,
+        "gross_pnl": pnl_details["gross_pnl"],
+        "net_pnl": pnl_details["net_pnl"],
+        "fees_paid": pnl_details["fees_paid"],
+        "entry_fee": pnl_details["entry_fee"],
+        "exit_fee": pnl_details["exit_fee"],
+        "is_win": pnl_details["net_pnl"] > 0,
+        "is_loss": pnl_details["net_pnl"] <= 0,
+    }
+
+
 async def execute_position(
     position: Position,
     live_mode: bool,
@@ -119,39 +203,50 @@ async def execute_position(
     logger.info(f"Live mode: {live_mode}")
 
     if not live_mode:
+        try:
+            paper_entry_price = await _get_current_executable_entry_price(
+                kalshi_client=kalshi_client,
+                ticker=position.market_id,
+                side=position.side,
+            )
+        except ValueError as exc:
+            logger.warning(str(exc))
+            return False
+        except Exception as exc:
+            paper_entry_price = position.entry_price
+            logger.warning(
+                f"Could not fetch live market data for paper entry on {position.market_id}; "
+                f"falling back to requested entry price {paper_entry_price:.4f}",
+                error=str(exc),
+            )
+
+        position.entry_price = paper_entry_price
         await db_manager.update_position_execution_details(
             position.id,
-            entry_price=position.entry_price,
+            entry_price=paper_entry_price,
             quantity=position.quantity,
             live=False,
         )
-        logger.info(f"PAPER TRADE SIMULATED for {position.market_id} - no real money used")
-        logger.info(f"Would have used: ${position.quantity * position.entry_price:.2f}")
+        entry_cost = calculate_entry_cost(paper_entry_price, position.quantity, maker=False)
+        logger.info(
+            f"PAPER TRADE EXECUTED for {position.market_id} at ${paper_entry_price:.4f} "
+            f"using live market data"
+        )
+        logger.info(
+            f"Estimated deployed capital: ${entry_cost['contracts_cost']:.2f} "
+            f"+ fees ${entry_cost['fee']:.2f} = ${entry_cost['total_cost']:.2f}"
+        )
         return True
 
     logger.warning(f"PLACING LIVE ORDER - real money will be used for {position.market_id}")
 
     try:
-        market_data = await kalshi_client.get_market(position.market_id)
-        market = market_data.get("market", {})
         side_lower = position.side.lower()
-
-        if not market:
-            logger.warning(f"Skipping {position.market_id}: no market data returned")
-            return False
-
-        if not is_tradeable_market(market):
-            logger.warning(f"Skipping {position.market_id}: collection/aggregate ticker")
-            return False
-
-        ask_dollars = get_best_ask_price(market, position.side)
-        ask_cents = dollars_to_cents(ask_dollars)
-        if ask_dollars <= 0 or ask_dollars >= 1 or ask_cents <= 0 or ask_cents >= 100:
-            logger.warning(
-                f"Skipping {position.market_id}: {side_lower} ask price {ask_dollars:.4f} "
-                f"({ask_cents}c rounded) is outside the valid range"
-            )
-            return False
+        ask_dollars = await _get_current_executable_entry_price(
+            kalshi_client=kalshi_client,
+            ticker=position.market_id,
+            side=position.side,
+        )
 
         client_order_id = str(uuid.uuid4())
         order_params = {
@@ -206,6 +301,9 @@ async def execute_position(
         logger.info(f"Real money used: ${fill_quantity * fill_price:.2f}")
         return True
 
+    except ValueError as exc:
+        logger.warning(str(exc))
+        return False
     except KalshiAPIError as exc:
         logger.error(f"FAILED to place LIVE order for {position.market_id}: {exc}")
         return False
@@ -285,13 +383,22 @@ async def place_profit_taking_orders(
     db_manager: DatabaseManager,
     kalshi_client: KalshiClient,
     profit_threshold: float = 0.25,
+    *,
+    live_mode: Optional[bool] = None,
 ) -> Dict[str, int]:
     """Place sell limits for positions that have reached profit targets."""
     logger = get_trading_logger("profit_taking")
-    results = {"orders_placed": 0, "positions_processed": 0}
+    if live_mode is None:
+        live_mode = getattr(settings.trading, "live_trading_enabled", False)
+
+    results = {"orders_placed": 0, "positions_processed": 0, "positions_closed": 0}
 
     try:
-        positions = await db_manager.get_open_live_positions()
+        positions = (
+            await db_manager.get_open_live_positions()
+            if live_mode
+            else await db_manager.get_open_non_live_positions()
+        )
         if not positions:
             logger.info("No open positions to process for profit taking")
             return results
@@ -299,13 +406,15 @@ async def place_profit_taking_orders(
         logger.info(f"Checking {len(positions)} positions for profit-taking opportunities")
         for position in positions:
             try:
-                if position.strategy == "quick_flip_scalping":
+                if position.strategy in {"quick_flip_scalping", "market_making"}:
                     continue
                 results["positions_processed"] += 1
                 market_response = await kalshi_client.get_market(position.market_id)
                 market_data = market_response.get("market", {})
                 if not market_data:
                     logger.warning(f"Could not get market data for {position.market_id}")
+                    continue
+                if get_market_status(market_data) in {"closed", "settled", "finalized"}:
                     continue
 
                 current_price = get_mid_price(market_data, position.side)
@@ -320,26 +429,47 @@ async def place_profit_taking_orders(
                 )
 
                 if profit_pct >= profit_threshold:
-                    sell_price = current_price * 0.98
                     logger.info(
                         f"PROFIT TARGET HIT: {position.market_id} - {profit_pct:.1%} profit (${unrealized_pnl:.2f})"
                     )
-                    success = await place_sell_limit_order(
-                        position=position,
-                        limit_price=sell_price,
-                        db_manager=db_manager,
-                        kalshi_client=kalshi_client,
-                    )
-                    if success:
-                        results["orders_placed"] += 1
-                        logger.info(f"Profit-taking order placed for {position.market_id}")
+
+                    if live_mode:
+                        sell_price = current_price * 0.98
+                        success = await place_sell_limit_order(
+                            position=position,
+                            limit_price=sell_price,
+                            db_manager=db_manager,
+                            kalshi_client=kalshi_client,
+                            live_mode=True,
+                        )
+                        if success:
+                            results["orders_placed"] += 1
+                            logger.info(f"Profit-taking order placed for {position.market_id}")
+                        else:
+                            logger.error(f"Failed to place profit-taking order for {position.market_id}")
                     else:
-                        logger.error(f"Failed to place profit-taking order for {position.market_id}")
+                        exit_price = get_best_bid_price(market_data, position.side) or current_price
+                        exit_result = await record_simulated_position_exit(
+                            position=position,
+                            exit_price=exit_price,
+                            db_manager=db_manager,
+                            rationale_suffix=f"PAPER PROFIT TARGET @ ${exit_price:.4f}",
+                            entry_maker=False,
+                            exit_maker=False,
+                            charge_entry_fee=True,
+                            charge_exit_fee=True,
+                        )
+                        results["positions_closed"] += 1
+                        logger.info(
+                            f"Paper profit-taking exit executed for {position.market_id}: "
+                            f"net=${float(exit_result['net_pnl']):.2f}"
+                        )
             except Exception as exc:
                 logger.error(f"Error processing position {position.market_id} for profit taking: {exc}")
 
         logger.info(
-            f"Profit-taking summary: {results['orders_placed']} orders placed from {results['positions_processed']} positions"
+            f"Profit-taking summary: {results['orders_placed']} orders placed, "
+            f"{results['positions_closed']} paper positions closed from {results['positions_processed']} positions"
         )
         return results
     except Exception as exc:
@@ -351,13 +481,22 @@ async def place_stop_loss_orders(
     db_manager: DatabaseManager,
     kalshi_client: KalshiClient,
     stop_loss_threshold: float = -0.10,
+    *,
+    live_mode: Optional[bool] = None,
 ) -> Dict[str, int]:
     """Place sell limits for positions that need stop-loss protection."""
     logger = get_trading_logger("stop_loss_orders")
-    results = {"orders_placed": 0, "positions_processed": 0}
+    if live_mode is None:
+        live_mode = getattr(settings.trading, "live_trading_enabled", False)
+
+    results = {"orders_placed": 0, "positions_processed": 0, "positions_closed": 0}
 
     try:
-        positions = await db_manager.get_open_live_positions()
+        positions = (
+            await db_manager.get_open_live_positions()
+            if live_mode
+            else await db_manager.get_open_non_live_positions()
+        )
         if not positions:
             logger.info("No open positions to process for stop-loss orders")
             return results
@@ -365,13 +504,15 @@ async def place_stop_loss_orders(
         logger.info(f"Checking {len(positions)} positions for stop-loss protection")
         for position in positions:
             try:
-                if position.strategy == "quick_flip_scalping":
+                if position.strategy in {"quick_flip_scalping", "market_making"}:
                     continue
                 results["positions_processed"] += 1
                 market_response = await kalshi_client.get_market(position.market_id)
                 market_data = market_response.get("market", {})
                 if not market_data:
                     logger.warning(f"Could not get market data for {position.market_id}")
+                    continue
+                if get_market_status(market_data) in {"closed", "settled", "finalized"}:
                     continue
 
                 current_price = get_mid_price(market_data, position.side)
@@ -385,22 +526,43 @@ async def place_stop_loss_orders(
                     logger.info(
                         f"STOP LOSS TRIGGERED: {position.market_id} - {loss_pct:.1%} loss (${unrealized_pnl:.2f})"
                     )
-                    success = await place_sell_limit_order(
-                        position=position,
-                        limit_price=stop_price,
-                        db_manager=db_manager,
-                        kalshi_client=kalshi_client,
-                    )
-                    if success:
-                        results["orders_placed"] += 1
-                        logger.info(f"Stop-loss order placed for {position.market_id}")
+
+                    if live_mode:
+                        success = await place_sell_limit_order(
+                            position=position,
+                            limit_price=stop_price,
+                            db_manager=db_manager,
+                            kalshi_client=kalshi_client,
+                            live_mode=True,
+                        )
+                        if success:
+                            results["orders_placed"] += 1
+                            logger.info(f"Stop-loss order placed for {position.market_id}")
+                        else:
+                            logger.error(f"Failed to place stop-loss order for {position.market_id}")
                     else:
-                        logger.error(f"Failed to place stop-loss order for {position.market_id}")
+                        exit_price = get_best_bid_price(market_data, position.side) or current_price
+                        exit_result = await record_simulated_position_exit(
+                            position=position,
+                            exit_price=exit_price,
+                            db_manager=db_manager,
+                            rationale_suffix=f"PAPER STOP LOSS @ ${exit_price:.4f}",
+                            entry_maker=False,
+                            exit_maker=False,
+                            charge_entry_fee=True,
+                            charge_exit_fee=True,
+                        )
+                        results["positions_closed"] += 1
+                        logger.info(
+                            f"Paper stop-loss exit executed for {position.market_id}: "
+                            f"net=${float(exit_result['net_pnl']):.2f}"
+                        )
             except Exception as exc:
                 logger.error(f"Error processing position {position.market_id} for stop loss: {exc}")
 
         logger.info(
-            f"Stop-loss summary: {results['orders_placed']} orders placed from {results['positions_processed']} positions"
+            f"Stop-loss summary: {results['orders_placed']} orders placed, "
+            f"{results['positions_closed']} paper positions closed from {results['positions_processed']} positions"
         )
         return results
     except Exception as exc:
