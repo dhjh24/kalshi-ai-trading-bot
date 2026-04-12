@@ -10,7 +10,7 @@ from src.strategies.quick_flip_scalping import (
     QuickFlipOpportunity,
     QuickFlipScalpingStrategy,
 )
-from src.utils.database import Market, Position
+from src.utils.database import DatabaseManager, Market, Position
 
 
 def _build_market() -> Market:
@@ -671,7 +671,21 @@ async def test_place_immediate_sell_order_in_paper_mode_waits_for_reachable_fill
     )
     strategy.active_positions[position.market_id] = position
 
-    with patch("src.strategies.quick_flip_scalping.place_sell_limit_order", AsyncMock(return_value=True)):
+    with (
+        patch("src.strategies.quick_flip_scalping.place_sell_limit_order", AsyncMock(return_value=True)),
+        patch(
+            "src.strategies.quick_flip_scalping.reconcile_simulated_exit_orders",
+            AsyncMock(
+                return_value={
+                    "positions_closed": 0,
+                    "orders_filled": 0,
+                    "orders_cancelled": 0,
+                    "net_pnl": 0.0,
+                    "fees_paid": 0.0,
+                }
+            ),
+        ),
+    ):
         result = await strategy._place_immediate_sell_order(opportunity)
 
     assert result["success"] is True
@@ -739,15 +753,119 @@ async def test_place_immediate_sell_order_in_paper_mode_books_only_reachable_fil
     )
     strategy.active_positions[position.market_id] = position
 
-    with patch("src.strategies.quick_flip_scalping.place_sell_limit_order", AsyncMock(return_value=True)):
+    with (
+        patch("src.strategies.quick_flip_scalping.place_sell_limit_order", AsyncMock(return_value=True)),
+        patch(
+            "src.strategies.quick_flip_scalping.reconcile_simulated_exit_orders",
+            AsyncMock(
+                return_value={
+                    "positions_closed": 1,
+                    "orders_filled": 1,
+                    "orders_cancelled": 0,
+                    "net_pnl": 0.17,
+                    "fees_paid": 0.02,
+                }
+            ),
+        ),
+    ):
         result = await strategy._place_immediate_sell_order(opportunity)
 
     assert result["success"] is True
     assert result["filled"] is True
-    trade_log = fake_db.add_trade_log.await_args.args[0]
-    assert trade_log.exit_price == pytest.approx(0.07)
-    assert trade_log.pnl > 0
-    fake_db.update_position_status.assert_awaited_once_with(99, "closed")
+    assert result["net_pnl"] > 0
+    fake_db.add_trade_log.assert_not_awaited()
+    fake_db.update_position_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_manage_live_positions_in_paper_mode_reprices_and_closes_persisted_positions(tmp_path):
+    db_path = tmp_path / "quick_flip_paper.db"
+    db_manager = DatabaseManager(db_path=str(db_path))
+    await db_manager.initialize()
+
+    position = Position(
+        market_id="TEST-MKT",
+        side="YES",
+        entry_price=0.051,
+        quantity=10,
+        timestamp=datetime.now(),
+        id=None,
+        strategy="quick_flip_scalping",
+        rationale="QUICK FLIP",
+        live=False,
+    )
+    position.id = await db_manager.add_position(position)
+
+    fake_client = SimpleNamespace(
+        get_market=AsyncMock(
+            return_value={
+                "market": {
+                    "yes_bid_dollars": "0.060",
+                    "yes_ask_dollars": "0.061",
+                    "no_bid_dollars": "0.939",
+                    "no_ask_dollars": "0.940",
+                    "last_price_dollars": "0.060",
+                    "price_ranges": [
+                        {
+                            "from_price_dollars": "0.0000",
+                            "to_price_dollars": "0.1000",
+                            "tick_size_dollars": "0.0010",
+                        }
+                    ],
+                }
+            }
+        )
+    )
+    strategy = QuickFlipScalpingStrategy(
+        db_manager=db_manager,
+        kalshi_client=fake_client,
+        xai_client=object(),
+        config=QuickFlipConfig(dynamic_exit_reprice_seconds=1),
+    )
+    strategy._calculate_dynamic_exit_price = AsyncMock(return_value=0.07)
+
+    previous_live_mode = settings.trading.live_trading_enabled
+    try:
+        settings.trading.live_trading_enabled = False
+        first_results = await strategy.manage_live_positions(persisted_only=True)
+
+        assert first_results["orders_adjusted"] == 1
+        resting_orders = await db_manager.get_simulated_orders(
+            strategy="quick_flip_scalping",
+            market_id="TEST-MKT",
+            side="YES",
+            action="sell",
+            status="resting",
+        )
+        assert len(resting_orders) == 1
+        assert resting_orders[0].price == pytest.approx(0.07)
+
+        fake_client.get_market.return_value = {
+            "market": {
+                "yes_bid_dollars": "0.071",
+                "yes_ask_dollars": "0.072",
+                "no_bid_dollars": "0.928",
+                "no_ask_dollars": "0.929",
+                "last_price_dollars": "0.071",
+                "price_ranges": [
+                    {
+                        "from_price_dollars": "0.0000",
+                        "to_price_dollars": "0.1000",
+                        "tick_size_dollars": "0.0010",
+                    }
+                ],
+            }
+        }
+        second_results = await strategy.manage_live_positions(persisted_only=True)
+
+        assert second_results["positions_closed"] == 1
+        assert second_results["total_pnl"] > 0
+        assert await db_manager.get_position_by_market_and_side("TEST-MKT", "YES") is None
+        trade_logs = await db_manager.get_all_trade_logs()
+        assert len(trade_logs) == 1
+        assert trade_logs[0].pnl > 0
+    finally:
+        settings.trading.live_trading_enabled = previous_live_mode
 
 
 @pytest.mark.asyncio
@@ -864,6 +982,67 @@ async def test_execute_single_quick_flip_rejects_negative_indicator_before_db_wr
 
     assert result is False
     fake_db.add_position.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_single_quick_flip_in_paper_mode_persists_exit_plan(tmp_path):
+    db_path = tmp_path / "quick_flip_execute_paper.db"
+    db_manager = DatabaseManager(db_path=str(db_path))
+    await db_manager.initialize()
+
+    fake_client = SimpleNamespace(
+        get_market=AsyncMock(
+            return_value={
+                "market": {
+                    "yes_bid_dollars": "0.050",
+                    "yes_ask_dollars": "0.051",
+                    "no_bid_dollars": "0.949",
+                    "no_ask_dollars": "0.950",
+                    "price_ranges": [
+                        {
+                            "from_price_dollars": "0.0000",
+                            "to_price_dollars": "0.1000",
+                            "tick_size_dollars": "0.0010",
+                        }
+                    ],
+                }
+            }
+        )
+    )
+    strategy = QuickFlipScalpingStrategy(
+        db_manager=db_manager,
+        kalshi_client=fake_client,
+        xai_client=object(),
+        config=QuickFlipConfig(max_hold_minutes=30),
+    )
+    opportunity = QuickFlipOpportunity(
+        market_id="TEST-MKT",
+        market_title="Test market",
+        side="YES",
+        entry_price=0.05,
+        exit_price=0.07,
+        quantity=10,
+        expected_profit=0.10,
+        confidence_score=0.95,
+        movement_indicator="short-term momentum",
+        max_hold_time=30,
+        tick_size=0.001,
+    )
+
+    previous_live_mode = settings.trading.live_trading_enabled
+    try:
+        settings.trading.live_trading_enabled = False
+        result = await strategy._execute_single_quick_flip(opportunity)
+    finally:
+        settings.trading.live_trading_enabled = previous_live_mode
+
+    assert result is True
+    persisted_position = await db_manager.get_position_by_market_and_side("TEST-MKT", "YES")
+    assert persisted_position is not None
+    assert persisted_position.entry_price == pytest.approx(0.051)
+    assert persisted_position.stop_loss_price == pytest.approx(0.046)
+    assert persisted_position.take_profit_price == pytest.approx(0.07)
+    assert persisted_position.max_hold_hours == 1
 
 
 @pytest.mark.asyncio

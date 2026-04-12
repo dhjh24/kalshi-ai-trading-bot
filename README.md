@@ -287,23 +287,28 @@ Fastify API, and FastAPI analysis bridge.
 
 ## 📊 Paper Trading Dashboard
 
-Simulate trades without risking real money. Every signal is logged to SQLite and a static HTML dashboard renders cumulative P&L, win rate, and per-signal details after markets settle.
+The unified `--paper` runtime now uses the same main SQLite database as live mode and records:
+
+- paper entries using live executable quotes
+- resting simulated paper orders that reconcile against live market data
+- fee-aware closed paper trades in `trade_logs`
+
+The static dashboard reads from `trading_system.db` when unified paper-runtime data exists, and falls back to the older signal tracker only if needed.
 
 ```bash
-# Scan markets and log signals
-python paper_trader.py
+# Main paper-trading runtime (mirrors the live bot without sending real orders)
+python cli.py run --paper
 
-# Continuous scanning every 15 minutes
-python paper_trader.py --loop --interval 900
+# Print unified paper stats from trading_system.db
+python paper_trader.py --stats
 
-# Settle markets and update outcomes
-python paper_trader.py --settle
-
-# Regenerate HTML dashboard
+# Regenerate the static HTML dashboard from unified paper data
 python paper_trader.py --dashboard
 
-# Print stats to terminal
-python paper_trader.py --stats
+# Legacy signal-tracker mode (fallback / historical path)
+python paper_trader.py
+python paper_trader.py --loop --interval 900
+python paper_trader.py --settle
 ```
 
 The dashboard writes to `docs/paper_dashboard.html` — open locally or host via GitHub Pages.
@@ -316,7 +321,7 @@ The dashboard writes to `docs/paper_dashboard.html` — open locally or host via
 kalshi-ai-trading-bot/
 ├── beast_mode_bot.py          # Main bot entry point (AI ensemble orchestrator)
 ├── cli.py                     # Unified CLI: run, dashboard, status, health, scores
-├── paper_trader.py            # Paper trading signal tracker
+├── paper_trader.py            # Paper dashboard/stats helper + legacy signal tracker
 ├── pyproject.toml             # PEP 621 project metadata
 ├── requirements.txt           # Pinned dependencies
 ├── env.template               # Environment variable template

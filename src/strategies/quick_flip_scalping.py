@@ -21,7 +21,13 @@ from json_repair import repair_json
 from src.clients.kalshi_client import KalshiClient
 from src.clients.xai_client import XAIClient
 from src.config.settings import settings
-from src.jobs.execute import execute_position, place_sell_limit_order
+from src.jobs.execute import (
+    execute_position,
+    place_sell_limit_order,
+    reconcile_simulated_exit_orders,
+    record_simulated_position_exit,
+    submit_simulated_sell_limit_order,
+)
 from src.utils.database import DatabaseManager, Market, Position, TradeLog
 from src.utils.kalshi_normalization import (
     build_limit_order_price_fields,
@@ -60,6 +66,7 @@ class QuickFlipOpportunity:
     confidence_score: float
     movement_indicator: str
     max_hold_time: int
+    tick_size: float = 0.01
 
 
 @dataclass
@@ -726,6 +733,7 @@ class QuickFlipScalpingStrategy:
             entry_timestamp=position.timestamp,
             exit_timestamp=datetime.now(),
             rationale=f"{position.rationale} | LIVE QUICK FLIP EXIT FILLED",
+            live=True,
             strategy=position.strategy,
         )
         await self.db_manager.add_trade_log(trade_log)
@@ -1059,6 +1067,7 @@ class QuickFlipScalpingStrategy:
             confidence_score=movement_analysis["confidence"],
             movement_indicator=reason,
             max_hold_time=self.config.max_hold_minutes,
+            tick_size=tick_size,
         )
 
     async def _analyze_market_movement(
@@ -1249,6 +1258,22 @@ Respond with JSON only:
                     kalshi_client=self.kalshi_client,
                 )
             if success:
+                if not live_mode:
+                    position.stop_loss_price = self._calculate_stop_loss_price(
+                        entry_price=position.entry_price,
+                        tick_size=opportunity.tick_size,
+                    )
+                    position.take_profit_price = opportunity.exit_price
+                    position.max_hold_hours = max(1, math.ceil(self.config.max_hold_minutes / 60))
+                    await self.db_manager.update_position_execution_details(
+                        position.id,
+                        entry_price=position.entry_price,
+                        quantity=position.quantity,
+                        live=False,
+                        stop_loss_price=position.stop_loss_price,
+                        take_profit_price=position.take_profit_price,
+                        max_hold_hours=position.max_hold_hours,
+                    )
                 self.active_positions[opportunity.market_id] = position
                 self.logger.info(
                     f"Quick flip entry: {opportunity.side} {opportunity.quantity} "
@@ -1287,6 +1312,7 @@ Respond with JSON only:
             entry_timestamp=position.timestamp,
             exit_timestamp=datetime.now(),
             rationale=f"{position.rationale} | {rationale_suffix}",
+            live=False,
             strategy=position.strategy,
         )
         await self.db_manager.add_trade_log(trade_log)
@@ -1357,21 +1383,27 @@ Respond with JSON only:
                 return {"success": False}
 
             if not live_mode:
-                reachable_fill_price = await self._get_paper_reachable_exit_price(
-                    position=position,
-                    target_price=sell_price,
+                reconciliation = await reconcile_simulated_exit_orders(
+                    db_manager=self.db_manager,
+                    kalshi_client=self.kalshi_client,
+                    strategy="quick_flip_scalping",
+                    market_id=position.market_id,
                 )
-                if reachable_fill_price is not None:
-                    result = await self._record_paper_exit(
-                        position=position,
-                        exit_price=reachable_fill_price,
-                        rationale_suffix=(
-                            f"PAPER QUICK FLIP FILL @ ${reachable_fill_price:.4f}"
-                        ),
-                    )
+                if int(reconciliation.get("positions_closed", 0)) > 0:
+                    self.active_positions.pop(position.market_id, None)
+                    self.pending_sells.pop(position.market_id, None)
+                    result = {
+                        "success": True,
+                        "filled": True,
+                        "gross_pnl": 0.0,
+                        "net_pnl": float(reconciliation.get("net_pnl", 0.0)),
+                        "fees_paid": float(reconciliation.get("fees_paid", 0.0)),
+                        "is_win": float(reconciliation.get("net_pnl", 0.0)) > 0,
+                        "is_loss": float(reconciliation.get("net_pnl", 0.0)) <= 0,
+                    }
                     self.logger.info(
                         f"Paper quick flip filled: {position.side} {position.quantity} "
-                        f"{position.market_id} exit=${reachable_fill_price:.4f} "
+                        f"{position.market_id} "
                         f"net=${float(result['net_pnl']):.2f}"
                     )
                     return result
@@ -1421,8 +1453,9 @@ Respond with JSON only:
             "total_pnl": 0.0,
         }
 
+        live_mode = getattr(settings.trading, "live_trading_enabled", False)
         positions: List[Position]
-        if getattr(settings.trading, "live_trading_enabled", False):
+        if live_mode:
             reconciliation = await self.reconcile_persisted_live_positions()
             for key in (
                 "positions_closed",
@@ -1439,26 +1472,44 @@ Respond with JSON only:
                 if position.strategy == "quick_flip_scalping"
             ]
         else:
-            positions = list(self.active_positions.values()) if not persisted_only else []
+            reconciliation = await reconcile_simulated_exit_orders(
+                db_manager=self.db_manager,
+                kalshi_client=self.kalshi_client,
+                strategy="quick_flip_scalping",
+            )
+            results["positions_closed"] += int(reconciliation.get("positions_closed", 0))
+            results["orders_cancelled"] += int(reconciliation.get("orders_cancelled", 0))
+            results["total_pnl"] += float(reconciliation.get("net_pnl", 0.0))
+            all_positions = await self.db_manager.get_open_non_live_positions()
+            positions = [
+                position
+                for position in all_positions
+                if position.strategy == "quick_flip_scalping"
+            ]
 
         current_time = datetime.now()
         for position in positions:
             try:
-                positions_response = await self.kalshi_client.get_positions(ticker=position.market_id)
-                exposure = sum(
-                    get_position_exposure_dollars(item)
-                    for item in positions_response.get("market_positions", [])
-                    if get_position_exposure_dollars(item) > 0
-                )
-                if exposure <= 0:
-                    closed = await self._close_position_from_recent_fills(position)
-                    if closed:
-                        results["positions_closed"] += 1
-                    continue
-
                 market_response = await self.kalshi_client.get_market(position.market_id)
                 market_info = market_response.get("market", {})
                 if not market_info:
+                    continue
+
+                if live_mode:
+                    positions_response = await self.kalshi_client.get_positions(ticker=position.market_id)
+                    exposure = sum(
+                        get_position_exposure_dollars(item)
+                        for item in positions_response.get("market_positions", [])
+                        if get_position_exposure_dollars(item) > 0
+                    )
+                    if exposure <= 0:
+                        closed = await self._close_position_from_recent_fills(position)
+                        if closed:
+                            results["positions_closed"] += 1
+                        continue
+
+                market_status = get_market_status(market_info)
+                if not live_mode and market_status in {"closed", "settled", "finalized"}:
                     continue
 
                 current_price = get_best_bid_price(market_info, position.side)
@@ -1468,41 +1519,87 @@ Respond with JSON only:
                         f"Quick flip stop loss triggered for {position.market_id}: "
                         f"{mark_price:.4f} <= {position.stop_loss_price:.4f}"
                     )
-                    cut_success = await self._cut_losses_market_order(position)
-                    if cut_success:
+                    if live_mode:
+                        cut_success = await self._cut_losses_market_order(position)
+                        if cut_success:
+                            results["losses_cut"] += 1
+                    else:
+                        if current_price <= 0 or current_price >= 1:
+                            self.logger.warning(
+                                f"Cannot simulate quick flip stop loss for {position.market_id}: "
+                                f"invalid best bid {current_price:.4f}"
+                            )
+                            continue
+                        resting_orders = await self.db_manager.get_simulated_orders(
+                            strategy="quick_flip_scalping",
+                            market_id=position.market_id,
+                            side=position.side,
+                            action="sell",
+                            status="resting",
+                        )
+                        for order in resting_orders:
+                            await self.db_manager.update_simulated_order(int(order.id), status="cancelled")
+                        results["orders_cancelled"] += len(resting_orders)
+                        exit_result = await record_simulated_position_exit(
+                            position=position,
+                            exit_price=current_price,
+                            db_manager=self.db_manager,
+                            rationale_suffix=f"PAPER QUICK FLIP STOP LOSS @ ${current_price:.4f}",
+                            entry_maker=False,
+                            exit_maker=False,
+                            charge_entry_fee=True,
+                            charge_exit_fee=True,
+                        )
+                        self.active_positions.pop(position.market_id, None)
+                        self.pending_sells.pop(position.market_id, None)
                         results["losses_cut"] += 1
+                        results["positions_closed"] += 1
+                        results["total_pnl"] += float(exit_result["net_pnl"])
                     continue
 
                 desired_exit = await self._calculate_dynamic_exit_price(position, market_info)
                 if desired_exit is None:
                     continue
 
-                existing_orders_response = await self.kalshi_client.get_orders(
-                    ticker=position.market_id,
-                    status="resting",
-                    limit=100,
-                )
-                existing_exit_orders = [
-                    order
-                    for order in existing_orders_response.get("orders", [])
-                    if str(order.get("action", "")).lower() == "sell"
-                    and str(order.get("side", "")).lower() == position.side.lower()
-                ]
+                if live_mode:
+                    existing_orders_response = await self.kalshi_client.get_orders(
+                        ticker=position.market_id,
+                        status="resting",
+                        limit=100,
+                    )
+                    existing_exit_orders = [
+                        order
+                        for order in existing_orders_response.get("orders", [])
+                        if str(order.get("action", "")).lower() == "sell"
+                        and str(order.get("side", "")).lower() == position.side.lower()
+                    ]
+                else:
+                    existing_exit_orders = await self.db_manager.get_simulated_orders(
+                        strategy="quick_flip_scalping",
+                        market_id=position.market_id,
+                        side=position.side,
+                        action="sell",
+                        status="resting",
+                    )
 
                 tick_size = get_market_tick_size(market_info, position.entry_price)
                 should_replace = not existing_exit_orders
                 if existing_exit_orders:
                     current_order = existing_exit_orders[0]
-                    current_order_price = self._normalize_fill_price(
-                        float(
-                            current_order.get(
-                                "yes_price_dollars" if position.side == "YES" else "no_price_dollars",
-                                0,
+                    if live_mode:
+                        current_order_price = self._normalize_fill_price(
+                            float(
+                                current_order.get(
+                                    "yes_price_dollars" if position.side == "YES" else "no_price_dollars",
+                                    0,
+                                )
+                                or 0
                             )
-                            or 0
                         )
-                    )
-                    placed_at = self.pending_sells.get(position.market_id, {}).get("placed_at")
+                        placed_at = self.pending_sells.get(position.market_id, {}).get("placed_at")
+                    else:
+                        current_order_price = float(current_order.price or 0.0)
+                        placed_at = current_order.placed_at
                     age_seconds = (
                         (current_time - placed_at).total_seconds()
                         if isinstance(placed_at, datetime)
@@ -1514,27 +1611,51 @@ Respond with JSON only:
                     )
 
                     if should_replace:
-                        for order in existing_exit_orders:
-                            order_id = order.get("order_id")
-                            if order_id:
-                                await self.kalshi_client.cancel_order(order_id)
+                        if live_mode:
+                            for order in existing_exit_orders:
+                                order_id = order.get("order_id")
+                                if order_id:
+                                    await self.kalshi_client.cancel_order(order_id)
+                        else:
+                            for order in existing_exit_orders:
+                                await self.db_manager.update_simulated_order(int(order.id), status="cancelled")
+                            results["orders_cancelled"] += len(existing_exit_orders)
 
                 if should_replace:
-                    success = await place_sell_limit_order(
-                        position=position,
-                        limit_price=desired_exit,
-                        db_manager=self.db_manager,
-                        kalshi_client=self.kalshi_client,
-                        live_mode=True,
-                    )
-                    if success:
-                        results["orders_adjusted"] += 1
-                        self.pending_sells[position.market_id] = {
-                            "position": position,
-                            "target_price": desired_exit,
-                            "placed_at": current_time,
-                            "max_hold_until": current_time + timedelta(minutes=self.config.max_hold_minutes),
-                        }
+                    if live_mode:
+                        success = await place_sell_limit_order(
+                            position=position,
+                            limit_price=desired_exit,
+                            db_manager=self.db_manager,
+                            kalshi_client=self.kalshi_client,
+                            live_mode=True,
+                        )
+                        if success:
+                            results["orders_adjusted"] += 1
+                            self.pending_sells[position.market_id] = {
+                                "position": position,
+                                "target_price": desired_exit,
+                                "placed_at": current_time,
+                                "max_hold_until": current_time + timedelta(minutes=self.config.max_hold_minutes),
+                            }
+                    else:
+                        paper_result = await submit_simulated_sell_limit_order(
+                            position=position,
+                            limit_price=desired_exit,
+                            db_manager=self.db_manager,
+                            kalshi_client=self.kalshi_client,
+                        )
+                        if paper_result.get("success"):
+                            results["orders_adjusted"] += int(paper_result.get("orders_placed", 0))
+                            results["positions_closed"] += int(paper_result.get("positions_closed", 0))
+                            results["total_pnl"] += float(paper_result.get("net_pnl", 0.0))
+                            if not paper_result.get("filled"):
+                                self.pending_sells[position.market_id] = {
+                                    "position": position,
+                                    "target_price": desired_exit,
+                                    "placed_at": current_time,
+                                    "max_hold_until": current_time + timedelta(minutes=self.config.max_hold_minutes),
+                                }
             except Exception as exc:
                 self.logger.error(f"Error managing position {position.market_id}: {exc}")
 

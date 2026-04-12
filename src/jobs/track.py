@@ -177,8 +177,26 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
         from src.jobs.execute import (
             place_profit_taking_orders,
             place_stop_loss_orders,
+            reconcile_simulated_exit_orders,
             record_simulated_position_exit,
         )
+
+        paper_reconciliation = {
+            "positions_closed": 0,
+            "orders_filled": 0,
+            "orders_cancelled": 0,
+            "net_pnl": 0.0,
+        }
+        if not live_mode:
+            paper_reconciliation = await reconcile_simulated_exit_orders(
+                db_manager=db_manager,
+                kalshi_client=kalshi_client,
+            )
+            if paper_reconciliation.get("positions_closed", 0):
+                logger.info(
+                    "Filled %d resting paper exit orders before scanning fresh exit signals.",
+                    paper_reconciliation["positions_closed"],
+                )
 
         logger.info("Checking for profit-taking opportunities.")
         profit_results = await place_profit_taking_orders(
@@ -197,7 +215,11 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
         )
 
         total_sell_orders = profit_results["orders_placed"] + stop_loss_results["orders_placed"]
-        total_paper_exits = profit_results.get("positions_closed", 0) + stop_loss_results.get("positions_closed", 0)
+        total_paper_exits = (
+            int(paper_reconciliation.get("positions_closed", 0))
+            + profit_results.get("positions_closed", 0)
+            + stop_loss_results.get("positions_closed", 0)
+        )
         if total_sell_orders > 0:
             logger.info(
                 "Sell limit order summary: %d orders placed (%d profit-taking, %d stop-loss)",
@@ -255,6 +277,20 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                 )
 
                 if should_exit:
+                    if not live_mode and exit_reason != "market_resolution":
+                        resting_orders = await db_manager.get_simulated_orders(
+                            market_id=position.market_id,
+                            side=position.side,
+                            action="sell",
+                            status="resting",
+                        )
+                        if resting_orders:
+                            logger.debug(
+                                "Keeping paper position %s open because a simulated exit order is already resting.",
+                                position.market_id,
+                            )
+                            continue
+
                     logger.info(
                         "Exiting position %s due to %s. Entry: %.3f, Exit: %.3f",
                         position.market_id,
@@ -275,6 +311,7 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                             entry_timestamp=position.timestamp,
                             exit_timestamp=datetime.now(),
                             rationale=f"{position.rationale} | EXIT: {exit_reason}",
+                            live=True,
                             strategy=position.strategy,
                         )
                         await db_manager.add_trade_log(trade_log)

@@ -3,7 +3,12 @@ import pytest
 from unittest.mock import AsyncMock
 from datetime import datetime
 
-from src.jobs.execute import execute_position, place_profit_taking_orders
+from src.jobs.execute import (
+    execute_position,
+    place_profit_taking_orders,
+    place_sell_limit_order,
+    reconcile_simulated_exit_orders,
+)
 from src.utils.database import DatabaseManager, Position
 from src.utils.trade_pricing import estimate_kalshi_fee
 from tests.test_database import TEST_DB
@@ -164,6 +169,60 @@ async def test_execute_position_paper_mode_keeps_position_non_live():
             os.remove(db_path)
 
 
+async def test_execute_position_paper_mode_preserves_exit_plan_metadata():
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+
+    test_position = Position(
+        market_id="PAPER-PLAN-1",
+        side="YES",
+        entry_price=0.25,
+        quantity=4,
+        timestamp=datetime.now(),
+        rationale="Paper trade with exit plan",
+        confidence=0.70,
+        live=False,
+        stop_loss_price=0.21,
+        take_profit_price=0.34,
+        max_hold_hours=6,
+    )
+    position_id = await db_manager.add_position(test_position)
+    test_position.id = position_id
+
+    mock_kalshi_client = AsyncMock()
+    mock_kalshi_client.get_market.return_value = {
+        "market": {
+            "ticker": "PAPER-PLAN-1",
+            "yes_bid_dollars": 0.24,
+            "yes_ask_dollars": 0.27,
+            "no_bid_dollars": 0.73,
+            "no_ask_dollars": 0.76,
+        }
+    }
+
+    try:
+        result = await execute_position(
+            position=test_position,
+            live_mode=False,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+        )
+
+        assert result is True
+        updated_position = await db_manager.get_position_by_market_id("PAPER-PLAN-1")
+        assert updated_position is not None
+        assert updated_position.stop_loss_price == pytest.approx(0.21)
+        assert updated_position.take_profit_price == pytest.approx(0.34)
+        assert updated_position.max_hold_hours == 6
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
 async def test_place_profit_taking_orders_paper_mode_books_fee_aware_exit():
     db_path = TEST_DB
     if os.path.exists(db_path):
@@ -204,7 +263,7 @@ async def test_place_profit_taking_orders_paper_mode_books_fee_aware_exit():
             live_mode=False,
         )
 
-        assert results["orders_placed"] == 0
+        assert results["orders_placed"] == 1
         assert results["positions_closed"] == 1
         assert await db_manager.get_position_by_market_id("PAPER-PROFIT-1") is None
 
@@ -220,12 +279,97 @@ async def test_place_profit_taking_orders_paper_mode_books_fee_aware_exit():
             os.remove(db_path)
 
 
+async def test_place_sell_limit_order_paper_mode_rests_then_fills_on_reconciliation():
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+
+    test_position = Position(
+        market_id="PAPER-REST-1",
+        side="YES",
+        entry_price=0.40,
+        quantity=10,
+        timestamp=datetime.now(),
+        rationale="Paper resting exit",
+        confidence=0.75,
+        live=False,
+        strategy="directional_trading",
+    )
+    position_id = await db_manager.add_position(test_position)
+    test_position.id = position_id
+
+    mock_kalshi_client = AsyncMock()
+    mock_kalshi_client.get_market.side_effect = [
+        {
+            "market": {
+                "ticker": "PAPER-REST-1",
+                "yes_bid_dollars": 0.48,
+                "yes_ask_dollars": 0.49,
+                "no_bid_dollars": 0.51,
+                "no_ask_dollars": 0.52,
+            }
+        },
+        {
+            "market": {
+                "ticker": "PAPER-REST-1",
+                "yes_bid_dollars": 0.56,
+                "yes_ask_dollars": 0.57,
+                "no_bid_dollars": 0.43,
+                "no_ask_dollars": 0.44,
+            }
+        },
+    ]
+
+    try:
+        success = await place_sell_limit_order(
+            position=test_position,
+            limit_price=0.55,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+            live_mode=False,
+        )
+
+        assert success is True
+        resting_orders = await db_manager.get_simulated_orders(
+            strategy="directional_trading",
+            market_id="PAPER-REST-1",
+            side="YES",
+            action="sell",
+            status="resting",
+        )
+        assert len(resting_orders) == 1
+        assert resting_orders[0].price == pytest.approx(0.55)
+
+        reconciliation = await reconcile_simulated_exit_orders(
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+            strategy="directional_trading",
+            market_id="PAPER-REST-1",
+        )
+
+        assert reconciliation["positions_closed"] == 1
+        assert await db_manager.get_position_by_market_id("PAPER-REST-1") is None
+
+        trade_logs = await db_manager.get_all_trade_logs()
+        assert len(trade_logs) == 1
+
+        expected_entry_fee = estimate_kalshi_fee(0.40, 10, maker=False)
+        expected_exit_fee = estimate_kalshi_fee(0.55, 10, maker=True)
+        expected_pnl = ((0.55 - 0.40) * 10) - expected_entry_fee - expected_exit_fee
+        assert trade_logs[0].pnl == pytest.approx(expected_pnl)
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
 async def test_sell_limit_order_functionality():
     """
     Test the sell limit order functionality with real Kalshi API.
     This test checks that we can place sell limit orders for existing positions.
     """
-    from src.jobs.execute import place_sell_limit_order
     from src.utils.database import DatabaseManager, Position
     from src.clients.kalshi_client import KalshiClient
     from tests.test_helpers import find_suitable_test_market

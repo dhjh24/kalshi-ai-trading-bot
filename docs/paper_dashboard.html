@@ -3,90 +3,132 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Kalshi AI Bot — Paper Trading Dashboard</title>
+<title>Kalshi AI Bot - Paper Trading Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
-  :root { --bg: #0d1117; --card: #161b22; --border: #30363d; --text: #c9d1d9;
-           --green: #3fb950; --red: #f85149; --yellow: #d29922; --blue: #58a6ff; }
-  * { margin:0; padding:0; box-sizing:border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-          background: var(--bg); color: var(--text); padding: 1.5rem; }
-  h1 { color: #fff; margin-bottom: .25rem; }
-  .subtitle { color: #8b949e; margin-bottom: 1.5rem; font-size: .9rem; }
-  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px,1fr));
-            gap: 1rem; margin-bottom: 1.5rem; }
-  .stat { background: var(--card); border: 1px solid var(--border); border-radius: 8px;
-           padding: 1rem; text-align: center; }
-  .stat .value { font-size: 1.8rem; font-weight: 700; }
-  .stat .label { font-size: .75rem; color: #8b949e; margin-top: .25rem; }
-  .stat .value.pos { color: var(--green); }
-  .stat .value.neg { color: var(--red); }
-  .chart-wrap { background: var(--card); border: 1px solid var(--border); border-radius: 8px;
-                 padding: 1rem; margin-bottom: 1.5rem; max-height: 300px; }
-  table { width: 100%; border-collapse: collapse; background: var(--card);
-           border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
-  th { background: #21262d; text-align: left; padding: .6rem .8rem; font-size: .75rem;
-        text-transform: uppercase; color: #8b949e; position: sticky; top: 0; }
-  td { padding: .5rem .8rem; border-top: 1px solid var(--border); font-size: .85rem; }
-  tr:hover { background: #1c2128; }
-  .badge { padding: 2px 8px; border-radius: 12px; font-size: .75rem; font-weight: 600; }
-  .badge.win { background: #23302a; color: var(--green); }
-  .badge.loss { background: #30201f; color: var(--red); }
-  .badge.pending { background: #2a2415; color: var(--yellow); }
+  :root { --bg: #0d1117; --card: #161b22; --card-2: #10161d; --border: #30363d; --text: #c9d1d9;
+           --muted: #8b949e; --green: #3fb950; --red: #f85149; --yellow: #d29922; --blue: #58a6ff; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); padding: 24px; }
+  h1 { color: #fff; margin-bottom: 6px; }
+  h2 { color: #fff; margin-bottom: 10px; font-size: 1.05rem; }
+  .subtitle { color: var(--muted); margin-bottom: 18px; font-size: 0.92rem; }
+  .banner { background: linear-gradient(135deg, #13261b, #102435); border: 1px solid #355f7c; border-radius: 12px; padding: 14px 16px; margin-bottom: 16px; }
+  .banner strong { color: #fff; }
+  .banner .meta { color: #9fc3dd; margin-top: 6px; font-size: 0.84rem; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .stat { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px; }
+  .stat .value { font-size: 1.7rem; font-weight: 700; }
+  .stat .label { color: var(--muted); font-size: 0.76rem; margin-top: 4px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .section { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-bottom: 16px; }
+  .chart-wrap { height: 280px; }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th { background: var(--card-2); color: var(--muted); font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.04em; text-align: left; padding: 10px 12px; }
+  td { border-top: 1px solid var(--border); padding: 10px 12px; font-size: 0.85rem; vertical-align: top; }
+  tr:hover { background: #1b222b; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.74rem; font-weight: 600; }
+  .pill.yes { background: #173624; color: var(--green); }
+  .pill.no { background: #341a1b; color: #ffb3ac; }
+  .pill.buy { background: #132b1d; color: var(--green); }
+  .pill.sell { background: #341f13; color: #f0c28e; }
   .pos { color: var(--green); }
   .neg { color: var(--red); }
-  .table-wrap { overflow-x: auto; }
-  a { color: var(--blue); text-decoration: none; }
-  footer { margin-top: 2rem; text-align: center; color: #484f58; font-size: .8rem; }
+  .empty { color: var(--muted); text-align: center; padding: 24px 12px; }
+  code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+  footer { margin-top: 18px; color: #6e7681; font-size: 0.8rem; text-align: center; }
 </style>
 </head>
 <body>
-<h1>📊 Paper Trading Dashboard</h1>
-<p class="subtitle">Kalshi AI Trading Bot — Signal tracker &amp; hypothetical P&amp;L · Updated 2026-02-16 06:53 UTC</p>
+<h1>Paper Trading Dashboard</h1>
+<p class="subtitle">Unified paper runtime sourced from <code>trading_system.db</code> - updated 2026-04-12 21:58 UTC</p>
+
+<div class="banner">
+  <div><strong>Paper mode mirrors the live runtime.</strong> Entries use live quotes, exits can rest locally, and closed trades reflect fee-aware simulated execution.</div>
+  <div class="meta">Source DB: <code>trading_system.db</code></div>
+</div>
 
 <div class="stats">
-  <div class="stat"><div class="value">0</div><div class="label">Total Signals</div></div>
-  <div class="stat"><div class="value">0</div><div class="label">Settled</div></div>
-  <div class="stat"><div class="value">0</div><div class="label">Pending</div></div>
+  <div class="stat"><div class="value">0</div><div class="label">Closed Trades</div></div>
+  <div class="stat"><div class="value">1</div><div class="label">Open Positions</div></div>
+  <div class="stat"><div class="value">0</div><div class="label">Resting Orders</div></div>
   <div class="stat"><div class="value">0.0%</div><div class="label">Win Rate</div></div>
   <div class="stat"><div class="value pos">$0.00</div><div class="label">Total P&amp;L</div></div>
-  <div class="stat"><div class="value">$0.0000</div><div class="label">Avg Return / Trade</div></div>
+  <div class="stat"><div class="value">$0.0000</div><div class="label">Avg P&amp;L / Trade</div></div>
   <div class="stat"><div class="value pos">$0.00</div><div class="label">Best Trade</div></div>
   <div class="stat"><div class="value neg">$0.00</div><div class="label">Worst Trade</div></div>
 </div>
 
-<div class="chart-wrap">
-  <canvas id="pnlChart"></canvas>
+<div class="section">
+  <h2>Cumulative P&amp;L</h2>
+  <div class="chart-wrap">
+    <canvas id="pnlChart"></canvas>
+  </div>
 </div>
 
-<div class="table-wrap">
-<table>
-<thead><tr>
-  <th>Time</th><th>Market</th><th>Side</th><th>Entry</th><th>Conf</th>
-  <th>Strategy</th><th>Outcome</th><th>P&amp;L</th><th>Reasoning</th>
-</tr></thead>
-<tbody><tr><td colspan="9" style="text-align:center;padding:2rem;color:#8b949e;">No signals yet. Run the bot with <code>--paper</code> to start tracking.</td></tr>
-</tbody>
-</table>
+<div class="section">
+  <h2>Open Paper Positions</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th>Opened</th><th>Market</th><th>Side</th><th>Entry</th><th>Qty</th><th>Strategy</th><th>Stop</th><th>Target</th>
+      </tr></thead>
+      <tbody>
+        <tr>
+            <td>2026-04-10 18:53</td>
+            <td title="KXTXSENCOMBO-26NOV-TALPAX">Will Dem Nominee be James Talarico AND GOP Nominee be Ke...</td>
+            <td><span class="pill no">NO</span></td>
+            <td>$0.3750</td>
+            <td>1</td>
+            <td>portfolio_optimization</td>
+            <td>-</td>
+            <td>-</td>
+        </tr></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Resting Paper Orders</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th>Placed</th><th>Market</th><th>Action</th><th>Side</th><th>Price</th><th>Qty</th><th>Strategy</th><th>Target</th>
+      </tr></thead>
+      <tbody><tr><td colspan="8" class="empty">No resting paper orders.</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Closed Paper Trades</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th>Closed</th><th>Market</th><th>Side</th><th>Entry</th><th>Exit</th><th>Qty</th><th>P&amp;L</th><th>Strategy</th><th>Rationale</th>
+      </tr></thead>
+      <tbody><tr><td colspan="9" class="empty">No closed paper trades yet.</td></tr></tbody>
+    </table>
+  </div>
 </div>
 
 <footer>
-  Generated by <a href="https://github.com/ryanfrigo/kalshi-ai-trading-bot">kalshi-ai-trading-bot</a> · Paper trading mode · Not financial advice
+  Generated by kalshi-ai-trading-bot. Paper-only metrics shown here exclude live trades.
 </footer>
 
 <script>
 const data = [];
 if (data.length > 0) {
-  new Chart(document.getElementById('pnlChart'), {
-    type: 'line',
+  new Chart(document.getElementById("pnlChart"), {
+    type: "line",
     data: {
-      labels: data.map(d => d.x.slice(0,10)),
+      labels: data.map(d => (d.x || "").slice(0, 19).replace("T", " ")),
       datasets: [{
-        label: 'Cumulative P&L ($)',
+        label: "Cumulative P&L ($)",
         data: data.map(d => d.y),
-        borderColor: data[data.length-1].y >= 0 ? '#3fb950' : '#f85149',
-        backgroundColor: 'transparent',
-        tension: 0.3,
+        borderColor: data[data.length - 1].y >= 0 ? "#3fb950" : "#f85149",
+        backgroundColor: "transparent",
+        tension: 0.25,
         pointRadius: 2,
       }]
     },
@@ -95,8 +137,8 @@ if (data.length > 0) {
       maintainAspectRatio: false,
       plugins: { legend: { display: false } },
       scales: {
-        x: { ticks: { color: '#8b949e', maxTicksLimit: 10 }, grid: { color: '#21262d' } },
-        y: { ticks: { color: '#8b949e', callback: v => '$'+v }, grid: { color: '#21262d' } }
+        x: { ticks: { color: "#8b949e", maxTicksLimit: 8 }, grid: { color: "#21262d" } },
+        y: { ticks: { color: "#8b949e", callback: v => "$" + v }, grid: { color: "#21262d" } }
       }
     }
   });

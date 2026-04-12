@@ -130,6 +130,7 @@ async def test_initialize_migrates_legacy_database(tmp_path):
         trade_log_info = await cursor.fetchall()
         trade_log_columns = {row[1] for row in trade_log_info}
         assert "strategy" in trade_log_columns
+        assert "live" in trade_log_columns
         assert next(row[2] for row in trade_log_info if row[1] == "quantity").upper() == "REAL"
 
         for table_name in ("llm_queries", "blocked_trades", "analysis_reports"):
@@ -173,6 +174,7 @@ async def test_fractional_quantity_round_trips_through_positions_and_trade_logs(
         entry_timestamp=position.timestamp,
         exit_timestamp=datetime.now(),
         rationale="fractional exit",
+        live=True,
         strategy="quick_flip_scalping",
     )
     await manager.add_trade_log(trade_log)
@@ -180,6 +182,7 @@ async def test_fractional_quantity_round_trips_through_positions_and_trade_logs(
     logs = await manager.get_all_trade_logs()
     assert len(logs) == 1
     assert logs[0].quantity == pytest.approx(10.95)
+    assert logs[0].live is True
 
 
 async def test_update_position_status_clears_market_has_position_when_last_position_closes(tmp_path):

@@ -57,6 +57,7 @@ class TradeLog:
     entry_timestamp: datetime
     exit_timestamp: datetime
     rationale: str
+    live: bool = False
     strategy: Optional[str] = None  # Strategy that created this trade
     id: Optional[int] = None
 
@@ -153,6 +154,9 @@ class DatabaseManager(TradingLoggerMixin):
             if "strategy" not in trade_log_columns:
                 await db.execute("ALTER TABLE trade_logs ADD COLUMN strategy TEXT")
                 self.logger.info("Added strategy column to trade_logs table")
+            if "live" not in trade_log_columns:
+                await db.execute("ALTER TABLE trade_logs ADD COLUMN live BOOLEAN NOT NULL DEFAULT 0")
+                self.logger.info("Added live column to trade_logs table")
 
             trade_log_quantity_type = next(
                 (str(col[2]).upper() for col in trade_log_info if col[1] == "quantity"),
@@ -314,6 +318,7 @@ class DatabaseManager(TradingLoggerMixin):
                 entry_timestamp TEXT NOT NULL,
                 exit_timestamp TEXT NOT NULL,
                 rationale TEXT,
+                live BOOLEAN NOT NULL DEFAULT 0,
                 strategy TEXT
             )
         """)
@@ -329,6 +334,7 @@ class DatabaseManager(TradingLoggerMixin):
                 entry_timestamp,
                 exit_timestamp,
                 rationale,
+                live,
                 strategy
             )
             SELECT
@@ -342,6 +348,7 @@ class DatabaseManager(TradingLoggerMixin):
                 entry_timestamp,
                 exit_timestamp,
                 rationale,
+                live,
                 strategy
             FROM trade_logs_legacy_quantity
         """)
@@ -369,6 +376,7 @@ class DatabaseManager(TradingLoggerMixin):
         trade_log_dict["quantity"] = self._normalize_quantity(trade_log_dict.get("quantity"))
         trade_log_dict["entry_timestamp"] = datetime.fromisoformat(trade_log_dict["entry_timestamp"])
         trade_log_dict["exit_timestamp"] = datetime.fromisoformat(trade_log_dict["exit_timestamp"])
+        trade_log_dict["live"] = bool(trade_log_dict.get("live", False))
         return TradeLog(**trade_log_dict)
 
     def _hydrate_simulated_order(self, row: aiosqlite.Row) -> SimulatedOrder:
@@ -509,6 +517,7 @@ class DatabaseManager(TradingLoggerMixin):
                 entry_timestamp TEXT NOT NULL,
                 exit_timestamp TEXT NOT NULL,
                 rationale TEXT,
+                live BOOLEAN NOT NULL DEFAULT 0,
                 strategy TEXT
             )
         """)
@@ -870,8 +879,14 @@ class DatabaseManager(TradingLoggerMixin):
         
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
-                INSERT INTO trade_logs (market_id, side, entry_price, exit_price, quantity, pnl, entry_timestamp, exit_timestamp, rationale, strategy)
-                VALUES (:market_id, :side, :entry_price, :exit_price, :quantity, :pnl, :entry_timestamp, :exit_timestamp, :rationale, :strategy)
+                INSERT INTO trade_logs (
+                    market_id, side, entry_price, exit_price, quantity, pnl,
+                    entry_timestamp, exit_timestamp, rationale, live, strategy
+                )
+                VALUES (
+                    :market_id, :side, :entry_price, :exit_price, :quantity, :pnl,
+                    :entry_timestamp, :exit_timestamp, :rationale, :live, :strategy
+                )
             """, trade_dict)
             await db.commit()
             self.logger.info(f"Added trade log for market {trade_log.market_id}.")
@@ -1326,7 +1341,7 @@ class DatabaseManager(TradingLoggerMixin):
             count = (await cursor.fetchone())[0]
             return count
 
-    async def get_all_trade_logs(self) -> List[TradeLog]:
+    async def get_all_trade_logs(self, *, live: Optional[bool] = None) -> List[TradeLog]:
         """
         Get all trade logs from the database.
         
@@ -1335,7 +1350,13 @@ class DatabaseManager(TradingLoggerMixin):
         """
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM trade_logs")
+            if live is None:
+                cursor = await db.execute("SELECT * FROM trade_logs")
+            else:
+                cursor = await db.execute(
+                    "SELECT * FROM trade_logs WHERE live = ?",
+                    (int(bool(live)),),
+                )
             rows = await cursor.fetchall()
             
             logs = []
