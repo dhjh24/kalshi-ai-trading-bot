@@ -86,7 +86,9 @@ async def test_run_tracking_closes_position(mock_kalshi_client, mock_manage_quic
         
         log = trade_logs[0]
         assert log.market_id == "TRACK-TEST-1"
-        assert log.pnl == (1.0 - 0.40) * 5, "PnL should be calculated correctly for a win."
+        expected_entry_fee = estimate_kalshi_fee(0.40, 5, maker=False)
+        expected_pnl = ((1.0 - 0.40) * 5) - expected_entry_fee
+        assert log.pnl == pytest.approx(expected_pnl), "PnL should include entry fees for a win."
 
         # 3. Verify mocks - Updated for new sell limit order functionality
         # The tracking system now calls get_market multiple times:

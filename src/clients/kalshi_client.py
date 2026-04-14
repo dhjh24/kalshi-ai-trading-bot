@@ -45,6 +45,7 @@ class KalshiClient(TradingLoggerMixin):
         self.backoff_factor = backoff_factor
         self.private_key = None
         self._private_key_loaded = False
+        self._series_cache: Dict[str, Dict[str, Any]] = {}
 
         self.client = httpx.AsyncClient(
             timeout=30.0,
@@ -294,6 +295,32 @@ class KalshiClient(TradingLoggerMixin):
         return await self._make_authenticated_request(
             "GET", f"/trade-api/v2/markets/{ticker}", require_auth=False
         )
+
+    async def get_series(
+        self,
+        series_ticker: str,
+        *,
+        include_volume: bool = False,
+        refresh: bool = False,
+    ) -> Dict[str, Any]:
+        """Get metadata for a specific series, caching repeat lookups."""
+        normalized_series_ticker = str(series_ticker or "").strip()
+        if not normalized_series_ticker:
+            return {}
+
+        if not refresh and normalized_series_ticker in self._series_cache:
+            return self._series_cache[normalized_series_ticker]
+
+        params = {"include_volume": "true"} if include_volume else None
+        response = await self._make_authenticated_request(
+            "GET",
+            f"/trade-api/v2/series/{normalized_series_ticker}",
+            params=params,
+            require_auth=False,
+        )
+        if isinstance(response, dict):
+            self._series_cache[normalized_series_ticker] = response
+        return response
 
     async def get_orderbook(self, ticker: str, depth: int = 100) -> Dict[str, Any]:
         """Get market orderbook."""

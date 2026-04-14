@@ -223,6 +223,132 @@ async def test_execute_position_paper_mode_preserves_exit_plan_metadata():
             os.remove(db_path)
 
 
+async def test_execute_position_paper_mode_records_filled_buy_order_and_fee_snapshot():
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+
+    test_position = Position(
+        market_id="PAPER-FILL-1",
+        side="YES",
+        entry_price=0.25,
+        quantity=4,
+        timestamp=datetime.now(),
+        rationale="Paper trade with execution trail",
+        confidence=0.70,
+        live=False,
+    )
+    position_id = await db_manager.add_position(test_position)
+    test_position.id = position_id
+
+    mock_kalshi_client = AsyncMock()
+    mock_kalshi_client.get_market.return_value = {
+        "market": {
+            "ticker": "PAPER-FILL-1",
+            "yes_bid_dollars": 0.24,
+            "yes_ask_dollars": 0.27,
+            "yes_ask_size_fp": "10.00",
+            "no_bid_dollars": 0.73,
+            "no_ask_dollars": 0.76,
+            "fee_type": "quadratic",
+            "fee_multiplier": 0,
+        }
+    }
+
+    try:
+        result = await execute_position(
+            position=test_position,
+            live_mode=False,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+        )
+
+        assert result is True
+        updated_position = await db_manager.get_position_by_market_id("PAPER-FILL-1")
+        assert updated_position is not None
+        assert updated_position.live is False
+        assert updated_position.entry_price == pytest.approx(0.27)
+        assert updated_position.entry_fee == pytest.approx(0.0)
+        assert updated_position.contracts_cost == pytest.approx(1.08)
+        assert updated_position.entry_order_id
+
+        simulated_buys = await db_manager.get_simulated_orders(
+            strategy="directional_trading",
+            market_id="PAPER-FILL-1",
+            side="YES",
+            action="buy",
+            status="filled",
+        )
+        assert len(simulated_buys) == 1
+        assert simulated_buys[0].filled_price == pytest.approx(0.27)
+        assert simulated_buys[0].order_id == updated_position.entry_order_id
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+async def test_execute_position_paper_mode_rejects_visible_book_size_shortfall():
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+
+    test_position = Position(
+        market_id="PAPER-DEPTH-1",
+        side="YES",
+        entry_price=0.25,
+        quantity=4,
+        timestamp=datetime.now(),
+        rationale="Paper trade depth check",
+        confidence=0.70,
+        live=False,
+    )
+    position_id = await db_manager.add_position(test_position)
+    test_position.id = position_id
+
+    mock_kalshi_client = AsyncMock()
+    mock_kalshi_client.get_market.return_value = {
+        "market": {
+            "ticker": "PAPER-DEPTH-1",
+            "yes_bid_dollars": 0.24,
+            "yes_ask_dollars": 0.27,
+            "yes_ask_size_fp": "2.00",
+            "no_bid_dollars": 0.73,
+            "no_ask_dollars": 0.76,
+        }
+    }
+
+    try:
+        result = await execute_position(
+            position=test_position,
+            live_mode=False,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+        )
+
+        assert result is False
+        updated_position = await db_manager.get_position_by_market_id("PAPER-DEPTH-1")
+        assert updated_position is not None
+        assert updated_position.entry_order_id is None
+
+        simulated_buys = await db_manager.get_simulated_orders(
+            strategy="directional_trading",
+            market_id="PAPER-DEPTH-1",
+            side="YES",
+            action="buy",
+            status="filled",
+        )
+        assert simulated_buys == []
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
 async def test_place_profit_taking_orders_paper_mode_books_fee_aware_exit():
     db_path = TEST_DB
     if os.path.exists(db_path):

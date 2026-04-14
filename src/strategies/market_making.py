@@ -24,10 +24,12 @@ from src.utils.kalshi_normalization import (
     get_best_ask_price,
     get_best_bid_price,
     get_market_result,
+    get_market_series_ticker,
     get_market_status,
     get_mid_price,
 )
 from src.utils.logging_setup import get_trading_logger
+from src.utils.trade_pricing import FeeMetadata, calculate_entry_cost, extract_fee_metadata
 
 
 @dataclass
@@ -174,15 +176,52 @@ class AdvancedMarketMaker:
         order.id = await self.db_manager.add_simulated_order(simulated_order)
         return order
 
-    async def _fill_paper_entry_order(self, order: LimitOrder) -> Dict[str, float]:
+    async def _resolve_fee_metadata(self, market_info: Dict[str, object]) -> FeeMetadata:
+        """Resolve fee metadata from the market payload and its parent series."""
+        metadata = extract_fee_metadata(market_info)
+        if metadata.fee_type:
+            return metadata
+
+        series_ticker = get_market_series_ticker(market_info)
+        if not series_ticker:
+            return metadata
+
+        try:
+            series_response = await self.kalshi_client.get_series(series_ticker)
+            series_info = series_response.get("series", {}) if isinstance(series_response, dict) else {}
+            return extract_fee_metadata(market_info, series_info)
+        except Exception as exc:
+            self.logger.debug(
+                f"Could not resolve series fee metadata for {series_ticker}: {exc}"
+            )
+            return metadata
+
+    async def _fill_paper_entry_order(
+        self,
+        order: LimitOrder,
+        *,
+        fee_metadata: FeeMetadata,
+    ) -> Dict[str, float]:
         """Convert a filled maker entry order into a paper position plus paired exit order."""
         filled_at = datetime.now()
+        entry_cost = calculate_entry_cost(
+            price=order.price,
+            quantity=order.quantity,
+            maker=True,
+            fee_type=fee_metadata.fee_type,
+            fee_multiplier=fee_metadata.fee_multiplier,
+            fee_waiver_expiration_time=fee_metadata.fee_waiver_expiration_time,
+            trade_ts=filled_at,
+        )
         position = Position(
             market_id=order.market_id,
             side=order.side,
             entry_price=order.price,
             quantity=order.quantity,
             timestamp=filled_at,
+            entry_fee=entry_cost["fee"],
+            contracts_cost=entry_cost["contracts_cost"],
+            entry_order_id=order.order_id,
             rationale=(
                 f"PAPER MARKET MAKING MAKER ENTRY @ ${order.price:.4f}"
                 f" target=${float(order.target_price or order.price):.4f}"
@@ -241,7 +280,12 @@ class AdvancedMarketMaker:
         )
         return {"entries_filled": 1.0, "exits_filled": 0.0, "realized_pnl": 0.0}
 
-    async def _fill_paper_exit_order(self, order: LimitOrder) -> Dict[str, float]:
+    async def _fill_paper_exit_order(
+        self,
+        order: LimitOrder,
+        *,
+        fee_metadata: FeeMetadata,
+    ) -> Dict[str, float]:
         """Close the linked paper position when the paired maker exit fills."""
         position = await self.db_manager.get_position_by_market_and_side(order.market_id, order.side)
         if not position:
@@ -261,6 +305,9 @@ class AdvancedMarketMaker:
             exit_maker=True,
             charge_entry_fee=True,
             charge_exit_fee=True,
+            exit_fee_type=fee_metadata.fee_type,
+            exit_fee_multiplier=fee_metadata.fee_multiplier,
+            exit_fee_waiver_expiration_time=fee_metadata.fee_waiver_expiration_time,
         )
         await self.db_manager.update_simulated_order(
             int(order.id),
@@ -316,6 +363,7 @@ class AdvancedMarketMaker:
                 market_info = market_data.get("market", {}) if isinstance(market_data, dict) else {}
                 if not market_info:
                     continue
+                fee_metadata = await self._resolve_fee_metadata(market_info)
 
                 market_status = get_market_status(market_info)
                 if market_status in {"closed", "settled", "finalized"}:
@@ -353,6 +401,9 @@ class AdvancedMarketMaker:
                         exit_maker=False,
                         charge_entry_fee=True,
                         charge_exit_fee=False,
+                        exit_fee_type=fee_metadata.fee_type,
+                        exit_fee_multiplier=fee_metadata.fee_multiplier,
+                        exit_fee_waiver_expiration_time=fee_metadata.fee_waiver_expiration_time,
                     )
                     await self.db_manager.update_simulated_order(
                         int(order.id),
@@ -384,13 +435,19 @@ class AdvancedMarketMaker:
                 if order.action == "buy":
                     best_ask = get_best_ask_price(market_info, order.side)
                     if best_ask > 0 and best_ask <= order.price + 1e-9:
-                        fill_result = await self._fill_paper_entry_order(order)
+                        fill_result = await self._fill_paper_entry_order(
+                            order,
+                            fee_metadata=fee_metadata,
+                        )
                         for key in results:
                             results[key] += float(fill_result.get(key, 0.0))
                 else:
                     best_bid = get_best_bid_price(market_info, order.side)
                     if best_bid > 0 and best_bid + 1e-9 >= order.price:
-                        fill_result = await self._fill_paper_exit_order(order)
+                        fill_result = await self._fill_paper_exit_order(
+                            order,
+                            fee_metadata=fee_metadata,
+                        )
                         for key in results:
                             results[key] += float(fill_result.get(key, 0.0))
             except Exception as exc:

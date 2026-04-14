@@ -109,6 +109,31 @@ def get_best_ask_price(market_info: Dict[str, Any], side: str) -> float:
     return yes_ask if side.upper() == "YES" else no_ask
 
 
+def _normalize_book_size(value: Any) -> float:
+    """Return a normalized top-of-book size from fixed-point or integer fields."""
+    if value in (None, ""):
+        return 0.0
+    return _as_float(value)
+
+
+def get_best_bid_size(market_info: Dict[str, Any], side: str) -> float:
+    """Return the displayed best-bid size for the requested side when available."""
+    if side.upper() == "YES":
+        size = market_info.get("yes_bid_size_fp", market_info.get("yes_bid_size", 0))
+    else:
+        size = market_info.get("no_bid_size_fp", market_info.get("no_bid_size", 0))
+    return _normalize_book_size(size)
+
+
+def get_best_ask_size(market_info: Dict[str, Any], side: str) -> float:
+    """Return the displayed best-ask size for the requested side when available."""
+    if side.upper() == "YES":
+        size = market_info.get("yes_ask_size_fp", market_info.get("yes_ask_size", 0))
+    else:
+        size = market_info.get("no_ask_size_fp", market_info.get("no_ask_size", 0))
+    return _normalize_book_size(size)
+
+
 def get_mid_price(market_info: Dict[str, Any], side: str) -> float:
     """Return a reasonable mark price for the requested side."""
     bid = get_best_bid_price(market_info, side)
@@ -187,6 +212,11 @@ def get_market_expiration_ts(market_info: Dict[str, Any]) -> Optional[int]:
         if parsed is not None:
             return parsed
     return None
+
+
+def get_market_series_ticker(market_info: Dict[str, Any]) -> str:
+    """Return the related series ticker when present on a market payload."""
+    return str(market_info.get("series_ticker") or "").strip()
 
 
 def get_market_tick_size(market_info: Dict[str, Any], price: Optional[float] = None) -> float:

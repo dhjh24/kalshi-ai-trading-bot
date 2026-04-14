@@ -25,16 +25,39 @@ from src.utils.database import DatabaseManager, Position, TradeLog
 from src.utils.kalshi_normalization import (
     get_best_bid_price,
     get_market_result,
+    get_market_series_ticker,
     get_market_status,
     get_mid_price,
 )
-from src.utils.trade_pricing import calculate_position_pnl
+from src.utils.trade_pricing import FeeMetadata, calculate_position_pnl, extract_fee_metadata
 from src.utils.logging_setup import get_trading_logger, setup_logging
 
 
 def _position_was_maker_entry(position: Position) -> bool:
     """Infer whether a paper/live position should be treated as maker-priced on entry."""
     return (position.strategy or "").strip().lower() == "market_making"
+
+
+async def _resolve_market_fee_metadata(
+    *,
+    kalshi_client: KalshiClient,
+    market_info: dict,
+) -> FeeMetadata:
+    """Resolve fee metadata from market and series payloads for tracker exits."""
+    metadata = extract_fee_metadata(market_info)
+    if metadata.fee_type:
+        return metadata
+
+    series_ticker = get_market_series_ticker(market_info)
+    if not series_ticker:
+        return metadata
+
+    try:
+        series_response = await kalshi_client.get_series(series_ticker)
+        series_info = series_response.get("series", {}) if isinstance(series_response, dict) else {}
+        return extract_fee_metadata(market_info, series_info)
+    except Exception:
+        return metadata
 
 
 async def should_exit_position(
@@ -283,6 +306,10 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                 )
 
                 if should_exit:
+                    fee_metadata = await _resolve_market_fee_metadata(
+                        kalshi_client=kalshi_client,
+                        market_info=market_data,
+                    )
                     if not live_mode and exit_reason != "market_resolution":
                         resting_orders = await db_manager.get_simulated_orders(
                             market_id=position.market_id,
@@ -314,6 +341,14 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                             exit_maker=False,
                             charge_entry_fee=True,
                             charge_exit_fee=exit_reason != "market_resolution",
+                            entry_fee_override=(
+                                position.entry_fee
+                                if position.entry_order_id or position.contracts_cost > 0 or position.entry_fee > 0
+                                else None
+                            ),
+                            exit_fee_type=fee_metadata.fee_type,
+                            exit_fee_multiplier=fee_metadata.fee_multiplier,
+                            exit_fee_waiver_expiration_time=fee_metadata.fee_waiver_expiration_time,
                         )
                         trade_log = TradeLog(
                             market_id=position.market_id,
@@ -328,7 +363,11 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                             entry_fee=pnl_details["entry_fee"],
                             exit_fee=pnl_details["exit_fee"],
                             fees_paid=pnl_details["fees_paid"],
-                            contracts_cost=position.entry_price * position.quantity,
+                            contracts_cost=(
+                                position.contracts_cost
+                                if position.contracts_cost > 0
+                                else position.entry_price * position.quantity
+                            ),
                             live=True,
                             strategy=position.strategy,
                         )
@@ -358,6 +397,9 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                             exit_maker=False,
                             charge_entry_fee=True,
                             charge_exit_fee=exit_reason != "market_resolution",
+                            exit_fee_type=fee_metadata.fee_type,
+                            exit_fee_multiplier=fee_metadata.fee_multiplier,
+                            exit_fee_waiver_expiration_time=fee_metadata.fee_waiver_expiration_time,
                         )
 
                         exits_executed += 1

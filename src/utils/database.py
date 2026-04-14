@@ -34,6 +34,9 @@ class Position:
     timestamp: datetime
     rationale: Optional[str] = None
     confidence: Optional[float] = None
+    entry_fee: float = 0.0
+    contracts_cost: float = 0.0
+    entry_order_id: Optional[str] = None
     live: bool = False
     status: str = "open"  # open, closed, pending
     id: Optional[int] = None
@@ -134,6 +137,9 @@ class DatabaseManager(TradingLoggerMixin):
                 "take_profit_price": "REAL",
                 "max_hold_hours": "INTEGER",
                 "target_confidence_change": "REAL",
+                "entry_fee": "REAL NOT NULL DEFAULT 0",
+                "contracts_cost": "REAL NOT NULL DEFAULT 0",
+                "entry_order_id": "TEXT",
             }
             for column_name, column_type in required_position_columns.items():
                 if column_name not in position_columns:
@@ -271,6 +277,9 @@ class DatabaseManager(TradingLoggerMixin):
                 timestamp TEXT NOT NULL,
                 rationale TEXT,
                 confidence REAL,
+                entry_fee REAL NOT NULL DEFAULT 0,
+                contracts_cost REAL NOT NULL DEFAULT 0,
+                entry_order_id TEXT,
                 live BOOLEAN NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'open',
                 strategy TEXT,
@@ -291,6 +300,9 @@ class DatabaseManager(TradingLoggerMixin):
                 timestamp,
                 rationale,
                 confidence,
+                entry_fee,
+                contracts_cost,
+                entry_order_id,
                 live,
                 status,
                 strategy,
@@ -308,6 +320,9 @@ class DatabaseManager(TradingLoggerMixin):
                 timestamp,
                 rationale,
                 confidence,
+                COALESCE(entry_fee, 0),
+                COALESCE(contracts_cost, 0),
+                entry_order_id,
                 live,
                 status,
                 strategy,
@@ -403,6 +418,8 @@ class DatabaseManager(TradingLoggerMixin):
         position_dict["quantity"] = self._normalize_quantity(position_dict.get("quantity"))
         position_dict["timestamp"] = datetime.fromisoformat(position_dict["timestamp"])
         position_dict["live"] = bool(position_dict.get("live", False))
+        position_dict["entry_fee"] = float(position_dict.get("entry_fee", 0.0) or 0.0)
+        position_dict["contracts_cost"] = float(position_dict.get("contracts_cost", 0.0) or 0.0)
         return Position(**position_dict)
 
     def _hydrate_trade_log(self, row: aiosqlite.Row) -> TradeLog:
@@ -535,6 +552,9 @@ class DatabaseManager(TradingLoggerMixin):
                 timestamp TEXT NOT NULL,
                 rationale TEXT,
                 confidence REAL,
+                entry_fee REAL NOT NULL DEFAULT 0,
+                contracts_cost REAL NOT NULL DEFAULT 0,
+                entry_order_id TEXT,
                 live BOOLEAN NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'open',
                 strategy TEXT,
@@ -1452,31 +1472,40 @@ class DatabaseManager(TradingLoggerMixin):
         *,
         entry_price: float,
         quantity: float,
-        live: bool = True,
+        live: Optional[bool] = None,
         stop_loss_price: Optional[float] = None,
         take_profit_price: Optional[float] = None,
         max_hold_hours: Optional[int] = None,
+        entry_fee: Optional[float] = None,
+        contracts_cost: Optional[float] = None,
+        entry_order_id: Optional[str] = None,
     ) -> None:
         """Update the executed fill and persisted exit plan for a position."""
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
                 """
                 UPDATE positions
-                SET live = ?,
+                SET live = COALESCE(?, live),
                     entry_price = ?,
                     quantity = ?,
-                    stop_loss_price = ?,
-                    take_profit_price = ?,
-                    max_hold_hours = ?
+                    stop_loss_price = COALESCE(?, stop_loss_price),
+                    take_profit_price = COALESCE(?, take_profit_price),
+                    max_hold_hours = COALESCE(?, max_hold_hours),
+                    entry_fee = COALESCE(?, entry_fee),
+                    contracts_cost = COALESCE(?, contracts_cost),
+                    entry_order_id = COALESCE(?, entry_order_id)
                 WHERE id = ?
                 """,
                 (
-                    int(bool(live)),
+                    int(bool(live)) if live is not None else None,
                     entry_price,
                     quantity,
                     stop_loss_price,
                     take_profit_price,
                     max_hold_hours,
+                    entry_fee,
+                    contracts_cost,
+                    entry_order_id,
                     position_id,
                 ),
             )
@@ -1504,8 +1533,44 @@ class DatabaseManager(TradingLoggerMixin):
             position_dict['timestamp'] = position.timestamp.isoformat()
 
             cursor = await db.execute("""
-                INSERT OR REPLACE INTO positions (market_id, side, entry_price, quantity, timestamp, rationale, confidence, live, status, strategy, stop_loss_price, take_profit_price, max_hold_hours, target_confidence_change)
-                VALUES (:market_id, :side, :entry_price, :quantity, :timestamp, :rationale, :confidence, :live, :status, :strategy, :stop_loss_price, :take_profit_price, :max_hold_hours, :target_confidence_change)
+                INSERT OR REPLACE INTO positions (
+                    market_id,
+                    side,
+                    entry_price,
+                    quantity,
+                    timestamp,
+                    rationale,
+                    confidence,
+                    entry_fee,
+                    contracts_cost,
+                    entry_order_id,
+                    live,
+                    status,
+                    strategy,
+                    stop_loss_price,
+                    take_profit_price,
+                    max_hold_hours,
+                    target_confidence_change
+                )
+                VALUES (
+                    :market_id,
+                    :side,
+                    :entry_price,
+                    :quantity,
+                    :timestamp,
+                    :rationale,
+                    :confidence,
+                    :entry_fee,
+                    :contracts_cost,
+                    :entry_order_id,
+                    :live,
+                    :status,
+                    :strategy,
+                    :stop_loss_price,
+                    :take_profit_price,
+                    :max_hold_hours,
+                    :target_confidence_change
+                )
             """, position_dict)
             await db.commit()
             

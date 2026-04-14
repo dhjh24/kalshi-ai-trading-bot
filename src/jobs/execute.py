@@ -17,9 +17,11 @@ from src.utils.kalshi_normalization import (
     dollars_to_cents,
     find_fill_price_for_order,
     get_best_ask_price,
+    get_best_ask_size,
     get_best_bid_price,
     get_fill_count,
     get_market_result,
+    get_market_series_ticker,
     get_market_status,
     get_market_tick_size,
     get_mid_price,
@@ -28,7 +30,13 @@ from src.utils.kalshi_normalization import (
     is_tradeable_market,
 )
 from src.utils.logging_setup import get_trading_logger
-from src.utils.trade_pricing import calculate_entry_cost, calculate_position_pnl
+from src.utils.trade_pricing import (
+    FeeMetadata,
+    calculate_entry_cost,
+    calculate_position_pnl,
+    estimate_kalshi_fee,
+    extract_fee_metadata,
+)
 
 
 def _validate_executable_price(*, ticker: str, side: str, price: float) -> float:
@@ -56,13 +64,111 @@ def _align_sell_limit_price(*, market_info: Dict[str, Any], price: float) -> flo
     return _floor_to_valid_tick(price, tick_size)
 
 
-async def _get_current_executable_entry_price(
+def _resolve_displayed_entry_liquidity(*, market_info: Dict[str, Any], side: str) -> float:
+    """Return the visible top-of-book size for an entry when the API provides it."""
+    return get_best_ask_size(market_info, side)
+
+
+def _validate_entry_liquidity(
+    *,
+    ticker: str,
+    side: str,
+    quantity: float,
+    available_quantity: float,
+) -> None:
+    """Reject paper/live entry attempts that exceed visible best-ask depth."""
+    if available_quantity <= 0:
+        return
+    if float(quantity or 0.0) <= available_quantity + 1e-9:
+        return
+
+    raise ValueError(
+        f"Skipping {ticker}: requested {float(quantity or 0.0):.2f} {side.upper()} contracts "
+        f"but only {available_quantity:.2f} are visible at the current best ask"
+    )
+
+
+def _get_simulated_order_id(*, prefix: str, position: Position) -> str:
+    """Build a deterministic-ish local order identifier for paper fills."""
+    return f"{prefix}_{position.market_id}_{position.side}_{uuid.uuid4().hex[:12]}"
+
+
+async def _resolve_market_fee_metadata(
+    *,
+    kalshi_client: KalshiClient,
+    ticker: str,
+    market_info: Dict[str, Any],
+) -> FeeMetadata:
+    """Resolve fee metadata from the market payload and, when needed, its series."""
+    metadata = extract_fee_metadata(market_info)
+    if metadata.fee_type:
+        return metadata
+
+    series_ticker = get_market_series_ticker(market_info)
+    if not series_ticker:
+        return metadata
+
+    try:
+        series_response = await kalshi_client.get_series(series_ticker)
+        series_info = series_response.get("series", {}) if isinstance(series_response, dict) else {}
+        return extract_fee_metadata(market_info, series_info)
+    except Exception as exc:
+        logger = get_trading_logger("trade_execution")
+        logger.debug(
+            f"Could not resolve series fee metadata for {ticker} ({series_ticker}); "
+            "falling back to market-level fee assumptions",
+            error=str(exc),
+        )
+        return metadata
+
+
+def _extract_order_fee_dollars(order_info: Dict[str, Any], *, maker: bool) -> Optional[float]:
+    """Return order-level fee metadata when the API includes it."""
+    fee_field = "maker_fees_dollars" if maker else "taker_fees_dollars"
+    try:
+        fee_value = order_info.get(fee_field)
+        if fee_value in (None, ""):
+            return None
+        return max(0.0, float(fee_value))
+    except (TypeError, ValueError):
+        return None
+
+
+async def _record_filled_paper_entry_order(
+    *,
+    position: Position,
+    db_manager: DatabaseManager,
+    fill_price: float,
+    filled_at: datetime,
+    order_id: str,
+) -> None:
+    """Persist a filled paper buy order so paper mode has the same execution trail as live."""
+    await db_manager.add_simulated_order(
+        SimulatedOrder(
+            strategy=position.strategy or "directional_trading",
+            market_id=position.market_id,
+            side=position.side,
+            action="buy",
+            price=fill_price,
+            quantity=position.quantity,
+            status="filled",
+            live=False,
+            order_id=order_id,
+            placed_at=filled_at,
+            filled_at=filled_at,
+            filled_price=fill_price,
+            position_id=position.id,
+        )
+    )
+
+
+async def _get_current_executable_entry_quote(
     *,
     kalshi_client: KalshiClient,
     ticker: str,
     side: str,
-) -> float:
-    """Fetch the best currently executable buy price for the requested side."""
+) -> tuple[float, float, Dict[str, Any]]:
+    """Fetch the current buy price, visible best-ask size, and raw market snapshot."""
     market_data = await kalshi_client.get_market(ticker)
     market = market_data.get("market", {})
 
@@ -73,7 +179,23 @@ async def _get_current_executable_entry_price(
         raise ValueError(f"Skipping {ticker}: collection/aggregate ticker")
 
     ask_dollars = get_best_ask_price(market, side)
-    return _validate_executable_price(ticker=ticker, side=side, price=ask_dollars)
+    ask_size = _resolve_displayed_entry_liquidity(market_info=market, side=side)
+    return _validate_executable_price(ticker=ticker, side=side, price=ask_dollars), ask_size, market
+
+
+async def _get_current_executable_entry_price(
+    *,
+    kalshi_client: KalshiClient,
+    ticker: str,
+    side: str,
+) -> float:
+    """Fetch the best currently executable buy price for the requested side."""
+    ask_dollars, _ask_size, _market = await _get_current_executable_entry_quote(
+        kalshi_client=kalshi_client,
+        ticker=ticker,
+        side=side,
+    )
+    return ask_dollars
 
 
 async def _reconcile_fill_price(
@@ -164,12 +286,27 @@ async def record_simulated_position_exit(
     exit_maker: bool = False,
     charge_entry_fee: bool = True,
     charge_exit_fee: bool = True,
+    exit_fee_type: Optional[str] = None,
+    exit_fee_multiplier: Optional[float] = None,
+    exit_fee_waiver_expiration_time: Any = None,
+    exit_trade_ts: Optional[datetime] = None,
 ) -> Dict[str, float | bool]:
     """Persist a paper exit using the shared fee-aware PnL model."""
+    stored_entry_fee = (
+        position.entry_fee
+        if position.entry_order_id or position.contracts_cost > 0 or position.entry_fee > 0
+        else None
+    )
+    stored_contracts_cost = (
+        position.contracts_cost
+        if position.entry_order_id or position.contracts_cost > 0
+        else None
+    )
     entry_cost = calculate_entry_cost(
         price=position.entry_price,
         quantity=position.quantity,
         maker=entry_maker,
+        fee_override=stored_entry_fee,
     )
     pnl_details = calculate_position_pnl(
         entry_price=position.entry_price,
@@ -179,6 +316,12 @@ async def record_simulated_position_exit(
         exit_maker=exit_maker,
         charge_entry_fee=charge_entry_fee,
         charge_exit_fee=charge_exit_fee,
+        entry_fee_override=stored_entry_fee,
+        entry_trade_ts=position.timestamp,
+        exit_fee_type=exit_fee_type,
+        exit_fee_multiplier=exit_fee_multiplier,
+        exit_fee_waiver_expiration_time=exit_fee_waiver_expiration_time,
+        exit_trade_ts=exit_trade_ts or datetime.now(),
     )
 
     trade_log = TradeLog(
@@ -196,7 +339,11 @@ async def record_simulated_position_exit(
         entry_fee=pnl_details["entry_fee"],
         exit_fee=pnl_details["exit_fee"],
         fees_paid=pnl_details["fees_paid"],
-        contracts_cost=entry_cost["contracts_cost"],
+        contracts_cost=(
+            stored_contracts_cost
+            if stored_contracts_cost is not None
+            else entry_cost["contracts_cost"]
+        ),
     )
     await db_manager.add_trade_log(trade_log)
     await db_manager.update_position_status(position.id, "closed")
@@ -266,9 +413,16 @@ async def submit_simulated_sell_limit_order(
         await db_manager.update_simulated_order(int(order.id), status="cancelled")
 
     market_info: Dict[str, Any] = {}
+    fee_metadata = FeeMetadata()
     try:
         market_response = await kalshi_client.get_market(position.market_id)
         market_info = market_response.get("market", {}) if isinstance(market_response, dict) else {}
+        if market_info:
+            fee_metadata = await _resolve_market_fee_metadata(
+                kalshi_client=kalshi_client,
+                ticker=position.market_id,
+                market_info=market_info,
+            )
     except Exception as exc:
         logger.warning(
             "Could not fetch live market data while submitting a paper sell order for %s; storing as resting.",
@@ -306,6 +460,10 @@ async def submit_simulated_sell_limit_order(
             exit_maker=False,
             charge_entry_fee=True,
             charge_exit_fee=True,
+            exit_fee_type=fee_metadata.fee_type,
+            exit_fee_multiplier=fee_metadata.fee_multiplier,
+            exit_fee_waiver_expiration_time=fee_metadata.fee_waiver_expiration_time,
+            exit_trade_ts=now,
         )
         logger.info(
             "Paper sell limit executed immediately for %s at $%.4f (limit $%.4f).",
@@ -393,6 +551,11 @@ async def reconcile_simulated_exit_orders(
             market_info = market_response.get("market", {}) if isinstance(market_response, dict) else {}
             if not market_info:
                 continue
+            fee_metadata = await _resolve_market_fee_metadata(
+                kalshi_client=kalshi_client,
+                ticker=order.market_id,
+                market_info=market_info,
+            )
 
             market_status = get_market_status(market_info)
             exit_price: Optional[float] = None
@@ -425,6 +588,9 @@ async def reconcile_simulated_exit_orders(
                 exit_maker=exit_maker,
                 charge_entry_fee=True,
                 charge_exit_fee=charge_exit_fee,
+                exit_fee_type=fee_metadata.fee_type,
+                exit_fee_multiplier=fee_metadata.fee_multiplier,
+                exit_fee_waiver_expiration_time=fee_metadata.fee_waiver_expiration_time,
             )
             await db_manager.update_simulated_order(
                 int(order.id),
@@ -472,23 +638,57 @@ async def execute_position(
 
     if not live_mode:
         try:
-            paper_entry_price = await _get_current_executable_entry_price(
+            paper_entry_price, displayed_ask_size, market_info = await _get_current_executable_entry_quote(
                 kalshi_client=kalshi_client,
                 ticker=position.market_id,
                 side=position.side,
+            )
+            _validate_entry_liquidity(
+                ticker=position.market_id,
+                side=position.side,
+                quantity=position.quantity,
+                available_quantity=displayed_ask_size,
             )
         except ValueError as exc:
             logger.warning(str(exc))
             return False
         except Exception as exc:
             paper_entry_price = position.entry_price
+            displayed_ask_size = 0.0
+            market_info = {}
             logger.warning(
                 f"Could not fetch live market data for paper entry on {position.market_id}; "
                 f"falling back to requested entry price {paper_entry_price:.4f}",
                 error=str(exc),
             )
 
+        filled_at = datetime.now()
+        fee_metadata = await _resolve_market_fee_metadata(
+            kalshi_client=kalshi_client,
+            ticker=position.market_id,
+            market_info=market_info,
+        ) if market_info else FeeMetadata()
+        entry_cost = calculate_entry_cost(
+            paper_entry_price,
+            position.quantity,
+            maker=False,
+            fee_type=fee_metadata.fee_type,
+            fee_multiplier=fee_metadata.fee_multiplier,
+            fee_waiver_expiration_time=fee_metadata.fee_waiver_expiration_time,
+            trade_ts=filled_at,
+        )
+        order_id = _get_simulated_order_id(prefix="sim_buy", position=position)
         position.entry_price = paper_entry_price
+        position.entry_fee = entry_cost["fee"]
+        position.contracts_cost = entry_cost["contracts_cost"]
+        position.entry_order_id = order_id
+        await _record_filled_paper_entry_order(
+            position=position,
+            db_manager=db_manager,
+            fill_price=paper_entry_price,
+            filled_at=filled_at,
+            order_id=order_id,
+        )
         await db_manager.update_position_execution_details(
             position.id,
             entry_price=paper_entry_price,
@@ -497,12 +697,18 @@ async def execute_position(
             stop_loss_price=position.stop_loss_price,
             take_profit_price=position.take_profit_price,
             max_hold_hours=position.max_hold_hours,
+            entry_fee=position.entry_fee,
+            contracts_cost=position.contracts_cost,
+            entry_order_id=position.entry_order_id,
         )
-        entry_cost = calculate_entry_cost(paper_entry_price, position.quantity, maker=False)
         logger.info(
             f"PAPER TRADE EXECUTED for {position.market_id} at ${paper_entry_price:.4f} "
             f"using live market data"
         )
+        if displayed_ask_size > 0:
+            logger.info(
+                f"Visible top-of-book liquidity at entry: {displayed_ask_size:.2f} contracts"
+            )
         logger.info(
             f"Estimated deployed capital: ${entry_cost['contracts_cost']:.2f} "
             f"+ fees ${entry_cost['fee']:.2f} = ${entry_cost['total_cost']:.2f}"
@@ -513,10 +719,16 @@ async def execute_position(
 
     try:
         side_lower = position.side.lower()
-        ask_dollars = await _get_current_executable_entry_price(
+        ask_dollars, displayed_ask_size, market_info = await _get_current_executable_entry_quote(
             kalshi_client=kalshi_client,
             ticker=position.market_id,
             side=position.side,
+        )
+        _validate_entry_liquidity(
+            ticker=position.market_id,
+            side=position.side,
+            quantity=position.quantity,
+            available_quantity=displayed_ask_size,
         )
 
         client_order_id = str(uuid.uuid4())
@@ -560,6 +772,25 @@ async def execute_position(
         position.entry_price = fill_price
         position.quantity = fill_quantity
         position.live = True
+        fee_metadata = await _resolve_market_fee_metadata(
+            kalshi_client=kalshi_client,
+            ticker=position.market_id,
+            market_info=market_info,
+        )
+        position.entry_fee = (
+            _extract_order_fee_dollars(order_info, maker=False)
+            or estimate_kalshi_fee(
+                fill_price,
+                fill_quantity,
+                maker=False,
+                fee_type=fee_metadata.fee_type,
+                fee_multiplier=fee_metadata.fee_multiplier,
+                fee_waiver_expiration_time=fee_metadata.fee_waiver_expiration_time,
+                trade_ts=datetime.now(),
+            )
+        )
+        position.contracts_cost = fill_price * fill_quantity
+        position.entry_order_id = order_info.get("order_id") or client_order_id
         await db_manager.update_position_execution_details(
             position.id,
             entry_price=fill_price,
@@ -568,11 +799,16 @@ async def execute_position(
             stop_loss_price=position.stop_loss_price,
             take_profit_price=position.take_profit_price,
             max_hold_hours=position.max_hold_hours,
+            entry_fee=position.entry_fee,
+            contracts_cost=position.contracts_cost,
+            entry_order_id=position.entry_order_id,
         )
         logger.info(
             f"LIVE ORDER PLACED for {position.market_id}. Order ID: {order_response.get('order', {}).get('order_id')}"
         )
-        logger.info(f"Real money used: ${fill_quantity * fill_price:.2f}")
+        logger.info(
+            f"Real money used: ${position.contracts_cost:.2f} + fees ${position.entry_fee:.2f}"
+        )
         return True
 
     except ValueError as exc:

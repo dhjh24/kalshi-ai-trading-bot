@@ -51,6 +51,7 @@ from src.utils.kalshi_normalization import (
 )
 from src.utils.logging_setup import get_trading_logger
 from src.utils.trade_pricing import estimate_kalshi_fee
+from src.utils.trade_pricing import FeeMetadata, calculate_entry_cost, extract_fee_metadata
 
 
 @dataclass
@@ -163,6 +164,26 @@ class QuickFlipScalpingStrategy:
     def _estimate_kalshi_fee(price: float, quantity: float, *, maker: bool) -> float:
         """Delegate to the shared fee model used across live and paper execution."""
         return estimate_kalshi_fee(price, quantity, maker=maker)
+
+    async def _resolve_fee_metadata(self, market_info: Dict[str, Any]) -> FeeMetadata:
+        """Resolve fee metadata from the market payload and its series when available."""
+        metadata = extract_fee_metadata(market_info)
+        if metadata.fee_type:
+            return metadata
+
+        series_ticker = str(market_info.get("series_ticker") or "").strip()
+        if not series_ticker:
+            return metadata
+
+        try:
+            series_response = await self.kalshi_client.get_series(series_ticker)
+            series_info = series_response.get("series", {}) if isinstance(series_response, dict) else {}
+            return extract_fee_metadata(market_info, series_info)
+        except Exception as exc:
+            self.logger.debug(
+                f"Could not resolve fee metadata for quick flip series {series_ticker}: {exc}"
+            )
+            return metadata
 
     @staticmethod
     def _normalize_orderbook_levels(orderbook: Dict[str, Any], side: str) -> List[Tuple[float, float]]:
@@ -621,6 +642,19 @@ class QuickFlipScalpingStrategy:
                 position.quantity = filled_quantity
                 position.entry_price = actual_fill_price
                 position.live = True
+                fee_metadata = await self._resolve_fee_metadata(market_info)
+                entry_cost = calculate_entry_cost(
+                    actual_fill_price,
+                    filled_quantity,
+                    maker=True,
+                    fee_type=fee_metadata.fee_type,
+                    fee_multiplier=fee_metadata.fee_multiplier,
+                    fee_waiver_expiration_time=fee_metadata.fee_waiver_expiration_time,
+                    trade_ts=datetime.now(timezone.utc),
+                )
+                position.entry_fee = entry_cost["fee"]
+                position.contracts_cost = entry_cost["contracts_cost"]
+                position.entry_order_id = order_id or order_params["client_order_id"]
                 position.stop_loss_price = self._calculate_stop_loss_price(
                     entry_price=actual_fill_price,
                     tick_size=tick_size,
@@ -636,6 +670,9 @@ class QuickFlipScalpingStrategy:
                     stop_loss_price=position.stop_loss_price,
                     take_profit_price=position.take_profit_price,
                     max_hold_hours=position.max_hold_hours,
+                    entry_fee=position.entry_fee,
+                    contracts_cost=position.contracts_cost,
+                    entry_order_id=position.entry_order_id,
                 )
                 self.logger.info(
                     f"LIVE MAKER ENTRY FILLED for {position.market_id} {position.side}: "
@@ -740,7 +777,11 @@ class QuickFlipScalpingStrategy:
             else position.entry_price
         )
 
-        total_entry_fee = self._estimate_kalshi_fee(entry_price, closed_quantity, maker=True)
+        total_entry_fee = (
+            position.entry_fee
+            if position.entry_order_id or position.contracts_cost > 0 or position.entry_fee > 0
+            else self._estimate_kalshi_fee(entry_price, closed_quantity, maker=True)
+        )
         if buy_fills and buy_fill_quantity > 0:
             try:
                 buy_fees = [_safe_float(fill.get("fee_cost", 0) or 0) for fill in buy_fills]
@@ -778,7 +819,11 @@ class QuickFlipScalpingStrategy:
             exit_fee=exit_fee,
             fees_paid=total_entry_fee + exit_fee,
             live=True,
-            contracts_cost=entry_price * closed_quantity,
+            contracts_cost=(
+                position.contracts_cost
+                if position.contracts_cost > 0
+                else entry_price * closed_quantity
+            ),
             strategy=position.strategy,
         )
         await self.db_manager.add_trade_log(trade_log)
@@ -888,6 +933,9 @@ class QuickFlipScalpingStrategy:
                         stop_loss_price=position.stop_loss_price,
                         take_profit_price=position.take_profit_price,
                         max_hold_hours=position.max_hold_hours,
+                        entry_fee=position.entry_fee,
+                        contracts_cost=position.contracts_cost,
+                        entry_order_id=position.entry_order_id,
                     )
                     position.quantity = actual_qty
                     results["positions_synced"] += 1
@@ -1318,6 +1366,9 @@ Respond with JSON only:
                         stop_loss_price=position.stop_loss_price,
                         take_profit_price=position.take_profit_price,
                         max_hold_hours=position.max_hold_hours,
+                        entry_fee=position.entry_fee,
+                        contracts_cost=position.contracts_cost,
+                        entry_order_id=position.entry_order_id,
                     )
                 self.active_positions[opportunity.market_id] = position
                 self.logger.info(
