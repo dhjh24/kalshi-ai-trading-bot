@@ -166,6 +166,11 @@ async def record_simulated_position_exit(
     charge_exit_fee: bool = True,
 ) -> Dict[str, float | bool]:
     """Persist a paper exit using the shared fee-aware PnL model."""
+    entry_cost = calculate_entry_cost(
+        price=position.entry_price,
+        quantity=position.quantity,
+        maker=entry_maker,
+    )
     pnl_details = calculate_position_pnl(
         entry_price=position.entry_price,
         exit_price=exit_price,
@@ -188,6 +193,10 @@ async def record_simulated_position_exit(
         rationale=f"{position.rationale} | {rationale_suffix}",
         live=False,
         strategy=position.strategy,
+        entry_fee=pnl_details["entry_fee"],
+        exit_fee=pnl_details["exit_fee"],
+        fees_paid=pnl_details["fees_paid"],
+        contracts_cost=entry_cost["contracts_cost"],
     )
     await db_manager.add_trade_log(trade_log)
     await db_manager.update_position_status(position.id, "closed")

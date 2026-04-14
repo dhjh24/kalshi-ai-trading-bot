@@ -57,6 +57,10 @@ class TradeLog:
     entry_timestamp: datetime
     exit_timestamp: datetime
     rationale: str
+    entry_fee: float = 0.0
+    exit_fee: float = 0.0
+    fees_paid: float = 0.0
+    contracts_cost: float = 0.0
     live: bool = False
     strategy: Optional[str] = None  # Strategy that created this trade
     id: Optional[int] = None
@@ -157,6 +161,18 @@ class DatabaseManager(TradingLoggerMixin):
             if "live" not in trade_log_columns:
                 await db.execute("ALTER TABLE trade_logs ADD COLUMN live BOOLEAN NOT NULL DEFAULT 0")
                 self.logger.info("Added live column to trade_logs table")
+            if "entry_fee" not in trade_log_columns:
+                await db.execute("ALTER TABLE trade_logs ADD COLUMN entry_fee REAL NOT NULL DEFAULT 0")
+                self.logger.info("Added entry_fee column to trade_logs table")
+            if "exit_fee" not in trade_log_columns:
+                await db.execute("ALTER TABLE trade_logs ADD COLUMN exit_fee REAL NOT NULL DEFAULT 0")
+                self.logger.info("Added exit_fee column to trade_logs table")
+            if "fees_paid" not in trade_log_columns:
+                await db.execute("ALTER TABLE trade_logs ADD COLUMN fees_paid REAL NOT NULL DEFAULT 0")
+                self.logger.info("Added fees_paid column to trade_logs table")
+            if "contracts_cost" not in trade_log_columns:
+                await db.execute("ALTER TABLE trade_logs ADD COLUMN contracts_cost REAL NOT NULL DEFAULT 0")
+                self.logger.info("Added contracts_cost column to trade_logs table")
 
             trade_log_quantity_type = next(
                 (str(col[2]).upper() for col in trade_log_info if col[1] == "quantity"),
@@ -315,6 +331,10 @@ class DatabaseManager(TradingLoggerMixin):
                 exit_price REAL NOT NULL,
                 quantity REAL NOT NULL,
                 pnl REAL NOT NULL,
+                entry_fee REAL NOT NULL DEFAULT 0,
+                exit_fee REAL NOT NULL DEFAULT 0,
+                fees_paid REAL NOT NULL DEFAULT 0,
+                contracts_cost REAL NOT NULL DEFAULT 0,
                 entry_timestamp TEXT NOT NULL,
                 exit_timestamp TEXT NOT NULL,
                 rationale TEXT,
@@ -322,36 +342,51 @@ class DatabaseManager(TradingLoggerMixin):
                 strategy TEXT
             )
         """)
-        await db.execute("""
-            INSERT INTO trade_logs (
-                id,
-                market_id,
-                side,
-                entry_price,
-                exit_price,
-                quantity,
-                pnl,
-                entry_timestamp,
-                exit_timestamp,
-                rationale,
-                live,
-                strategy
-            )
-            SELECT
-                id,
-                market_id,
-                side,
-                entry_price,
-                exit_price,
-                CAST(quantity AS REAL),
-                pnl,
-                entry_timestamp,
-                exit_timestamp,
-                rationale,
-                live,
-                strategy
-            FROM trade_logs_legacy_quantity
-        """)
+        cursor = await db.execute("PRAGMA table_info(trade_logs_legacy_quantity)")
+        legacy_columns = await cursor.fetchall()
+        legacy_column_names = {row[1] for row in legacy_columns}
+
+        insert_columns = (
+            "id, market_id, side, entry_price, exit_price, quantity, pnl, "
+            "entry_fee, exit_fee, fees_paid, contracts_cost, entry_timestamp, "
+            "exit_timestamp, rationale, live, strategy"
+        )
+
+        entry_fee_expr = (
+            "COALESCE(entry_fee, 0)"
+            if "entry_fee" in legacy_column_names
+            else "0.0"
+        )
+        exit_fee_expr = (
+            "COALESCE(exit_fee, 0)"
+            if "exit_fee" in legacy_column_names
+            else "0.0"
+        )
+        fees_paid_expr = (
+            "COALESCE(fees_paid, 0)"
+            if "fees_paid" in legacy_column_names
+            else "0.0"
+        )
+        contracts_cost_expr = (
+            "COALESCE(contracts_cost, 0)"
+            if "contracts_cost" in legacy_column_names
+            else "0.0"
+        )
+        live_expr = "COALESCE(live, 0)" if "live" in legacy_column_names else "0"
+        strategy_expr = "strategy" if "strategy" in legacy_column_names else "NULL"
+
+        select_statement = (
+            "SELECT "
+            "id, market_id, side, entry_price, exit_price, CAST(quantity AS REAL), pnl, "
+            f"{entry_fee_expr} AS entry_fee, {exit_fee_expr} AS exit_fee, "
+            f"{fees_paid_expr} AS fees_paid, {contracts_cost_expr} AS contracts_cost, "
+            "entry_timestamp, exit_timestamp, rationale, "
+            f"{live_expr} AS live, {strategy_expr} AS strategy "
+            "FROM trade_logs_legacy_quantity"
+        )
+        await db.execute(
+            f"INSERT INTO trade_logs ({insert_columns}) {select_statement}"
+        )
         await db.execute("DROP TABLE trade_logs_legacy_quantity")
 
     @staticmethod
@@ -377,6 +412,12 @@ class DatabaseManager(TradingLoggerMixin):
         trade_log_dict["entry_timestamp"] = datetime.fromisoformat(trade_log_dict["entry_timestamp"])
         trade_log_dict["exit_timestamp"] = datetime.fromisoformat(trade_log_dict["exit_timestamp"])
         trade_log_dict["live"] = bool(trade_log_dict.get("live", False))
+        trade_log_dict["entry_fee"] = float(trade_log_dict.get("entry_fee", 0.0) or 0.0)
+        trade_log_dict["exit_fee"] = float(trade_log_dict.get("exit_fee", 0.0) or 0.0)
+        trade_log_dict["fees_paid"] = float(trade_log_dict.get("fees_paid", 0.0) or 0.0)
+        trade_log_dict["contracts_cost"] = float(
+            trade_log_dict.get("contracts_cost", 0.0) or 0.0
+        )
         return TradeLog(**trade_log_dict)
 
     def _hydrate_simulated_order(self, row: aiosqlite.Row) -> SimulatedOrder:
@@ -514,6 +555,10 @@ class DatabaseManager(TradingLoggerMixin):
                 exit_price REAL NOT NULL,
                 quantity REAL NOT NULL,
                 pnl REAL NOT NULL,
+                entry_fee REAL NOT NULL DEFAULT 0,
+                exit_fee REAL NOT NULL DEFAULT 0,
+                fees_paid REAL NOT NULL DEFAULT 0,
+                contracts_cost REAL NOT NULL DEFAULT 0,
                 entry_timestamp TEXT NOT NULL,
                 exit_timestamp TEXT NOT NULL,
                 rationale TEXT,
@@ -876,18 +921,38 @@ class DatabaseManager(TradingLoggerMixin):
         trade_dict = asdict(trade_log)
         trade_dict['entry_timestamp'] = trade_log.entry_timestamp.isoformat()
         trade_dict['exit_timestamp'] = trade_log.exit_timestamp.isoformat()
+        trade_dict["id"] = None
+        trade_dict["live"] = int(bool(trade_dict.get("live", False)))
         
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                INSERT INTO trade_logs (
-                    market_id, side, entry_price, exit_price, quantity, pnl,
-                    entry_timestamp, exit_timestamp, rationale, live, strategy
-                )
-                VALUES (
-                    :market_id, :side, :entry_price, :exit_price, :quantity, :pnl,
-                    :entry_timestamp, :exit_timestamp, :rationale, :live, :strategy
-                )
-            """, trade_dict)
+            cursor = await db.execute("PRAGMA table_info(trade_logs)")
+            trade_log_columns = await cursor.fetchall()
+            trade_log_column_names = {col[1] for col in trade_log_columns}
+
+            candidate_columns = (
+                "market_id",
+                "side",
+                "entry_price",
+                "exit_price",
+                "quantity",
+                "pnl",
+                "entry_fee",
+                "exit_fee",
+                "fees_paid",
+                "contracts_cost",
+                "entry_timestamp",
+                "exit_timestamp",
+                "rationale",
+                "live",
+                "strategy",
+            )
+            insert_columns = [c for c in candidate_columns if c in trade_log_column_names]
+            placeholders = ", ".join(f":{column}" for column in insert_columns)
+            statement = (
+                f"INSERT INTO trade_logs ({', '.join(insert_columns)}) "
+                f"VALUES ({placeholders})"
+            )
+            await db.execute(statement, trade_dict)
             await db.commit()
             self.logger.info(f"Added trade log for market {trade_log.market_id}.")
 

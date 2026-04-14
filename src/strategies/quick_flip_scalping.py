@@ -37,6 +37,7 @@ from src.utils.kalshi_normalization import (
     get_best_bid_price,
     get_fill_price_dollars,
     get_last_price,
+    get_market_result,
     get_market_expiration_ts,
     get_market_status,
     get_market_tick_size,
@@ -699,41 +700,85 @@ class QuickFlipScalpingStrategy:
         if sell_quantity <= 0:
             return False
 
-        exit_price = (
-            sum(get_fill_price_dollars(fill, side=position.side) * get_fill_count(fill) for fill in sell_fills)
-            / sell_quantity
-        )
-
-        buy_quantity = sum(get_fill_count(fill) for fill in buy_fills)
-        entry_fee = self._estimate_kalshi_fee(position.entry_price, position.quantity, maker=False)
-        if buy_fills and buy_quantity > 0:
-            try:
-                entry_fee = sum(float(fill.get("fee_cost", 0) or 0) for fill in buy_fills)
-            except (TypeError, ValueError):
-                entry_fee = self._estimate_kalshi_fee(position.entry_price, position.quantity, maker=False)
-
-        try:
-            exit_fee = sum(float(fill.get("fee_cost", 0) or 0) for fill in sell_fills)
-        except (TypeError, ValueError):
-            exit_fee = 0.0
-
         closed_quantity = min(position.quantity, sell_quantity)
         if closed_quantity <= 0:
             closed_quantity = position.quantity
 
-        net_pnl = ((exit_price - position.entry_price) * closed_quantity) - entry_fee - exit_fee
+        def _safe_float(value: Any) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
+
+        buy_fill_quantity = 0.0
+        buy_fill_value = 0.0
+        for fill in buy_fills:
+            count = get_fill_count(fill)
+            if count <= 0:
+                continue
+            buy_fill_quantity += count
+            buy_fill_value += get_fill_price_dollars(fill, side=position.side) * count
+
+        sell_fill_quantity = 0.0
+        sell_fill_value = 0.0
+        for fill in sell_fills:
+            count = get_fill_count(fill)
+            if count <= 0:
+                continue
+            sell_fill_quantity += count
+            sell_fill_value += get_fill_price_dollars(fill, side=position.side) * count
+
+        exit_price = (
+            sell_fill_value / sell_fill_quantity
+            if sell_fill_quantity > 0
+            else sum(get_fill_price_dollars(fill, side=position.side) * get_fill_count(fill) for fill in sell_fills)
+            / sell_quantity
+        )
+        entry_price = (
+            buy_fill_value / buy_fill_quantity
+            if buy_fill_quantity > 0
+            else position.entry_price
+        )
+
+        total_entry_fee = self._estimate_kalshi_fee(entry_price, closed_quantity, maker=True)
+        if buy_fills and buy_fill_quantity > 0:
+            try:
+                buy_fees = [_safe_float(fill.get("fee_cost", 0) or 0) for fill in buy_fills]
+                if any(fee > 0 for fee in buy_fees):
+                    total_entry_fee = sum(buy_fees)
+                    if buy_fill_quantity > 0:
+                        total_entry_fee = total_entry_fee * (closed_quantity / buy_fill_quantity)
+            except (TypeError, ValueError):
+                pass
+
+        try:
+            exit_fees = [_safe_float(fill.get("fee_cost", 0) or 0) for fill in sell_fills]
+            exit_fee = sum(exit_fees)
+            if sell_fill_quantity > 0:
+                exit_fee = exit_fee * (closed_quantity / sell_fill_quantity)
+        except (TypeError, ValueError):
+            exit_fee = self._estimate_kalshi_fee(exit_price, closed_quantity, maker=True)
+
+        if sell_fill_quantity <= 0 and exit_fee <= 0:
+            exit_fee = self._estimate_kalshi_fee(exit_price, closed_quantity, maker=True)
+
+        net_pnl = ((exit_price - entry_price) * closed_quantity) - total_entry_fee - exit_fee
 
         trade_log = TradeLog(
             market_id=position.market_id,
             side=position.side,
-            entry_price=position.entry_price,
+            entry_price=entry_price,
             exit_price=exit_price,
             quantity=closed_quantity,
             pnl=net_pnl,
             entry_timestamp=position.timestamp,
             exit_timestamp=datetime.now(),
             rationale=f"{position.rationale} | LIVE QUICK FLIP EXIT FILLED",
+            entry_fee=total_entry_fee,
+            exit_fee=exit_fee,
+            fees_paid=total_entry_fee + exit_fee,
             live=True,
+            contracts_cost=entry_price * closed_quantity,
             strategy=position.strategy,
         )
         await self.db_manager.add_trade_log(trade_log)
@@ -1296,38 +1341,26 @@ Respond with JSON only:
         rationale_suffix: str,
     ) -> Dict[str, float | bool]:
         """Persist a simulated paper exit using fee-aware PnL."""
-        entry_fee = self._estimate_kalshi_fee(position.entry_price, position.quantity, maker=False)
-        exit_fee = self._estimate_kalshi_fee(exit_price, position.quantity, maker=True)
-        gross_pnl = (exit_price - position.entry_price) * position.quantity
-        fees_paid = entry_fee + exit_fee
-        net_pnl = gross_pnl - fees_paid
-
-        trade_log = TradeLog(
-            market_id=position.market_id,
-            side=position.side,
-            entry_price=position.entry_price,
+        exit_result = await record_simulated_position_exit(
+            position=position,
             exit_price=exit_price,
-            quantity=position.quantity,
-            pnl=net_pnl,
-            entry_timestamp=position.timestamp,
-            exit_timestamp=datetime.now(),
-            rationale=f"{position.rationale} | {rationale_suffix}",
-            live=False,
-            strategy=position.strategy,
+            db_manager=self.db_manager,
+            rationale_suffix=rationale_suffix,
+            entry_maker=False,
+            exit_maker=True,
+            charge_entry_fee=True,
+            charge_exit_fee=True,
         )
-        await self.db_manager.add_trade_log(trade_log)
-        await self.db_manager.update_position_status(position.id, "closed")
         self.active_positions.pop(position.market_id, None)
         self.pending_sells.pop(position.market_id, None)
-
         return {
             "success": True,
             "filled": True,
-            "gross_pnl": gross_pnl,
-            "net_pnl": net_pnl,
-            "fees_paid": fees_paid,
-            "is_win": net_pnl > 0,
-            "is_loss": net_pnl <= 0,
+            "gross_pnl": float(exit_result["gross_pnl"]),
+            "net_pnl": float(exit_result["net_pnl"]),
+            "fees_paid": float(exit_result["fees_paid"]),
+            "is_win": bool(exit_result["is_win"]),
+            "is_loss": bool(exit_result["is_loss"]),
         }
 
     async def _get_paper_reachable_exit_price(
@@ -1510,6 +1543,47 @@ Respond with JSON only:
 
                 market_status = get_market_status(market_info)
                 if not live_mode and market_status in {"closed", "settled", "finalized"}:
+                    resting_orders = await self.db_manager.get_simulated_orders(
+                        strategy="quick_flip_scalping",
+                        market_id=position.market_id,
+                        side=position.side,
+                        action="sell",
+                        status="resting",
+                    )
+                    for order in resting_orders:
+                        await self.db_manager.update_simulated_order(int(order.id), status="cancelled")
+                    results["orders_cancelled"] += len(resting_orders)
+
+                    market_result = get_market_result(market_info)
+                    if market_result:
+                        exit_price = (
+                            1.0 if str(market_result).upper() == position.side.upper() else 0.0
+                        )
+                    else:
+                        exit_price = (
+                            get_last_price(market_info, position.side)
+                            or get_best_bid_price(market_info, position.side)
+                            or position.entry_price
+                        )
+
+                    exit_result = await record_simulated_position_exit(
+                        position=position,
+                        exit_price=float(exit_price),
+                        db_manager=self.db_manager,
+                        rationale_suffix=f"PAPER QUICK FLIP MARKET RESOLUTION @ ${float(exit_price):.4f}",
+                        entry_maker=False,
+                        exit_maker=False,
+                        charge_entry_fee=True,
+                        charge_exit_fee=False,
+                    )
+                    self.active_positions.pop(position.market_id, None)
+                    self.pending_sells.pop(position.market_id, None)
+                    results["positions_closed"] += 1
+                    results["total_pnl"] += float(exit_result["net_pnl"])
+                    self.logger.info(
+                        f"Paper quick flip resolved on market close for {position.market_id}: "
+                        f"net=${float(exit_result['net_pnl']):.2f}"
+                    )
                     continue
 
                 current_price = get_best_bid_price(market_info, position.side)

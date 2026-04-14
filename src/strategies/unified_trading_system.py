@@ -1,5 +1,5 @@
-"""
-Unified Advanced Trading System - The Beast Mode 🚀
+﻿"""
+Unified Advanced Trading System - The Beast Mode ðŸš€
 
 This system orchestrates all cutting-edge strategies:
 1. Market Making Strategy (limit orders for spreads)
@@ -57,7 +57,7 @@ from src.strategies.quick_flip_scalping import QuickFlipConfig, run_quick_flip_s
 class TradingSystemConfig:
     """Configuration for the unified trading system."""
     # Capital allocation across strategies
-    # Quick flip strategy REMOVED — 0% win rate, -$208 in 12 trades.
+    # Quick flip strategy REMOVED â€” 0% win rate, -$208 in 12 trades.
     # Reallocated to directional (ensemble-driven) trading.
     market_making_allocation: float = 0.30  # 30% for market making
     directional_trading_allocation: float = 0.70  # 70% for directional positions (AI ensemble)
@@ -88,6 +88,9 @@ class TradingSystemResults:
     market_making_orders: int = 0
     market_making_exposure: float = 0.0
     market_making_expected_profit: float = 0.0
+    market_making_paper_entries_filled: int = 0
+    market_making_paper_exits_filled: int = 0
+    market_making_realized_pnl: float = 0.0
     
     # Directional trading results
     directional_positions: int = 0
@@ -118,7 +121,7 @@ class TradingSystemResults:
 
 class UnifiedAdvancedTradingSystem:
     """
-    The Beast Mode Trading System 🚀
+    The Beast Mode Trading System ðŸš€
     
     This orchestrates all advanced strategies to maximize returns while
     optimally using ALL available capital with sophisticated risk management.
@@ -149,7 +152,7 @@ class UnifiedAdvancedTradingSystem:
         self.config = config or TradingSystemConfig()
         self.logger = get_trading_logger("unified_trading_system")
         
-        # 🚨 DYNAMIC CAPITAL: Will be set by async_initialize() from actual Kalshi balance
+        # ðŸš¨ DYNAMIC CAPITAL: Will be set by async_initialize() from actual Kalshi balance
         self.total_capital = 100  # Temporary default, will be updated by async_initialize()
         
         # OLD HARDCODED WAY (REMOVED):
@@ -181,21 +184,21 @@ class UnifiedAdvancedTradingSystem:
             event_positions = positions_response.get('event_positions', []) if isinstance(positions_response, dict) else []
             active_positions = [p for p in event_positions if get_position_exposure_dollars(p) > 0]
             if active_positions:
-                self.logger.info(f"📊 Active positions: {len(active_positions)}")
+                self.logger.info(f"ðŸ“Š Active positions: {len(active_positions)}")
                 for pos in active_positions:
                     ticker = get_position_ticker(pos) or '?'
                     exposure = get_position_exposure_dollars(pos)
                     pnl = float(pos.get('realized_pnl_dollars', '0'))
-                    self.logger.info(f"  📌 {ticker}: exposure=${exposure:.2f}, realized_pnl=${pnl:.2f}")
+                    self.logger.info(f"  ðŸ“Œ {ticker}: exposure=${exposure:.2f}, realized_pnl=${pnl:.2f}")
 
             # Total portfolio value is the basis for all allocations
             total_portfolio_value = available_cash + total_position_value
             self.total_capital = total_portfolio_value
 
-            self.logger.info(f"💰 PORTFOLIO VALUE: Cash=${available_cash:.2f} + Positions=${total_position_value:.2f} = Total=${self.total_capital:.2f}")
+            self.logger.info(f"ðŸ’° PORTFOLIO VALUE: Cash=${available_cash:.2f} + Positions=${total_position_value:.2f} = Total=${self.total_capital:.2f}")
 
             if self.total_capital < 10:  # Minimum $10 to trade
-                self.logger.warning(f"⚠️ Total capital too low: ${self.total_capital:.2f} - may limit trading")
+                self.logger.warning(f"âš ï¸ Total capital too low: ${self.total_capital:.2f} - may limit trading")
 
         except Exception as e:
             self.logger.error(f"Failed to get portfolio value, using default: {e}")
@@ -216,7 +219,7 @@ class UnifiedAdvancedTradingSystem:
         self.portfolio_optimizer = AdvancedPortfolioOptimizer(self.db_manager, self.kalshi_client, self.xai_client)
 
         self.logger.info(
-            f"🎯 CAPITAL ALLOCATION: Market Making=${self.market_making_capital:.2f}, "
+            f"ðŸŽ¯ CAPITAL ALLOCATION: Market Making=${self.market_making_capital:.2f}, "
             f"Directional=${self.directional_capital:.2f}, Quick Flip=${self.quick_flip_capital:.2f}, "
             f"Arbitrage=${self.arbitrage_capital:.2f}"
         )
@@ -233,7 +236,7 @@ class UnifiedAdvancedTradingSystem:
         5. Execute trades across all strategies
         6. Monitor and rebalance as needed
         """
-        self.logger.info("🚀 Executing Unified Advanced Trading Strategy")
+        self.logger.info("ðŸš€ Executing Unified Advanced Trading Strategy")
         
         try:
             # Step 0: Check and enforce position limits AND cash reserves
@@ -245,28 +248,28 @@ class UnifiedAdvancedTradingSystem:
             
             # Check position limits
             limits_status = await limits_manager.get_position_limits_status()
-            self.logger.info(f"📊 POSITION LIMITS STATUS: {limits_status['status']} ({limits_status['position_utilization']})")
+            self.logger.info(f"ðŸ“Š POSITION LIMITS STATUS: {limits_status['status']} ({limits_status['position_utilization']})")
             
             # Check cash reserves
             cash_status = await cash_manager.get_cash_status()
-            self.logger.info(f"💰 CASH RESERVES STATUS: {cash_status['status']} ({cash_status['reserve_percentage']:.1f}%)")
+            self.logger.info(f"ðŸ’° CASH RESERVES STATUS: {cash_status['status']} ({cash_status['reserve_percentage']:.1f}%)")
             
             # Handle cash emergency first (higher priority)
             if cash_status['emergency_status']:
-                self.logger.warning(f"🚨 CASH EMERGENCY: {cash_status['recommendations']}")
+                self.logger.warning(f"ðŸš¨ CASH EMERGENCY: {cash_status['recommendations']}")
                 emergency_action = await cash_manager.handle_cash_emergency()
                 if emergency_action.action_type == 'halt_trading':
-                    self.logger.critical(f"🛑 TRADING HALTED DUE TO CASH EMERGENCY: {emergency_action.reason}")
+                    self.logger.critical(f"ðŸ›‘ TRADING HALTED DUE TO CASH EMERGENCY: {emergency_action.reason}")
                     return TradingSystemResults()  # Return empty results
                 elif emergency_action.action_type == 'close_positions':
-                    self.logger.warning(f"⚠️ Need to close {emergency_action.positions_to_close} positions for cash reserves")
+                    self.logger.warning(f"âš ï¸ Need to close {emergency_action.positions_to_close} positions for cash reserves")
             
             # Enforce position limits if needed (after cash check)
             if limits_status['status'] in ['OVER_LIMIT', 'WARNING']:
-                self.logger.info(f"⚠️  Position limits enforcement needed: {limits_status['recommendations']}")
+                self.logger.info(f"âš ï¸  Position limits enforcement needed: {limits_status['recommendations']}")
                 enforcement_result = await limits_manager.enforce_position_limits()
                 if enforcement_result['action'] == 'positions_closed':
-                    self.logger.info(f"✅ CLOSED {enforcement_result['positions_closed']} positions to meet limits")
+                    self.logger.info(f"âœ… CLOSED {enforcement_result['positions_closed']} positions to meet limits")
             
             # Step 1: Get ALL available markets (no time restrictions) - MORE PERMISSIVE VOLUME
             markets = await self.db_manager.get_eligible_markets(
@@ -302,11 +305,17 @@ class UnifiedAdvancedTradingSystem:
             await self._manage_risk_and_rebalance(results)
             
             self.logger.info(
-                f"🎯 Unified Strategy Complete: "
+                f"ðŸŽ¯ Unified Strategy Complete: "
                 f"Capital Used: ${results.total_capital_used:.0f} ({results.capital_efficiency:.1%}), "
                 f"Expected Return: {results.expected_annual_return:.1%}, "
                 f"Sharpe Ratio: {results.portfolio_sharpe_ratio:.2f}, "
                 f"Positions: {results.total_positions}"
+            )
+            self.logger.info(
+                "Paper Market Making: "
+                f"{results.market_making_paper_entries_filled} entries, "
+                f"{results.market_making_paper_exits_filled} exits, "
+                f"realized PnL ${results.market_making_realized_pnl:.2f}"
             )
             
             return results
@@ -319,40 +328,61 @@ class UnifiedAdvancedTradingSystem:
         """
         Execute market making strategy for spread profits.
         """
+        default_results = {
+            "orders_placed": 0,
+            "total_exposure": 0.0,
+            "expected_profit": 0.0,
+            "markets_count": 0,
+            "paper_entries_filled": 0,
+            "paper_exits_filled": 0,
+            "realized_pnl": 0.0,
+        }
+
+        async def _reconcile_if_paper() -> None:
+            if getattr(settings.trading, "live_trading_enabled", False):
+                return
+            reconciliation = await self.market_maker.reconcile_persisted_paper_orders()
+            default_results["paper_entries_filled"] += int(reconciliation.get("entries_filled", 0))
+            default_results["paper_exits_filled"] += int(reconciliation.get("exits_filled", 0))
+            default_results["realized_pnl"] += float(reconciliation.get("realized_pnl", 0.0))
+
         try:
-            self.logger.info(f"🎯 Executing Market Making Strategy on {len(markets)} markets")
+            self.logger.info(f"ðŸŽ¯ Executing Market Making Strategy on {len(markets)} markets")
             
             # Analyze market making opportunities
             opportunities = await self.market_maker.analyze_market_making_opportunities(markets)
-            
+
             if not opportunities:
                 self.logger.warning("No market making opportunities found")
-                return {'orders_placed': 0, 'expected_profit': 0.0}
-            
+                await _reconcile_if_paper()
+                return default_results
+
             # Filter to top opportunities within capital allocation
             max_opportunities = int(self.market_making_capital / 100)  # $100 per opportunity
             top_opportunities = opportunities[:max_opportunities]
-            
+
             # Execute market making
             results = await self.market_maker.execute_market_making_strategy(top_opportunities)
-            
+
             self.logger.info(
-                f"✅ Market Making: {results['orders_placed']} orders, "
+                f"âœ… Market Making: {results['orders_placed']} orders, "
                 f"${results['expected_profit']:.2f} expected profit"
             )
-            
-            return results
-            
+
+            merged_results = {**default_results, **results}
+            return merged_results
+
         except Exception as e:
             self.logger.error(f"Error in market making strategy: {e}")
-            return {'orders_placed': 0, 'expected_profit': 0.0}
+            await _reconcile_if_paper()
+            return default_results
 
     async def _execute_directional_trading_strategy(self, markets: List[Market]) -> PortfolioAllocation:
         """
         Execute directional trading with advanced portfolio optimization.
         """
         try:
-            self.logger.info(f"🎯 Executing Directional Trading Strategy")
+            self.logger.info(f"ðŸŽ¯ Executing Directional Trading Strategy")
             
             # Convert markets to opportunities (with immediate trading capability)
             opportunities = await create_market_opportunities_from_markets(
@@ -387,7 +417,7 @@ class UnifiedAdvancedTradingSystem:
                 self.logger.warning(f"No allocations to execute. Allocation exists: {allocation is not None}, Has allocations: {bool(allocation and allocation.allocations)}")
             
             self.logger.info(
-                f"✅ Directional Trading: {len(allocation.allocations)} positions, "
+                f"âœ… Directional Trading: {len(allocation.allocations)} positions, "
                 f"${allocation.total_capital_used:.0f} allocated, "
                 f"Sharpe: {allocation.portfolio_sharpe:.2f}"
             )
@@ -410,7 +440,7 @@ class UnifiedAdvancedTradingSystem:
 
         try:
             self.logger.info(
-                f"🎯 Executing Quick Flip Strategy with ${self.quick_flip_capital:.2f}"
+                f"ðŸŽ¯ Executing Quick Flip Strategy with ${self.quick_flip_capital:.2f}"
             )
             quick_flip_config = QuickFlipConfig(
                 min_entry_price=settings.trading.quick_flip_min_entry_price,
@@ -484,11 +514,11 @@ class UnifiedAdvancedTradingSystem:
                     # Determine the intended side based on edge direction
                     intended_side = "YES" if opportunity.edge > 0 else "NO"
                     
-                    # 🚨 ONLY SKIP if we already have a position on the EXACT same market_id AND side
+                    # ðŸš¨ ONLY SKIP if we already have a position on the EXACT same market_id AND side
                     existing_position = await self.db_manager.get_position_by_market_and_side(market_id, intended_side)
                     
                     if existing_position:
-                        self.logger.info(f"⏭️ SKIPPING {market_id} {intended_side} - exact position already exists (likely from immediate trade)")
+                        self.logger.info(f"â­ï¸ SKIPPING {market_id} {intended_side} - exact position already exists (likely from immediate trade)")
                         results['positions_created'] += 1  # Count as created since it exists
                         results['total_capital_used'] += allocation_fraction * self.directional_capital
                         continue
@@ -497,9 +527,9 @@ class UnifiedAdvancedTradingSystem:
                         opposite_side = "NO" if intended_side == "YES" else "YES"
                         opposite_position = await self.db_manager.get_position_by_market_and_side(market_id, opposite_side)
                         if opposite_position:
-                            self.logger.info(f"📊 {market_id} - Adding {intended_side} position (already have {opposite_side})")
+                            self.logger.info(f"ðŸ“Š {market_id} - Adding {intended_side} position (already have {opposite_side})")
                         else:
-                            self.logger.info(f"📊 {market_id} - New {intended_side} position")
+                            self.logger.info(f"ðŸ“Š {market_id} - New {intended_side} position")
                     
                     # Calculate initial position size
                     initial_position_value = allocation_fraction * self.directional_capital
@@ -513,7 +543,7 @@ class UnifiedAdvancedTradingSystem:
                     
                     if not can_add_position:
                         # Instead of blocking, try to find a smaller position size that fits
-                        self.logger.info(f"⚠️ Position size ${initial_position_value:.2f} exceeds limits, attempting to reduce...")
+                        self.logger.info(f"âš ï¸ Position size ${initial_position_value:.2f} exceeds limits, attempting to reduce...")
                         
                         # Try progressively smaller position sizes
                         for reduction_factor in [0.8, 0.6, 0.4, 0.2, 0.1]:
@@ -524,7 +554,7 @@ class UnifiedAdvancedTradingSystem:
                             
                             if can_add_reduced:
                                 initial_position_value = reduced_position_value
-                                self.logger.info(f"✅ Position size reduced to ${initial_position_value:.2f} to fit limits")
+                                self.logger.info(f"âœ… Position size reduced to ${initial_position_value:.2f} to fit limits")
                                 break
                         else:
                             # If even the smallest size doesn't fit, check if it's due to position count
@@ -533,16 +563,16 @@ class UnifiedAdvancedTradingSystem:
                             current_positions = await limits_manager._get_position_count()
                             
                             if current_positions >= limits_manager.max_positions:
-                                self.logger.info(f"❌ POSITION COUNT LIMIT: {current_positions}/{limits_manager.max_positions} positions - cannot add new position")
+                                self.logger.info(f"âŒ POSITION COUNT LIMIT: {current_positions}/{limits_manager.max_positions} positions - cannot add new position")
                                 results['failed_executions'] += 1
                                 continue
                             else:
-                                self.logger.info(f"❌ POSITION SIZE LIMIT: Even minimum size ${initial_position_value * 0.1:.2f} exceeds limits")
+                                self.logger.info(f"âŒ POSITION SIZE LIMIT: Even minimum size ${initial_position_value * 0.1:.2f} exceeds limits")
                                 results['failed_executions'] += 1
                                 continue
                     
                     position_value = initial_position_value
-                    self.logger.info(f"✅ POSITION LIMITS OK FOR ALLOCATION: ${position_value:.2f}")
+                    self.logger.info(f"âœ… POSITION LIMITS OK FOR ALLOCATION: ${position_value:.2f}")
                     
                     # Check cash reserves for this allocation
                     from src.utils.cash_reserves import check_can_trade_with_cash_reserves
@@ -552,11 +582,11 @@ class UnifiedAdvancedTradingSystem:
                     )
                     
                     if not can_trade_reserves:
-                        self.logger.info(f"❌ CASH RESERVES BLOCK ALLOCATION: {market_id} - {reserves_reason}")
+                        self.logger.info(f"âŒ CASH RESERVES BLOCK ALLOCATION: {market_id} - {reserves_reason}")
                         results['failed_executions'] += 1
                         continue
                     
-                    self.logger.info(f"✅ CASH RESERVES OK FOR ALLOCATION: {market_id}")
+                    self.logger.info(f"âœ… CASH RESERVES OK FOR ALLOCATION: {market_id}")
                     
                     # Get current market data
                     market_data = await self.kalshi_client.get_market(market_id)
@@ -627,7 +657,7 @@ class UnifiedAdvancedTradingSystem:
                     
                     # Execute the position
                     live_mode = getattr(settings.trading, 'live_trading_enabled', False)
-                    self.logger.info(f"🎛️ Trading mode check: live_mode={live_mode} for market {opportunity.market_id}")
+                    self.logger.info(f"ðŸŽ›ï¸ Trading mode check: live_mode={live_mode} for market {opportunity.market_id}")
                     
                     success = await execute_position(
                         position=position,
@@ -640,10 +670,10 @@ class UnifiedAdvancedTradingSystem:
                         results['successful_executions'] += 1
                         results['positions_created'] += 1
                         results['total_capital_used'] += position_value
-                        self.logger.info(f"✅ Executed position: {market_id} {intended_side} {quantity} at {price:.3f}")
+                        self.logger.info(f"âœ… Executed position: {market_id} {intended_side} {quantity} at {price:.3f}")
                     else:
                         results['failed_executions'] += 1
-                        self.logger.error(f"❌ Failed to execute position for {market_id}")
+                        self.logger.error(f"âŒ Failed to execute position for {market_id}")
                 
                 except Exception as e:
                     self.logger.error(f"Error executing allocation for {market_id}: {e}")
@@ -667,7 +697,7 @@ class UnifiedAdvancedTradingSystem:
             # - Related market arbitrage (correlated events)
             # - Temporal arbitrage (same event, different expiries)
             
-            self.logger.info("🎯 Arbitrage opportunities analysis (future feature)")
+            self.logger.info("ðŸŽ¯ Arbitrage opportunities analysis (future feature)")
             return {
                 'arbitrage_trades': 0,
                 'arbitrage_profit': 0.0,
@@ -730,6 +760,15 @@ class UnifiedAdvancedTradingSystem:
                 market_making_orders=market_making_results.get('orders_placed', 0),
                 market_making_exposure=market_making_results.get('total_exposure', 0),
                 market_making_expected_profit=market_making_results.get('expected_profit', 0),
+                market_making_paper_entries_filled=int(
+                    market_making_results.get('paper_entries_filled', 0)
+                ),
+                market_making_paper_exits_filled=int(
+                    market_making_results.get('paper_exits_filled', 0)
+                ),
+                market_making_realized_pnl=float(
+                    market_making_results.get('realized_pnl', 0.0)
+                ),
                 
                 # Directional trading
                 directional_positions=len(portfolio_allocation.allocations),
@@ -780,22 +819,22 @@ class UnifiedAdvancedTradingSystem:
                 risk_violations.append(f"Correlation {results.correlation_score:.1%} > limit {self.config.max_correlation_exposure:.1%}")
             
             if risk_violations:
-                self.logger.warning(f"⚠️  Risk violations detected: {risk_violations}")
+                self.logger.warning(f"âš ï¸  Risk violations detected: {risk_violations}")
                 # TODO: Implement automatic position sizing reduction
             
             # Check if rebalancing is needed
             time_since_rebalance = datetime.now() - self.last_rebalance
             if time_since_rebalance.total_seconds() > (self.config.rebalance_frequency_hours * 3600):
-                self.logger.info("🔄 Portfolio rebalancing triggered")
+                self.logger.info("ðŸ”„ Portfolio rebalancing triggered")
                 # TODO: Implement rebalancing logic
                 self.last_rebalance = datetime.now()
             
             # Performance monitoring
             if results.portfolio_sharpe_ratio < self.config.target_sharpe_ratio * 0.5:
-                self.logger.warning(f"⚠️  Low Sharpe ratio: {results.portfolio_sharpe_ratio:.2f}")
+                self.logger.warning(f"âš ï¸  Low Sharpe ratio: {results.portfolio_sharpe_ratio:.2f}")
             
             if results.capital_efficiency < 0.8:
-                self.logger.warning(f"⚠️  Low capital efficiency: {results.capital_efficiency:.1%}")
+                self.logger.warning(f"âš ï¸  Low capital efficiency: {results.capital_efficiency:.1%}")
             
         except Exception as e:
             self.logger.error(f"Error in risk management: {e}")
@@ -808,7 +847,7 @@ class UnifiedAdvancedTradingSystem:
         try:
             # Get individual strategy performance
 
-            # 🚨 FIX: Check if market_maker is initialized (not None)
+            # ðŸš¨ FIX: Check if market_maker is initialized (not None)
             if self.market_maker:
                 mm_performance = self.market_maker.get_performance_summary()
             else:
@@ -859,14 +898,14 @@ async def run_unified_trading_system(
     logger = get_trading_logger("unified_trading_main")
     
     try:
-        logger.info("🚀 Starting Unified Advanced Trading System")
+        logger.info("ðŸš€ Starting Unified Advanced Trading System")
         
         # Initialize system
         trading_system = UnifiedAdvancedTradingSystem(
             db_manager, kalshi_client, xai_client, config
         )
         
-        # 🚨 CRITICAL: Initialize with dynamic balance from Kalshi
+        # ðŸš¨ CRITICAL: Initialize with dynamic balance from Kalshi
         await trading_system.async_initialize()
         
         # Execute unified strategy
@@ -874,21 +913,21 @@ async def run_unified_trading_system(
         
         # Log final summary
         logger.info(
-            f"🎯 UNIFIED SYSTEM COMPLETE 🎯\n"
-            f"📊 PERFORMANCE SUMMARY:\n"
-            f"  • Total Positions: {results.total_positions}\n" 
-            f"  • Capital Used: ${results.total_capital_used:.0f} ({results.capital_efficiency:.1%})\n"
-            f"  • Expected Annual Return: {results.expected_annual_return:.1%}\n"
-            f"  • Portfolio Sharpe Ratio: {results.portfolio_sharpe_ratio:.2f}\n"
-            f"  • Portfolio Volatility: {results.portfolio_volatility:.1%}\n"
-            f"  • Max Drawdown: {results.max_portfolio_drawdown:.1%}\n"
-            f"  • Diversification Ratio: {results.diversification_ratio:.2f}\n"
+            f"ðŸŽ¯ UNIFIED SYSTEM COMPLETE ðŸŽ¯\n"
+            f"ðŸ“Š PERFORMANCE SUMMARY:\n"
+            f"  â€¢ Total Positions: {results.total_positions}\n" 
+            f"  â€¢ Capital Used: ${results.total_capital_used:.0f} ({results.capital_efficiency:.1%})\n"
+            f"  â€¢ Expected Annual Return: {results.expected_annual_return:.1%}\n"
+            f"  â€¢ Portfolio Sharpe Ratio: {results.portfolio_sharpe_ratio:.2f}\n"
+            f"  â€¢ Portfolio Volatility: {results.portfolio_volatility:.1%}\n"
+            f"  â€¢ Max Drawdown: {results.max_portfolio_drawdown:.1%}\n"
+            f"  â€¢ Diversification Ratio: {results.diversification_ratio:.2f}\n"
             f"\n"
-            f"💰 STRATEGY BREAKDOWN:\n"
-            f"  • Market Making: {results.market_making_orders} orders, ${results.market_making_expected_profit:.2f} profit\n"
-            f"  • Directional: {results.directional_positions} positions, ${results.directional_expected_return:.2f} return\n"
+            f"ðŸ’° STRATEGY BREAKDOWN:\n"
+            f"  â€¢ Market Making: {results.market_making_orders} orders, ${results.market_making_expected_profit:.2f} profit\n"
+            f"  â€¢ Directional: {results.directional_positions} positions, ${results.directional_expected_return:.2f} return\n"
             f"\n"
-            f"🚀 SYSTEM STATUS: BEAST MODE ACTIVATED! 🚀"
+            f"ðŸš€ SYSTEM STATUS: BEAST MODE ACTIVATED! ðŸš€"
         )
         
         return results
@@ -896,3 +935,4 @@ async def run_unified_trading_system(
     except Exception as e:
         logger.error(f"Error in unified trading system: {e}")
         return TradingSystemResults() 
+

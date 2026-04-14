@@ -28,7 +28,13 @@ from src.utils.kalshi_normalization import (
     get_market_status,
     get_mid_price,
 )
+from src.utils.trade_pricing import calculate_position_pnl
 from src.utils.logging_setup import get_trading_logger, setup_logging
+
+
+def _position_was_maker_entry(position: Position) -> bool:
+    """Infer whether a paper/live position should be treated as maker-priced on entry."""
+    return (position.strategy or "").strip().lower() == "market_making"
 
 
 async def should_exit_position(
@@ -300,17 +306,29 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                     )
 
                     if live_mode:
-                        pnl = (exit_price - position.entry_price) * position.quantity
+                        pnl_details = calculate_position_pnl(
+                            entry_price=position.entry_price,
+                            exit_price=exit_price,
+                            quantity=position.quantity,
+                            entry_maker=_position_was_maker_entry(position),
+                            exit_maker=False,
+                            charge_entry_fee=True,
+                            charge_exit_fee=exit_reason != "market_resolution",
+                        )
                         trade_log = TradeLog(
                             market_id=position.market_id,
                             side=position.side,
                             entry_price=position.entry_price,
                             exit_price=exit_price,
                             quantity=position.quantity,
-                            pnl=pnl,
+                            pnl=pnl_details["net_pnl"],
                             entry_timestamp=position.timestamp,
                             exit_timestamp=datetime.now(),
                             rationale=f"{position.rationale} | EXIT: {exit_reason}",
+                            entry_fee=pnl_details["entry_fee"],
+                            exit_fee=pnl_details["exit_fee"],
+                            fees_paid=pnl_details["fees_paid"],
+                            contracts_cost=position.entry_price * position.quantity,
                             live=True,
                             strategy=position.strategy,
                         )
@@ -322,7 +340,7 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                             "Position for market %s closed via %s. PnL: $%.2f",
                             position.market_id,
                             exit_reason,
-                            pnl,
+                            float(pnl_details["net_pnl"]),
                         )
                     else:
                         paper_exit_price = exit_price

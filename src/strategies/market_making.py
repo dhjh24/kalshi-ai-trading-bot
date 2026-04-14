@@ -23,6 +23,8 @@ from src.utils.kalshi_normalization import (
     build_limit_order_price_fields,
     get_best_ask_price,
     get_best_bid_price,
+    get_market_result,
+    get_market_status,
     get_mid_price,
 )
 from src.utils.logging_setup import get_trading_logger
@@ -286,6 +288,21 @@ class AdvancedMarketMaker:
             "realized_pnl": float(exit_result["net_pnl"]),
         }
 
+    @staticmethod
+    def _market_settlement_exit_price(
+        market_info: Dict[str, object],
+        side: str,
+    ) -> float:
+        """Return settlement exit price for a paper order in a closed market."""
+        market_result = get_market_result(market_info)
+        if market_result:
+            return 1.0 if str(market_result).upper() == str(side).upper() else 0.0
+
+        fallback_price = get_best_bid_price(market_info, side)
+        if fallback_price <= 0:
+            return 0.0
+        return fallback_price
+
     async def reconcile_persisted_paper_orders(self) -> Dict[str, float]:
         """Simulate fills for resting paper market-making orders using live quotes."""
         results = {"entries_filled": 0.0, "exits_filled": 0.0, "realized_pnl": 0.0}
@@ -298,6 +315,70 @@ class AdvancedMarketMaker:
                 market_data = await self.kalshi_client.get_market(order.market_id)
                 market_info = market_data.get("market", {}) if isinstance(market_data, dict) else {}
                 if not market_info:
+                    continue
+
+                market_status = get_market_status(market_info)
+                if market_status in {"closed", "settled", "finalized"}:
+                    if order.action == "buy":
+                        await self.db_manager.update_simulated_order(
+                            int(order.id),
+                            status="cancelled",
+                        )
+                        continue
+
+                    position = await self.db_manager.get_position_by_market_and_side(
+                        order.market_id,
+                        order.side,
+                    )
+                    if (
+                        not position
+                        or (order.position_id is not None and position.id != order.position_id)
+                    ):
+                        await self.db_manager.update_simulated_order(
+                            int(order.id),
+                            status="cancelled",
+                        )
+                        continue
+
+                    exit_price = self._market_settlement_exit_price(
+                        market_info,
+                        order.side,
+                    )
+                    exit_result = await record_simulated_position_exit(
+                        position=position,
+                        exit_price=exit_price,
+                        db_manager=self.db_manager,
+                        rationale_suffix=f"PAPER MARKET MAKING SETTLEMENT @ ${exit_price:.4f}",
+                        entry_maker=True,
+                        exit_maker=False,
+                        charge_entry_fee=True,
+                        charge_exit_fee=False,
+                    )
+                    await self.db_manager.update_simulated_order(
+                        int(order.id),
+                        status="filled",
+                        filled_price=exit_price,
+                        filled_at=datetime.now(),
+                        position_id=position.id,
+                    )
+                    order.status = "filled"
+                    self.filled_orders.append(order)
+                    self.total_pnl += float(exit_result["net_pnl"])
+                    self.markets_traded += 1
+                    self.logger.info(
+                        "Paper market-making position closed by settlement: %s %s x%s @ $%.4f net=$%.2f",
+                        order.market_id,
+                        order.side,
+                        order.quantity,
+                        exit_price,
+                        float(exit_result["net_pnl"]),
+                    )
+                    for key in results:
+                        results[key] += float(
+                            {"entries_filled": 0.0, "exits_filled": 1.0, "realized_pnl": exit_result["net_pnl"]}[
+                                key
+                            ]
+                        )
                     continue
 
                 if order.action == "buy":
