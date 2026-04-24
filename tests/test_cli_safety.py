@@ -1,7 +1,12 @@
 import asyncio
+import os
+import tempfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import aiosqlite
 import pytest
 
 from cli import _run_bot_entrypoint, build_parser
@@ -81,3 +86,394 @@ async def test_run_bot_entrypoint_requests_shutdown_on_timeout():
 
     assert result is None
     bot.request_shutdown.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# W7 — Per-strategy circuit breaker tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def ephemeral_db(tmp_path: Path) -> str:
+    """Fresh SQLite DB per test so halts/trade_logs don't bleed across tests."""
+    return str(tmp_path / "w7_safety.db")
+
+
+async def _enforcer(db_path: str, portfolio_value: float = 1000.0):
+    """Build a fully-initialized enforcer with both the DB schema AND its own
+    tables (blocked_trades, strategy_halts) in place."""
+    from src.utils.database import DatabaseManager
+    from src.strategies.portfolio_enforcer import PortfolioEnforcer
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+
+    enforcer = PortfolioEnforcer(db_path=db_path, portfolio_value=portfolio_value)
+    await enforcer.initialize()
+    return enforcer
+
+
+async def _insert_trade_log(
+    db_path: str,
+    *,
+    strategy: str,
+    pnl: float,
+    exit_timestamp: str,
+    entry_timestamp: str | None = None,
+) -> None:
+    """Insert a closed trade into trade_logs so enforcer counts it."""
+    entry_ts = entry_timestamp or exit_timestamp
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """
+            INSERT INTO trade_logs
+            (market_id, side, entry_price, exit_price, quantity, pnl,
+             entry_fee, exit_fee, fees_paid, contracts_cost,
+             entry_timestamp, exit_timestamp, rationale, live, strategy)
+            VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, ?, ?, ?, 0, ?)
+            """,
+            (
+                "KXNCAAB-TEST",
+                "yes",
+                0.50,
+                0.50,
+                1.0,
+                pnl,
+                entry_ts,
+                exit_timestamp,
+                "test",
+                strategy,
+            ),
+        )
+        await db.commit()
+
+
+async def _insert_open_position(db_path: str, *, strategy: str, idx: int) -> None:
+    """Insert an open position — each with a unique (market_id, side) pair."""
+    ts = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """
+            INSERT INTO positions
+            (market_id, side, entry_price, quantity, timestamp, rationale,
+             confidence, entry_fee, contracts_cost, entry_order_id, live,
+             status, strategy)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, NULL, 0, 'open', ?)
+            """,
+            (
+                f"KXNCAAB-OPEN-{idx}",
+                "yes",
+                0.50,
+                1.0,
+                ts,
+                "test open",
+                0.7,
+                strategy,
+            ),
+        )
+        await db.commit()
+
+
+# --- Strategy tagging & backwards compat ---
+
+
+@pytest.mark.asyncio
+async def test_enforcer_legacy_default_has_no_per_strategy_limits(ephemeral_db):
+    """Legacy callers (no strategy tag) keep their old behavior — no daily-loss,
+    no open-position cap, no trade-rate cap."""
+    from src.strategies.portfolio_enforcer import STRATEGY_DEFAULT
+
+    enforcer = await _enforcer(ephemeral_db)
+    limits = enforcer.limits_for(None)
+
+    assert limits.daily_loss_budget_pct is None
+    assert limits.max_open_positions is None
+    assert limits.max_trades_per_hour is None
+    # Same when called with an unknown tag.
+    assert enforcer.limits_for("some_random_strategy").daily_loss_budget_pct is None
+    # Normalization: unknown → default bucket.
+    assert enforcer._normalize_strategy(None) == STRATEGY_DEFAULT
+    assert enforcer._normalize_strategy("mystery") == STRATEGY_DEFAULT
+
+
+@pytest.mark.asyncio
+async def test_enforcer_allows_legacy_trade_with_huge_loss_history(ephemeral_db):
+    """Backwards-compat sanity: a trade with no strategy tag should not be
+    blocked even if trade_logs has huge losses (legacy default has no budget)."""
+    enforcer = await _enforcer(ephemeral_db, portfolio_value=1000.0)
+    # Pile on huge losses — but the legacy bucket shouldn't care.
+    now = datetime.now(timezone.utc).isoformat()
+    await _insert_trade_log(ephemeral_db, strategy=None, pnl=-999.0, exit_timestamp=now)
+
+    allowed, reason = await enforcer.check_trade(
+        ticker="KXNCAAB-TEST",
+        side="yes",
+        amount=5.0,   # well within category max
+        strategy=None,
+    )
+    assert allowed, f"Legacy call should be allowed, got reason={reason}"
+
+
+# --- Circuit breaker 1: daily-loss halt ---
+
+
+@pytest.mark.asyncio
+async def test_daily_loss_halt_blocks_quick_flip(ephemeral_db):
+    """When quick_flip daily loss exceeds its budget, next trade is blocked and
+    a halt row is persisted."""
+    from src.strategies.portfolio_enforcer import STRATEGY_QUICK_FLIP
+
+    portfolio = 1000.0
+    enforcer = await _enforcer(ephemeral_db, portfolio_value=portfolio)
+    # Default quick_flip budget is 5% = $50. Record a -$60 loss today.
+    now = datetime.now(timezone.utc).isoformat()
+    await _insert_trade_log(
+        ephemeral_db,
+        strategy=STRATEGY_QUICK_FLIP,
+        pnl=-60.0,
+        exit_timestamp=now,
+    )
+
+    daily_loss = await enforcer.get_daily_loss(STRATEGY_QUICK_FLIP)
+    assert daily_loss == pytest.approx(60.0)
+
+    allowed, reason = await enforcer.check_trade(
+        ticker="KXNCAAB-TEST",
+        side="yes",
+        amount=5.0,
+        strategy=STRATEGY_QUICK_FLIP,
+    )
+    assert not allowed
+    assert "daily-loss budget" in reason.lower()
+    # Halt is now persisted.
+    assert await enforcer.is_halted(STRATEGY_QUICK_FLIP)
+
+
+@pytest.mark.asyncio
+async def test_daily_loss_halt_persists_across_restart(ephemeral_db):
+    """The halt row survives process restart (same DB, brand new enforcer)."""
+    from src.strategies.portfolio_enforcer import PortfolioEnforcer, STRATEGY_LIVE_TRADE
+
+    portfolio = 1000.0
+    enforcer_1 = await _enforcer(ephemeral_db, portfolio_value=portfolio)
+    now = datetime.now(timezone.utc).isoformat()
+    await _insert_trade_log(
+        ephemeral_db,
+        strategy=STRATEGY_LIVE_TRADE,
+        pnl=-75.0,  # over the 5% = $50 budget
+        exit_timestamp=now,
+    )
+
+    allowed_1, _ = await enforcer_1.check_trade(
+        ticker="KXNCAAB-TEST",
+        side="yes",
+        amount=5.0,
+        strategy=STRATEGY_LIVE_TRADE,
+    )
+    assert not allowed_1
+    assert await enforcer_1.is_halted(STRATEGY_LIVE_TRADE)
+
+    # New enforcer, same DB — halt should still apply.
+    enforcer_2 = PortfolioEnforcer(db_path=ephemeral_db, portfolio_value=portfolio)
+    await enforcer_2.initialize()
+    assert await enforcer_2.is_halted(STRATEGY_LIVE_TRADE)
+
+    allowed_2, reason_2 = await enforcer_2.check_trade(
+        ticker="KXNCAAB-TEST",
+        side="yes",
+        amount=5.0,
+        strategy=STRATEGY_LIVE_TRADE,
+    )
+    assert not allowed_2
+    assert "halted" in reason_2.lower()
+
+
+@pytest.mark.asyncio
+async def test_halt_does_not_spill_to_other_strategies(ephemeral_db):
+    """Halting quick_flip must not block live_trade, and vice-versa."""
+    from src.strategies.portfolio_enforcer import (
+        STRATEGY_QUICK_FLIP,
+        STRATEGY_LIVE_TRADE,
+    )
+
+    enforcer = await _enforcer(ephemeral_db, portfolio_value=1000.0)
+    now = datetime.now(timezone.utc).isoformat()
+    await _insert_trade_log(
+        ephemeral_db,
+        strategy=STRATEGY_QUICK_FLIP,
+        pnl=-75.0,
+        exit_timestamp=now,
+    )
+    # Trigger the halt for quick_flip.
+    await enforcer.check_trade(
+        ticker="KXNCAAB-TEST", side="yes", amount=5.0,
+        strategy=STRATEGY_QUICK_FLIP,
+    )
+    assert await enforcer.is_halted(STRATEGY_QUICK_FLIP)
+    # live_trade should be clean.
+    assert not await enforcer.is_halted(STRATEGY_LIVE_TRADE)
+    allowed, _ = await enforcer.check_trade(
+        ticker="KXNCAAB-TEST", side="yes", amount=5.0,
+        strategy=STRATEGY_LIVE_TRADE,
+    )
+    assert allowed
+
+
+# --- Circuit breaker 2: hourly trade-rate cap ---
+
+
+@pytest.mark.asyncio
+async def test_live_trade_hourly_rate_cap_default_20(ephemeral_db):
+    """live_trade defaults to 20 trades/hr (mirrors TradingConfig.max_trades_per_hour)."""
+    from src.strategies.portfolio_enforcer import STRATEGY_LIVE_TRADE
+
+    enforcer = await _enforcer(ephemeral_db, portfolio_value=10_000.0)
+    assert enforcer.limits_for(STRATEGY_LIVE_TRADE).max_trades_per_hour == 20
+
+    # Insert 20 recent trades for live_trade (all within last hour).
+    recent_ts = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+    for i in range(20):
+        await _insert_trade_log(
+            ephemeral_db,
+            strategy=STRATEGY_LIVE_TRADE,
+            pnl=0.01,  # tiny positive so no daily-loss halt triggers
+            exit_timestamp=recent_ts,
+            entry_timestamp=recent_ts,
+        )
+
+    count = await enforcer.get_trades_in_last_hour(STRATEGY_LIVE_TRADE)
+    assert count >= 20
+
+    allowed, reason = await enforcer.check_trade(
+        ticker="KXNCAAB-TEST",
+        side="yes",
+        amount=5.0,
+        strategy=STRATEGY_LIVE_TRADE,
+    )
+    assert not allowed
+    assert "trade-rate cap" in reason.lower()
+
+
+@pytest.mark.asyncio
+async def test_hourly_rate_cap_ignores_old_trades(ephemeral_db):
+    """Trades older than 1h do NOT count against the hourly rate cap."""
+    from src.strategies.portfolio_enforcer import STRATEGY_LIVE_TRADE
+
+    enforcer = await _enforcer(ephemeral_db, portfolio_value=10_000.0)
+
+    old_ts = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    for _ in range(50):
+        await _insert_trade_log(
+            ephemeral_db,
+            strategy=STRATEGY_LIVE_TRADE,
+            pnl=0.01,
+            exit_timestamp=old_ts,
+            entry_timestamp=old_ts,
+        )
+
+    count = await enforcer.get_trades_in_last_hour(STRATEGY_LIVE_TRADE)
+    assert count == 0
+
+
+# --- Circuit breaker 3: open-position cap ---
+
+
+@pytest.mark.asyncio
+async def test_open_position_cap_blocks_live_trade(ephemeral_db):
+    """live_trade default open-position cap is 5."""
+    from src.strategies.portfolio_enforcer import STRATEGY_LIVE_TRADE
+
+    enforcer = await _enforcer(ephemeral_db, portfolio_value=10_000.0)
+    cap = enforcer.limits_for(STRATEGY_LIVE_TRADE).max_open_positions
+    assert cap == 5
+
+    for i in range(cap):
+        await _insert_open_position(ephemeral_db, strategy=STRATEGY_LIVE_TRADE, idx=i)
+
+    open_count = await enforcer.get_open_position_count(STRATEGY_LIVE_TRADE)
+    assert open_count == cap
+
+    allowed, reason = await enforcer.check_trade(
+        ticker="KXNCAAB-NEW-TICKER",
+        side="yes",
+        amount=5.0,
+        strategy=STRATEGY_LIVE_TRADE,
+    )
+    assert not allowed
+    assert "open position" in reason.lower()
+
+
+# --- Shadow-mode parity (paper / shadow / live all share limits) ---
+
+
+@pytest.mark.asyncio
+async def test_shadow_mode_parity_all_modes_share_limits(ephemeral_db):
+    """Paper, shadow, and live MUST see identical limits for the same strategy.
+    This is the W7 shadow-mode parity requirement: flipping `mode` does not
+    change which trades are blocked."""
+    from src.strategies.portfolio_enforcer import (
+        STRATEGY_QUICK_FLIP,
+        MODE_PAPER, MODE_SHADOW, MODE_LIVE,
+    )
+
+    enforcer = await _enforcer(ephemeral_db, portfolio_value=1000.0)
+    now = datetime.now(timezone.utc).isoformat()
+    await _insert_trade_log(
+        ephemeral_db,
+        strategy=STRATEGY_QUICK_FLIP,
+        pnl=-75.0,  # trip the 5% = $50 budget
+        exit_timestamp=now,
+    )
+
+    # Same limits object regardless of mode.
+    limits_paper = enforcer.limits_for(STRATEGY_QUICK_FLIP)
+    limits_shadow = enforcer.limits_for(STRATEGY_QUICK_FLIP)
+    limits_live = enforcer.limits_for(STRATEGY_QUICK_FLIP)
+    assert limits_paper == limits_shadow == limits_live
+
+    # All three modes block identically.
+    results = {}
+    for mode in (MODE_PAPER, MODE_SHADOW, MODE_LIVE):
+        # Clear the halt between modes so we test each mode's decision fresh,
+        # proving they each independently hit the same budget.
+        await enforcer.clear_halt(STRATEGY_QUICK_FLIP)
+        allowed, reason = await enforcer.check_trade(
+            ticker="KXNCAAB-TEST",
+            side="yes",
+            amount=5.0,
+            strategy=STRATEGY_QUICK_FLIP,
+            mode=mode,
+        )
+        results[mode] = (allowed, reason)
+
+    # All three should block on the daily-loss budget.
+    for mode, (allowed, reason) in results.items():
+        assert not allowed, f"mode={mode} unexpectedly allowed: {reason}"
+        assert "daily-loss" in reason.lower(), f"mode={mode} wrong reason: {reason}"
+
+
+# --- Status reporting for CLI ---
+
+
+@pytest.mark.asyncio
+async def test_get_strategy_status_reports_budget_remaining(ephemeral_db):
+    """`cli.py status` depends on get_strategy_status returning clean fields."""
+    from src.strategies.portfolio_enforcer import STRATEGY_LIVE_TRADE
+
+    enforcer = await _enforcer(ephemeral_db, portfolio_value=1000.0)
+    now = datetime.now(timezone.utc).isoformat()
+    await _insert_trade_log(
+        ephemeral_db,
+        strategy=STRATEGY_LIVE_TRADE,
+        pnl=-20.0,  # under 5% = $50 budget
+        exit_timestamp=now,
+    )
+
+    status = await enforcer.get_strategy_status(STRATEGY_LIVE_TRADE)
+
+    assert status["strategy"] == STRATEGY_LIVE_TRADE
+    assert status["halted"] is False
+    assert status["daily_loss_dollars"] == pytest.approx(20.0)
+    assert status["daily_loss_budget_dollars"] == pytest.approx(50.0)
+    assert status["daily_loss_budget_remaining_dollars"] == pytest.approx(30.0)
+    assert status["max_trades_per_hour"] == 20

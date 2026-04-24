@@ -324,6 +324,24 @@ class DatabaseManager(TradingLoggerMixin):
                 "ON market_snapshots(ticker, timestamp)"
             )
 
+            # W7: per-strategy daily-loss halt state. Idempotent for legacy DBs.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS strategy_halts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    strategy TEXT NOT NULL,
+                    halt_date TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    loss_amount REAL NOT NULL DEFAULT 0.0,
+                    budget REAL NOT NULL DEFAULT 0.0,
+                    halted_at TEXT NOT NULL,
+                    UNIQUE(strategy, halt_date)
+                )
+            """)
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_strategy_halts_strategy_date "
+                "ON strategy_halts(strategy, halt_date)"
+            )
+
             await self._migrate_existing_strategy_data(db)
             await db.commit()
         except Exception as e:
@@ -756,6 +774,21 @@ class DatabaseManager(TradingLoggerMixin):
             )
         """)
 
+        # W7: per-strategy daily-loss halt state. One row per (strategy, halt_date)
+        # so halts survive process restarts but only last through the calendar day.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS strategy_halts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                strategy TEXT NOT NULL,
+                halt_date TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                loss_amount REAL NOT NULL DEFAULT 0.0,
+                budget REAL NOT NULL DEFAULT 0.0,
+                halted_at TEXT NOT NULL,
+                UNIQUE(strategy, halt_date)
+            )
+        """)
+
         # Create indices for performance
         await db.execute("CREATE INDEX IF NOT EXISTS idx_market_analyses_market_id ON market_analyses(market_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_market_analyses_timestamp ON market_analyses(analysis_timestamp)")
@@ -775,6 +808,10 @@ class DatabaseManager(TradingLoggerMixin):
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_market_snapshots_ticker_ts "
             "ON market_snapshots(ticker, timestamp)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_strategy_halts_strategy_date "
+            "ON strategy_halts(strategy, halt_date)"
         )
 
         self.logger.info("Tables created or already exist.")
