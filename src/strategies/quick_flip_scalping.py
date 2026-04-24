@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 import math
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
@@ -52,6 +53,13 @@ from src.utils.kalshi_normalization import (
 from src.utils.logging_setup import get_trading_logger
 from src.utils.trade_pricing import estimate_kalshi_fee
 from src.utils.trade_pricing import FeeMetadata, calculate_entry_cost, extract_fee_metadata
+
+
+def _env_flag_is_truthy(value: Optional[str]) -> bool:
+    """Accept a loose ``--no-ai`` / env-var convention for disabling AI calls."""
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -131,6 +139,8 @@ class QuickFlipScalpingStrategy:
         kalshi_client: KalshiClient,
         xai_client: XAIClient,
         config: Optional[QuickFlipConfig] = None,
+        *,
+        disable_ai: Optional[bool] = None,
     ) -> None:
         self.db_manager = db_manager
         self.kalshi_client = kalshi_client
@@ -139,6 +149,17 @@ class QuickFlipScalpingStrategy:
         self.logger = get_trading_logger("quick_flip_scalping")
         self.active_positions: Dict[str, Position] = {}
         self.pending_sells: Dict[str, dict] = {}
+        # W2 Gap 4: AI-less fallback. When either the constructor flag or the
+        # QUICK_FLIP_DISABLE_AI env var is set, quick flip skips the movement
+        # prediction LLM call and derives a target price from recent-trade
+        # momentum and book depth. Keeps the bot running when the daily AI
+        # budget is exhausted or Codex is unreachable.
+        # TODO: move to settings.py once W1 merges.
+        self.disable_ai = (
+            bool(disable_ai)
+            if disable_ai is not None
+            else _env_flag_is_truthy(os.environ.get("QUICK_FLIP_DISABLE_AI"))
+        )
 
     def _snapshot_prices_in_entry_band(self, market: Market) -> Tuple[float, ...]:
         """
@@ -1163,6 +1184,113 @@ class QuickFlipScalpingStrategy:
             tick_size=tick_size,
         )
 
+    async def _heuristic_movement_analysis(
+        self,
+        market: Market,
+        side: str,
+        current_price: float,
+        *,
+        required_exit_price: float,
+        hours_to_expiry: float,
+        spread: float,
+    ) -> dict:
+        """
+        AI-less movement prediction fallback for quick flip.
+
+        Uses recent-trade momentum + book-depth as the signal. This mirrors the
+        seed filters around :meth:`_evaluate_price_opportunity` so the bot keeps
+        running when the daily AI budget is exhausted or Codex is unreachable.
+
+        Criteria for a bullish call:
+        - Recent tape has enough trades to be meaningful.
+        - Last price is in the top half of the recent range.
+        - Recent max price sits at or above the required profitable exit, and
+          current ask is not already higher than that recent high by more than
+          one spread-width.
+        - Hours to expiry is short enough that momentum still matters.
+        """
+        try:
+            recent = await self._get_recent_trade_stats(market.market_id, side)
+        except Exception as exc:
+            return {
+                "target_price": current_price,
+                "confidence": 0.0,
+                "reason": f"Heuristic fallback failed to fetch trades: {exc}",
+            }
+
+        trade_count = float(recent.get("trade_count") or 0.0)
+        recent_last = float(recent.get("recent_last_price") or 0.0)
+        recent_max = float(recent.get("recent_max_price") or 0.0)
+        recent_min = float(recent.get("recent_min_price") or 0.0)
+        recent_range = float(
+            recent.get("recent_range", max(0.0, recent_max - recent_min)) or 0.0
+        )
+
+        if trade_count < max(1, self.config.min_recent_trade_count):
+            return {
+                "target_price": current_price,
+                "confidence": 0.0,
+                "reason": "Heuristic: insufficient recent tape",
+            }
+
+        if recent_range <= 0:
+            return {
+                "target_price": current_price,
+                "confidence": 0.0,
+                "reason": "Heuristic: flat tape",
+            }
+
+        price_position = (recent_last - recent_min) / recent_range if recent_range > 0 else 0.0
+        if price_position < self.config.min_recent_price_position:
+            return {
+                "target_price": current_price,
+                "confidence": 0.0,
+                "reason": f"Heuristic: last {recent_last:.4f} in bottom half of range",
+            }
+
+        # Entry must be near the recent last print; if someone has already lifted
+        # the ask past the tape the momentum is exhausted.
+        if current_price - recent_last > self.config.max_entry_vs_recent_last_gap:
+            return {
+                "target_price": current_price,
+                "confidence": 0.0,
+                "reason": "Heuristic: ask is gapping above recent tape",
+            }
+
+        # Target price: prefer the recent high but cap at 0.95 and don't exceed
+        # required_exit by more than the configured gap.
+        gap_ceiling = recent_max + max(self.config.max_target_vs_recent_trade_gap, 0.0)
+        target_price = max(required_exit_price, min(recent_max, gap_ceiling))
+        target_price = max(current_price, min(0.95, target_price))
+
+        # Confidence scales with tape strength and inverse time pressure.
+        tape_strength = min(1.0, trade_count / max(1.0, 3.0 * self.config.min_recent_trade_count))
+        position_strength = min(1.0, max(0.0, price_position))
+        time_pressure = min(1.0, max(0.0, 1.0 - (hours_to_expiry / 24.0)))
+        spread_health = 1.0 if spread <= self.config.max_bid_ask_spread else 0.0
+        raw_confidence = (
+            0.45 * tape_strength
+            + 0.35 * position_strength
+            + 0.15 * time_pressure
+            + 0.05 * spread_health
+        )
+        # Only clear the gate when the target actually pays. If the recent high
+        # is below the profitable-exit floor, there's no momentum edge.
+        if target_price + 1e-9 < required_exit_price:
+            raw_confidence = 0.0
+
+        confidence = max(0.0, min(1.0, raw_confidence))
+        reason = (
+            "Heuristic momentum: "
+            f"trades={int(trade_count)} pos={price_position:.2f} "
+            f"recent=${recent_last:.4f} max=${recent_max:.4f} hours_to_expiry={hours_to_expiry:.1f}"
+        )
+        return {
+            "target_price": target_price,
+            "confidence": confidence,
+            "reason": reason,
+        }
+
     async def _analyze_market_movement(
         self,
         market: Market,
@@ -1176,12 +1304,28 @@ class QuickFlipScalpingStrategy:
     ) -> dict:
         """Use AI to estimate short-horizon upside potential."""
         try:
+            if self.disable_ai:
+                return await self._heuristic_movement_analysis(
+                    market,
+                    side,
+                    current_price,
+                    required_exit_price=required_exit_price,
+                    hours_to_expiry=hours_to_expiry,
+                    spread=spread,
+                )
+
             if self.xai_client is None:
-                return {
-                    "target_price": current_price,
-                    "confidence": 0.0,
-                    "reason": "AI analysis unavailable",
-                }
+                # No AI client available and the caller did not explicitly opt in
+                # to the heuristic fallback — fall back to it anyway rather than
+                # hard-killing the strategy.
+                return await self._heuristic_movement_analysis(
+                    market,
+                    side,
+                    current_price,
+                    required_exit_price=required_exit_price,
+                    hours_to_expiry=hours_to_expiry,
+                    spread=spread,
+                )
 
             prompt = f"""
 QUICK SCALP ANALYSIS for {market.title}
@@ -1837,6 +1981,8 @@ async def run_quick_flip_strategy(
     xai_client: XAIClient,
     available_capital: float,
     config: Optional[QuickFlipConfig] = None,
+    *,
+    disable_ai: Optional[bool] = None,
 ) -> Dict:
     """Main entry point for the quick-flip strategy."""
     logger = get_trading_logger("quick_flip_main")
@@ -1844,7 +1990,14 @@ async def run_quick_flip_strategy(
     try:
         logger.info("Starting Quick Flip Scalping Strategy")
         config = config or QuickFlipConfig()
-        strategy = QuickFlipScalpingStrategy(db_manager, kalshi_client, xai_client, config)
+        strategy = QuickFlipScalpingStrategy(
+            db_manager, kalshi_client, xai_client, config, disable_ai=disable_ai
+        )
+        if strategy.disable_ai:
+            logger.info(
+                "Quick Flip running in AI-less fallback mode "
+                "(heuristic momentum + book depth only)"
+            )
 
         markets = await db_manager.get_eligible_markets(
             volume_min=max(100, config.min_market_volume),
