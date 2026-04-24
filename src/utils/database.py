@@ -296,6 +296,40 @@ class DatabaseManager(TradingLoggerMixin):
                 "CREATE INDEX IF NOT EXISTS idx_simulated_orders_market "
                 "ON simulated_orders(market_id)"
             )
+            # W2 Gap 2: prevent resting-order collisions. Only one resting exit
+            # order per (position_id, action) at a time. Partial unique index so
+            # filled/cancelled rows do not clash with new resting orders.
+            await self._migrate_simulated_orders_resting_uniqueness(db)
+            await db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_simulated_orders_resting_position_action "
+                "ON simulated_orders(position_id, action) "
+                "WHERE status = 'resting' AND position_id IS NOT NULL"
+            )
+            # W2 Gap 3: track live-vs-estimated fee divergence per fill so the
+            # dashboard can surface drift. See fee_reconciliation table below.
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS fee_divergence_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    market_id TEXT NOT NULL,
+                    side TEXT,
+                    leg TEXT NOT NULL,
+                    position_id INTEGER,
+                    trade_log_id INTEGER,
+                    order_id TEXT,
+                    estimated_fee REAL NOT NULL,
+                    actual_fee REAL NOT NULL,
+                    divergence REAL NOT NULL,
+                    quantity REAL,
+                    price REAL,
+                    recorded_at TEXT NOT NULL
+                )
+                """
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_fee_divergence_market "
+                "ON fee_divergence_log(market_id, recorded_at)"
+            )
 
             # W3 replay harness - market_snapshots is additive-only. Back-fill on
             # existing DBs so ingest.py has somewhere to write from day one.
@@ -346,6 +380,49 @@ class DatabaseManager(TradingLoggerMixin):
             await db.commit()
         except Exception as e:
             self.logger.error(f"Error running migrations: {e}")
+
+    async def _migrate_simulated_orders_resting_uniqueness(
+        self, db: aiosqlite.Connection
+    ) -> None:
+        """
+        One-shot cleanup so the new unique partial index can be created on
+        legacy databases that accumulated duplicate resting paper exits for the
+        same `(position_id, action)`. Keeps the oldest row, cancels the rest.
+        """
+        try:
+            cursor = await db.execute(
+                """
+                SELECT position_id, action, COUNT(*) AS dupes
+                FROM simulated_orders
+                WHERE status = 'resting' AND position_id IS NOT NULL
+                GROUP BY position_id, action
+                HAVING dupes > 1
+                """
+            )
+            duplicate_groups = await cursor.fetchall()
+            for position_id, action, _count in duplicate_groups:
+                await db.execute(
+                    """
+                    UPDATE simulated_orders
+                    SET status = 'cancelled'
+                    WHERE id NOT IN (
+                        SELECT MIN(id) FROM simulated_orders
+                        WHERE position_id = ? AND action = ? AND status = 'resting'
+                    )
+                    AND position_id = ? AND action = ? AND status = 'resting'
+                    """,
+                    (position_id, action, position_id, action),
+                )
+            if duplicate_groups:
+                self.logger.info(
+                    "Cancelled duplicate resting simulated_orders",
+                    duplicate_groups=len(duplicate_groups),
+                )
+        except Exception as exc:
+            self.logger.warning(
+                "Could not run simulated_orders resting-uniqueness migration",
+                error=str(exc),
+            )
 
     async def _rebuild_positions_quantity_as_real(self, db: aiosqlite.Connection) -> None:
         """Recreate the positions table so quantity can store fractional fills."""
@@ -814,7 +891,146 @@ class DatabaseManager(TradingLoggerMixin):
             "ON strategy_halts(strategy, halt_date)"
         )
 
+        # W2 Gap 2: partial unique index so only one resting exit order may
+        # exist per (position_id, action).
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_simulated_orders_resting_position_action "
+            "ON simulated_orders(position_id, action) "
+            "WHERE status = 'resting' AND position_id IS NOT NULL"
+        )
+
+        # W2 Gap 3: fee divergence tracking (estimated vs actual Kalshi fee).
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fee_divergence_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_id TEXT NOT NULL,
+                side TEXT,
+                leg TEXT NOT NULL,
+                position_id INTEGER,
+                trade_log_id INTEGER,
+                order_id TEXT,
+                estimated_fee REAL NOT NULL,
+                actual_fee REAL NOT NULL,
+                divergence REAL NOT NULL,
+                quantity REAL,
+                price REAL,
+                recorded_at TEXT NOT NULL
+            )
+            """
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fee_divergence_market "
+            "ON fee_divergence_log(market_id, recorded_at)"
+        )
+
         self.logger.info("Tables created or already exist.")
+
+    async def record_fee_divergence(
+        self,
+        *,
+        market_id: str,
+        leg: str,
+        estimated_fee: float,
+        actual_fee: float,
+        side: Optional[str] = None,
+        position_id: Optional[int] = None,
+        trade_log_id: Optional[int] = None,
+        order_id: Optional[str] = None,
+        quantity: Optional[float] = None,
+        price: Optional[float] = None,
+    ) -> None:
+        """
+        Persist a live-vs-estimated fee divergence for dashboard consumption.
+
+        `leg` should be "entry" or "exit". Divergence is expressed as
+        `actual_fee - estimated_fee` (signed) so dashboard aggregates can see
+        direction as well as magnitude.
+        """
+        normalized_leg = str(leg or "").strip().lower()
+        if normalized_leg not in {"entry", "exit"}:
+            self.logger.warning(
+                "Skipping fee divergence entry with invalid leg",
+                leg=leg,
+                market_id=market_id,
+            )
+            return
+        try:
+            estimated = float(estimated_fee or 0.0)
+            actual = float(actual_fee or 0.0)
+        except (TypeError, ValueError):
+            self.logger.warning(
+                "Skipping fee divergence entry with non-numeric fees",
+                market_id=market_id,
+                estimated_fee=estimated_fee,
+                actual_fee=actual_fee,
+            )
+            return
+
+        divergence = actual - estimated
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    """
+                    INSERT INTO fee_divergence_log (
+                        market_id, side, leg, position_id, trade_log_id, order_id,
+                        estimated_fee, actual_fee, divergence, quantity, price, recorded_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        market_id,
+                        side,
+                        normalized_leg,
+                        position_id,
+                        trade_log_id,
+                        order_id,
+                        estimated,
+                        actual,
+                        divergence,
+                        quantity,
+                        price,
+                        datetime.now().isoformat(),
+                    ),
+                )
+                await db.commit()
+        except Exception as exc:
+            self.logger.error(
+                "Failed to record fee divergence entry",
+                market_id=market_id,
+                leg=normalized_leg,
+                error=str(exc),
+            )
+
+    async def get_fee_divergence_entries(
+        self,
+        *,
+        market_id: Optional[str] = None,
+        leg: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Return recent fee divergence rows (newest first) for tests and dashboards."""
+        query = "SELECT * FROM fee_divergence_log WHERE 1=1"
+        params: List[Any] = []
+        if market_id is not None:
+            query += " AND market_id = ?"
+            params.append(market_id)
+        if leg is not None:
+            query += " AND leg = ?"
+            params.append(leg)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(int(limit))
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(query, tuple(params))
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as exc:
+            self.logger.error(
+                "Failed to fetch fee divergence entries",
+                error=str(exc),
+            )
+            return []
 
     async def upsert_markets(self, markets: List[Market]):
         """
@@ -1033,6 +1249,19 @@ class DatabaseManager(TradingLoggerMixin):
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM positions WHERE market_id = ? AND status = 'open' LIMIT 1", (market_id,))
+            row = await cursor.fetchone()
+            if row:
+                return self._hydrate_position(row)
+            return None
+
+    async def get_position_by_id(self, position_id: int) -> Optional[Position]:
+        """Return a position (regardless of status) by its primary key."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM positions WHERE id = ? LIMIT 1",
+                (position_id,),
+            )
             row = await cursor.fetchone()
             if row:
                 return self._hydrate_position(row)

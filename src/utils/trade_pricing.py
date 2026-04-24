@@ -148,6 +148,62 @@ def estimate_kalshi_fee(
     return max(0.0, math.ceil((raw_fee * 100.0) - 1e-9) / 100.0)
 
 
+def _as_non_negative_float(value: Any) -> Optional[float]:
+    """Convert a loose API value into a non-negative float or None."""
+    if value in (None, ""):
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_fill_fee_cost(fill: Any) -> Optional[float]:
+    """
+    Return the live fee reported on a Kalshi fill payload, in dollars.
+
+    Kalshi typically includes `fee_cost` (dollars) on `/fills` rows; accept
+    `fees_paid` / `fees_dollars` as secondary fields so we stay compatible
+    with older / paginated responses. Returns None when no field is present.
+    """
+    if not isinstance(fill, dict):
+        return None
+    for key in ("fee_cost", "fees_dollars", "fees_paid"):
+        fee = _as_non_negative_float(fill.get(key))
+        if fee is not None:
+            return fee
+    return None
+
+
+def sum_fill_fees(fills: Any) -> Optional[float]:
+    """
+    Sum the authoritative `fee_cost` across a list of fill rows for a given leg.
+
+    Returns None when the provided list is empty or every row lacks a fee field
+    (so the caller can fall back to the estimated rate-card fee). Zero is a
+    *valid* reported fee (e.g. fee-waived markets) and is preserved.
+    """
+    if not isinstance(fills, (list, tuple)) or not fills:
+        return None
+    total = 0.0
+    saw_any_fee = False
+    for fill in fills:
+        fee = extract_fill_fee_cost(fill)
+        if fee is None:
+            continue
+        saw_any_fee = True
+        total += fee
+    return total if saw_any_fee else None
+
+
+def fee_divergence(actual_fee: float, estimated_fee: float) -> float:
+    """Return signed divergence of live vs estimated fee (dollars)."""
+    try:
+        return float(actual_fee or 0.0) - float(estimated_fee or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def calculate_entry_cost(
     price: float,
     quantity: float,

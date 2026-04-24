@@ -599,5 +599,437 @@ async def test_profit_taking_orders():
             os.remove(test_db) 
 
 
+# ---------------------------------------------------------------------------
+# W2 Gap 1 — Entry snapshot drift: depth-aware FOK simulation
+# ---------------------------------------------------------------------------
+
+
+async def test_execute_position_paper_mode_walks_visible_book_for_avg_fill_price():
+    """
+    When the top of book can't absorb the order size, paper entry should walk
+    the visible levels and report a size-weighted average fill price rather
+    than pretending the whole order filled at the best ask.
+    """
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+
+    test_position = Position(
+        market_id="PAPER-DEPTH-WALK",
+        side="YES",
+        entry_price=0.27,
+        quantity=10,
+        timestamp=datetime.now(),
+        rationale="Depth-aware paper entry",
+        confidence=0.70,
+        live=False,
+    )
+    position_id = await db_manager.add_position(test_position)
+    test_position.id = position_id
+
+    mock_kalshi_client = AsyncMock()
+    mock_kalshi_client.get_market.return_value = {
+        "market": {
+            "ticker": "PAPER-DEPTH-WALK",
+            "yes_bid_dollars": 0.26,
+            "yes_ask_dollars": 0.27,
+            "yes_ask_size_fp": "20.00",
+            "no_bid_dollars": 0.73,
+            "no_ask_dollars": 0.74,
+        }
+    }
+    # Top-of-book ask is 0.27 for 4 contracts; next level is 0.28 for 6.
+    # A FOK for 10 contracts should walk both levels and land at avg = 0.276.
+    mock_kalshi_client.get_orderbook.return_value = {
+        "orderbook": {
+            "yes": [[0.27, 4], [0.28, 6], [0.29, 20]],
+            "no": [[0.73, 40]],
+        }
+    }
+
+    try:
+        result = await execute_position(
+            position=test_position,
+            live_mode=False,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+        )
+
+        assert result is True
+        updated = await db_manager.get_position_by_market_id("PAPER-DEPTH-WALK")
+        assert updated is not None
+        # 4 * 0.27 + 6 * 0.28 = 1.08 + 1.68 = 2.76 / 10 = 0.276
+        assert updated.entry_price == pytest.approx(0.276)
+        assert updated.contracts_cost == pytest.approx(2.76)
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+async def test_execute_position_paper_mode_rejects_when_book_too_thin_for_fok():
+    """
+    When the visible book can't fill within the slippage cap, the FOK
+    simulation rejects the entry so paper matches real-world FOK behavior.
+    """
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+
+    test_position = Position(
+        market_id="PAPER-DEPTH-THIN",
+        side="YES",
+        entry_price=0.27,
+        quantity=50,
+        timestamp=datetime.now(),
+        rationale="Thin book FOK rejection",
+        confidence=0.70,
+        live=False,
+    )
+    position_id = await db_manager.add_position(test_position)
+    test_position.id = position_id
+
+    mock_kalshi_client = AsyncMock()
+    mock_kalshi_client.get_market.return_value = {
+        "market": {
+            "ticker": "PAPER-DEPTH-THIN",
+            "yes_bid_dollars": 0.26,
+            "yes_ask_dollars": 0.27,
+            "yes_ask_size_fp": "100.00",  # top-of-book claims plenty, book is sparse
+            "no_bid_dollars": 0.73,
+            "no_ask_dollars": 0.74,
+        }
+    }
+    mock_kalshi_client.get_orderbook.return_value = {
+        "orderbook": {
+            "yes": [[0.27, 5], [0.35, 50]],  # only 5 within slippage cap
+            "no": [[0.73, 40]],
+        }
+    }
+
+    try:
+        result = await execute_position(
+            position=test_position,
+            live_mode=False,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+        )
+
+        assert result is False
+        # No filled buy order should be recorded.
+        simulated_buys = await db_manager.get_simulated_orders(
+            strategy="directional_trading",
+            market_id="PAPER-DEPTH-THIN",
+            side="YES",
+            action="buy",
+            status="filled",
+        )
+        assert simulated_buys == []
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+# ---------------------------------------------------------------------------
+# W2 Gap 2 — Resting-order collision: unique-per-position reconciliation
+# ---------------------------------------------------------------------------
+
+
+async def test_reconcile_simulated_exit_orders_does_not_cross_positions():
+    """
+    Two positions on the same (market_id, side) must not race: reconciliation
+    should use each order's position_id so a resting exit for position A stays
+    bound to A even when position B is the first open row found by the legacy
+    (market_id, side) query.
+    """
+    from src.jobs.execute import submit_simulated_sell_limit_order
+
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+
+    # Position A (will close via reconciliation).
+    position_a = Position(
+        market_id="PAPER-COLLISION-1",
+        side="YES",
+        entry_price=0.40,
+        quantity=10,
+        timestamp=datetime.now(),
+        rationale="Collision A",
+        confidence=0.70,
+        live=False,
+        strategy="quick_flip_scalping",
+    )
+    position_a.id = await db_manager.add_position(position_a)
+
+    mock_kalshi_client = AsyncMock()
+    # Initial get_market (place_sell_limit) sees a bid well below the limit so
+    # the order rests.
+    resting_market = {
+        "market": {
+            "ticker": "PAPER-COLLISION-1",
+            "yes_bid_dollars": 0.44,
+            "yes_ask_dollars": 0.46,
+            "no_bid_dollars": 0.54,
+            "no_ask_dollars": 0.56,
+        }
+    }
+    mock_kalshi_client.get_market.return_value = resting_market
+
+    # Rest the exit order for position A.
+    await submit_simulated_sell_limit_order(
+        position=position_a,
+        limit_price=0.55,
+        db_manager=db_manager,
+        kalshi_client=mock_kalshi_client,
+    )
+
+    # Now close position A externally (e.g. user cancelled, or it was filled
+    # elsewhere) and create a brand-new position B on the same market/side.
+    await db_manager.update_position_status(position_a.id, "closed")
+
+    position_b = Position(
+        market_id="PAPER-COLLISION-1",
+        side="YES",
+        entry_price=0.42,
+        quantity=5,
+        timestamp=datetime.now(),
+        rationale="Collision B",
+        confidence=0.70,
+        live=False,
+        strategy="quick_flip_scalping",
+    )
+    position_b.id = await db_manager.add_position(position_b)
+
+    # Reconciliation should cancel A's stale resting order (A is no longer
+    # open), not tag position B with A's exit.
+    fillable_market = {
+        "market": {
+            "ticker": "PAPER-COLLISION-1",
+            "yes_bid_dollars": 0.56,
+            "yes_ask_dollars": 0.57,
+            "no_bid_dollars": 0.43,
+            "no_ask_dollars": 0.44,
+        }
+    }
+    mock_kalshi_client.get_market.return_value = fillable_market
+
+    try:
+        result = await reconcile_simulated_exit_orders(
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+            market_id="PAPER-COLLISION-1",
+        )
+
+        assert result["orders_cancelled"] == 1
+        assert result["positions_closed"] == 0
+
+        # Position B must still be open; no fills should have been attributed
+        # to it from A's stale resting order.
+        refreshed_b = await db_manager.get_position_by_id(position_b.id)
+        assert refreshed_b is not None
+        assert refreshed_b.status == "open"
+
+        trade_logs = await db_manager.get_all_trade_logs()
+        assert trade_logs == []
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+async def test_submit_simulated_sell_limit_order_unique_per_position_id():
+    """
+    The partial unique index prevents two resting rows with the same
+    (position_id, action). `submit_simulated_sell_limit_order` should reuse
+    an existing resting order for the same position instead of creating a
+    duplicate.
+    """
+    from src.jobs.execute import submit_simulated_sell_limit_order
+
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+
+    position = Position(
+        market_id="PAPER-UNIQUE-1",
+        side="YES",
+        entry_price=0.40,
+        quantity=10,
+        timestamp=datetime.now(),
+        rationale="Uniqueness check",
+        confidence=0.70,
+        live=False,
+        strategy="quick_flip_scalping",
+    )
+    position.id = await db_manager.add_position(position)
+
+    mock_kalshi_client = AsyncMock()
+    mock_kalshi_client.get_market.return_value = {
+        "market": {
+            "ticker": "PAPER-UNIQUE-1",
+            "yes_bid_dollars": 0.44,
+            "yes_ask_dollars": 0.46,
+            "no_bid_dollars": 0.54,
+            "no_ask_dollars": 0.56,
+        }
+    }
+
+    try:
+        first = await submit_simulated_sell_limit_order(
+            position=position,
+            limit_price=0.55,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+        )
+        # Same limit price and quantity -> reuse the existing resting row.
+        second = await submit_simulated_sell_limit_order(
+            position=position,
+            limit_price=0.55,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+        )
+        assert first["success"] and second["success"]
+        assert first["order_id"] == second["order_id"]
+
+        # Different limit price -> old row gets cancelled, new one takes its
+        # place. Exactly one resting row should remain.
+        third = await submit_simulated_sell_limit_order(
+            position=position,
+            limit_price=0.58,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+        )
+        assert third["success"]
+
+        resting_orders = await db_manager.get_simulated_orders(
+            strategy="quick_flip_scalping",
+            market_id="PAPER-UNIQUE-1",
+            side="YES",
+            action="sell",
+            status="resting",
+        )
+        assert len(resting_orders) == 1
+        assert resting_orders[0].position_id == position.id
+        assert resting_orders[0].price == pytest.approx(0.58)
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+# ---------------------------------------------------------------------------
+# W2 Gap 3 — Fee reconciliation: persist live fee_cost, log divergence
+# ---------------------------------------------------------------------------
+
+
+async def test_execute_position_live_mode_records_fee_divergence_from_fill_fee_cost():
+    """
+    When Kalshi reports a `fee_cost` on the live fill that diverges from the
+    public-formula estimate, execute_position should persist the ACTUAL fee on
+    the position and log a divergence metric for dashboard consumption.
+    """
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+
+    test_position = Position(
+        market_id="LIVE-FEE-RECON",
+        side="YES",
+        entry_price=0.60,
+        quantity=10,
+        timestamp=datetime.now(),
+        rationale="Fee reconciliation",
+        confidence=0.80,
+        live=False,
+    )
+    position_id = await db_manager.add_position(test_position)
+    test_position.id = position_id
+
+    from unittest.mock import Mock
+    mock_kalshi_client = Mock()
+    mock_kalshi_client.get_market = AsyncMock(
+        return_value={
+            "market": {
+                "ticker": "LIVE-FEE-RECON",
+                "yes_bid_dollars": 0.58,
+                "yes_ask_dollars": 0.60,
+                "no_bid_dollars": 0.38,
+                "no_ask_dollars": 0.40,
+            }
+        }
+    )
+    mock_kalshi_client.place_order = AsyncMock(
+        return_value={
+            "order": {
+                "order_id": "fee-order-1",
+                "status": "filled",
+                "fill_count_fp": "10.00",
+                "yes_price_dollars": "0.6000",
+            }
+        }
+    )
+    # Kalshi reports 0.13 total fee on the fills (the public estimate is 0.17
+    # for 10 contracts at 0.60 taker → divergence should be logged).
+    mock_kalshi_client.get_fills = AsyncMock(
+        return_value={
+            "fills": [
+                {
+                    "ticker": "LIVE-FEE-RECON",
+                    "order_id": "fee-order-1",
+                    "client_order_id": "ignored",
+                    "count_fp": "10.00",
+                    "yes_price_dollars": "0.6000",
+                    "purchased_side": "yes",
+                    "fee_cost": "0.13",
+                }
+            ]
+        }
+    )
+    mock_kalshi_client.close = AsyncMock()
+
+    expected_estimate = estimate_kalshi_fee(0.60, 10, maker=False)
+    assert expected_estimate != pytest.approx(0.13)  # sanity: they really diverge
+
+    try:
+        result = await execute_position(
+            position=test_position,
+            live_mode=True,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+        )
+
+        assert result is True
+        refreshed = await db_manager.get_position_by_market_id("LIVE-FEE-RECON")
+        assert refreshed is not None
+        assert refreshed.live is True
+        assert refreshed.entry_fee == pytest.approx(0.13)
+
+        divergences = await db_manager.get_fee_divergence_entries(
+            market_id="LIVE-FEE-RECON"
+        )
+        assert len(divergences) == 1
+        entry = divergences[0]
+        assert entry["leg"] == "entry"
+        assert entry["actual_fee"] == pytest.approx(0.13)
+        assert entry["estimated_fee"] == pytest.approx(expected_estimate)
+        assert entry["divergence"] == pytest.approx(0.13 - expected_estimate)
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
 test_sell_limit_order_functionality = pytest.mark.live_kalshi(test_sell_limit_order_functionality)
 test_profit_taking_orders = pytest.mark.live_kalshi(test_profit_taking_orders)

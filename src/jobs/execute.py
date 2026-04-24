@@ -36,6 +36,8 @@ from src.utils.trade_pricing import (
     calculate_position_pnl,
     estimate_kalshi_fee,
     extract_fee_metadata,
+    fee_divergence,
+    sum_fill_fees,
 )
 
 
@@ -183,6 +185,132 @@ async def _get_current_executable_entry_quote(
     return _validate_executable_price(ticker=ticker, side=side, price=ask_dollars), ask_size, market
 
 
+def _normalize_book_levels(
+    orderbook: Dict[str, Any], side: str, *, ascending: bool
+) -> list[tuple[float, float]]:
+    """
+    Return sorted `(price, size)` levels for the resting side that an entry order
+    would lift. For buying YES (side="YES") we want the ask side of the YES book;
+    the Kalshi orderbook payload stores the ask side as the requested side's list
+    (the resting sell orders), so the caller picks `ascending=True` to walk from
+    cheapest ask to deepest.
+    """
+    raw_levels = orderbook.get(f"{side.lower()}_dollars") or orderbook.get(side.lower(), [])
+    levels: list[tuple[float, float]] = []
+
+    for level in raw_levels or []:
+        if not isinstance(level, (list, tuple)) or len(level) < 2:
+            continue
+        try:
+            price = float(level[0])
+            size = float(level[1])
+        except (TypeError, ValueError):
+            continue
+        if price > 1.0:
+            price = price / 100.0
+        if price <= 0 or size <= 0:
+            continue
+        levels.append((price, size))
+
+    levels.sort(key=lambda item: item[0], reverse=not ascending)
+    return levels
+
+
+def _simulate_fok_depth_walk(
+    *,
+    orderbook: Dict[str, Any],
+    side: str,
+    quantity: float,
+    max_slippage_ticks: int = 1,
+    tick_size: float = 0.01,
+    best_ask: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Simulate a FOK-style buy that walks the visible ask side of the book.
+
+    Returns a dict with:
+      - filled_quantity: number of contracts that can be filled within slippage
+      - average_price: size-weighted average price across filled levels (dollars)
+      - worst_price: deepest level touched
+      - levels: list of (price, qty) that were consumed
+      - can_fill: True when `filled_quantity >= quantity` within slippage cap
+
+    Notes:
+      - Kalshi's order book on the entry side is a stack of resting sell orders;
+        we walk from best (lowest) ask upwards.
+      - `max_slippage_ticks` guards against "fat book" situations where the FOK
+        would silently walk multiple ticks. A true FOK that can't fill within the
+        cap is rejected (can_fill=False), matching live behavior when the order
+        would need to sweep beyond the submitted limit.
+    """
+    levels = _normalize_book_levels(orderbook, side, ascending=True)
+    if not levels:
+        return {
+            "filled_quantity": 0.0,
+            "average_price": 0.0,
+            "worst_price": 0.0,
+            "levels": [],
+            "can_fill": False,
+        }
+
+    target_quantity = max(0.0, float(quantity or 0.0))
+    if target_quantity <= 0:
+        return {
+            "filled_quantity": 0.0,
+            "average_price": float(levels[0][0]),
+            "worst_price": float(levels[0][0]),
+            "levels": [],
+            "can_fill": True,
+        }
+
+    effective_tick = tick_size if tick_size > 0 else 0.01
+    reference_ask = float(best_ask) if best_ask and best_ask > 0 else float(levels[0][0])
+    price_cap = reference_ask + (max_slippage_ticks * effective_tick) + 1e-9
+
+    filled_qty = 0.0
+    cost = 0.0
+    consumed: list[tuple[float, float]] = []
+    worst_price = reference_ask
+
+    for price, size in levels:
+        if price > price_cap:
+            break
+        take = min(size, target_quantity - filled_qty)
+        if take <= 0:
+            break
+        filled_qty += take
+        cost += take * price
+        worst_price = max(worst_price, price)
+        consumed.append((price, take))
+        if filled_qty + 1e-9 >= target_quantity:
+            break
+
+    average_price = (cost / filled_qty) if filled_qty > 0 else reference_ask
+    can_fill = filled_qty + 1e-9 >= target_quantity
+    return {
+        "filled_quantity": filled_qty,
+        "average_price": average_price,
+        "worst_price": worst_price,
+        "levels": consumed,
+        "can_fill": can_fill,
+    }
+
+
+async def _fetch_entry_orderbook(
+    *,
+    kalshi_client: KalshiClient,
+    ticker: str,
+) -> Dict[str, Any]:
+    """Fetch the live orderbook payload used for depth-aware FOK simulation."""
+    try:
+        response = await kalshi_client.get_orderbook(ticker, depth=10)
+    except Exception:
+        return {}
+    if not isinstance(response, dict):
+        return {}
+    return response.get("orderbook_fp") or response.get("orderbook") or response or {}
+
+
 async def _get_current_executable_entry_price(
     *,
     kalshi_client: KalshiClient,
@@ -274,6 +402,45 @@ async def _reconcile_fill_quantity(
         )
 
     return fallback_quantity
+
+
+async def _reconcile_fill_fee(
+    *,
+    kalshi_client: KalshiClient,
+    ticker: str,
+    client_order_id: str,
+    order_response: Dict,
+) -> Optional[float]:
+    """
+    Return the total Kalshi-reported fee for this order, when available.
+
+    Pulls per-fill `fee_cost` rows from `/fills` and sums them so the caller
+    can compare to the estimated fee schedule. Returns None if Kalshi did
+    not include any fee metadata on the fills we can match.
+    """
+    logger = get_trading_logger("trade_execution")
+    order = order_response.get("order", {}) if isinstance(order_response, dict) else {}
+    order_id = order.get("order_id")
+
+    try:
+        fills_response = await kalshi_client.get_fills(ticker=ticker, limit=20)
+    except Exception as exc:
+        logger.warning(
+            f"Could not fetch fills for fee reconciliation on {ticker}",
+            error=str(exc),
+        )
+        return None
+
+    fills = fills_response.get("fills", []) if isinstance(fills_response, dict) else []
+    matched = [
+        fill
+        for fill in fills
+        if (order_id and fill.get("order_id") == order_id)
+        or (client_order_id and fill.get("client_order_id") == client_order_id)
+    ]
+    if not matched:
+        return None
+    return sum_fill_fees(matched)
 
 
 async def record_simulated_position_exit(
@@ -378,22 +545,51 @@ async def submit_simulated_sell_limit_order(
     Paper orders now mirror live intent more closely:
     - if the limit crosses the current best bid, simulate an immediate taker fill
     - otherwise persist a resting local order for later reconciliation
+
+    W2 Gap 2: resting orders are keyed by `position_id` (not `(market_id, side)`)
+    so two positions on the same side cannot race for the same fill during
+    reconciliation.
     """
     logger = get_trading_logger("simulated_sell_limit_order")
     strategy = position.strategy or "directional_trading"
     now = datetime.now()
-    resting_orders = await db_manager.get_simulated_orders(
-        strategy=strategy,
-        market_id=position.market_id,
-        side=position.side,
-        action="sell",
-        status="resting",
-    )
 
-    for order in resting_orders:
+    if position.id is None:
+        logger.warning(
+            "Cannot submit simulated sell order without a persisted position_id for %s %s",
+            position.market_id,
+            position.side,
+        )
+        return {
+            "success": False,
+            "filled": False,
+            "orders_placed": 0,
+            "positions_closed": 0,
+            "net_pnl": 0.0,
+            "fees_paid": 0.0,
+            "filled_price": None,
+            "order_id": None,
+        }
+
+    # Key resting orders by position_id. Any legacy market-keyed rows that
+    # belong to other positions are left alone by this query.
+    resting_orders_same_position = [
+        order
+        for order in await db_manager.get_simulated_orders(
+            strategy=strategy,
+            market_id=position.market_id,
+            side=position.side,
+            action="sell",
+            status="resting",
+        )
+        if order.position_id == position.id
+    ]
+
+    for order in resting_orders_same_position:
         if abs(float(order.price) - limit_price) < 1e-9 and abs(float(order.quantity) - position.quantity) < 1e-9:
             logger.info(
-                "Paper sell limit already resting for %s %s at $%.4f; reusing existing order.",
+                "Paper sell limit already resting for position %s (%s %s) at $%.4f; reusing existing order.",
+                position.id,
                 position.market_id,
                 position.side,
                 limit_price,
@@ -409,7 +605,7 @@ async def submit_simulated_sell_limit_order(
                 "order_id": order.order_id,
             }
 
-    for order in resting_orders:
+    for order in resting_orders_same_position:
         await db_manager.update_simulated_order(int(order.id), status="cancelled")
 
     market_info: Dict[str, Any] = {}
@@ -541,8 +737,23 @@ async def reconcile_simulated_exit_orders(
 
     for order in resting_orders:
         try:
-            position = await db_manager.get_position_by_market_and_side(order.market_id, order.side)
-            if not position or (order.position_id is not None and position.id != order.position_id):
+            # W2 Gap 2: look up the position by position_id first so two orders
+            # that happen to share (market_id, side) cannot race for the same
+            # reconciliation. Fall back to the legacy (market_id, side) path
+            # only when an order predates the position_id column.
+            position: Optional[Position] = None
+            if order.position_id is not None:
+                position = await db_manager.get_position_by_id(int(order.position_id))
+                if position and position.status != "open":
+                    await db_manager.update_simulated_order(int(order.id), status="cancelled")
+                    results["orders_cancelled"] += 1
+                    continue
+            else:
+                position = await db_manager.get_position_by_market_and_side(
+                    order.market_id, order.side
+                )
+
+            if not position:
                 await db_manager.update_simulated_order(int(order.id), status="cancelled")
                 results["orders_cancelled"] += 1
                 continue
@@ -638,7 +849,7 @@ async def execute_position(
 
     if not live_mode:
         try:
-            paper_entry_price, displayed_ask_size, market_info = await _get_current_executable_entry_quote(
+            top_of_book_price, displayed_ask_size, market_info = await _get_current_executable_entry_quote(
                 kalshi_client=kalshi_client,
                 ticker=position.market_id,
                 side=position.side,
@@ -653,14 +864,45 @@ async def execute_position(
             logger.warning(str(exc))
             return False
         except Exception as exc:
-            paper_entry_price = position.entry_price
+            top_of_book_price = position.entry_price
             displayed_ask_size = 0.0
             market_info = {}
             logger.warning(
                 f"Could not fetch live market data for paper entry on {position.market_id}; "
-                f"falling back to requested entry price {paper_entry_price:.4f}",
+                f"falling back to requested entry price {top_of_book_price:.4f}",
                 error=str(exc),
             )
+
+        # Depth-aware FOK simulation: walk the visible book so paper fills match
+        # what a real FOK limit would actually achieve. If the order can't be fully
+        # filled within one tick of the submitted limit, reject the entry just like
+        # Kalshi would.
+        paper_entry_price = top_of_book_price
+        depth_summary: Optional[Dict[str, Any]] = None
+        if market_info:
+            orderbook = await _fetch_entry_orderbook(
+                kalshi_client=kalshi_client,
+                ticker=position.market_id,
+            )
+            if orderbook:
+                tick_size = get_market_tick_size(market_info, top_of_book_price)
+                depth_summary = _simulate_fok_depth_walk(
+                    orderbook=orderbook,
+                    side=position.side,
+                    quantity=position.quantity,
+                    max_slippage_ticks=1,
+                    tick_size=tick_size,
+                    best_ask=top_of_book_price,
+                )
+                if not depth_summary["can_fill"]:
+                    logger.warning(
+                        f"Skipping paper entry for {position.market_id}: "
+                        f"visible book can only fill {depth_summary['filled_quantity']:.2f} of "
+                        f"{position.quantity:.2f} contracts within one tick of "
+                        f"${top_of_book_price:.4f}"
+                    )
+                    return False
+                paper_entry_price = depth_summary["average_price"]
 
         filled_at = datetime.now()
         fee_metadata = await _resolve_market_fee_metadata(
@@ -701,10 +943,20 @@ async def execute_position(
             contracts_cost=position.contracts_cost,
             entry_order_id=position.entry_order_id,
         )
-        logger.info(
-            f"PAPER TRADE EXECUTED for {position.market_id} at ${paper_entry_price:.4f} "
-            f"using live market data"
-        )
+        if depth_summary and depth_summary.get("levels"):
+            walk_trail = ", ".join(
+                f"{qty:.2f}@${price:.4f}" for price, qty in depth_summary["levels"]
+            )
+            logger.info(
+                f"PAPER TRADE EXECUTED for {position.market_id} "
+                f"avg ${paper_entry_price:.4f} (top ${top_of_book_price:.4f}) "
+                f"via FOK walk: {walk_trail}"
+            )
+        else:
+            logger.info(
+                f"PAPER TRADE EXECUTED for {position.market_id} at ${paper_entry_price:.4f} "
+                f"using live market data"
+            )
         if displayed_ask_size > 0:
             logger.info(
                 f"Visible top-of-book liquidity at entry: {displayed_ask_size:.2f} contracts"
@@ -777,18 +1029,48 @@ async def execute_position(
             ticker=position.market_id,
             market_info=market_info,
         )
-        position.entry_fee = (
-            _extract_order_fee_dollars(order_info, maker=False)
-            or estimate_kalshi_fee(
-                fill_price,
-                fill_quantity,
-                maker=False,
-                fee_type=fee_metadata.fee_type,
-                fee_multiplier=fee_metadata.fee_multiplier,
-                fee_waiver_expiration_time=fee_metadata.fee_waiver_expiration_time,
-                trade_ts=datetime.now(),
-            )
+        estimated_entry_fee = estimate_kalshi_fee(
+            fill_price,
+            fill_quantity,
+            maker=False,
+            fee_type=fee_metadata.fee_type,
+            fee_multiplier=fee_metadata.fee_multiplier,
+            fee_waiver_expiration_time=fee_metadata.fee_waiver_expiration_time,
+            trade_ts=datetime.now(),
         )
+        # W2 Gap 3: prefer the fee values Kalshi actually reported (order-level
+        # `taker_fees_dollars` / per-fill `fee_cost`) over the public-formula
+        # estimate. When live and estimated diverge, log the delta so the
+        # paper-vs-live dashboard can surface fee drift.
+        order_fee = _extract_order_fee_dollars(order_info, maker=False)
+        fill_fee = await _reconcile_fill_fee(
+            kalshi_client=kalshi_client,
+            ticker=position.market_id,
+            client_order_id=client_order_id,
+            order_response=order_response,
+        )
+        actual_entry_fee: Optional[float] = None
+        if order_fee is not None:
+            actual_entry_fee = order_fee
+        elif fill_fee is not None:
+            actual_entry_fee = fill_fee
+
+        if actual_entry_fee is not None:
+            position.entry_fee = actual_entry_fee
+            if abs(fee_divergence(actual_entry_fee, estimated_entry_fee)) > 1e-9:
+                await db_manager.record_fee_divergence(
+                    market_id=position.market_id,
+                    side=position.side,
+                    leg="entry",
+                    estimated_fee=estimated_entry_fee,
+                    actual_fee=actual_entry_fee,
+                    position_id=position.id,
+                    order_id=order_info.get("order_id") or client_order_id,
+                    quantity=fill_quantity,
+                    price=fill_price,
+                )
+        else:
+            position.entry_fee = estimated_entry_fee
         position.contracts_cost = fill_price * fill_quantity
         position.entry_order_id = order_info.get("order_id") or client_order_id
         await db_manager.update_position_execution_details(

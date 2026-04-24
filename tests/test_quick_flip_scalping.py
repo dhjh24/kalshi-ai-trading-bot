@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -1095,3 +1096,216 @@ async def test_reconcile_persisted_live_positions_voids_flat_stale_record():
         ),
     )
     fake_db.update_position_execution_details.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# W2 Gap 4 — AI-less fallback path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_analyze_market_movement_uses_heuristic_when_disable_ai_flag_set():
+    """
+    With disable_ai=True, the strategy should never touch the xai client and
+    should derive a target price from recent-trade momentum instead.
+    """
+    failing_client = SimpleNamespace(
+        get_completion=AsyncMock(side_effect=AssertionError("AI must not be called"))
+    )
+    strategy = QuickFlipScalpingStrategy(
+        db_manager=object(),
+        kalshi_client=object(),
+        xai_client=failing_client,
+        config=QuickFlipConfig(min_recent_trade_count=3),
+        disable_ai=True,
+    )
+    strategy._get_recent_trade_stats = AsyncMock(
+        return_value={
+            "trade_count": 15.0,
+            "recent_max_price": 0.068,
+            "recent_min_price": 0.050,
+            "recent_last_price": 0.066,
+            "recent_range": 0.018,
+        }
+    )
+
+    analysis = await strategy._analyze_market_movement(
+        _build_market(),
+        "YES",
+        0.057,
+        required_exit_price=0.065,
+        hours_to_expiry=2.0,
+        market_volume=5000,
+        spread=0.005,
+    )
+
+    assert analysis["confidence"] > 0.0
+    assert analysis["target_price"] >= 0.065
+    assert "Heuristic" in analysis["reason"]
+    failing_client.get_completion.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_analyze_market_movement_uses_heuristic_when_env_var_truthy(monkeypatch):
+    """
+    Setting ``QUICK_FLIP_DISABLE_AI=1`` should be enough to switch the strategy
+    into heuristic-only mode — no explicit constructor kwarg required.
+    """
+    monkeypatch.setenv("QUICK_FLIP_DISABLE_AI", "1")
+    failing_client = SimpleNamespace(
+        get_completion=AsyncMock(side_effect=AssertionError("AI must not be called"))
+    )
+    strategy = QuickFlipScalpingStrategy(
+        db_manager=object(),
+        kalshi_client=object(),
+        xai_client=failing_client,
+        config=QuickFlipConfig(min_recent_trade_count=3),
+    )
+    assert strategy.disable_ai is True
+
+    strategy._get_recent_trade_stats = AsyncMock(
+        return_value={
+            "trade_count": 10.0,
+            "recent_max_price": 0.070,
+            "recent_min_price": 0.050,
+            "recent_last_price": 0.068,
+            "recent_range": 0.020,
+        }
+    )
+
+    analysis = await strategy._analyze_market_movement(
+        _build_market(),
+        "YES",
+        0.057,
+        required_exit_price=0.065,
+        hours_to_expiry=1.5,
+        market_volume=5000,
+        spread=0.005,
+    )
+
+    assert analysis["confidence"] > 0.0
+    failing_client.get_completion.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_heuristic_movement_analysis_rejects_flat_tape():
+    """Flat or bottom-half tape must not produce a bullish heuristic call."""
+    strategy = QuickFlipScalpingStrategy(
+        db_manager=object(),
+        kalshi_client=object(),
+        xai_client=None,
+        config=QuickFlipConfig(min_recent_trade_count=3),
+        disable_ai=True,
+    )
+    # Flat tape: range is essentially zero.
+    strategy._get_recent_trade_stats = AsyncMock(
+        return_value={
+            "trade_count": 10.0,
+            "recent_max_price": 0.057,
+            "recent_min_price": 0.057,
+            "recent_last_price": 0.057,
+            "recent_range": 0.0,
+        }
+    )
+    analysis = await strategy._heuristic_movement_analysis(
+        _build_market(),
+        "YES",
+        0.057,
+        required_exit_price=0.065,
+        hours_to_expiry=2.0,
+        spread=0.005,
+    )
+    assert analysis["confidence"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_heuristic_movement_analysis_rejects_gap_above_recent_tape():
+    """
+    When the current ask is gapping above recent prints the heuristic should
+    refuse to enter, because momentum is already exhausted.
+    """
+    strategy = QuickFlipScalpingStrategy(
+        db_manager=object(),
+        kalshi_client=object(),
+        xai_client=None,
+        config=QuickFlipConfig(
+            min_recent_trade_count=3,
+            max_entry_vs_recent_last_gap=0.01,
+        ),
+        disable_ai=True,
+    )
+    strategy._get_recent_trade_stats = AsyncMock(
+        return_value={
+            "trade_count": 10.0,
+            "recent_max_price": 0.068,
+            "recent_min_price": 0.05,
+            "recent_last_price": 0.055,
+            "recent_range": 0.018,
+        }
+    )
+    # Ask is 0.075 but recent last is 0.055 -> gap of 0.02 exceeds config cap.
+    analysis = await strategy._heuristic_movement_analysis(
+        _build_market(),
+        "YES",
+        0.075,
+        required_exit_price=0.08,
+        hours_to_expiry=2.0,
+        spread=0.005,
+    )
+    assert analysis["confidence"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_evaluate_price_opportunity_works_without_ai_via_heuristic():
+    """End-to-end: identify_quick_flip_opportunities can run without an AI call."""
+    strategy = QuickFlipScalpingStrategy(
+        db_manager=object(),
+        kalshi_client=object(),
+        xai_client=None,
+        config=QuickFlipConfig(
+            capital_per_trade=5.0,
+            max_position_size=25,
+            confidence_threshold=0.5,
+            min_net_profit_per_trade=0.05,
+            min_net_roi=0.01,
+            min_recent_trade_count=5,
+            min_recent_price_position=0.4,
+            max_entry_vs_recent_last_gap=0.02,
+            max_target_vs_recent_trade_gap=0.02,
+        ),
+        disable_ai=True,
+    )
+    strategy._get_recent_trade_stats = AsyncMock(
+        return_value={
+            "trade_count": 20.0,
+            "recent_max_price": 0.22,
+            "recent_min_price": 0.17,
+            "recent_last_price": 0.21,
+            "recent_range": 0.05,
+        }
+    )
+
+    market_info = {
+        "yes_bid_dollars": "0.18",
+        "yes_ask_dollars": "0.19",
+        "no_bid_dollars": "0.81",
+        "no_ask_dollars": "0.82",
+        "volume_fp": "5000.00",
+    }
+    orderbook = {
+        "yes_dollars": [["0.18", "100.00"]],
+        "no_dollars": [["0.81", "100.00"]],
+    }
+
+    opportunity = await strategy._evaluate_price_opportunity(
+        _build_market(),
+        market_info,
+        orderbook,
+        "YES",
+        hours_to_expiry=2.0,
+        market_volume=5000,
+    )
+
+    assert opportunity is not None
+    assert "Heuristic" in opportunity.movement_indicator
+    assert opportunity.expected_profit > 0
