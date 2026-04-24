@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from src.clients.xai_client import TradingDecision, DailyUsageTracker
 from src.clients.openai_client import OpenAIClient
 from src.clients.openrouter_client import OpenRouterClient, MODEL_PRICING
+from src.clients.codex_client import CodexClient
 from src.config.settings import settings
 from src.utils.logging_setup import TradingLoggerMixin
 
@@ -78,6 +79,36 @@ OPENAI_FULL_FLEET: List[Tuple[str, str]] = [
     ("openai/gpt-5.4", "openai"),
     ("openai/o3", "openai"),
     ("openai/gpt-4.1", "openai"),
+]
+
+# Codex CLI fleet — free plan-quota usage via a signed-in ChatGPT plan.
+# Models exposed by the Codex CLI track the OpenAI reasoning lineup but are
+# invoked through subprocess, not via OpenAI billing.
+CODEX_CAPABILITY_MAP: Dict[str, List[Tuple[str, str]]] = {
+    "fast": [
+        ("codex/gpt-5-codex", "codex"),
+        ("codex/gpt-5.4-codex", "codex"),
+    ],
+    "cheap": [
+        ("codex/gpt-5-codex", "codex"),
+        ("codex/o3-codex", "codex"),
+    ],
+    "reasoning": [
+        ("codex/gpt-5.4-codex", "codex"),
+        ("codex/o3-codex", "codex"),
+        ("codex/gpt-5-codex", "codex"),
+    ],
+    "balanced": [
+        ("codex/gpt-5-codex", "codex"),
+        ("codex/gpt-5.4-codex", "codex"),
+        ("codex/o3-codex", "codex"),
+    ],
+}
+
+CODEX_FULL_FLEET: List[Tuple[str, str]] = [
+    ("codex/gpt-5-codex", "codex"),
+    ("codex/gpt-5.4-codex", "codex"),
+    ("codex/o3-codex", "codex"),
 ]
 
 
@@ -160,6 +191,7 @@ class ModelRouter(TradingLoggerMixin):
         self,
         openai_client: Optional[OpenAIClient] = None,
         openrouter_client: Optional[OpenRouterClient] = None,
+        codex_client: Optional[CodexClient] = None,
         db_manager: Any = None,
         # xai_client param accepted for backward compat but ignored — all routing
         # now goes through OpenRouter.
@@ -170,21 +202,23 @@ class ModelRouter(TradingLoggerMixin):
 
         self.openai_client: Optional[OpenAIClient] = openai_client
         self.openrouter_client: Optional[OpenRouterClient] = openrouter_client
+        self.codex_client: Optional[CodexClient] = codex_client
 
         # Daily cost tracking (persisted via pickle, shared with OpenRouterClient)
         self.daily_tracker: DailyUsageTracker = self._load_daily_tracker()
 
-        # Build health trackers for both provider fleets.
+        # Build health trackers for all supported provider fleets.
         self.model_health: Dict[str, ModelHealth] = {}
         for model_name, provider in self._all_fleets():
             key = self._model_key(model_name, provider)
             self.model_health[key] = ModelHealth(model=model_name, provider=provider)
 
         self.logger.info(
-            "ModelRouter initialized — all models via OpenRouter",
+            "ModelRouter initialized",
             default_provider=self.default_provider,
             openai_available=self.openai_client is not None,
             openrouter_available=self.openrouter_client is not None,
+            codex_available=self.codex_client is not None,
             fleet_size=len(self._active_fleet()),
         )
 
@@ -286,16 +320,20 @@ class ModelRouter(TradingLoggerMixin):
     @staticmethod
     def _all_fleets() -> List[Tuple[str, str]]:
         """Return the union of supported model/provider pairs."""
-        return list(dict.fromkeys(FULL_FLEET + OPENAI_FULL_FLEET))
+        return list(dict.fromkeys(FULL_FLEET + OPENAI_FULL_FLEET + CODEX_FULL_FLEET))
 
     def _active_capability_map(self) -> Dict[str, List[Tuple[str, str]]]:
         """Return the capability map for the selected provider mode."""
+        if self.default_provider == "codex":
+            return CODEX_CAPABILITY_MAP
         if self.default_provider == "openai":
             return OPENAI_CAPABILITY_MAP
         return CAPABILITY_MAP
 
     def _active_fleet(self) -> List[Tuple[str, str]]:
         """Return the active fleet for the selected provider mode."""
+        if self.default_provider == "codex":
+            return CODEX_FULL_FLEET
         if self.default_provider == "openai":
             return OPENAI_FULL_FLEET
         return FULL_FLEET
@@ -314,13 +352,30 @@ class ModelRouter(TradingLoggerMixin):
             self.logger.info("Lazily initialized OpenAIClient")
         return self.openai_client
 
+    def _ensure_codex(self) -> CodexClient:
+        """Return the Codex CLI client, creating it on first use if needed."""
+        if self.codex_client is None:
+            self.codex_client = CodexClient(db_manager=self.db_manager)
+            self.logger.info("Lazily initialized CodexClient")
+        return self.codex_client
+
+    def _get_client(self, provider: str):
+        """Return the provider-specific client instance."""
+        if provider == "codex":
+            return self._ensure_codex()
+        if provider == "openai":
+            return self._ensure_openai()
+        return self._ensure_openrouter()
+
     def _infer_provider(self, model: str) -> str:
         """
         Infer the provider to use for a requested model.
 
-        When OpenAI is the selected provider mode, all routed requests stay on
-        the OpenAI fleet. Otherwise, requests go through OpenRouter.
+        Codex mode keeps requests on the Codex CLI fleet; OpenAI mode stays
+        on OpenAI; everything else flows through OpenRouter.
         """
+        if self.default_provider == "codex":
+            return "codex"
         if self.default_provider == "openai":
             return "openai"
         return "openrouter"
@@ -409,7 +464,7 @@ class ModelRouter(TradingLoggerMixin):
         trace: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """Send a completion request through the selected provider."""
-        client = self._ensure_openai() if provider == "openai" else self._ensure_openrouter()
+        client = self._get_client(provider)
         return await client.get_completion(
             prompt=prompt,
             model=model,
@@ -443,7 +498,7 @@ class ModelRouter(TradingLoggerMixin):
         trace: Optional[Dict[str, Any]] = None,
     ) -> Optional[TradingDecision]:
         """Request a trading decision through the selected provider."""
-        client = self._ensure_openai() if provider == "openai" else self._ensure_openrouter()
+        client = self._get_client(provider)
         return await client.get_trading_decision(
             market_data=market_data,
             portfolio_data=portfolio_data,
@@ -521,7 +576,7 @@ class ModelRouter(TradingLoggerMixin):
             )
 
             if result is not None:
-                client = self._ensure_openai() if primary_provider == "openai" else self._ensure_openrouter()
+                client = self._get_client(primary_provider)
                 actual_model = client.last_request_metadata.actual_model or primary_model
                 actual_provider = self._infer_provider(actual_model)
                 self._record_success(actual_model, actual_provider, time.time() - start)
@@ -678,7 +733,7 @@ class ModelRouter(TradingLoggerMixin):
             )
 
             if decision is not None:
-                client = self._ensure_openai() if primary_provider == "openai" else self._ensure_openrouter()
+                client = self._get_client(primary_provider)
                 actual_model = client.last_request_metadata.actual_model or primary_model
                 actual_provider = self._infer_provider(actual_model)
                 self._record_success(actual_model, actual_provider, time.time() - start)
@@ -722,6 +777,9 @@ class ModelRouter(TradingLoggerMixin):
             total += self.openai_client.total_cost
         if self.openrouter_client:
             total += self.openrouter_client.total_cost
+        if self.codex_client:
+            # Codex plan usage is $0 metered but we include it for parity.
+            total += self.codex_client.total_cost
         return total
 
     def get_total_requests(self) -> int:
@@ -731,6 +789,8 @@ class ModelRouter(TradingLoggerMixin):
             total += self.openai_client.request_count
         if self.openrouter_client:
             total += self.openrouter_client.request_count
+        if self.codex_client:
+            total += self.codex_client.request_count
         return total
 
     def get_cost_summary(self) -> Dict[str, Any]:
@@ -755,6 +815,8 @@ class ModelRouter(TradingLoggerMixin):
             summary["providers"]["openai"] = self.openai_client.get_cost_summary()
         if self.openrouter_client:
             summary["providers"]["openrouter"] = self.openrouter_client.get_cost_summary()
+        if self.codex_client:
+            summary["providers"]["codex"] = self.codex_client.get_cost_summary()
 
         for key, health in self.model_health.items():
             if health.total_requests > 0:
@@ -781,6 +843,8 @@ class ModelRouter(TradingLoggerMixin):
             tasks.append(self.openai_client.close())
         if self.openrouter_client:
             tasks.append(self.openrouter_client.close())
+        if self.codex_client:
+            tasks.append(self.codex_client.close())
 
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)

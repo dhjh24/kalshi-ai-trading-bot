@@ -48,16 +48,46 @@ def _get_llm_provider() -> str:
     return os.getenv("LLM_PROVIDER", "auto").strip().lower() or "auto"
 
 
+def _is_codex_cli_ready() -> bool:
+    """
+    Return ``True`` when the Codex CLI is both on PATH and authenticated.
+
+    Wrapped in a try/except because the Codex client is an optional
+    dependency; importing it must never hard-fail settings initialization.
+    The result is cached inside :mod:`src.clients.codex_client` so calling
+    this from multiple settings helpers is cheap.
+    """
+    try:
+        # Local import to avoid a circular import at module load.
+        from src.clients.codex_client import (
+            is_codex_authenticated,
+            resolve_codex_cli_path,
+        )
+    except Exception:
+        return False
+
+    try:
+        path = resolve_codex_cli_path()
+        if not path:
+            return False
+        return bool(is_codex_authenticated(path))
+    except Exception:
+        return False
+
+
 def _resolve_default_llm_provider() -> str:
     """
     Resolve the effective provider from environment state.
 
-    `auto` prefers direct OpenAI access when an API key is configured, then
-    falls back to OpenRouter.
+    `auto` prefers the Codex CLI (ChatGPT plan quota) when it is on PATH
+    AND signed in, then direct OpenAI access when an API key is configured,
+    and finally falls back to OpenRouter.
     """
     provider = _get_llm_provider()
     if provider != "auto":
         return provider
+    if _is_codex_cli_ready():
+        return "codex"
     if os.getenv("OPENAI_API_KEY", "").strip():
         return "openai"
     return "openrouter"
@@ -69,7 +99,10 @@ def _get_default_primary_model() -> str:
     if env_override:
         return env_override
 
-    if _resolve_default_llm_provider() == "openai":
+    provider = _resolve_default_llm_provider()
+    if provider == "codex":
+        return "codex/gpt-5-codex"
+    if provider == "openai":
         return "openai/gpt-5.4"
     return "anthropic/claude-sonnet-4.5"
 
@@ -80,7 +113,10 @@ def _get_default_fallback_model() -> str:
     if env_override:
         return env_override
 
-    if _resolve_default_llm_provider() == "openai":
+    provider = _resolve_default_llm_provider()
+    if provider == "codex":
+        return "codex/gpt-5.4-codex"
+    if provider == "openai":
         return "openai/o3"
     return "deepseek/deepseek-v3.2"
 
@@ -91,7 +127,10 @@ def _get_default_sentiment_model() -> str:
     if env_override:
         return env_override
 
-    if _resolve_default_llm_provider() == "openai":
+    provider = _resolve_default_llm_provider()
+    if provider == "codex":
+        return "codex/gpt-5-codex"
+    if provider == "openai":
         return "openai/gpt-4.1"
     return "google/gemini-3.1-flash-lite-preview"
 
@@ -116,6 +155,14 @@ class APIConfig:
         ).strip()
     )
 
+    # Codex CLI integration (ChatGPT plan quota)
+    codex_cli_path: str = field(
+        default_factory=lambda: os.getenv("CODEX_CLI_PATH", "").strip()
+    )
+    codex_plan_tier: str = field(
+        default_factory=lambda: os.getenv("CODEX_PLAN_TIER", "plus").strip() or "plus"
+    )
+
     # xai_api_key removed — all models now route through OpenRouter
 
     def get_openrouter_headers(self) -> Dict[str, str]:
@@ -131,6 +178,8 @@ class APIConfig:
         """Return the effective provider after applying `auto` fallback rules."""
         if self.llm_provider != "auto":
             return self.llm_provider
+        if _is_codex_cli_ready():
+            return "codex"
         if self.openai_api_key:
             return "openai"
         return "openrouter"
@@ -523,21 +572,36 @@ class Settings:
         if self.api.kalshi_env not in {"prod", "demo"}:
             raise ValueError("KALSHI_ENV must be 'prod' or 'demo'")
 
-        if self.api.llm_provider not in {"auto", "openai", "openrouter"}:
-            raise ValueError("LLM_PROVIDER must be 'auto', 'openai', or 'openrouter'")
+        if self.api.llm_provider not in {"auto", "openai", "openrouter", "codex"}:
+            raise ValueError(
+                "LLM_PROVIDER must be 'auto', 'codex', 'openai', or 'openrouter'"
+            )
 
         if not self.api.kalshi_api_key:
             raise ValueError("KALSHI_API_KEY environment variable is required")
 
-        if self.api.resolve_llm_provider() == "openai" and not self.api.openai_api_key:
+        effective_provider = self.api.resolve_llm_provider()
+
+        if effective_provider == "openai" and not self.api.openai_api_key:
             raise ValueError(
                 "OPENAI_API_KEY is required when LLM_PROVIDER resolves to 'openai'"
             )
 
-        if self.api.resolve_llm_provider() == "openrouter" and not self.api.openrouter_api_key:
+        if effective_provider == "openrouter" and not self.api.openrouter_api_key:
             raise ValueError(
                 "OPENROUTER_API_KEY is required when LLM_PROVIDER resolves to 'openrouter'"
             )
+
+        if effective_provider == "codex":
+            # Only enforce CLI presence when the user explicitly asked for
+            # codex. `auto` already falls back to openai/openrouter when the
+            # CLI is missing, so we don't double-validate here.
+            if self.api.llm_provider == "codex" and not _is_codex_cli_ready():
+                raise ValueError(
+                    "LLM_PROVIDER=codex requires the Codex CLI to be on PATH "
+                    "and signed in via a ChatGPT plan. Set CODEX_CLI_PATH "
+                    "or run `codex login` before starting."
+                )
 
         if self.trading.max_position_size_pct <= 0 or self.trading.max_position_size_pct > 100:
             raise ValueError("max_position_size_pct must be between 0 and 100")
