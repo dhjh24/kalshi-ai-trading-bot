@@ -397,6 +397,7 @@ async def test_live_trade_loop_skips_immediately_when_live_mode_enabled(monkeypa
 
     runtime_state = await db_manager.get_live_trade_runtime_state()
     assert runtime_state is not None
+    assert runtime_state["runtime_mode"] == "live"
     assert runtime_state["loop_status"] == "completed"
     assert runtime_state["last_step"] == "startup"
     assert runtime_state["last_step_status"] == "skipped"
@@ -433,6 +434,7 @@ async def test_live_trade_loop_skips_when_daily_ai_budget_is_exhausted(monkeypat
 
     runtime_state = await db_manager.get_live_trade_runtime_state()
     assert runtime_state is not None
+    assert runtime_state["runtime_mode"] == "paper"
     assert runtime_state["loop_status"] == "completed"
     assert runtime_state["last_step"] == "budget_check"
     assert runtime_state["last_step_status"] == "skipped"
@@ -538,6 +540,7 @@ async def test_live_trade_loop_records_blocked_execution_when_guardrail_rejects(
 
     runtime_state = await db_manager.get_live_trade_runtime_state()
     assert runtime_state is not None
+    assert runtime_state["runtime_mode"] == "paper"
     assert runtime_state["latest_execution_status"] == "blocked"
     assert runtime_state["last_step"] == "execution"
     assert runtime_state["last_step_status"] == "blocked"

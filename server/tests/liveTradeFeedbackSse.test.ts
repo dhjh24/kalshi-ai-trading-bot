@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 const serverRoot = process.cwd();
 const tempDirs: string[] = [];
+const outputMarker = "__RUN_ACCEPTANCE_JSON__";
 
 afterEach(() => {
   while (tempDirs.length > 0) {
@@ -22,16 +23,25 @@ function runAcceptanceScript(scriptName: string, source: string) {
 
   writeFileSync(scriptPath, source);
 
-  return JSON.parse(
-    execFileSync(process.execPath, ["--import", "tsx/esm", scriptPath], {
-      cwd: serverRoot,
-      env: {
-        ...process.env,
-        DB_PATH: databasePath
-      },
-      encoding: "utf8"
-    }).trim()
+  const output = execFileSync(process.execPath, ["--import", "tsx/esm", scriptPath], {
+    cwd: serverRoot,
+    env: {
+      ...process.env,
+      DB_PATH: databasePath
+    },
+    encoding: "utf8"
+  }).trim();
+
+  const cleanedOutput = output.replace(/\u001b\[[0-9;]*m/g, "");
+  const markedMatch = cleanedOutput.match(
+    new RegExp(`${outputMarker}([\\s\\S]*?)${outputMarker}`)
   );
+
+  if (!markedMatch) {
+    return JSON.parse(cleanedOutput);
+  }
+
+  return JSON.parse(markedMatch[1]);
 }
 
 function buildSeedSql(): string {
@@ -265,7 +275,7 @@ describe("live-trade feedback acceptance", () => {
           ).run(staleHeartbeatAt, staleHeartbeatAt, staleHeartbeatAt);
           const stale = getLiveTradeDecisionFeedPayload(5);
 
-          console.log(JSON.stringify({ fresh, stale }));
+          console.log(${JSON.stringify(outputMarker)} + JSON.stringify({ fresh, stale }) + ${JSON.stringify(outputMarker)});
         } finally {
           db.close();
         }
@@ -423,7 +433,7 @@ describe("live-trade feedback acceptance", () => {
           db.prepare("UPDATE live_trade_decisions SET created_at = ? WHERE id = 2").run(staleErrorTimestamp);
           const stale = getLiveTradeDecisionFeedPayload(5);
 
-          console.log(JSON.stringify({ fresh, stale }));
+          console.log(${JSON.stringify(outputMarker)} + JSON.stringify({ fresh, stale }) + ${JSON.stringify(outputMarker)});
         } finally {
           db.close();
         }
@@ -653,10 +663,14 @@ describe("live-trade feedback acceptance", () => {
                 url: '/api/live-trade?limit=1&category=Sports'
               });
 
-              console.log(JSON.stringify({
-                statusCode: response.statusCode,
-                body: response.json()
-              }));
+              console.log(
+                ${JSON.stringify(outputMarker)} +
+                  JSON.stringify({
+                    statusCode: response.statusCode,
+                    body: response.json()
+                  }) +
+                  ${JSON.stringify(outputMarker)}
+              );
             } finally {
               await app.close();
             }
@@ -809,10 +823,14 @@ describe("live-trade feedback acceptance", () => {
               url: '/api/portfolio'
             });
 
-            console.log(JSON.stringify({
-              statusCode: response.statusCode,
-              body: response.json()
-            }));
+            console.log(
+              ${JSON.stringify(outputMarker)} +
+                JSON.stringify({
+                  statusCode: response.statusCode,
+                  body: response.json()
+                }) +
+                ${JSON.stringify(outputMarker)}
+            );
           } finally {
             await app.close();
           }
@@ -856,6 +874,116 @@ describe("live-trade feedback acceptance", () => {
     });
   });
 
+  it("uses the shared 24-row default for the live-trade decision feed endpoint", () => {
+    const dbUrl = pathToFileURL(path.join(serverRoot, "src/db.ts")).href;
+    const appUrl = pathToFileURL(path.join(serverRoot, "src/app.ts")).href;
+    const result = runAcceptanceScript(
+      "live-trade-decisions-default-limit.mjs",
+      `
+        import { getDb } from ${JSON.stringify(dbUrl)};
+        import { buildServer } from ${JSON.stringify(appUrl)};
+
+        const db = getDb();
+
+        try {
+          db.exec(\`
+            CREATE TABLE live_trade_decisions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              created_at TEXT,
+              run_id TEXT,
+              step TEXT,
+              strategy TEXT,
+              status TEXT,
+              event_ticker TEXT,
+              market_ticker TEXT,
+              title TEXT,
+              focus_type TEXT,
+              provider TEXT,
+              model TEXT,
+              action TEXT,
+              side TEXT,
+              confidence REAL,
+              hold_minutes INTEGER,
+              paper_trade INTEGER,
+              live_trade INTEGER,
+              summary TEXT,
+              rationale TEXT,
+              payload_json TEXT
+            );
+          \`);
+
+          const insert = db.prepare(\`
+            INSERT INTO live_trade_decisions (
+              created_at, run_id, step, strategy, status, event_ticker, market_ticker,
+              title, focus_type, provider, model, action, side, confidence,
+              hold_minutes, paper_trade, live_trade, summary, rationale, payload_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          \`);
+
+          for (let index = 1; index <= 30; index += 1) {
+            insert.run(
+              new Date(Date.UTC(2026, 3, 24, 0, index, 0)).toISOString(),
+              'run-' + index,
+              'ranked',
+              'live_trade',
+              'completed',
+              'EVENT-' + index,
+              'MARKET-' + index,
+              'Decision ' + index,
+              'sports',
+              'openai',
+              'gpt-5.1-mini',
+              'BUY',
+              'YES',
+              0.5,
+              15,
+              1,
+              0,
+              'Decision row ' + index,
+              'Reason ' + index,
+              '{"market":{"yesPrice":0.51}}'
+            );
+          }
+
+          const app = await buildServer();
+
+          try {
+            const response = await app.inject({
+              method: 'GET',
+              url: '/api/live-trade/decisions'
+            });
+
+            console.log(
+              ${JSON.stringify(outputMarker)} +
+                JSON.stringify({
+                  statusCode: response.statusCode,
+                  body: response.json()
+                }) +
+                ${JSON.stringify(outputMarker)}
+            );
+          } finally {
+            await app.close();
+          }
+        } finally {
+          db.close();
+        }
+      `
+    );
+
+    expect(result.statusCode).toBe(200);
+    expect(result.body.limit).toBe(24);
+    expect(result.body.decisions).toHaveLength(24);
+    expect(result.body.decisions[0]).toMatchObject({
+      id: "30",
+      runId: "run-30"
+    });
+    expect(result.body.decisions.at(-1)).toMatchObject({
+      id: "7",
+      runId: "run-7"
+    });
+  });
+
   it("refreshes the live-trade-decisions snapshot immediately after feedback writes", () => {
     const dbUrl = pathToFileURL(path.join(serverRoot, "src/db.ts")).href;
     const appUrl = pathToFileURL(path.join(serverRoot, "src/app.ts")).href;
@@ -885,11 +1013,15 @@ describe("live-trade feedback acceptance", () => {
               }
             });
 
-            console.log(JSON.stringify({
-              statusCode: response.statusCode,
-              body: response.json(),
-              snapshot: liveStreamHub.getSnapshot('live-trade-decisions')
-            }));
+            console.log(
+              ${JSON.stringify(outputMarker)} +
+                JSON.stringify({
+                  statusCode: response.statusCode,
+                  body: response.json(),
+                  snapshot: liveStreamHub.getSnapshot('live-trade-decisions')
+                }) +
+                ${JSON.stringify(outputMarker)}
+            );
           } finally {
             await app.close();
           }
@@ -1007,12 +1139,16 @@ describe("live-trade feedback acceptance", () => {
             controller.abort();
             await reader.cancel().catch(() => {});
 
-            console.log(JSON.stringify({
-              initialEvent,
-              feedbackStatus: feedbackResponse.status,
-              feedbackBody: await feedbackResponse.json(),
-              pushedEvent
-            }));
+            console.log(
+              ${JSON.stringify(outputMarker)} +
+                JSON.stringify({
+                  initialEvent,
+                  feedbackStatus: feedbackResponse.status,
+                  feedbackBody: await feedbackResponse.json(),
+                  pushedEvent
+                }) +
+                ${JSON.stringify(outputMarker)}
+            );
           } finally {
             await app.close();
           }

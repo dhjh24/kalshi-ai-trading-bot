@@ -141,6 +141,10 @@ describe("getPortfolioAiSpendSummary", () => {
     const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
     const threeDaysAgo = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString();
     const tenDaysAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+    const sixHoursAgoSql = `'${sixHoursAgo}'`;
+    const twoHoursAgoSql = `'${twoHoursAgo}'`;
+    const threeDaysAgoSql = `'${threeDaysAgo}'`;
+    const tenDaysAgoSql = `'${tenDaysAgo}'`;
     tempDirs.push(tempDir);
 
     writeFileSync(
@@ -163,10 +167,10 @@ describe("getPortfolioAiSpendSummary", () => {
 
             INSERT INTO llm_queries (provider, cost_usd, tokens_used, timestamp)
             VALUES
-              ('codex', 0.4, 120, ${JSON.stringify(sixHoursAgo)}),
-              ('openai', 0.1, 60, ${JSON.stringify(twoHoursAgo)}),
-              ('codex', 0.2, 80, ${JSON.stringify(threeDaysAgo)}),
-              ('codex', 0.5, 200, ${JSON.stringify(tenDaysAgo)});
+              ('codex', 0.4, 120, ${sixHoursAgoSql}),
+              ('openai', 0.1, 60, ${twoHoursAgoSql}),
+              ('codex', 0.2, 80, ${threeDaysAgoSql}),
+              ('codex', 0.5, 200, ${tenDaysAgoSql});
           \`);
 
           console.log(JSON.stringify(getPortfolioAiSpendSummary()));
@@ -217,6 +221,131 @@ describe("getPortfolioAiSpendSummary", () => {
           latestAt: sixHoursAgo
         }
       }
+    });
+  });
+});
+
+describe("getPortfolioStrategyPnlBreakdown", () => {
+  it("combines closed-trade P&L with open-position exposure by strategy", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "dashboard-repository-"));
+    const databasePath = path.join(tempDir, "dashboard.sqlite");
+    const scriptPath = path.join(tempDir, "strategy-pnl-breakdown-check.mjs");
+    const repositoryUrl = pathToFileURL(
+      path.join(serverRoot, "src/repositories/dashboardRepository.ts")
+    ).href;
+    const dbUrl = pathToFileURL(path.join(serverRoot, "src/db.ts")).href;
+    tempDirs.push(tempDir);
+
+    writeFileSync(
+      scriptPath,
+      `
+        import { getDb } from ${JSON.stringify(dbUrl)};
+        import { getPortfolioStrategyPnlBreakdown } from ${JSON.stringify(repositoryUrl)};
+
+        const db = getDb();
+
+        try {
+          db.exec(\`
+            CREATE TABLE positions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              market_id TEXT NOT NULL,
+              side TEXT NOT NULL,
+              entry_price REAL NOT NULL,
+              quantity REAL NOT NULL,
+              timestamp TEXT NOT NULL,
+              rationale TEXT NOT NULL,
+              live BOOLEAN NOT NULL DEFAULT 0,
+              status TEXT DEFAULT 'open',
+              strategy TEXT
+            );
+
+            CREATE TABLE trade_logs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              market_id TEXT NOT NULL,
+              side TEXT NOT NULL,
+              entry_price REAL NOT NULL,
+              exit_price REAL NOT NULL,
+              quantity REAL NOT NULL,
+              pnl REAL NOT NULL,
+              fees_paid REAL NOT NULL DEFAULT 0,
+              entry_timestamp TEXT NOT NULL,
+              exit_timestamp TEXT NOT NULL,
+              rationale TEXT,
+              live BOOLEAN NOT NULL DEFAULT 0,
+              strategy TEXT
+            );
+
+            INSERT INTO positions (market_id, side, entry_price, quantity, timestamp, rationale, live, status, strategy)
+            VALUES
+              ('QB-1', 'YES', 0.42, 10, '2026-04-24T00:00:00Z', 'open', 0, 'open', 'quick_flip_scalping'),
+              ('LT-1', 'NO', 0.58, 4, '2026-04-24T00:01:00Z', 'open', 1, 'open', 'live_trade');
+
+            INSERT INTO trade_logs (
+              market_id, side, entry_price, exit_price, quantity, pnl, fees_paid,
+              entry_timestamp, exit_timestamp, rationale, live, strategy
+            )
+            VALUES
+              ('QB-1', 'YES', 0.41, 0.47, 10, 12.5, 0.3, '2026-04-23T22:00:00Z', '2026-04-23T23:00:00Z', 'paper scalp', 0, 'quick_flip_scalping'),
+              ('LT-1', 'NO', 0.56, 0.44, 4, -3.25, 0.1, '2026-04-23T20:00:00Z', '2026-04-23T21:00:00Z', 'live hedge', 1, 'live_trade'),
+              ('GEN-1', 'YES', 0.33, 0.38, 1, 1.75, 0.05, '2026-04-23T18:00:00Z', '2026-04-23T19:00:00Z', 'fallback', 0, NULL);
+          \`);
+
+          console.log(JSON.stringify(getPortfolioStrategyPnlBreakdown()));
+        } finally {
+          db.close();
+        }
+      `
+    );
+
+    const result = JSON.parse(
+      execFileSync(process.execPath, ["--import", "tsx/esm", scriptPath], {
+        cwd: serverRoot,
+        env: {
+          ...process.env,
+          DB_PATH: databasePath
+        },
+        encoding: "utf8"
+      }).trim()
+    );
+
+    expect(result).toEqual({
+      available: true,
+      sourceTables: ["trade_logs", "positions"],
+      items: [
+        {
+          strategy: "quick_flip_scalping",
+          openPositions: 1,
+          openExposure: 4.2,
+          realizedPnl: 12.5,
+          totalTrades: 1,
+          paperTrades: 1,
+          liveTrades: 0,
+          paperPnl: 12.5,
+          livePnl: 0
+        },
+        {
+          strategy: "live_trade",
+          openPositions: 1,
+          openExposure: 2.32,
+          realizedPnl: -3.25,
+          totalTrades: 1,
+          paperTrades: 0,
+          liveTrades: 1,
+          paperPnl: 0,
+          livePnl: -3.25
+        },
+        {
+          strategy: "unattributed",
+          openPositions: 0,
+          openExposure: 0,
+          realizedPnl: 1.75,
+          totalTrades: 1,
+          paperTrades: 1,
+          liveTrades: 0,
+          paperPnl: 1.75,
+          livePnl: 0
+        }
+      ]
     });
   });
 });
