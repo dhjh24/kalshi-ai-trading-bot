@@ -502,7 +502,37 @@ class UnifiedAdvancedTradingSystem:
         
         try:
             from src.jobs.execute import execute_position
-            
+            from src.strategies.portfolio_enforcer import (
+                MODE_LIVE,
+                MODE_PAPER,
+                PortfolioEnforcer,
+                STRATEGY_LIVE_TRADE,
+            )
+
+            async def _current_position_exposures() -> Dict[str, float]:
+                exposures: Dict[str, float] = {}
+                for existing in await self.db_manager.get_open_positions():
+                    market_key = str(getattr(existing, "market_id", "") or "")
+                    if not market_key:
+                        continue
+                    contracts_cost = float(getattr(existing, "contracts_cost", 0.0) or 0.0)
+                    if contracts_cost <= 0:
+                        quantity = float(getattr(existing, "quantity", 0.0) or 0.0)
+                        entry_price = float(getattr(existing, "entry_price", 0.0) or 0.0)
+                        entry_fee = max(float(getattr(existing, "entry_fee", 0.0) or 0.0), 0.0)
+                        contracts_cost = max((quantity * entry_price) + entry_fee, 0.0)
+                    exposures[market_key] = exposures.get(market_key, 0.0) + contracts_cost
+                return exposures
+
+            portfolio_enforcer = None
+            db_path = getattr(self.db_manager, "db_path", None)
+            if db_path:
+                portfolio_enforcer = PortfolioEnforcer(
+                    db_path=str(db_path),
+                    portfolio_value=max(float(self.total_capital or 0.0), 0.0),
+                )
+                await portfolio_enforcer.initialize()
+             
             for market_id, allocation_fraction in allocation.allocations.items():
                 try:
                     # Find the corresponding opportunity first to determine intended side
@@ -606,7 +636,26 @@ class UnifiedAdvancedTradingSystem:
                     
                     # Calculate quantity
                     quantity = max(1, int(position_value / price))
-                    
+                    live_mode = getattr(settings.trading, 'live_trading_enabled', False)
+
+                    if portfolio_enforcer is not None:
+                        allowed, guardrail_reason = await portfolio_enforcer.check_trade(
+                            ticker=market_id,
+                            side=intended_side.lower(),
+                            amount=position_value,
+                            title=str(market_info.get("title") or market_id),
+                            category=market_info.get("category"),
+                            current_positions=(await _current_position_exposures()) or None,
+                            strategy=STRATEGY_LIVE_TRADE,
+                            mode=MODE_LIVE if live_mode else MODE_PAPER,
+                        )
+                        if not allowed:
+                            self.logger.info(
+                                f"PORTFOLIO ENFORCER BLOCKED ALLOCATION: {market_id} - {guardrail_reason}"
+                            )
+                            results['failed_executions'] += 1
+                            continue
+                     
                     # Calculate proper stop-loss levels using Grok4 recommendations
                     from src.utils.stop_loss_calculator import StopLossCalculator
                     
@@ -656,7 +705,6 @@ class UnifiedAdvancedTradingSystem:
                     position.id = position_id
                     
                     # Execute the position
-                    live_mode = getattr(settings.trading, 'live_trading_enabled', False)
                     self.logger.info(f"ðŸŽ›ï¸ Trading mode check: live_mode={live_mode} for market {opportunity.market_id}")
                     
                     success = await execute_position(

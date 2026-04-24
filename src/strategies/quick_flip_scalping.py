@@ -23,9 +23,11 @@ from src.clients.kalshi_client import KalshiClient
 from src.clients.xai_client import XAIClient
 from src.config.settings import settings
 from src.jobs.execute import (
+    _record_live_exit_fee_divergence_if_filled,
     execute_position,
     place_sell_limit_order,
     reconcile_simulated_exit_orders,
+    record_live_fee_divergence_if_needed,
     record_simulated_position_exit,
     submit_simulated_sell_limit_order,
 )
@@ -54,7 +56,12 @@ from src.utils.kalshi_normalization import (
 )
 from src.utils.logging_setup import get_trading_logger
 from src.utils.trade_pricing import estimate_kalshi_fee
-from src.utils.trade_pricing import FeeMetadata, calculate_entry_cost, extract_fee_metadata
+from src.utils.trade_pricing import (
+    FeeMetadata,
+    calculate_entry_cost,
+    extract_fee_metadata,
+    sum_fill_fees,
+)
 
 
 def _env_flag_is_truthy(value: Optional[str]) -> bool:
@@ -788,7 +795,12 @@ class QuickFlipScalpingStrategy:
         )
         return False
 
-    async def _close_position_from_recent_fills(self, position: Position) -> bool:
+    async def _close_position_from_recent_fills(
+        self,
+        position: Position,
+        *,
+        market_info: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         """Close the local quick-flip position record once exchange exposure is gone."""
         fills: List[Dict[str, Any]] = []
         live_fills_response = await self.kalshi_client.get_fills(ticker=position.market_id, limit=50)
@@ -888,15 +900,52 @@ class QuickFlipScalpingStrategy:
                 pass
 
         try:
-            exit_fees = [_safe_float(fill.get("fee_cost", 0) or 0) for fill in sell_fills]
-            exit_fee = sum(exit_fees)
-            if sell_fill_quantity > 0:
-                exit_fee = exit_fee * (closed_quantity / sell_fill_quantity)
+            actual_exit_fee = sum_fill_fees(sell_fills)
+            if actual_exit_fee is not None and sell_fill_quantity > 0:
+                actual_exit_fee = actual_exit_fee * (closed_quantity / sell_fill_quantity)
         except (TypeError, ValueError):
-            exit_fee = self._estimate_kalshi_fee(exit_price, closed_quantity, maker=True)
+            actual_exit_fee = None
+
+        effective_market_info = market_info or {}
+        if not effective_market_info and actual_exit_fee is not None:
+            try:
+                market_response = await self.kalshi_client.get_market(position.market_id)
+                effective_market_info = (
+                    market_response.get("market", {}) if isinstance(market_response, dict) else {}
+                )
+            except Exception as exc:
+                self.logger.debug(
+                    f"Could not refresh market metadata for quick-flip exit fee reconciliation on {position.market_id}: {exc}"
+                )
+                effective_market_info = {}
+
+        fee_metadata = FeeMetadata()
+        if effective_market_info:
+            fee_metadata = await self._resolve_fee_metadata(effective_market_info)
+
+        estimated_exit_fee = estimate_kalshi_fee(
+            exit_price,
+            closed_quantity,
+            maker=True,
+            fee_type=fee_metadata.fee_type,
+            fee_multiplier=fee_metadata.fee_multiplier,
+            fee_waiver_expiration_time=fee_metadata.fee_waiver_expiration_time,
+            trade_ts=datetime.now(),
+        )
+        exit_fee = actual_exit_fee if actual_exit_fee is not None else estimated_exit_fee
 
         if sell_fill_quantity <= 0 and exit_fee <= 0:
-            exit_fee = self._estimate_kalshi_fee(exit_price, closed_quantity, maker=True)
+            exit_fee = estimate_kalshi_fee(
+                exit_price,
+                closed_quantity,
+                maker=True,
+                fee_type=fee_metadata.fee_type,
+                fee_multiplier=fee_metadata.fee_multiplier,
+                fee_waiver_expiration_time=fee_metadata.fee_waiver_expiration_time,
+                trade_ts=datetime.now(),
+            )
+            estimated_exit_fee = exit_fee
+            actual_exit_fee = None
 
         net_pnl = ((exit_price - entry_price) * closed_quantity) - total_entry_fee - exit_fee
 
@@ -922,6 +971,23 @@ class QuickFlipScalpingStrategy:
             strategy=position.strategy,
         )
         await self.db_manager.add_trade_log(trade_log)
+        sell_order_ids = {
+            str(fill.get("order_id"))
+            for fill in sell_fills
+            if fill.get("order_id") not in (None, "")
+        }
+        await record_live_fee_divergence_if_needed(
+            db_manager=self.db_manager,
+            market_id=position.market_id,
+            side=position.side,
+            leg="exit",
+            estimated_fee=estimated_exit_fee,
+            actual_fee=actual_exit_fee,
+            position_id=position.id,
+            order_id=next(iter(sell_order_ids)) if len(sell_order_ids) == 1 else None,
+            quantity=closed_quantity,
+            price=exit_price,
+        )
         await self.db_manager.update_position_status(position.id, "closed")
         self.active_positions.pop(position.market_id, None)
         self.pending_sells.pop(position.market_id, None)
@@ -1808,7 +1874,10 @@ Respond with JSON only:
                         if get_position_exposure_dollars(item) > 0
                     )
                     if exposure <= 0:
-                        closed = await self._close_position_from_recent_fills(position)
+                        closed = await self._close_position_from_recent_fills(
+                            position,
+                            market_info=market_info,
+                        )
                         if closed:
                             results["positions_closed"] += 1
                         continue
@@ -2034,6 +2103,17 @@ Respond with JSON only:
             if getattr(settings.trading, "live_trading_enabled", False):
                 response = await self.kalshi_client.place_order(**order_params)
                 if response and "order" in response:
+                    fee_metadata = await self._resolve_fee_metadata(market_info)
+                    await _record_live_exit_fee_divergence_if_filled(
+                        position=position,
+                        limit_price=exit_price,
+                        db_manager=self.db_manager,
+                        kalshi_client=self.kalshi_client,
+                        client_order_id=order_params["client_order_id"],
+                        order_response=response,
+                        fee_metadata=fee_metadata,
+                        allow_partial_fill=True,
+                    )
                     self.logger.info(
                         f"Loss cut order placed: {position.side} {position.quantity} "
                         f"LIMIT SELL @ ${exit_price:.4f} for {position.market_id}"

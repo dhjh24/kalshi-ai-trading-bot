@@ -918,6 +918,7 @@ class CodexClient(TradingLoggerMixin):
                 market_id=market_id,
                 prompt=prompt[:2000],
                 response=response[:5000],
+                provider="codex",
                 tokens_used=tokens_used,
                 cost_usd=cost_usd if cost_usd is not None else 0.0,
                 confidence_extracted=confidence_extracted,

@@ -916,10 +916,105 @@ export function getPortfolioAiSpendSummary(): PortfolioAiSpendSummary {
 }
 
 export function getPortfolioAiSpendByProvider(): PortfolioAiSpendBreakdown {
-  return getAiSpendBreakdown({
-    tableName: "analysis_requests",
-    sourceField: "provider"
-  });
+  const providerTables = [
+    "analysis_requests",
+    "llm_queries"
+  ].filter(
+    (tableName) =>
+      tableExists(tableName) &&
+      columnExists(tableName, "provider") &&
+      columnExists(tableName, "cost_usd")
+  );
+
+  if (providerTables.length === 0) {
+    return emptyAiSpendBreakdown("provider");
+  }
+
+  const bucketRows = new Map<string, { count: number; cost: number }>();
+
+  for (const tableName of providerTables) {
+    const rows = rowsAs<
+      Array<{
+        bucket_key?: string;
+        bucket_count?: number;
+        cost_usd?: number;
+      }>
+    >(
+      db.prepare(
+        `
+          SELECT
+            COALESCE(NULLIF(TRIM(CAST(provider AS TEXT)), ''), 'unattributed') AS bucket_key,
+            COUNT(*) AS bucket_count,
+            COALESCE(SUM(COALESCE(cost_usd, 0)), 0) AS cost_usd
+          FROM ${tableName}
+          GROUP BY bucket_key
+        `
+      ).all()
+    );
+
+    for (const row of rows) {
+      const key = row.bucket_key || "unattributed";
+      const next = bucketRows.get(key) ?? { count: 0, cost: 0 };
+      const costUsd = Number(row.cost_usd);
+      next.count += toCount(row.bucket_count);
+      next.cost += Number.isFinite(costUsd) ? costUsd : 0;
+      bucketRows.set(key, next);
+    }
+  }
+
+  const totalCostUsd = toNumber(
+    Array.from(bucketRows.values()).reduce((sum, value) => sum + value.cost, 0),
+    4
+  );
+  const attributedCostUsd = toNumber(
+    Array.from(bucketRows.entries()).reduce(
+      (sum, [key, value]) => (key === "unattributed" ? sum : sum + value.cost),
+      0
+    ),
+    4
+  );
+  const sortedRows = Array.from(bucketRows.entries())
+    .map(([key, value]) => ({
+      bucket_key: key,
+      bucket_count: value.count,
+      cost_usd: value.cost
+    }))
+    .sort((a, b) => {
+      const costCompare = toNumber(b.cost_usd, 4) - toNumber(a.cost_usd, 4);
+      if (costCompare !== 0) {
+        return costCompare;
+      }
+      if ((b.bucket_count || 0) !== (a.bucket_count || 0)) {
+        return toCount(b.bucket_count) - toCount(a.bucket_count);
+      }
+      return String(a.bucket_key).localeCompare(String(b.bucket_key));
+    })
+    .slice(0, 8);
+
+  return {
+    available: true,
+    sourceTable: providerTables.join("+"),
+    sourceField: "provider",
+    totalCostUsd,
+    attributedCostUsd,
+    unattributedCostUsd: toNumber(totalCostUsd - attributedCostUsd, 4),
+    items: sortedRows.map((row) => {
+      const key = row.bucket_key || "unattributed";
+      const costUsd = toNumber(row.cost_usd, 4);
+      const shareOfKnownCostPct =
+        key !== "unattributed" && attributedCostUsd > 0
+          ? toNumber((costUsd / attributedCostUsd) * 100, 1)
+          : 0;
+      return {
+        key,
+        label: key === "unattributed" ? "Unattributed" : key,
+        costUsd,
+        count: toCount(row.bucket_count),
+        tokensUsed: null,
+        shareOfKnownCostPct
+      };
+    })
+  };
 }
 
 export function getPortfolioAiSpendByStrategy(): PortfolioAiSpendBreakdown {

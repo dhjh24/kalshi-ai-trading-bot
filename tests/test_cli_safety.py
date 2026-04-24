@@ -1,7 +1,6 @@
 import asyncio
 import os
 import sys
-import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -528,7 +527,10 @@ def _install_status_stubs(
             return None
 
         async def get_open_positions(self):
-            return [{"market_id": "TEST-1"}, {"market_id": "TEST-2"}]
+            return [
+                {"market_id": "TEST-1", "contracts_cost": 25.0},
+                {"market_id": "TEST-2", "quantity": 30, "entry_price": 0.5},
+            ]
 
         async def get_fee_divergence_entries(self, limit=25):
             return [
@@ -577,15 +579,15 @@ def _install_status_stubs(
             return None
 
         async def get_strategy_status(self, strategy):
+            daily_loss = 1.25 if strategy == "quick_flip" else 0.70
+            budget = self.portfolio_value * 0.05 if self.portfolio_value > 0 else None
             return {
                 "strategy": strategy,
                 "halted": False,
-                "daily_loss_dollars": 12.5 if strategy == "quick_flip" else 7.0,
-                "daily_loss_budget_dollars": (
-                    50.0 if self.portfolio_value > 0 else None
-                ),
+                "daily_loss_dollars": daily_loss,
+                "daily_loss_budget_dollars": budget,
                 "daily_loss_budget_remaining_dollars": (
-                    37.5 if self.portfolio_value > 0 else None
+                    max(0.0, budget - daily_loss) if budget is not None else None
                 ),
                 "trades_last_hour": 3,
                 "max_trades_per_hour": 20,
@@ -615,11 +617,14 @@ def test_cmd_status_surfaces_local_fallbacks_when_kalshi_api_unavailable(
     assert "Position Value:" in output
     assert "Total Portfolio:" in output
     assert "Local Open Positions:" in output
+    assert "Local Portfolio Est:" in output
     assert "Strategy Risk Budgets (daily):" in output
     assert "Paper vs Live:" in output
     assert "fee-drift proxy" in output
     assert "AI Spend:" in output
     assert "provider breakdown pending DB helper" in output
+    assert "40.00" in output
+    assert "$2.00" in output
     assert "Error fetching status" not in output
 
 

@@ -45,6 +45,11 @@ STRATEGY_QUICK_FLIP = "quick_flip"
 STRATEGY_LIVE_TRADE = "live_trade"
 STRATEGY_DEFAULT = "default"  # legacy / untagged callers
 KNOWN_STRATEGIES = (STRATEGY_QUICK_FLIP, STRATEGY_LIVE_TRADE)
+LIVE_TRADE_STRATEGY_ALIASES = (
+    "directional_trading",
+    "portfolio_optimization",
+    "immediate_portfolio_optimization",
+)
 
 
 # --- Execution modes ---------------------------------------------------------
@@ -239,9 +244,32 @@ class PortfolioEnforcer:
         # the quick_flip bucket so halt state is respected across the two names.
         if s.startswith("quick_flip"):
             return STRATEGY_QUICK_FLIP
-        if s.startswith("live_trade"):
+        if s.startswith("live_trade") or s in LIVE_TRADE_STRATEGY_ALIASES:
             return STRATEGY_LIVE_TRADE
         return STRATEGY_DEFAULT
+
+    def _strategy_match_params(self, strategy: Optional[str]) -> Tuple[str, str, List[str]]:
+        """
+        Return the normalized bucket plus a SQL matcher for strategy-backed tables.
+
+        The live-trade bucket includes historical directional aliases so the W7
+        circuit breakers apply to the existing execution paths before W5 lands.
+        """
+        name = self._normalize_strategy(strategy)
+        if name == STRATEGY_DEFAULT:
+            return name, "", []
+
+        aliases = [name]
+        if name == STRATEGY_LIVE_TRADE:
+            aliases.extend(LIVE_TRADE_STRATEGY_ALIASES)
+
+        clauses: List[str] = []
+        params: List[str] = []
+        for alias in aliases:
+            clauses.append("(strategy = ? OR strategy LIKE ?)")
+            params.extend([alias, f"{alias}%"])
+
+        return name, " OR ".join(clauses), params
 
     def limits_for(self, strategy: Optional[str]) -> StrategyLimits:
         """Return the active limits for a strategy (public — used by tests/CLI)."""
@@ -324,7 +352,7 @@ class PortfolioEnforcer:
         Reads from trade_logs. Matches on either the canonical bucket name
         (quick_flip / live_trade) or legacy suffixed variants (quick_flip_scalping).
         """
-        name = self._normalize_strategy(strategy)
+        name, strategy_clause, strategy_params = self._strategy_match_params(strategy)
         if name == STRATEGY_DEFAULT:
             return 0.0
         day = on_date or self._today_utc()
@@ -333,14 +361,14 @@ class PortfolioEnforcer:
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 cursor = await db.execute(
-                    """
+                    f"""
                     SELECT COALESCE(SUM(pnl), 0)
                     FROM trade_logs
-                    WHERE (strategy = ? OR strategy LIKE ?)
+                    WHERE ({strategy_clause})
                       AND exit_timestamp >= ?
                       AND exit_timestamp <= ?
                     """,
-                    (name, f"{name}%", start_iso, end_iso),
+                    (*strategy_params, start_iso, end_iso),
                 )
                 row = await cursor.fetchone()
                 total_pnl = float(row[0]) if row and row[0] is not None else 0.0
@@ -351,7 +379,7 @@ class PortfolioEnforcer:
 
     async def get_trades_in_last_hour(self, strategy: str) -> int:
         """Count entries (positions opened) for `strategy` in the last 60 min."""
-        name = self._normalize_strategy(strategy)
+        name, strategy_clause, strategy_params = self._strategy_match_params(strategy)
         if name == STRATEGY_DEFAULT:
             return 0
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
@@ -359,24 +387,24 @@ class PortfolioEnforcer:
             async with aiosqlite.connect(self.db_path) as db:
                 # Count closed trades (entry in last hour) via trade_logs.
                 cursor = await db.execute(
-                    """
+                    f"""
                     SELECT COUNT(*)
                     FROM trade_logs
-                    WHERE (strategy = ? OR strategy LIKE ?)
+                    WHERE ({strategy_clause})
                       AND entry_timestamp >= ?
                     """,
-                    (name, f"{name}%", cutoff),
+                    (*strategy_params, cutoff),
                 )
                 closed_count = (await cursor.fetchone())[0] or 0
                 # Plus any currently-open positions entered in the last hour.
                 cursor = await db.execute(
-                    """
+                    f"""
                     SELECT COUNT(*)
                     FROM positions
-                    WHERE (strategy = ? OR strategy LIKE ?)
+                    WHERE ({strategy_clause})
                       AND timestamp >= ?
                     """,
-                    (name, f"{name}%", cutoff),
+                    (*strategy_params, cutoff),
                 )
                 open_count = (await cursor.fetchone())[0] or 0
         except aiosqlite.OperationalError:
@@ -385,19 +413,19 @@ class PortfolioEnforcer:
 
     async def get_open_position_count(self, strategy: str) -> int:
         """Count open positions for `strategy`."""
-        name = self._normalize_strategy(strategy)
+        name, strategy_clause, strategy_params = self._strategy_match_params(strategy)
         if name == STRATEGY_DEFAULT:
             return 0
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 cursor = await db.execute(
-                    """
+                    f"""
                     SELECT COUNT(*)
                     FROM positions
-                    WHERE (strategy = ? OR strategy LIKE ?)
+                    WHERE ({strategy_clause})
                       AND status = 'open'
                     """,
-                    (name, f"{name}%"),
+                    strategy_params,
                 )
                 row = await cursor.fetchone()
                 return int(row[0]) if row and row[0] is not None else 0

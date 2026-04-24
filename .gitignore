@@ -8,6 +8,7 @@ kalshi_private_key
 secrets.json
 config.json
 .codex
+/codex*
 
 # Database files
 *.db

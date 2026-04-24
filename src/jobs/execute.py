@@ -149,6 +149,163 @@ def _extract_order_fee_dollars(order_info: Dict[str, Any], *, maker: bool) -> Op
         return None
 
 
+def _extract_reported_order_fee(order_info: Dict[str, Any]) -> tuple[Optional[float], Optional[bool]]:
+    """
+    Return the reported order fee plus its maker/taker hint when present.
+
+    Kalshi sometimes includes either `maker_fees_dollars` or
+    `taker_fees_dollars` on the order response. Preserve which fee lane was
+    populated so exit-fee reconciliation can compare against the right estimate.
+    """
+    maker_fee = _extract_order_fee_dollars(order_info, maker=True)
+    if maker_fee is not None:
+        return maker_fee, True
+
+    taker_fee = _extract_order_fee_dollars(order_info, maker=False)
+    if taker_fee is not None:
+        return taker_fee, False
+
+    return None, None
+
+
+async def resolve_live_order_fee(
+    *,
+    kalshi_client: KalshiClient,
+    ticker: str,
+    client_order_id: str,
+    order_response: Dict,
+    maker: bool,
+) -> Optional[float]:
+    """Return Kalshi-reported live fees, preferring order-level metadata over fills."""
+    order = order_response.get("order", {}) if isinstance(order_response, dict) else {}
+    order_fee = _extract_order_fee_dollars(order, maker=maker)
+    if order_fee is not None:
+        return order_fee
+    return await _reconcile_fill_fee(
+        kalshi_client=kalshi_client,
+        ticker=ticker,
+        client_order_id=client_order_id,
+        order_response=order_response,
+    )
+
+
+async def _live_fee_divergence_already_recorded(
+    *,
+    db_manager: DatabaseManager,
+    market_id: str,
+    leg: str,
+    position_id: Optional[int],
+    order_id: Optional[str],
+    estimated_fee: float,
+    actual_fee: float,
+    quantity: Optional[float],
+    price: Optional[float],
+) -> bool:
+    """Best-effort duplicate check so immediate and delayed exit paths do not log twice."""
+    get_entries = getattr(db_manager, "get_fee_divergence_entries", None)
+    if not callable(get_entries):
+        return False
+
+    try:
+        entries = await get_entries(market_id=market_id, leg=leg, limit=50)
+    except Exception:
+        return False
+
+    for entry in entries or []:
+        existing_order_id = entry.get("order_id")
+        existing_position_id = entry.get("position_id")
+        if order_id and existing_order_id and str(existing_order_id) == str(order_id):
+            if position_id is None or existing_position_id in (None, position_id):
+                return True
+
+        if position_id is not None and existing_position_id != position_id:
+            continue
+
+        try:
+            existing_estimated = float(entry.get("estimated_fee", 0.0) or 0.0)
+            existing_actual = float(entry.get("actual_fee", 0.0) or 0.0)
+            existing_quantity = (
+                None
+                if entry.get("quantity") in (None, "")
+                else float(entry.get("quantity", 0.0) or 0.0)
+            )
+            existing_price = (
+                None
+                if entry.get("price") in (None, "")
+                else float(entry.get("price", 0.0) or 0.0)
+            )
+        except (TypeError, ValueError):
+            continue
+
+        quantity_matches = quantity is None or existing_quantity is None or abs(existing_quantity - quantity) <= 1e-9
+        price_matches = price is None or existing_price is None or abs(existing_price - price) <= 1e-9
+        if (
+            abs(existing_estimated - estimated_fee) <= 1e-9
+            and abs(existing_actual - actual_fee) <= 1e-9
+            and quantity_matches
+            and price_matches
+        ):
+            return True
+
+    return False
+
+
+async def record_live_fee_divergence_if_needed(
+    *,
+    db_manager: DatabaseManager,
+    market_id: str,
+    side: str,
+    leg: str,
+    estimated_fee: float,
+    actual_fee: Optional[float],
+    position_id: Optional[int] = None,
+    order_id: Optional[str] = None,
+    quantity: Optional[float] = None,
+    price: Optional[float] = None,
+) -> None:
+    """Persist a live fee drift row only when Kalshi reported a real divergence."""
+    if actual_fee is None:
+        return
+
+    try:
+        estimated = float(estimated_fee or 0.0)
+        actual = float(actual_fee or 0.0)
+    except (TypeError, ValueError):
+        return
+
+    if abs(fee_divergence(actual, estimated)) <= 1e-9:
+        return
+
+    record_divergence = getattr(db_manager, "record_fee_divergence", None)
+    if not callable(record_divergence):
+        return
+
+    if await _live_fee_divergence_already_recorded(
+        db_manager=db_manager,
+        market_id=market_id,
+        leg=leg,
+        position_id=position_id,
+        order_id=order_id,
+        estimated_fee=estimated,
+        actual_fee=actual,
+        quantity=quantity,
+        price=price,
+    ):
+        return
+
+    await record_divergence(
+        market_id=market_id,
+        side=side,
+        leg=leg,
+        estimated_fee=estimated,
+        actual_fee=actual,
+        position_id=position_id,
+        order_id=order_id,
+        quantity=quantity,
+        price=price,
+    )
+
+
 async def _record_filled_paper_entry_order(
     *,
     position: Position,
@@ -588,6 +745,73 @@ async def _reconcile_fill_fee(
     return sum_fill_fees(matched)
 
 
+async def _record_live_exit_fee_divergence_if_filled(
+    *,
+    position: Position,
+    limit_price: float,
+    db_manager: DatabaseManager,
+    kalshi_client: KalshiClient,
+    client_order_id: str,
+    order_response: Dict[str, Any],
+    fee_metadata: FeeMetadata,
+    allow_partial_fill: bool = False,
+) -> None:
+    """
+    Persist exit-leg fee drift when a live sell limit already executed.
+
+    Resting sell limits reconcile later when positions are closed. By default
+    this helper only records fully filled exits; IOC callers can opt in to
+    partial terminal fills via `allow_partial_fill=True`.
+    """
+    order_info = order_response.get("order", {}) if isinstance(order_response, dict) else {}
+    order_status = str(order_info.get("status", "")).lower()
+    filled_quantity = get_order_fill_count(order_info)
+    if filled_quantity <= 0 and order_status not in {"filled", "executed"}:
+        return
+    if filled_quantity > 0 and order_status not in {"filled", "executed"} and not allow_partial_fill:
+        return
+
+    if filled_quantity <= 0:
+        filled_quantity = float(position.quantity or 0.0)
+    if filled_quantity <= 0:
+        return
+
+    actual_fee, maker_hint = _extract_reported_order_fee(order_info)
+    if actual_fee is None:
+        actual_fee = await resolve_live_order_fee(
+            kalshi_client=kalshi_client,
+            ticker=position.market_id,
+            client_order_id=client_order_id,
+            order_response=order_response,
+            maker=False,
+        )
+    if actual_fee is None:
+        return
+
+    fill_price = get_order_average_fill_price(order_info, side=position.side) or limit_price
+    estimated_fee = estimate_kalshi_fee(
+        fill_price,
+        filled_quantity,
+        maker=bool(maker_hint) if maker_hint is not None else False,
+        fee_type=fee_metadata.fee_type,
+        fee_multiplier=fee_metadata.fee_multiplier,
+        fee_waiver_expiration_time=fee_metadata.fee_waiver_expiration_time,
+        trade_ts=datetime.now(),
+    )
+    await record_live_fee_divergence_if_needed(
+        db_manager=db_manager,
+        market_id=position.market_id,
+        side=position.side,
+        leg="exit",
+        estimated_fee=estimated_fee,
+        actual_fee=actual_fee,
+        position_id=position.id,
+        order_id=order_info.get("order_id") or client_order_id,
+        quantity=filled_quantity,
+        price=fill_price,
+    )
+
+
 async def record_simulated_position_exit(
     *,
     position: Position,
@@ -1002,15 +1226,6 @@ async def execute_position(
                 ticker=position.market_id,
                 side=position.side,
             )
-            _validate_entry_liquidity(
-                ticker=position.market_id,
-                side=position.side,
-                quantity=position.quantity,
-                available_quantity=displayed_ask_size,
-            )
-        except ValueError as exc:
-            logger.warning(str(exc))
-            return False
         except Exception as exc:
             top_of_book_price = position.entry_price
             displayed_ask_size = 0.0
@@ -1052,6 +1267,17 @@ async def execute_position(
                     )
                     return False
                 paper_entry_price = depth_summary["average_price"]
+            else:
+                try:
+                    _validate_entry_liquidity(
+                        ticker=position.market_id,
+                        side=position.side,
+                        quantity=position.quantity,
+                        available_quantity=displayed_ask_size,
+                    )
+                except ValueError as exc:
+                    logger.warning(str(exc))
+                    return False
 
         filled_at = datetime.now()
         fee_metadata = await _resolve_market_fee_metadata(
@@ -1215,33 +1441,28 @@ async def execute_position(
         # `taker_fees_dollars` / per-fill `fee_cost`) over the public-formula
         # estimate. When live and estimated diverge, log the delta so the
         # paper-vs-live dashboard can surface fee drift.
-        order_fee = _extract_order_fee_dollars(order_info, maker=False)
-        fill_fee = await _reconcile_fill_fee(
+        actual_entry_fee = await resolve_live_order_fee(
             kalshi_client=kalshi_client,
             ticker=position.market_id,
             client_order_id=client_order_id,
             order_response=order_response,
+            maker=False,
         )
-        actual_entry_fee: Optional[float] = None
-        if order_fee is not None:
-            actual_entry_fee = order_fee
-        elif fill_fee is not None:
-            actual_entry_fee = fill_fee
 
         if actual_entry_fee is not None:
             position.entry_fee = actual_entry_fee
-            if abs(fee_divergence(actual_entry_fee, estimated_entry_fee)) > 1e-9:
-                await db_manager.record_fee_divergence(
-                    market_id=position.market_id,
-                    side=position.side,
-                    leg="entry",
-                    estimated_fee=estimated_entry_fee,
-                    actual_fee=actual_entry_fee,
-                    position_id=position.id,
-                    order_id=order_info.get("order_id") or client_order_id,
-                    quantity=fill_quantity,
-                    price=fill_price,
-                )
+            await record_live_fee_divergence_if_needed(
+                db_manager=db_manager,
+                market_id=position.market_id,
+                side=position.side,
+                leg="entry",
+                estimated_fee=estimated_entry_fee,
+                actual_fee=actual_entry_fee,
+                position_id=position.id,
+                order_id=order_info.get("order_id") or client_order_id,
+                quantity=fill_quantity,
+                price=fill_price,
+            )
         else:
             position.entry_fee = estimated_entry_fee
         position.contracts_cost = fill_price * fill_quantity
@@ -1393,6 +1614,36 @@ async def place_sell_limit_order(
 
         if response and "order" in response:
             order_id = response["order"].get("order_id", client_order_id)
+            fee_market_info = shadow_market_info
+            if not fee_market_info:
+                try:
+                    fee_market_response = await kalshi_client.get_market(position.market_id)
+                    fee_market_info = (
+                        fee_market_response.get("market", {})
+                        if isinstance(fee_market_response, dict)
+                        else {}
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "Could not refresh market metadata for exit-fee reconciliation on %s.",
+                        position.market_id,
+                        error=str(exc),
+                    )
+                    fee_market_info = {}
+            fee_metadata = await _resolve_market_fee_metadata(
+                kalshi_client=kalshi_client,
+                ticker=position.market_id,
+                market_info=fee_market_info,
+            )
+            await _record_live_exit_fee_divergence_if_filled(
+                position=position,
+                limit_price=limit_price,
+                db_manager=db_manager,
+                kalshi_client=kalshi_client,
+                client_order_id=client_order_id,
+                order_response=response,
+                fee_metadata=fee_metadata,
+            )
             logger.info(f"SELL LIMIT ORDER placed successfully. Order ID: {order_id}")
             logger.info(f"Market: {position.market_id}")
             logger.info(f"Side: {side.upper()} (selling {position.quantity} shares)")

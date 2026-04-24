@@ -12,6 +12,7 @@ from src.strategies.quick_flip_scalping import (
     QuickFlipScalpingStrategy,
 )
 from src.utils.database import DatabaseManager, Market, Position
+from src.utils.trade_pricing import estimate_kalshi_fee
 
 
 def _build_market() -> Market:
@@ -575,7 +576,8 @@ async def test_close_position_from_recent_fills_ignores_stale_same_ticker_fills(
                         "action": "sell",
                         "count_fp": "10.95",
                         "created_time": "2026-04-09T21:31:15Z",
-                        "fee_cost": "0.02",
+                        "fee_cost": "0.00",
+                        "order_id": "quick-flip-exit-1",
                         "no_price_dollars": "0.1040",
                         "yes_price_dollars": "0.8960",
                     },
@@ -585,6 +587,7 @@ async def test_close_position_from_recent_fills_ignores_stale_same_ticker_fills(
     )
     fake_db = SimpleNamespace(
         add_trade_log=AsyncMock(),
+        record_fee_divergence=AsyncMock(),
         update_position_status=AsyncMock(),
     )
     strategy = QuickFlipScalpingStrategy(
@@ -611,7 +614,154 @@ async def test_close_position_from_recent_fills_ignores_stale_same_ticker_fills(
     trade_log = fake_db.add_trade_log.await_args.args[0]
     assert trade_log.exit_price == pytest.approx(0.104)
     assert trade_log.quantity == pytest.approx(10.95)
-    assert trade_log.pnl == pytest.approx(0.0295)
+    assert trade_log.pnl == pytest.approx(0.0495)
+    expected_exit_fee = estimate_kalshi_fee(0.104, 10.95, maker=True)
+    fake_db.record_fee_divergence.assert_awaited_once_with(
+        market_id="TEST-MKT",
+        side="NO",
+        leg="exit",
+        estimated_fee=pytest.approx(expected_exit_fee),
+        actual_fee=pytest.approx(0.0),
+        position_id=7,
+        order_id="quick-flip-exit-1",
+        quantity=pytest.approx(10.95),
+        price=pytest.approx(0.104),
+    )
+
+
+@pytest.mark.asyncio
+async def test_close_position_from_recent_fills_skips_duplicate_exit_fee_divergence():
+    entry_ts = datetime(2026, 4, 9, 21, 30, tzinfo=timezone.utc)
+    fake_client = SimpleNamespace(
+        get_fills=AsyncMock(
+            return_value={
+                "fills": [
+                    {
+                        "action": "buy",
+                        "count_fp": "10.95",
+                        "created_time": "2026-04-09T21:30:05Z",
+                        "fee_cost": "0.06",
+                        "no_price_dollars": "0.0940",
+                        "yes_price_dollars": "0.9060",
+                    },
+                    {
+                        "action": "sell",
+                        "count_fp": "10.95",
+                        "created_time": "2026-04-09T21:31:15Z",
+                        "fee_cost": "0.00",
+                        "order_id": "quick-flip-exit-1",
+                        "no_price_dollars": "0.1040",
+                        "yes_price_dollars": "0.8960",
+                    },
+                ]
+            }
+        )
+    )
+    fake_db = SimpleNamespace(
+        add_trade_log=AsyncMock(),
+        get_fee_divergence_entries=AsyncMock(
+            return_value=[
+                {
+                    "order_id": "quick-flip-exit-1",
+                    "position_id": 7,
+                    "estimated_fee": 0.11,
+                    "actual_fee": 0.00,
+                    "quantity": 10.95,
+                    "price": 0.104,
+                }
+            ]
+        ),
+        record_fee_divergence=AsyncMock(),
+        update_position_status=AsyncMock(),
+    )
+    strategy = QuickFlipScalpingStrategy(
+        db_manager=fake_db,
+        kalshi_client=fake_client,
+        xai_client=object(),
+        config=QuickFlipConfig(),
+    )
+    position = Position(
+        market_id="TEST-MKT",
+        side="NO",
+        entry_price=0.094,
+        quantity=10.95,
+        timestamp=entry_ts,
+        id=7,
+        strategy="quick_flip_scalping",
+        rationale="QUICK FLIP",
+    )
+
+    closed = await strategy._close_position_from_recent_fills(position)
+
+    assert closed is True
+    fake_db.record_fee_divergence.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cut_losses_records_exit_fee_divergence_for_partial_ioc_fill():
+    fake_client = SimpleNamespace(
+        get_market=AsyncMock(
+            return_value={
+                "market": {
+                    "yes_bid_dollars": "0.16",
+                    "yes_ask_dollars": "0.18",
+                    "no_bid_dollars": "0.82",
+                    "no_ask_dollars": "0.84",
+                }
+            }
+        ),
+        place_order=AsyncMock(
+            return_value={
+                "order": {
+                    "order_id": "abc123",
+                    "status": "partially_filled",
+                    "fill_count_fp": "5.00",
+                    "yes_price_dollars": "0.1600",
+                    "taker_fees_dollars": "0.07",
+                }
+            }
+        ),
+    )
+    fake_db = SimpleNamespace(
+        get_fee_divergence_entries=AsyncMock(return_value=[]),
+        record_fee_divergence=AsyncMock(),
+    )
+    strategy = QuickFlipScalpingStrategy(
+        db_manager=fake_db,
+        kalshi_client=fake_client,
+        xai_client=object(),
+        config=QuickFlipConfig(),
+    )
+    position = Position(
+        market_id="TEST-MKT",
+        side="YES",
+        entry_price=0.18,
+        quantity=10,
+        timestamp=datetime.now(),
+        id=11,
+        strategy="quick_flip_scalping",
+    )
+
+    previous_live_mode = settings.trading.live_trading_enabled
+    try:
+        settings.trading.live_trading_enabled = True
+        success = await strategy._cut_losses_market_order(position)
+    finally:
+        settings.trading.live_trading_enabled = previous_live_mode
+
+    assert success is True
+    expected_exit_fee = estimate_kalshi_fee(0.16, 5.0, maker=False)
+    fake_db.record_fee_divergence.assert_awaited_once_with(
+        market_id="TEST-MKT",
+        side="YES",
+        leg="exit",
+        estimated_fee=pytest.approx(expected_exit_fee),
+        actual_fee=pytest.approx(0.07),
+        position_id=11,
+        order_id="abc123",
+        quantity=pytest.approx(5.0),
+        price=pytest.approx(0.16),
+    )
 
 
 @pytest.mark.asyncio

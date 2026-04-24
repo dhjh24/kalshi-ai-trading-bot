@@ -679,6 +679,76 @@ async def test_place_sell_limit_order_live_mode_records_shadow_exit_order_when_r
             os.remove(db_path)
 
 
+async def test_place_sell_limit_order_live_mode_records_exit_fee_divergence_for_immediate_fill():
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+
+    test_position = Position(
+        market_id="LIVE-EXIT-FEE-1",
+        side="YES",
+        entry_price=0.40,
+        quantity=10,
+        timestamp=datetime.now(),
+        rationale="Live trade with immediate filled exit",
+        confidence=0.75,
+        live=True,
+        strategy="directional_trading",
+    )
+    position_id = await db_manager.add_position(test_position)
+    test_position.id = position_id
+
+    mock_kalshi_client = AsyncMock()
+    mock_kalshi_client.get_market.return_value = {
+        "market": {
+            "ticker": "LIVE-EXIT-FEE-1",
+            "yes_bid_dollars": 0.54,
+            "yes_ask_dollars": 0.55,
+            "no_bid_dollars": 0.45,
+            "no_ask_dollars": 0.46,
+        }
+    }
+    mock_kalshi_client.place_order.return_value = {
+        "order": {
+            "order_id": "live-exit-fee-1",
+            "status": "filled",
+            "fill_count_fp": "10.00",
+            "yes_price_dollars": "0.5400",
+            "taker_fees_dollars": "0.09",
+        }
+    }
+    mock_kalshi_client.get_fills.return_value = {"fills": []}
+
+    expected_estimate = estimate_kalshi_fee(0.54, 10, maker=False)
+    assert expected_estimate != pytest.approx(0.09)
+
+    try:
+        success = await place_sell_limit_order(
+            position=test_position,
+            limit_price=0.54,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+            live_mode=True,
+        )
+
+        assert success is True
+        divergences = await db_manager.get_fee_divergence_entries(
+            market_id="LIVE-EXIT-FEE-1",
+            leg="exit",
+        )
+        assert len(divergences) == 1
+        exit_entry = divergences[0]
+        assert exit_entry["actual_fee"] == pytest.approx(0.09)
+        assert exit_entry["estimated_fee"] == pytest.approx(expected_estimate)
+        assert exit_entry["divergence"] == pytest.approx(0.09 - expected_estimate)
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
 async def test_place_sell_limit_order_paper_mode_records_shadow_exit_order_when_requested():
     db_path = TEST_DB
     if os.path.exists(db_path):

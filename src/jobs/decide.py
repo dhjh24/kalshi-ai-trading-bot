@@ -11,6 +11,7 @@ from datetime import datetime
 
 from src.utils.database import DatabaseManager, Market, Position
 from src.config.settings import settings
+from src.utils.kalshi_normalization import get_balance_dollars, get_portfolio_value_dollars
 from src.utils.logging_setup import get_trading_logger
 from src.clients.xai_client import XAIClient
 from src.clients.kalshi_client import KalshiClient
@@ -57,6 +58,84 @@ def _calculate_dynamic_quantity(
     )
     
     return quantity
+
+
+def _estimate_position_cost_basis(position) -> float:
+    """Estimate deployed capital for an open position."""
+    contracts_cost = float(getattr(position, "contracts_cost", 0.0) or 0.0)
+    if contracts_cost > 0:
+        return contracts_cost
+
+    quantity = float(getattr(position, "quantity", 0.0) or 0.0)
+    entry_price = float(getattr(position, "entry_price", 0.0) or 0.0)
+    entry_fee = max(float(getattr(position, "entry_fee", 0.0) or 0.0), 0.0)
+    return max((quantity * entry_price) + entry_fee, 0.0)
+
+
+async def _get_current_position_exposures(db_manager: DatabaseManager) -> Dict[str, float]:
+    """Return a best-effort market exposure map for the enforcer."""
+    getter = getattr(db_manager, "get_open_positions", None)
+    if not callable(getter):
+        return {}
+
+    result = getter()
+    if asyncio.iscoroutine(result):
+        result = await result
+
+    exposures: Dict[str, float] = {}
+    for position in result or []:
+        market_id = str(getattr(position, "market_id", "") or "")
+        if not market_id:
+            continue
+        exposures[market_id] = exposures.get(market_id, 0.0) + _estimate_position_cost_basis(position)
+    return exposures
+
+
+async def _passes_live_trade_guardrails(
+    *,
+    market: Market,
+    side: str,
+    trade_value: float,
+    portfolio_value: float,
+    db_manager: DatabaseManager,
+) -> tuple[bool, str | None]:
+    """Apply the W7 live-trade portfolio enforcer before returning a position."""
+    db_path = getattr(db_manager, "db_path", None)
+    if trade_value <= 0 or not db_path:
+        return True, None
+
+    try:
+        from src.strategies.portfolio_enforcer import (
+            MODE_LIVE,
+            MODE_PAPER,
+            PortfolioEnforcer,
+            STRATEGY_LIVE_TRADE,
+        )
+
+        enforcer = PortfolioEnforcer(
+            db_path=str(db_path),
+            portfolio_value=max(float(portfolio_value or 0.0), 0.0),
+        )
+        await enforcer.initialize()
+        current_positions = await _get_current_position_exposures(db_manager)
+        allowed, reason = await enforcer.check_trade(
+            ticker=market.market_id,
+            side=str(side or "").lower(),
+            amount=float(trade_value),
+            title=market.title,
+            category=market.category,
+            current_positions=current_positions or None,
+            strategy=STRATEGY_LIVE_TRADE,
+            mode=MODE_LIVE if getattr(settings.trading, "live_trading_enabled", False) else MODE_PAPER,
+        )
+        return allowed, (reason or None)
+    except Exception as exc:
+        get_trading_logger("decision_engine").warning(
+            "Portfolio enforcer check failed open for %s",
+            market.market_id,
+            error=str(exc),
+        )
+        return True, None
 
 
 async def _run_ensemble_decision(
@@ -170,7 +249,8 @@ async def make_decision_for_market(
 
         # Get real-time portfolio balance
         balance_response = await kalshi_client.get_balance()
-        available_balance = balance_response.get("balance", 0) / 100  # Convert cents to dollars
+        available_balance = get_balance_dollars(balance_response)
+        portfolio_value = available_balance + get_portfolio_value_dollars(balance_response)
         portfolio_data = {"available_balance": available_balance}
         
         logger.info(f"Current available balance: ${available_balance:.2f}")
@@ -218,6 +298,25 @@ async def make_decision_for_market(
                     quantity = _calculate_dynamic_quantity(available_balance, market.yes_price, confidence_delta)
 
                     if quantity > 0:
+                        trade_value = quantity * market.yes_price
+                        allowed, reason = await _passes_live_trade_guardrails(
+                            market=market,
+                            side=decision.side,
+                            trade_value=trade_value,
+                            portfolio_value=portfolio_value,
+                            db_manager=db_manager,
+                        )
+                        if not allowed:
+                            logger.info(f"🚫 PORTFOLIO ENFORCER BLOCKED: {market.market_id} - {reason}")
+                            await db_manager.record_market_analysis(
+                                market.market_id,
+                                "PORTFOLIO_ENFORCER",
+                                decision.confidence,
+                                total_analysis_cost,
+                                reason or "live-trade guardrail blocked trade",
+                            )
+                            return None
+
                         # Calculate exit strategy using Grok4 recommendations  
                         from src.utils.stop_loss_calculator import StopLossCalculator
                         
@@ -483,6 +582,24 @@ async def make_decision_for_market(
             quantity = initial_quantity
 
             if quantity > 0:
+                allowed, reason = await _passes_live_trade_guardrails(
+                    market=market,
+                    side=decision.side,
+                    trade_value=trade_value,
+                    portfolio_value=portfolio_value,
+                    db_manager=db_manager,
+                )
+                if not allowed:
+                    logger.info(f"🚫 PORTFOLIO ENFORCER BLOCKED: {market.market_id} - {reason}")
+                    await db_manager.record_market_analysis(
+                        market.market_id,
+                        "PORTFOLIO_ENFORCER",
+                        decision.confidence,
+                        total_analysis_cost,
+                        reason or "live-trade guardrail blocked trade",
+                    )
+                    return None
+
                 rationale = getattr(decision, 'reasoning', 'No reasoning provided by LLM.')
                 # Calculate exit strategy using Grok4 recommendations
                 from src.utils.stop_loss_calculator import StopLossCalculator
@@ -504,6 +621,7 @@ async def make_decision_for_market(
                     rationale=rationale,
                     confidence=confidence,
                     live=False,
+                    strategy="directional_trading",
                     
                     # Enhanced exit strategy fields using Grok4 recommendations
                     stop_loss_price=exit_strategy['stop_loss_price'],

@@ -962,6 +962,7 @@ Example skip:
                 market_id=market_id,
                 prompt=prompt[:2000],
                 response=response[:5000],
+                provider="openrouter",
                 tokens_used=tokens_used,
                 cost_usd=cost_usd,
                 confidence_extracted=confidence_extracted,

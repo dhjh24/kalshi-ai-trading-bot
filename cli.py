@@ -224,18 +224,62 @@ async def _close_async_resource(resource) -> None:
         return
 
 
-async def _get_local_open_position_count(db_manager) -> int | None:
-    """Return the locally persisted open-position count if available."""
+def _configured_local_portfolio_floor() -> float:
+    """Return a conservative local bankroll floor when the API is unavailable."""
+    try:
+        from src.config.settings import settings as runtime_settings
+
+        return max(float(getattr(runtime_settings.trading, "min_balance", 0.0) or 0.0), 0.0)
+    except Exception:
+        return 0.0
+
+
+def _estimate_local_position_cost_basis(position) -> float:
+    """Estimate locally deployed capital for one persisted open position."""
+    if isinstance(position, dict):
+        getter = position.get
+    else:
+        getter = lambda key, default=None: getattr(position, key, default)
+
+    def _as_float(value) -> float:
+        try:
+            return float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    contracts_cost = _as_float(getter("contracts_cost", 0.0))
+    if contracts_cost > 0:
+        return contracts_cost
+
+    quantity = _as_float(getter("quantity", 0.0))
+    entry_price = _as_float(getter("entry_price", 0.0))
+    entry_fee = max(_as_float(getter("entry_fee", 0.0)), 0.0)
+    estimated_cost = (quantity * entry_price) + entry_fee
+    return estimated_cost if estimated_cost > 0 else 0.0
+
+
+async def _get_local_open_position_snapshot(db_manager) -> tuple[int | None, float | None]:
+    """Return local open-position count plus a conservative portfolio estimate."""
     getter = getattr(db_manager, "get_open_positions", None)
     if not callable(getter):
-        return None
+        return None, None
     try:
         result = getter()
         if inspect.isawaitable(result):
             result = await result
-        return len(result or [])
+        positions = list(result or [])
+        estimated_portfolio_value = sum(
+            _estimate_local_position_cost_basis(position)
+            for position in positions
+        )
+        if not positions and estimated_portfolio_value <= 0:
+            estimated_portfolio_value = _configured_local_portfolio_floor()
+        return (
+            len(positions),
+            estimated_portfolio_value if estimated_portfolio_value > 0 else None,
+        )
     except Exception:
-        return None
+        return None, None
 
 
 async def _build_paper_live_summary_line(db_manager) -> str:
@@ -632,7 +676,9 @@ def cmd_status(args: argparse.Namespace) -> None:
 
         db_path = _resolve_db_path()
         db_manager = await _load_status_db_manager(db_path)
-        local_open_positions = await _get_local_open_position_count(db_manager)
+        local_open_positions, local_portfolio_estimate = (
+            await _get_local_open_position_snapshot(db_manager)
+        )
 
         client = None
         api_error = None
@@ -689,6 +735,11 @@ def cmd_status(args: argparse.Namespace) -> None:
             )
             print(f"  Active Positions:   {'API unavailable':>10}")
             print(f"  Local Open Positions:{local_positions_display}")
+            if local_portfolio_estimate is not None:
+                print(
+                    "  Local Portfolio Est: "
+                    f"{_format_currency_or_placeholder(local_portfolio_estimate)}"
+                )
 
         if active_positions:
             print()
@@ -717,7 +768,12 @@ def cmd_status(args: argparse.Namespace) -> None:
             print()
             print("  Open-position detail unavailable from Kalshi; showing local analytics below.")
 
-        await _print_strategy_budget_status(total_portfolio or 0.0)
+        strategy_budget_portfolio_value = (
+            total_portfolio
+            if total_portfolio is not None
+            else (local_portfolio_estimate or 0.0)
+        )
+        await _print_strategy_budget_status(strategy_budget_portfolio_value)
         await _print_status_local_analytics(db_manager)
         print("=" * 56)
         await _close_async_resource(db_manager)
