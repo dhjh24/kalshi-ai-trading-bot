@@ -5,16 +5,19 @@ import { serverConfig } from "./config.js";
 import {
   getAnalysisHistoryPayload,
   getEventDetailPayload,
+  getLiveTradeDecisionFeedPayload,
+  getLiveTradeDecisionFeedbackPayload,
   getLiveTradePayload,
   getMarketDetailPayload,
   getMarketsPayload,
   getOverviewPayload,
-  getPortfolioPayload
+  getPortfolioPayload,
+  submitLiveTradeDecisionFeedbackPayload
 } from "./services/dashboardService.js";
 import { queueAnalysisRequest } from "./services/analysisService.js";
 import { liveStreamHub } from "./services/liveStreamHub.js";
 
-const streamTopicSchema = z.enum(["markets", "btc", "scores", "analysis"]);
+const streamTopicSchema = z.enum(["markets", "btc", "scores", "analysis", "live-trade-decisions"]);
 const dashboardOrigins = new Set([
   "http://127.0.0.1:3000",
   "http://localhost:3000"
@@ -69,6 +72,49 @@ export async function buildServer() {
 
   app.get("/api/portfolio", async () => getPortfolioPayload());
   app.get("/api/analysis/requests", async () => getAnalysisHistoryPayload());
+  app.get("/api/live-trade/decisions", async (request) => {
+    const query = z
+      .object({
+        limit: z.coerce.number().min(1).max(100).optional()
+      })
+      .parse(request.query);
+
+    return getLiveTradeDecisionFeedPayload(query.limit);
+  });
+  app.get("/api/live-trade/decisions/:decisionId/feedback", async (request, reply) => {
+    const params = z.object({ decisionId: z.string().min(1) }).parse(request.params);
+    const payload = getLiveTradeDecisionFeedbackPayload(params.decisionId);
+    if (!payload) {
+      reply.code(404);
+      return { error: "Decision not found" };
+    }
+
+    return payload;
+  });
+  const liveTradeDecisionFeedbackBodySchema = z.object({
+    feedback: z.enum(["up", "down"]),
+    notes: z.string().trim().max(2000).nullable().optional(),
+    source: z.string().trim().min(1).max(120).nullable().optional()
+  });
+  const submitLiveTradeDecisionFeedback = async (request: {
+    params: unknown;
+    body: unknown;
+  }, reply: {
+    code: (statusCode: number) => void;
+  }) => {
+    const params = z.object({ decisionId: z.string().min(1) }).parse(request.params);
+    const body = liveTradeDecisionFeedbackBodySchema.parse(request.body);
+    const payload = submitLiveTradeDecisionFeedbackPayload(params.decisionId, body);
+    if (!payload) {
+      reply.code(404);
+      return { error: "Decision not found" };
+    }
+
+    liveStreamHub.refreshLiveTradeDecisions();
+    return payload;
+  };
+  app.post("/api/live-trade/decisions/:decisionId/feedback", submitLiveTradeDecisionFeedback);
+  app.put("/api/live-trade/decisions/:decisionId/feedback", submitLiveTradeDecisionFeedback);
   app.get("/api/live-trade", async (request) => {
     const query = z
       .object({

@@ -249,6 +249,9 @@ python cli.py run --paper
 # AI Ensemble — live trading (real money)
 python cli.py run --live
 
+# Paper-only live-trade decision loop
+python cli.py run --live-trade
+
 # Run one bounded cycle and exit
 python cli.py run --once
 
@@ -286,6 +289,15 @@ python beast_mode_bot.py --live       # Live trading
 
 Use `python cli.py dashboard` for the current dashboard flow. That command owns the Next.js web app,
 Fastify API, and FastAPI analysis bridge.
+
+### Live-Trade Operator Loop
+
+When running `python cli.py run --live-trade`, open `http://127.0.0.1:3000/live-trade` in the dashboard stack.
+
+- The runtime banner is the first safety check: confirm `paper`, `shadow`, or `live` mode plus the Kalshi exchange target before acting on any row.
+- The decision monitoring strip/rollup summarizes worker heartbeat, latest execution status, recent errors, and which visible events already have persisted decision rows.
+- The page auto-refreshes every 20 seconds by default, and operators can pause auto-refresh or force an immediate refresh from the controls bar.
+- Heartbeat freshness prefers `live_trade_runtime_state` telemetry when available and falls back to recent persisted decision rows if that table has not been created yet.
 
 ---
 
@@ -418,6 +430,7 @@ Five frontier LLMs debate every trade. Positions only open when models agree.
 ```bash
 python cli.py run --paper        # Paper trading (safe, no real money)
 python cli.py run --live         # Live trading
+python cli.py run --live-trade   # Paper-only live-trade loop
 ```
 
 Guardrails active:

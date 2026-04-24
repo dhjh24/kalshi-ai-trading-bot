@@ -36,6 +36,7 @@ from src.strategies.unified_trading_system import (
 # Import individual jobs for fallback
 from src.jobs.decide import make_decision_for_market
 from src.jobs.execute import execute_position
+from src.jobs.live_trade import run_live_trade_loop_cycle
 
 
 def _resolve_quick_flip_runtime_config() -> tuple[bool, float, str | None]:
@@ -123,7 +124,19 @@ async def run_trading_job(*, shadow_mode: Optional[bool] = None) -> Optional[Tra
         results = await run_unified_trading_system(
             db_manager, kalshi_client, xai_client, config
         )
-        
+        live_trade_summary = None
+        if not bool(getattr(settings.trading, "live_trading_enabled", False)):
+            try:
+                live_trade_summary = await run_live_trade_loop_cycle(
+                    db_manager=db_manager,
+                    kalshi_client=kalshi_client,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Live-trade decision loop failed open for this cycle",
+                    error=str(exc),
+                )
+
         # Log comprehensive results
         if results.total_positions > 0:
             logger.info(
@@ -142,6 +155,9 @@ async def run_trading_job(*, shadow_mode: Optional[bool] = None) -> Optional[Tra
                 f"${results.market_making_realized_pnl:.2f} realized PnL\n"
                 f"  â€¢ Directional: {results.directional_positions} positions, ${results.directional_expected_return:.2f} return\n"
                 f"  â€¢ Quick Flip: {results.quick_flip_positions} positions, ${results.quick_flip_expected_profit:.2f} expected profit\n"
+                f"  â€¢ Live Trade Loop: "
+                f"{0 if live_trade_summary is None else live_trade_summary.executed_positions} paper positions, "
+                f"{0 if live_trade_summary is None else live_trade_summary.specialist_candidates} specialist candidates\n"
                 f"\n"
                 f"âš¡ SYSTEM STATUS: MAXIMUM CAPITAL EFFICIENCY ACHIEVED!"
             )
@@ -150,7 +166,17 @@ async def run_trading_job(*, shadow_mode: Optional[bool] = None) -> Optional[Tra
                 f"ðŸ“Š Trading job complete - no new positions created this cycle\n"
                 f"   Reasons: Market conditions, risk limits, or insufficient opportunities"
             )
-        
+            if live_trade_summary is not None:
+                logger.info(
+                    "Live-trade loop summary",
+                    events_scanned=live_trade_summary.events_scanned,
+                    shortlisted_events=live_trade_summary.shortlisted_events,
+                    specialist_candidates=live_trade_summary.specialist_candidates,
+                    executed_positions=live_trade_summary.executed_positions,
+                    skipped_reason=live_trade_summary.skipped_reason,
+                    run_id=live_trade_summary.run_id,
+                )
+
         return results
         
     except Exception as e:

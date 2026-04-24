@@ -83,6 +83,92 @@ async def _run_bot_entrypoint(
     )
 
 
+def _format_live_trade_loop_summary(summary) -> str:
+    """Render a compact one-line summary for the paper live-trade loop."""
+    skipped_reason = getattr(summary, "skipped_reason", None)
+    line = (
+        "Live-trade cycle "
+        f"{getattr(summary, 'run_id', 'unknown')}: "
+        f"events={getattr(summary, 'events_scanned', 0)}, "
+        f"shortlisted={getattr(summary, 'shortlisted_events', 0)}, "
+        f"specialists={getattr(summary, 'specialist_candidates', 0)}, "
+        f"executed={getattr(summary, 'executed_positions', 0)}"
+    )
+    if skipped_reason:
+        line += f" | skip={skipped_reason}"
+    return line
+
+
+async def _run_live_trade_loop_entrypoint(
+    *,
+    once: bool = False,
+    max_runtime_seconds: int | None = None,
+):
+    """Run the paper-first live-trade decision loop directly from the CLI."""
+    from src.clients.kalshi_client import KalshiClient
+    from src.config.settings import settings as runtime_settings
+    from src.jobs.live_trade import LiveTradeDecisionLoop
+    from src.utils.database import DatabaseManager
+
+    db_manager = DatabaseManager()
+    kalshi_client = KalshiClient()
+    loop = LiveTradeDecisionLoop(
+        db_manager=db_manager,
+        kalshi_client=kalshi_client,
+    )
+    interval_seconds = max(
+        int(getattr(runtime_settings.trading, "market_scan_interval", 30) or 30),
+        5,
+    )
+
+    async def _run_once():
+        summary = await loop.run_once()
+        print(_format_live_trade_loop_summary(summary))
+        return summary
+
+    async def _run_forever():
+        while True:
+            await _run_once()
+            print(
+                "Sleeping "
+                f"{interval_seconds} seconds before the next live-trade cycle."
+            )
+            await asyncio.sleep(interval_seconds)
+
+    try:
+        initialize = getattr(db_manager, "initialize", None)
+        if callable(initialize):
+            result = initialize()
+            if inspect.isawaitable(result):
+                await result
+        return await _run_with_runtime_guard(
+            _run_once if once else _run_forever,
+            label="live-trade loop",
+            max_runtime_seconds=max_runtime_seconds,
+        )
+    finally:
+        await _close_async_resource(loop)
+        await _close_async_resource(kalshi_client)
+        await _close_async_resource(db_manager)
+
+
+def _run_live_trade_loop_command(
+    *,
+    once: bool = False,
+    max_runtime_seconds: int | None = None,
+) -> None:
+    """Synchronous wrapper for the dedicated live-trade CLI path."""
+    try:
+        asyncio.run(
+            _run_live_trade_loop_entrypoint(
+                once=once,
+                max_runtime_seconds=max_runtime_seconds,
+            )
+        )
+    except KeyboardInterrupt:
+        print("\nLive-trade loop stopped by user.")
+
+
 def _resolve_db_path() -> Path:
     """Return the primary trading database path for CLI status/health helpers."""
     return Path(__file__).parent / "trading_system.db"
@@ -421,6 +507,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     beast = getattr(args, "beast", False)
     disciplined = getattr(args, "disciplined", False)
     safe_compounder = getattr(args, "safe_compounder", False)
+    live_trade_only = getattr(args, "live_trade", False)
     once = getattr(args, "once", False)
     smoke = getattr(args, "smoke", False)
     max_runtime_seconds = getattr(args, "max_runtime_seconds", None)
@@ -436,6 +523,24 @@ def cmd_run(args: argparse.Namespace) -> None:
     live_mode = live
     if smoke:
         once = True
+
+    if live_trade_only:
+        if run_mode != "paper":
+            print("Error: --live-trade currently supports paper mode only.")
+            sys.exit(1)
+        if smoke:
+            print("Error: --live-trade does not support --smoke.")
+            sys.exit(1)
+        if beast or safe_compounder:
+            print("Error: --live-trade cannot be combined with other runtime modes.")
+            sys.exit(1)
+        print("📡  LIVE-TRADE LOOP MODE")
+        print("   Paper-first scout/specialist/synth loop with SQLite decision logging.")
+        _run_live_trade_loop_command(
+            once=once,
+            max_runtime_seconds=max_runtime_seconds,
+        )
+        return
 
     if live_mode:
         print("⚠️  WARNING: LIVE TRADING MODE ENABLED")
@@ -1069,6 +1174,7 @@ def build_parser() -> argparse.ArgumentParser:
             "examples:\n"
             "  python cli.py run                      Start AI Ensemble mode (default, paper)\n"
             "  python cli.py run --live               AI Ensemble with real capital\n"
+            "  python cli.py run --live-trade         Paper-only live-trade decision loop\n"
             "  python cli.py run --shadow             Shadow mode (dry-run execution, live-like analytics)\n"
             "  python cli.py run --safe-compounder    Safe Compounder: conservative, math-only\n"
             "  python cli.py run --safe-compounder --live  Safe Compounder live\n"
@@ -1129,6 +1235,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="safe_compounder",
         help="Safe Compounder: NO-side only, edge-based, near-certain outcomes",
+    )
+    p_run.add_argument(
+        "--live-trade",
+        action="store_true",
+        dest="live_trade",
+        help="Run only the paper-first live-trade decision loop",
     )
     p_run.add_argument(
         "--log-level",

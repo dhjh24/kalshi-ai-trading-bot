@@ -48,6 +48,18 @@ def test_run_parser_accepts_shadow_flag():
     assert args.paper is False
 
 
+def test_run_parser_accepts_live_trade_flag():
+    parser = build_parser()
+
+    args = parser.parse_args(["run", "--live-trade", "--once"])
+
+    assert args.command == "run"
+    assert args.live_trade is True
+    assert args.once is True
+    assert args.live is False
+    assert args.shadow is False
+
+
 def test_run_parser_rejects_shadow_with_live_flag():
     parser = build_parser()
 
@@ -108,6 +120,71 @@ async def test_run_bot_entrypoint_requests_shutdown_on_timeout():
 
     assert result is None
     bot.request_shutdown.assert_called_once()
+
+
+def test_cmd_run_dispatches_live_trade_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logging_module = ModuleType("src.utils.logging_setup")
+    logging_module.setup_logging = MagicMock()
+    monkeypatch.setitem(sys.modules, "src.utils.logging_setup", logging_module)
+
+    dispatched = {}
+
+    def fake_run_live_trade_loop_command(*, once: bool, max_runtime_seconds: int | None):
+        dispatched["once"] = once
+        dispatched["max_runtime_seconds"] = max_runtime_seconds
+
+    monkeypatch.setattr(
+        cli,
+        "_run_live_trade_loop_command",
+        fake_run_live_trade_loop_command,
+    )
+
+    cli.cmd_run(
+        SimpleNamespace(
+            log_level="INFO",
+            live=False,
+            paper=False,
+            shadow=False,
+            beast=False,
+            disciplined=True,
+            safe_compounder=False,
+            live_trade=True,
+            once=True,
+            smoke=False,
+            max_runtime_seconds=45,
+        )
+    )
+
+    assert dispatched == {"once": True, "max_runtime_seconds": 45}
+
+
+def test_cmd_run_rejects_live_trade_with_live_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logging_module = ModuleType("src.utils.logging_setup")
+    logging_module.setup_logging = MagicMock()
+    monkeypatch.setitem(sys.modules, "src.utils.logging_setup", logging_module)
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.cmd_run(
+            SimpleNamespace(
+                log_level="INFO",
+                live=True,
+                paper=False,
+                shadow=False,
+                beast=False,
+                disciplined=True,
+                safe_compounder=False,
+                live_trade=True,
+                once=False,
+                smoke=False,
+                max_runtime_seconds=None,
+            )
+        )
+
+    assert excinfo.value.code == 1
 
 
 # ---------------------------------------------------------------------------
@@ -555,7 +632,7 @@ def _install_status_stubs(
             return "paper/live delta +1.2% vs replay"
 
         async def get_ai_spend_provider_breakdown(self):
-            return {"summary": "OpenAI $1.00 | OpenRouter $0.50"}
+            return {"summary": "OpenAI $1.00 | codex $0.00 (3 req, 1,024 tok) | OpenRouter $0.50"}
 
         FakeDatabaseManager.get_paper_live_divergence_summary = (
             get_paper_live_divergence_summary
@@ -644,9 +721,100 @@ def test_cmd_status_prefers_db_helper_summaries_when_available(
 
     output = capsys.readouterr().out
     assert "paper/live delta +1.2% vs replay" in output
-    assert "OpenAI $1.00 | OpenRouter $0.50" in output
+    assert "OpenAI $1.00 | codex $0.00 (3 req, 1,024 tok) | OpenRouter $0.50" in output
+    assert "codex $0.00 (3 req, 1,024 tok)" in output
     assert "fee-drift proxy" not in output
     assert "provider breakdown pending DB helper" not in output
+
+
+@pytest.mark.asyncio
+async def test_ai_spend_provider_breakdown_makes_codex_quota_explicit(
+    tmp_path: Path,
+):
+    from src.utils.database import DatabaseManager, LLMQuery
+
+    db_path = tmp_path / "codex_quota_summary.db"
+    manager = DatabaseManager(db_path=str(db_path))
+    await manager.initialize()
+    now = datetime.now(timezone.utc)
+
+    await manager.log_llm_query(
+        LLMQuery(
+            timestamp=now,
+            strategy="quick_flip",
+            query_type="completion",
+            market_id="COD-1",
+            prompt="hello",
+            response="world",
+            provider="codex",
+            tokens_used=321,
+            cost_usd=0.0,
+        )
+    )
+    await manager.log_llm_query(
+        LLMQuery(
+            timestamp=now,
+            strategy="quick_flip",
+            query_type="completion",
+            market_id="OPENAI-1",
+            prompt="hello",
+            response="world",
+            provider="openai",
+            tokens_used=40,
+            cost_usd=0.12,
+        )
+    )
+
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """
+            CREATE TABLE analysis_requests (
+                request_id TEXT PRIMARY KEY,
+                target_type TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                requested_at TEXT NOT NULL,
+                completed_at TEXT,
+                provider TEXT,
+                model TEXT,
+                cost_usd REAL,
+                sources_json TEXT,
+                response_json TEXT,
+                context_json TEXT,
+                error TEXT
+            )
+            """
+        )
+        await db.execute(
+            """
+            INSERT INTO analysis_requests (
+                request_id, target_type, target_id, status, requested_at,
+                completed_at, provider, model, cost_usd, sources_json,
+                response_json, context_json, error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "codex-analysis",
+                "market",
+                "COD-ANALYSIS",
+                "completed",
+                now.isoformat(),
+                now.isoformat(),
+                "codex",
+                "codex/gpt-5-codex",
+                0.0,
+                "{}",
+                "{}",
+                "{}",
+                None,
+            ),
+        )
+        await db.commit()
+
+    summary = (await manager.get_ai_spend_provider_breakdown())["summary"]
+
+    assert "codex $0.00 (2 req, 321 tok)" in summary
+    assert "openai $0.12" in summary
 
 
 @pytest.mark.asyncio

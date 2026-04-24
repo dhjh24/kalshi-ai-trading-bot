@@ -2,18 +2,25 @@ import type {
   AnalysisRequestRow,
   AnalysisRequestStatus,
   AnalysisTargetType,
+  LiveTradeDecisionFeedbackRecord,
+  LiveTradeDecisionFeedbackValue,
+  LiveTradeDecisionRecord,
+  LiveTradeRuntimeStateRecord,
   MarketContextLinkRow,
   MarketRow,
   PortfolioAiSpendBreakdown,
+  PortfolioCodexQuotaSummary,
   PortfolioAiSpendSummary,
   PortfolioDivergenceRollup,
   PortfolioModeSplit,
   PortfolioOrderDriftMetrics,
+  PortfolioStrategyPnlBreakdown,
+  PortfolioStrategyPnlRow,
   PositionRow,
   TradeLogRow
 } from "../types.js";
 import { getDb } from "../db.js";
-import { isoNow } from "../utils/helpers.js";
+import { isoNow, parseJson } from "../utils/helpers.js";
 
 const db = getDb();
 
@@ -44,6 +51,396 @@ function columnExists(tableName: string, columnName: string): boolean {
 
   const columns = rowsAs<Array<{ name?: string }>>(db.prepare(`PRAGMA table_info(${tableName})`).all());
   return columns.some((column) => column.name === columnName);
+}
+
+function getTableColumns(tableName: string): string[] {
+  if (!tableExists(tableName)) {
+    return [];
+  }
+
+  return rowsAs<Array<{ name?: string }>>(db.prepare(`PRAGMA table_info(${tableName})`).all())
+    .map((column) => column.name)
+    .filter((column): column is string => Boolean(column));
+}
+
+type SqlRow = Record<string, unknown>;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readPath(source: unknown, path: string[]): unknown {
+  let current = source;
+
+  for (const segment of path) {
+    if (!isRecord(current) || !(segment in current)) {
+      return undefined;
+    }
+    current = current[segment];
+  }
+
+  return current;
+}
+
+function firstValue(sources: unknown[], paths: string[][]): unknown {
+  for (const source of sources) {
+    for (const path of paths) {
+      const value = readPath(source, path);
+      if (value === undefined || value === null) {
+        continue;
+      }
+
+      if (typeof value === "string" && value.trim() === "") {
+        continue;
+      }
+
+      return value;
+    }
+  }
+
+  return null;
+}
+
+function toNullableNumber(value: unknown, digits = 4): number | null {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+
+  return Number(parsed.toFixed(digits));
+}
+
+function toNullableText(value: unknown): string | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  const normalized = String(value).trim();
+  return normalized ? normalized : null;
+}
+
+function toNullableBoolean(value: unknown): boolean | null {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  if (typeof value === "number") {
+    return value !== 0;
+  }
+
+  const normalized = String(value).trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+
+  if (["1", "true", "yes", "y"].includes(normalized)) {
+    return true;
+  }
+
+  if (["0", "false", "no", "n"].includes(normalized)) {
+    return false;
+  }
+
+  return null;
+}
+
+function toJsonObject(value: unknown): Record<string, unknown> | null {
+  if (isRecord(value)) {
+    return value;
+  }
+
+  if (typeof value !== "string" || !value.trim()) {
+    return null;
+  }
+
+  const parsed = parseJson<unknown>(value, null);
+  return isRecord(parsed) ? parsed : null;
+}
+
+function toLiveTradeDecisionFeedbackValue(value: unknown): LiveTradeDecisionFeedbackValue | null {
+  const normalized = toNullableText(value)?.toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+
+  if (normalized === "up" || normalized === "down") {
+    return normalized;
+  }
+
+  if (["thumbs_up", "positive", "like", "+1"].includes(normalized)) {
+    return "up";
+  }
+
+  if (["thumbs_down", "negative", "dislike", "-1"].includes(normalized)) {
+    return "down";
+  }
+
+  return null;
+}
+
+function normalizeLiveTradeDecision(row: SqlRow): LiveTradeDecisionRecord {
+  const payload = [
+    "payload_json",
+    "decision_payload_json",
+    "decision_json",
+    "response_json",
+    "context_json",
+    "metadata_json",
+    "details_json",
+    "raw_json",
+    "payload",
+    "decision_payload"
+  ]
+    .map((column) => toJsonObject(row[column]))
+    .find((value) => Boolean(value)) ?? null;
+  const sources = [row, payload];
+  const sequence = toNullableNumber(firstValue(sources, [["id"], ["decision_id"], ["__rowid"]]), 0);
+  const id =
+    toNullableText(firstValue(sources, [["uuid"], ["request_id"], ["decision_uuid"], ["decision_id"]])) ??
+    (sequence !== null
+      ? String(sequence)
+      : `row-${toNullableText(row.market_id) ?? toNullableText(row.event_ticker) ?? "unknown"}`);
+
+  return {
+    id,
+    sequence,
+    recordedAt: toNullableText(
+      firstValue(sources, [
+        ["created_at"],
+        ["recorded_at"],
+        ["decision_timestamp"],
+        ["timestamp"],
+        ["updated_at"],
+        ["recordedAt"],
+        ["createdAt"]
+      ])
+    ),
+    runId: toNullableText(firstValue(sources, [["run_id"], ["runId"]])),
+    step: toNullableText(firstValue(sources, [["step"]])),
+    marketId: toNullableText(
+      firstValue(sources, [
+        ["market_ticker"],
+        ["market_id"],
+        ["ticker"],
+        ["marketId"],
+        ["market", "ticker"],
+        ["market", "market_id"],
+        ["market", "marketId"]
+      ])
+    ),
+    eventTicker: toNullableText(
+      firstValue(sources, [
+        ["event_ticker"],
+        ["eventTicker"],
+        ["event", "event_ticker"],
+        ["event", "eventTicker"],
+        ["event", "ticker"]
+      ])
+    ),
+    title: toNullableText(
+      firstValue(sources, [
+        ["title"],
+        ["market_title"],
+        ["event_title"],
+        ["headline"],
+        ["market", "title"],
+        ["event", "title"]
+      ])
+    ),
+    focusType: toNullableText(firstValue(sources, [["focus_type"], ["focusType"]])),
+    strategy: toNullableText(
+      firstValue(sources, [
+        ["strategy"],
+        ["strategy_name"],
+        ["source_strategy"],
+        ["engine"],
+        ["metadata", "strategy"]
+      ])
+    ),
+    provider: toNullableText(firstValue(sources, [["provider"]])),
+    model: toNullableText(firstValue(sources, [["model"]])),
+    source: toNullableText(firstValue(sources, [["source"], ["provider"], ["model"], ["engine"]])),
+    status: toNullableText(firstValue(sources, [["status"], ["result"], ["decision_status"]])),
+    decision: toNullableText(
+      firstValue(sources, [
+        ["decision_action"],
+        ["action"],
+        ["decision", "action"],
+        ["trade", "action"],
+        ["outcome"]
+      ])
+    ),
+    side: toNullableText(
+      firstValue(sources, [
+        ["side"],
+        ["trade_side"],
+        ["decision_side"],
+        ["decision", "side"],
+        ["trade", "side"]
+      ])
+    ),
+    confidence: toNullableNumber(
+      firstValue(sources, [
+        ["confidence"],
+        ["score"],
+        ["decision_confidence"],
+        ["decision", "confidence"],
+        ["trade", "confidence"],
+        ["probability"]
+      ])
+    ),
+    holdMinutes: toNullableNumber(firstValue(sources, [["hold_minutes"], ["holdMinutes"]]), 0),
+    paperTrade: toNullableBoolean(firstValue(sources, [["paper_trade"], ["paperTrade"]])),
+    liveTrade: toNullableBoolean(firstValue(sources, [["live_trade"], ["liveTrade"]])),
+    summary: toNullableText(firstValue(sources, [["summary"]])),
+    rationale: toNullableText(
+      firstValue(sources, [
+        ["rationale"],
+        ["reasoning"],
+        ["explanation"],
+        ["summary"],
+        ["decision", "reasoning"],
+        ["decision", "rationale"]
+      ])
+    ),
+    error: toNullableText(firstValue(sources, [["error"]])),
+    payload,
+    metrics: {
+      limitPrice: toNullableNumber(
+        firstValue(sources, [["limit_price"], ["price"], ["decision", "limit_price"], ["trade", "limit_price"]])
+      ),
+      yesPrice: toNullableNumber(
+        firstValue(sources, [["yes_price"], ["yesPrice"], ["market", "yes_price"], ["market", "yesPrice"]])
+      ),
+      noPrice: toNullableNumber(
+        firstValue(sources, [["no_price"], ["noPrice"], ["market", "no_price"], ["market", "noPrice"]])
+      ),
+      edge: toNullableNumber(
+        firstValue(sources, [["edge_pct"], ["edge"], ["expected_edge"], ["decision", "edge"], ["trade", "edge"]])
+      ),
+      quantity: toNullableNumber(
+        firstValue(sources, [
+          ["quantity"],
+          ["position_size"],
+          ["size"],
+          ["contracts"],
+          ["decision", "quantity"],
+          ["trade", "quantity"],
+          ["trade", "size"]
+        ])
+      ),
+      contractsCost: toNullableNumber(
+        firstValue(sources, [["contracts_cost"], ["notional"], ["decision", "contracts_cost"], ["trade", "contracts_cost"]])
+      ),
+      costUsd: toNullableNumber(
+        firstValue(sources, [["cost_usd"], ["estimated_cost_usd"], ["decision", "cost_usd"], ["trade", "cost_usd"]])
+      )
+    },
+    feedback: null
+  };
+}
+
+function normalizeLiveTradeDecisionFeedback(row: SqlRow): LiveTradeDecisionFeedbackRecord | null {
+  const payload = [
+    "payload_json",
+    "feedback_json",
+    "metadata_json",
+    "details_json",
+    "raw_json",
+    "payload"
+  ]
+    .map((column) => toJsonObject(row[column]))
+    .find((value) => Boolean(value)) ?? null;
+  const sources = [row, payload];
+  const decisionId =
+    toNullableText(
+      firstValue(sources, [
+        ["decision_id"],
+        ["decisionId"],
+        ["decision", "id"],
+        ["decision", "decision_id"],
+        ["id"]
+      ])
+    ) ??
+    (toNullableNumber(firstValue(sources, [["__rowid"]]), 0) !== null
+      ? String(toNullableNumber(firstValue(sources, [["__rowid"]]), 0))
+      : null);
+  const feedback = toLiveTradeDecisionFeedbackValue(
+    firstValue(sources, [
+      ["feedback"],
+      ["value"],
+      ["vote"],
+      ["thumb"],
+      ["feedback", "feedback"],
+      ["feedback", "value"]
+    ])
+  );
+
+  if (!decisionId || !feedback) {
+    return null;
+  }
+
+  return {
+    decisionId,
+    runId: toNullableText(firstValue(sources, [["run_id"], ["runId"]])),
+    eventTicker: toNullableText(
+      firstValue(sources, [
+        ["event_ticker"],
+        ["eventTicker"],
+        ["event", "event_ticker"],
+        ["event", "eventTicker"]
+      ])
+    ),
+    marketId: toNullableText(
+      firstValue(sources, [
+        ["market_ticker"],
+        ["market_id"],
+        ["marketTicker"],
+        ["marketId"],
+        ["market", "ticker"],
+        ["market", "market_id"],
+        ["market", "marketId"]
+      ])
+    ),
+    feedback,
+    notes: toNullableText(firstValue(sources, [["notes"], ["comment"], ["feedback", "notes"]])),
+    source: toNullableText(firstValue(sources, [["source"], ["feedback_source"], ["feedback", "source"]])),
+    createdAt: toNullableText(firstValue(sources, [["created_at"], ["createdAt"], ["timestamp"]])),
+    updatedAt: toNullableText(
+      firstValue(sources, [["updated_at"], ["updatedAt"], ["recorded_at"], ["timestamp"], ["created_at"]])
+    )
+  };
+}
+
+function normalizeLiveTradeRuntimeState(row: SqlRow): LiveTradeRuntimeStateRecord {
+  return {
+    strategy: toNullableText(row.strategy) ?? "live_trade",
+    worker: toNullableText(row.worker) ?? "decision_loop",
+    heartbeatAt: toNullableText(row.heartbeat_at),
+    runtimeMode: toNullableText(row.runtime_mode),
+    exchangeEnv: toNullableText(row.exchange_env),
+    runId: toNullableText(row.run_id),
+    loopStatus: toNullableText(row.loop_status),
+    lastStartedAt: toNullableText(row.last_started_at),
+    lastCompletedAt: toNullableText(row.last_completed_at),
+    lastStep: toNullableText(row.last_step),
+    lastStepAt: toNullableText(row.last_step_at),
+    lastStepStatus: toNullableText(row.last_step_status),
+    lastSummary: toNullableText(row.last_summary),
+    lastHealthyAt: toNullableText(row.last_healthy_at),
+    lastHealthyStep: toNullableText(row.last_healthy_step),
+    latestExecutionAt: toNullableText(row.latest_execution_at),
+    latestExecutionStatus: toNullableText(row.latest_execution_status),
+    error: toNullableText(row.error)
+  };
 }
 
 function toNumber(value: unknown, digits = 2): number {
@@ -159,6 +556,25 @@ function emptyAiSpendBreakdown(
     attributedCostUsd: 0,
     unattributedCostUsd: 0,
     items: []
+  };
+}
+
+function emptyQuotaWindowSummary() {
+  return {
+    queryCount: 0,
+    tokensUsed: 0,
+    latestAt: null
+  };
+}
+
+function emptyCodexQuotaSummary(sourceTable: string | null = null): PortfolioCodexQuotaSummary {
+  return {
+    available: false,
+    sourceTable,
+    provider: "codex",
+    last24h: emptyQuotaWindowSummary(),
+    last7d: emptyQuotaWindowSummary(),
+    lifetime: emptyQuotaWindowSummary()
   };
 }
 
@@ -585,6 +1001,156 @@ export function getTotalTrades(): number {
   return toCount(row?.total_trades);
 }
 
+export function getPortfolioStrategyPnlBreakdown(): PortfolioStrategyPnlBreakdown {
+  const hasTradeLogs = tableExists("trade_logs");
+  const hasPositions = tableExists("positions");
+  const sourceTables = [
+    ...(hasTradeLogs ? ["trade_logs"] : []),
+    ...(hasPositions ? ["positions"] : [])
+  ];
+
+  if (sourceTables.length === 0) {
+    return {
+      available: false,
+      sourceTables,
+      items: []
+    };
+  }
+
+  const items = new Map<string, PortfolioStrategyPnlRow>();
+
+  const ensureItem = (strategy: string): PortfolioStrategyPnlRow => {
+    const key = strategy.trim() || "unattributed";
+    const existing = items.get(key);
+    if (existing) {
+      return existing;
+    }
+
+    const created: PortfolioStrategyPnlRow = {
+      strategy: key,
+      openPositions: 0,
+      openExposure: 0,
+      realizedPnl: 0,
+      totalTrades: 0,
+      paperTrades: 0,
+      liveTrades: 0,
+      paperPnl: 0,
+      livePnl: 0
+    };
+    items.set(key, created);
+    return created;
+  };
+
+  if (hasTradeLogs) {
+    const hasLiveColumn = columnExists("trade_logs", "live");
+    const tradeRows = rowsAs<
+      Array<{
+        strategy: string;
+        total_trades?: number;
+        paper_trades?: number;
+        live_trades?: number;
+        paper_pnl?: number;
+        live_pnl?: number;
+        realized_pnl?: number;
+      }>
+    >(
+      db
+        .prepare(
+          hasLiveColumn
+            ? `
+                SELECT
+                  COALESCE(NULLIF(TRIM(strategy), ''), 'unattributed') AS strategy,
+                  COUNT(*) AS total_trades,
+                  COALESCE(SUM(CASE WHEN live = 0 THEN 1 ELSE 0 END), 0) AS paper_trades,
+                  COALESCE(SUM(CASE WHEN live = 1 THEN 1 ELSE 0 END), 0) AS live_trades,
+                  COALESCE(SUM(CASE WHEN live = 0 THEN pnl ELSE 0 END), 0) AS paper_pnl,
+                  COALESCE(SUM(CASE WHEN live = 1 THEN pnl ELSE 0 END), 0) AS live_pnl,
+                  COALESCE(SUM(pnl), 0) AS realized_pnl
+                FROM trade_logs
+                GROUP BY 1
+              `
+            : `
+                SELECT
+                  COALESCE(NULLIF(TRIM(strategy), ''), 'unattributed') AS strategy,
+                  COUNT(*) AS total_trades,
+                  COUNT(*) AS paper_trades,
+                  0 AS live_trades,
+                  COALESCE(SUM(pnl), 0) AS paper_pnl,
+                  0 AS live_pnl,
+                  COALESCE(SUM(pnl), 0) AS realized_pnl
+                FROM trade_logs
+                GROUP BY 1
+              `
+        )
+        .all()
+    );
+
+    for (const row of tradeRows) {
+      const item = ensureItem(row.strategy);
+      item.totalTrades = toCount(row.total_trades);
+      item.paperTrades = toCount(row.paper_trades);
+      item.liveTrades = toCount(row.live_trades);
+      item.paperPnl = toNumber(row.paper_pnl);
+      item.livePnl = toNumber(row.live_pnl);
+      item.realizedPnl = toNumber(row.realized_pnl);
+    }
+  }
+
+  if (hasPositions) {
+    const whereClause = columnExists("positions", "status") ? "WHERE status = 'open'" : "";
+    const positionRows = rowsAs<
+      Array<{
+        strategy: string;
+        open_positions?: number;
+        open_exposure?: number;
+      }>
+    >(
+      db
+        .prepare(
+          `
+            SELECT
+              COALESCE(NULLIF(TRIM(strategy), ''), 'unattributed') AS strategy,
+              COUNT(*) AS open_positions,
+              COALESCE(SUM(entry_price * quantity), 0) AS open_exposure
+            FROM positions
+            ${whereClause}
+            GROUP BY 1
+          `
+        )
+        .all()
+    );
+
+    for (const row of positionRows) {
+      const item = ensureItem(row.strategy);
+      item.openPositions = toCount(row.open_positions);
+      item.openExposure = toNumber(row.open_exposure);
+    }
+  }
+
+  return {
+    available: true,
+    sourceTables,
+    items: Array.from(items.values()).sort((left, right) => {
+      const pnlDelta = Math.abs(right.realizedPnl) - Math.abs(left.realizedPnl);
+      if (pnlDelta !== 0) {
+        return pnlDelta;
+      }
+
+      const exposureDelta = right.openExposure - left.openExposure;
+      if (exposureDelta !== 0) {
+        return exposureDelta;
+      }
+
+      const tradeDelta = right.totalTrades - left.totalTrades;
+      if (tradeDelta !== 0) {
+        return tradeDelta;
+      }
+
+      return left.strategy.localeCompare(right.strategy);
+    })
+  };
+}
+
 export function getPortfolioOpenModeSummary(): {
   openPositions: PortfolioModeSplit;
   openExposure: PortfolioModeSplit;
@@ -882,6 +1448,95 @@ export function getPortfolioFeeDriftMetrics(trailingHours = 168): PortfolioFeeDr
   };
 }
 
+export function getPortfolioCodexQuotaSummary(): PortfolioCodexQuotaSummary {
+  if (!tableExists("llm_queries")) {
+    return emptyCodexQuotaSummary();
+  }
+
+  if (
+    !columnExists("llm_queries", "provider") ||
+    !columnExists("llm_queries", "timestamp")
+  ) {
+    return emptyCodexQuotaSummary("llm_queries");
+  }
+
+  const tokensField = columnExists("llm_queries", "tokens_used") ? "tokens_used" : null;
+  const tokensValue = (timePredicate = "1 = 1") =>
+    tokensField
+      ? `COALESCE(SUM(CASE WHEN ${timePredicate} THEN COALESCE(${tokensField}, 0) ELSE 0 END), 0)`
+      : "0";
+  const providerExpression = "LOWER(TRIM(CAST(provider AS TEXT)))";
+  const row = db
+    .prepare(
+      `
+        SELECT
+          COUNT(*) AS lifetime_count,
+          ${tokensValue()} AS lifetime_tokens,
+          MAX(timestamp) AS lifetime_latest_at,
+          COALESCE(
+            SUM(CASE WHEN julianday(timestamp) >= julianday('now', '-1 day') THEN 1 ELSE 0 END),
+            0
+          ) AS count_24h,
+          ${tokensValue("julianday(timestamp) >= julianday('now', '-1 day')")} AS tokens_24h,
+          MAX(
+            CASE
+              WHEN julianday(timestamp) >= julianday('now', '-1 day')
+              THEN timestamp
+              ELSE NULL
+            END
+          ) AS latest_24h_at,
+          COALESCE(
+            SUM(CASE WHEN julianday(timestamp) >= julianday('now', '-7 day') THEN 1 ELSE 0 END),
+            0
+          ) AS count_7d,
+          ${tokensValue("julianday(timestamp) >= julianday('now', '-7 day')")} AS tokens_7d,
+          MAX(
+            CASE
+              WHEN julianday(timestamp) >= julianday('now', '-7 day')
+              THEN timestamp
+              ELSE NULL
+            END
+          ) AS latest_7d_at
+        FROM llm_queries
+        WHERE ${providerExpression} = 'codex'
+      `
+    )
+    .get() as
+    | {
+        lifetime_count?: number;
+        lifetime_tokens?: number;
+        lifetime_latest_at?: string | null;
+        count_24h?: number;
+        tokens_24h?: number;
+        latest_24h_at?: string | null;
+        count_7d?: number;
+        tokens_7d?: number;
+        latest_7d_at?: string | null;
+      }
+    | undefined;
+
+  return {
+    available: true,
+    sourceTable: "llm_queries",
+    provider: "codex",
+    last24h: {
+      queryCount: toCount(row?.count_24h),
+      tokensUsed: toCount(row?.tokens_24h),
+      latestAt: row?.latest_24h_at ?? null
+    },
+    last7d: {
+      queryCount: toCount(row?.count_7d),
+      tokensUsed: toCount(row?.tokens_7d),
+      latestAt: row?.latest_7d_at ?? null
+    },
+    lifetime: {
+      queryCount: toCount(row?.lifetime_count),
+      tokensUsed: toCount(row?.lifetime_tokens),
+      latestAt: row?.lifetime_latest_at ?? null
+    }
+  };
+}
+
 export function getPortfolioAiSpendSummary(): PortfolioAiSpendSummary {
   const llmQuerySummary = getTableSpendSummary({
     tableName: "llm_queries",
@@ -911,7 +1566,8 @@ export function getPortfolioAiSpendSummary(): PortfolioAiSpendSummary {
     analysisRequestCount: analysisRequestSummary.count,
     tokensUsed: llmQuerySummary.tokensUsed,
     latestLlmQueryAt: llmQuerySummary.latestAt,
-    latestAnalysisRequestAt: analysisRequestSummary.latestAt
+    latestAnalysisRequestAt: analysisRequestSummary.latestAt,
+    codexQuota: getPortfolioCodexQuotaSummary()
   };
 }
 
@@ -930,14 +1586,19 @@ export function getPortfolioAiSpendByProvider(): PortfolioAiSpendBreakdown {
     return emptyAiSpendBreakdown("provider");
   }
 
-  const bucketRows = new Map<string, { count: number; cost: number }>();
+  const bucketRows = new Map<string, { count: number; cost: number; tokensUsed: number; hasTokens: boolean }>();
 
   for (const tableName of providerTables) {
+    const hasTokens = columnExists(tableName, "tokens_used");
+    const tokensSql = hasTokens
+      ? "COALESCE(SUM(COALESCE(tokens_used, 0)), 0) AS tokens_used"
+      : "NULL AS tokens_used";
     const rows = rowsAs<
       Array<{
         bucket_key?: string;
         bucket_count?: number;
         cost_usd?: number;
+        tokens_used?: number | null;
       }>
     >(
       db.prepare(
@@ -945,7 +1606,8 @@ export function getPortfolioAiSpendByProvider(): PortfolioAiSpendBreakdown {
           SELECT
             COALESCE(NULLIF(TRIM(CAST(provider AS TEXT)), ''), 'unattributed') AS bucket_key,
             COUNT(*) AS bucket_count,
-            COALESCE(SUM(COALESCE(cost_usd, 0)), 0) AS cost_usd
+            COALESCE(SUM(COALESCE(cost_usd, 0)), 0) AS cost_usd,
+            ${tokensSql}
           FROM ${tableName}
           GROUP BY bucket_key
         `
@@ -954,10 +1616,19 @@ export function getPortfolioAiSpendByProvider(): PortfolioAiSpendBreakdown {
 
     for (const row of rows) {
       const key = row.bucket_key || "unattributed";
-      const next = bucketRows.get(key) ?? { count: 0, cost: 0 };
+      const next = bucketRows.get(key) ?? {
+        count: 0,
+        cost: 0,
+        tokensUsed: 0,
+        hasTokens: false
+      };
       const costUsd = Number(row.cost_usd);
       next.count += toCount(row.bucket_count);
       next.cost += Number.isFinite(costUsd) ? costUsd : 0;
+      if (hasTokens) {
+        next.tokensUsed += toCount(row.tokens_used);
+        next.hasTokens = true;
+      }
       bucketRows.set(key, next);
     }
   }
@@ -977,7 +1648,9 @@ export function getPortfolioAiSpendByProvider(): PortfolioAiSpendBreakdown {
     .map(([key, value]) => ({
       bucket_key: key,
       bucket_count: value.count,
-      cost_usd: value.cost
+      cost_usd: value.cost,
+      tokens_used: value.tokensUsed,
+      has_tokens: value.hasTokens
     }))
     .sort((a, b) => {
       const costCompare = toNumber(b.cost_usd, 4) - toNumber(a.cost_usd, 4);
@@ -1010,7 +1683,7 @@ export function getPortfolioAiSpendByProvider(): PortfolioAiSpendBreakdown {
         label: key === "unattributed" ? "Unattributed" : key,
         costUsd,
         count: toCount(row.bucket_count),
-        tokensUsed: null,
+        tokensUsed: row.has_tokens ? toCount(row.tokens_used) : null,
         shareOfKnownCostPct
       };
     })
@@ -1031,6 +1704,215 @@ export function getPortfolioAiSpendByRole(): PortfolioAiSpendBreakdown {
     sourceField: "query_type",
     tokensField: "tokens_used"
   });
+}
+
+function getLiveTradeDecisionOrderColumn(columns: Set<string>): string {
+  return (
+    ["created_at", "recorded_at", "decision_timestamp", "timestamp", "updated_at", "id"].find((column) =>
+      columns.has(column)
+    ) ?? "__rowid"
+  );
+}
+
+export function hasLiveTradeDecisionTable(): boolean {
+  return tableExists("live_trade_decisions");
+}
+
+export function hasLiveTradeDecisionFeedbackTable(): boolean {
+  return tableExists("live_trade_decision_feedback");
+}
+
+export function hasLiveTradeRuntimeStateTable(): boolean {
+  return tableExists("live_trade_runtime_state");
+}
+
+function ensureLiveTradeDecisionFeedbackTable(): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS live_trade_decision_feedback (
+      decision_id TEXT NOT NULL UNIQUE,
+      run_id TEXT,
+      event_ticker TEXT,
+      market_ticker TEXT,
+      feedback TEXT NOT NULL CHECK (feedback IN ('up', 'down')),
+      notes TEXT,
+      source TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_live_trade_decision_feedback_updated_at
+      ON live_trade_decision_feedback(updated_at DESC);
+  `);
+}
+
+export function listLiveTradeDecisions(limit = 20): LiveTradeDecisionRecord[] {
+  if (!hasLiveTradeDecisionTable()) {
+    return [];
+  }
+
+  const columns = new Set(getTableColumns("live_trade_decisions"));
+  const orderColumn = getLiveTradeDecisionOrderColumn(columns);
+
+  const rows = rowsAs<SqlRow[]>(
+    db.prepare(
+      `
+        SELECT rowid AS __rowid, *
+        FROM live_trade_decisions
+        ORDER BY ${orderColumn} DESC, __rowid DESC
+        LIMIT ?
+      `
+    ).all(limit)
+  );
+
+  return rows.map((row) => normalizeLiveTradeDecision(row));
+}
+
+export function getLiveTradeDecisionById(decisionId: string): LiveTradeDecisionRecord | null {
+  if (!hasLiveTradeDecisionTable()) {
+    return null;
+  }
+
+  const columns = new Set(getTableColumns("live_trade_decisions"));
+  const predicates = [
+    "CAST(rowid AS TEXT) = ?",
+    ...["id", "decision_id", "uuid", "request_id", "decision_uuid"]
+      .filter((column) => columns.has(column))
+      .map((column) => `CAST(${column} AS TEXT) = ?`)
+  ];
+  const params = Array.from({ length: predicates.length }, () => decisionId);
+  const row = db
+    .prepare(
+      `
+        SELECT rowid AS __rowid, *
+        FROM live_trade_decisions
+        WHERE ${predicates.join(" OR ")}
+        LIMIT 1
+      `
+    )
+    .get(...params) as SqlRow | undefined;
+
+  return row ? normalizeLiveTradeDecision(row) : null;
+}
+
+export function listLiveTradeDecisionFeedbackByDecisionIds(
+  decisionIds: string[]
+): LiveTradeDecisionFeedbackRecord[] {
+  if (!hasLiveTradeDecisionFeedbackTable() || decisionIds.length === 0) {
+    return [];
+  }
+
+  const placeholders = decisionIds.map(() => "?").join(", ");
+  const rows = rowsAs<SqlRow[]>(
+    db.prepare(
+      `
+        SELECT rowid AS __rowid, *
+        FROM live_trade_decision_feedback
+        WHERE decision_id IN (${placeholders})
+        ORDER BY __rowid ASC
+      `
+    ).all(...decisionIds)
+  );
+
+  return rows
+    .map((row) => normalizeLiveTradeDecisionFeedback(row))
+    .filter((row): row is LiveTradeDecisionFeedbackRecord => Boolean(row));
+}
+
+export function getLiveTradeDecisionFeedbackByDecisionId(
+  decisionId: string
+): LiveTradeDecisionFeedbackRecord | null {
+  if (!hasLiveTradeDecisionFeedbackTable()) {
+    return null;
+  }
+
+  const row = db
+    .prepare(
+      `
+        SELECT rowid AS __rowid, *
+        FROM live_trade_decision_feedback
+        WHERE decision_id = ?
+        LIMIT 1
+      `
+    )
+    .get(decisionId) as SqlRow | undefined;
+  return row ? normalizeLiveTradeDecisionFeedback(row) : null;
+}
+
+export function getLiveTradeRuntimeState(
+  strategy = "live_trade",
+  worker = "decision_loop"
+): LiveTradeRuntimeStateRecord | null {
+  if (!hasLiveTradeRuntimeStateTable()) {
+    return null;
+  }
+
+  const row = db
+    .prepare(
+      `
+        SELECT *
+        FROM live_trade_runtime_state
+        WHERE strategy = ?
+          AND worker = ?
+        LIMIT 1
+      `
+    )
+    .get(strategy, worker) as SqlRow | undefined;
+
+  return row ? normalizeLiveTradeRuntimeState(row) : null;
+}
+
+export function upsertLiveTradeDecisionFeedback(payload: {
+  decisionId: string;
+  runId?: string | null;
+  eventTicker?: string | null;
+  marketId?: string | null;
+  feedback: LiveTradeDecisionFeedbackValue;
+  notes?: string | null;
+  source?: string | null;
+}): LiveTradeDecisionFeedbackRecord {
+  ensureLiveTradeDecisionFeedbackTable();
+
+  const now = isoNow();
+  const existing = getLiveTradeDecisionFeedbackByDecisionId(payload.decisionId);
+  const createdAt = existing?.createdAt ?? now;
+
+  db.prepare(
+    `
+      INSERT INTO live_trade_decision_feedback (
+        decision_id,
+        run_id,
+        event_ticker,
+        market_ticker,
+        feedback,
+        notes,
+        source,
+        created_at,
+        updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(decision_id)
+      DO UPDATE SET
+        run_id = excluded.run_id,
+        event_ticker = excluded.event_ticker,
+        market_ticker = excluded.market_ticker,
+        feedback = excluded.feedback,
+        notes = excluded.notes,
+        source = excluded.source,
+        updated_at = excluded.updated_at
+    `
+  ).run(
+    payload.decisionId,
+    payload.runId ?? null,
+    payload.eventTicker ?? null,
+    payload.marketId ?? null,
+    payload.feedback,
+    payload.notes ?? null,
+    payload.source ?? null,
+    createdAt,
+    now
+  );
+
+  return getLiveTradeDecisionFeedbackByDecisionId(payload.decisionId)!;
 }
 
 export function createAnalysisRequest(

@@ -1,6 +1,9 @@
 import { serverConfig } from "../config.js";
 import {
   getDailyAiCost,
+  getLiveTradeDecisionById,
+  getLiveTradeDecisionFeedbackByDecisionId,
+  getLiveTradeRuntimeState,
   getLatestAnalysisForTarget,
   getOpenPositions,
   getPortfolioAiSpendByProvider,
@@ -10,24 +13,38 @@ import {
   getPortfolioAiSpendSummary,
   getPortfolioOpenModeSummary,
   getPortfolioOrderDriftMetrics,
+  getPortfolioStrategyPnlBreakdown,
   getPortfolioTradeDivergenceRollup,
   getRealizedPnl,
   getRecentTrades,
   getTotalTrades,
+  hasLiveTradeDecisionFeedbackTable,
+  hasLiveTradeDecisionTable,
+  hasLiveTradeRuntimeStateTable,
   getMarketRow,
   listAnalysisRequests,
+  listLiveTradeDecisionFeedbackByDecisionIds,
+  listLiveTradeDecisions,
   listMarkets,
   listMarketsByCategory,
+  upsertLiveTradeDecisionFeedback,
   upsertMarketContextLink
 } from "../repositories/dashboardRepository.js";
 import type {
   AnalysisRequestRow,
   KalshiEvent,
+  LiveTradeDecisionFeedPayload,
+  LiveTradeDecisionHeartbeat,
+  LiveTradeDecisionFeedbackInput,
+  LiveTradeDecisionFeedbackPayload,
+  LiveTradeDecisionRecord,
+  LiveTradeRuntimeStateRecord,
   LiveTradeEventSnapshot,
   LiveTradePayload,
   MarketRow,
   OverviewPayload,
   PortfolioPayload,
+  RuntimeModeVisibility,
   SportsContext
 } from "../types.js";
 import { parseJson } from "../utils/helpers.js";
@@ -55,12 +72,8 @@ const liveTradeBridgeInflight = new Map<
     generated_at?: string;
   }>
 >();
-
-type PortfolioPayloadWithFeeDrift = PortfolioPayload & {
-  divergence: PortfolioPayload["divergence"] & {
-    feeDivergence: ReturnType<typeof getPortfolioFeeDriftMetrics>;
-  };
-};
+const LIVE_TRADE_HEARTBEAT_LOOKBACK_LIMIT = 100;
+export const LIVE_TRADE_DECISION_FEED_LIMIT = 24;
 
 function normalizeLiveTradeCategories(categories: string[]): string[] {
   return Array.from(
@@ -174,8 +187,250 @@ function mapLatestAnalysis(row: AnalysisRequestRow | null) {
   };
 }
 
+function attachLiveTradeDecisionFeedback(
+  decisions: LiveTradeDecisionRecord[]
+): LiveTradeDecisionRecord[] {
+  if (decisions.length === 0) {
+    return decisions;
+  }
+
+  const feedbackByDecisionId = new Map(
+    listLiveTradeDecisionFeedbackByDecisionIds(decisions.map((decision) => decision.id)).map((feedback) => [
+      feedback.decisionId,
+      feedback
+    ])
+  );
+
+  return decisions.map((decision) => ({
+    ...decision,
+    feedback: feedbackByDecisionId.get(decision.id) ?? null
+  }));
+}
+
+function isHealthyLiveTradeDecision(decision: LiveTradeDecisionRecord): boolean {
+  return decision.status !== "error" && !decision.error;
+}
+
+function parseEnvBoolean(value: string | undefined): boolean | null {
+  if (!value) {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on", "enabled"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off", "disabled"].includes(normalized)) {
+    return false;
+  }
+  return null;
+}
+
+function heartbeatStatusFromTimestamp(
+  timestamp: string | null,
+  staleAfterSeconds: number
+): { status: LiveTradeDecisionHeartbeat["status"]; ageSeconds: number | null } {
+  if (!timestamp) {
+    return { status: "idle", ageSeconds: null };
+  }
+
+  const parsed = Date.parse(timestamp);
+  if (!Number.isFinite(parsed)) {
+    return { status: "idle", ageSeconds: null };
+  }
+
+  const ageSeconds = Math.max(0, Math.round((Date.now() - parsed) / 1000));
+  return {
+    status: ageSeconds > staleAfterSeconds ? "stale" : "fresh",
+    ageSeconds
+  };
+}
+
+function buildLiveTradeDecisionHeartbeat(
+  decisions: LiveTradeDecisionRecord[],
+  available: boolean,
+  runtimeState: LiveTradeRuntimeStateRecord | null
+): LiveTradeDecisionHeartbeat {
+  const staleAfterSeconds = Math.max(
+    60,
+    Math.round(serverConfig.liveTradeHeartbeatStaleAfterMs / 1000)
+  );
+  const recentDecisionCount = decisions.length;
+  const recentRunCount = new Set(decisions.map((decision) => decision.runId).filter(Boolean)).size;
+  const decisionErrorCount = decisions.filter(
+    (decision) => decision.status === "error" || Boolean(decision.error)
+  ).length;
+
+  if (runtimeState) {
+    const lastSeenAt =
+      runtimeState.heartbeatAt ??
+      runtimeState.lastStepAt ??
+      runtimeState.lastCompletedAt ??
+      runtimeState.lastStartedAt;
+    const { status, ageSeconds } = heartbeatStatusFromTimestamp(lastSeenAt, staleAfterSeconds);
+
+    return {
+      status,
+      staleAfterSeconds,
+      lastSeenAt,
+      ageSeconds,
+      latestRunId: runtimeState.runId,
+      latestStep: runtimeState.lastStep,
+      latestStatus: runtimeState.lastStepStatus ?? runtimeState.loopStatus,
+      latestSummary: runtimeState.lastSummary,
+      lastHealthyAt: runtimeState.lastHealthyAt,
+      lastHealthyStep: runtimeState.lastHealthyStep,
+      latestExecutionAt: runtimeState.latestExecutionAt,
+      latestExecutionStatus: runtimeState.latestExecutionStatus,
+      recentDecisionCount,
+      recentRunCount: Math.max(recentRunCount, runtimeState.runId ? 1 : 0),
+      errorCount: Math.max(decisionErrorCount, runtimeState.error ? 1 : 0)
+    };
+  }
+
+  if (!available) {
+    return {
+      status: "unavailable",
+      staleAfterSeconds,
+      lastSeenAt: null,
+      ageSeconds: null,
+      latestRunId: null,
+      latestStep: null,
+      latestStatus: null,
+      latestSummary: null,
+      lastHealthyAt: null,
+      lastHealthyStep: null,
+      latestExecutionAt: null,
+      latestExecutionStatus: null,
+      recentDecisionCount,
+      recentRunCount,
+      errorCount: decisionErrorCount
+    };
+  }
+
+  const latestDecision = decisions[0] ?? null;
+  const { status, ageSeconds } = heartbeatStatusFromTimestamp(
+    latestDecision?.recordedAt ?? null,
+    staleAfterSeconds
+  );
+  const lastHealthyDecision = decisions.find(isHealthyLiveTradeDecision) ?? null;
+  const latestExecutionDecision = decisions.find((decision) => decision.step === "execution") ?? null;
+
+  return {
+    status,
+    staleAfterSeconds,
+    lastSeenAt: latestDecision?.recordedAt ?? null,
+    ageSeconds,
+    latestRunId: latestDecision?.runId ?? null,
+    latestStep: latestDecision?.step ?? null,
+    latestStatus: latestDecision?.status ?? null,
+    latestSummary: latestDecision?.summary ?? null,
+    lastHealthyAt: lastHealthyDecision?.recordedAt ?? null,
+    lastHealthyStep: lastHealthyDecision?.step ?? null,
+    latestExecutionAt: latestExecutionDecision?.recordedAt ?? null,
+    latestExecutionStatus: latestExecutionDecision?.status ?? null,
+    recentDecisionCount,
+    recentRunCount,
+    errorCount: decisionErrorCount
+  };
+}
+
+export function getLiveTradeDecisionFeedPayload(
+  limit = LIVE_TRADE_DECISION_FEED_LIMIT
+): LiveTradeDecisionFeedPayload {
+  const available = hasLiveTradeDecisionTable();
+  const runtimeState = hasLiveTradeRuntimeStateTable() ? getLiveTradeRuntimeState() : null;
+  const decisions = attachLiveTradeDecisionFeedback(listLiveTradeDecisions(limit));
+  const heartbeatDecisions =
+    limit >= LIVE_TRADE_HEARTBEAT_LOOKBACK_LIMIT
+      ? decisions
+      : attachLiveTradeDecisionFeedback(listLiveTradeDecisions(LIVE_TRADE_HEARTBEAT_LOOKBACK_LIMIT));
+
+  return {
+    available,
+    generatedAt: new Date().toISOString(),
+    limit,
+    latestRecordedAt: decisions.find((decision) => Boolean(decision.recordedAt))?.recordedAt ?? null,
+    heartbeat: buildLiveTradeDecisionHeartbeat(heartbeatDecisions, available, runtimeState),
+    decisions
+  };
+}
+
+export function getLiveTradeDecisionFeedbackPayload(
+  decisionId: string
+): LiveTradeDecisionFeedbackPayload | null {
+  const decision = getLiveTradeDecisionById(decisionId);
+  if (!decision) {
+    return null;
+  }
+
+  return {
+    available: hasLiveTradeDecisionFeedbackTable(),
+    decisionId: decision.id,
+    feedback: getLiveTradeDecisionFeedbackByDecisionId(decision.id)
+  };
+}
+
+export function submitLiveTradeDecisionFeedbackPayload(
+  decisionId: string,
+  input: LiveTradeDecisionFeedbackInput
+): LiveTradeDecisionFeedbackPayload | null {
+  const decision = getLiveTradeDecisionById(decisionId);
+  if (!decision) {
+    return null;
+  }
+
+  return {
+    available: true,
+    decisionId: decision.id,
+    feedback: upsertLiveTradeDecisionFeedback({
+      decisionId: decision.id,
+      runId: decision.runId,
+      eventTicker: decision.eventTicker,
+      marketId: decision.marketId,
+      feedback: input.feedback,
+      notes: input.notes ?? null,
+      source: input.source ?? "dashboard"
+    })
+  };
+}
+
 function buildSearchQuery(event: KalshiEvent): string {
   return eventToSearchText(event).slice(0, 180);
+}
+
+function getLiveTradeRuntimeVisibility(
+  runtimeState: LiveTradeRuntimeStateRecord | null
+): RuntimeModeVisibility {
+  const runtimeMode = runtimeState?.runtimeMode?.trim().toLowerCase();
+  const mode =
+    runtimeMode === "live" || runtimeMode === "shadow" || runtimeMode === "paper"
+      ? runtimeMode
+      : null;
+  const live = mode ? mode === "live" : (parseEnvBoolean(process.env.LIVE_TRADING_ENABLED) ?? false);
+  const shadow = mode ? mode === "shadow" : (parseEnvBoolean(process.env.SHADOW_MODE_ENABLED) ?? false);
+  const paper = mode ? mode === "paper" : !live && !shadow;
+
+  return {
+    mode: mode ?? (live ? "live" : shadow ? "shadow" : "paper"),
+    paper,
+    shadow,
+    live,
+    exchange: runtimeState?.exchangeEnv ?? process.env.KALSHI_ENV ?? null,
+    source: runtimeState ? "live_trade_runtime_state" : "dashboard env",
+    worker: runtimeState?.worker ?? "decision_loop",
+    workerStatus: runtimeState?.loopStatus ?? null,
+    heartbeatAt: runtimeState?.heartbeatAt ?? null,
+    runId: runtimeState?.runId ?? null,
+    lastStartedAt: runtimeState?.lastStartedAt ?? null,
+    lastCompletedAt: runtimeState?.lastCompletedAt ?? null,
+    lastStep: runtimeState?.lastStep ?? null,
+    lastStepAt: runtimeState?.lastStepAt ?? null,
+    lastStepStatus: runtimeState?.lastStepStatus ?? null,
+    latestExecutionAt: runtimeState?.latestExecutionAt ?? null,
+    latestExecutionStatus: runtimeState?.latestExecutionStatus ?? null,
+    error: runtimeState?.error ?? null
+  };
 }
 
 async function getBridgeLiveTradeEvents(options: {
@@ -368,7 +623,7 @@ export async function getEventDetailPayload(eventTicker: string) {
   };
 }
 
-export function getPortfolioPayload(): PortfolioPayloadWithFeeDrift {
+export function getPortfolioPayload(): PortfolioPayload {
   const positions = getOpenPositions();
   const trades = getRecentTrades(50);
   const exposure = positions.reduce(
@@ -376,8 +631,10 @@ export function getPortfolioPayload(): PortfolioPayloadWithFeeDrift {
     0
   );
   const divergenceSummary = getPortfolioOpenModeSummary();
+  const runtimeState = hasLiveTradeRuntimeStateTable() ? getLiveTradeRuntimeState() : null;
 
   return {
+    generatedAt: new Date().toISOString(),
     positions,
     trades,
     metrics: {
@@ -386,6 +643,7 @@ export function getPortfolioPayload(): PortfolioPayloadWithFeeDrift {
       realizedPnl: getRealizedPnl(),
       todayAiCost: getDailyAiCost()
     },
+    runtime: getLiveTradeRuntimeVisibility(runtimeState),
     divergence: {
       summary: divergenceSummary,
       rollups: {
@@ -395,6 +653,7 @@ export function getPortfolioPayload(): PortfolioPayloadWithFeeDrift {
       recentOrderDrift: getPortfolioOrderDriftMetrics(24),
       feeDivergence: getPortfolioFeeDriftMetrics(24 * 7)
     },
+    strategyPnl: getPortfolioStrategyPnlBreakdown(),
     aiSpend: {
       summary: getPortfolioAiSpendSummary(),
       byProvider: getPortfolioAiSpendByProvider(),
@@ -451,6 +710,10 @@ export async function getLiveTradePayload(query?: {
   const shouldLoadBitcoin =
     filters.categories.includes("Crypto") ||
     events.some((event) => event.focus_type === "bitcoin" || event.focus_type === "crypto");
+  const runtimeState = hasLiveTradeRuntimeStateTable() ? getLiveTradeRuntimeState() : null;
+  const decisionFeed = getLiveTradeDecisionFeedPayload(
+    Math.min(filters.limit, LIVE_TRADE_DECISION_FEED_LIMIT)
+  );
 
   return {
     generatedAt: bridgePayload.generated_at || new Date().toISOString(),
@@ -482,6 +745,8 @@ export async function getLiveTradePayload(query?: {
           : null
     },
     liveBtc: shouldLoadBitcoin ? await getBitcoinSnapshot().catch(() => null) : null,
+    runtime: getLiveTradeRuntimeVisibility(runtimeState),
+    decisionFeed,
     events: events.map((event) => ({
       ...event,
       latestAnalysis: latestAnalysisByEvent.get(event.event_ticker) ?? null

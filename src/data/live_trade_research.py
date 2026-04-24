@@ -20,7 +20,10 @@ from json_repair import repair_json
 
 from src.clients.kalshi_client import KalshiClient
 from src.clients.model_router import ModelRouter
+from src.data.crypto_adapter import CryptoAdapter
+from src.data.macro_adapter import MacroAdapter
 from src.data.news_aggregator import NewsAggregator
+from src.data.sports_adapter import SportsAdapter
 from src.utils.kalshi_normalization import (
     get_last_price,
     get_market_expiration_ts,
@@ -229,6 +232,9 @@ class LiveTradeResearchService(TradingLoggerMixin):
         model_router: Optional[ModelRouter] = None,
         news_aggregator: Optional[NewsAggregator] = None,
         http_client: Optional[httpx.AsyncClient] = None,
+        sports_adapter: Optional[SportsAdapter] = None,
+        crypto_adapter: Optional[CryptoAdapter] = None,
+        macro_adapter: Optional[MacroAdapter] = None,
     ) -> None:
         self.kalshi_client = kalshi_client or KalshiClient()
         self.model_router = model_router
@@ -241,6 +247,12 @@ class LiveTradeResearchService(TradingLoggerMixin):
         self._owns_kalshi_client = kalshi_client is None
         self._owns_model_router = model_router is None
         self._owns_http_client = http_client is None
+        self.sports_adapter = sports_adapter or SportsAdapter(http_client=self.http_client)
+        self.crypto_adapter = crypto_adapter or CryptoAdapter(http_client=self.http_client)
+        self.macro_adapter = macro_adapter or MacroAdapter(http_client=self.http_client)
+        self._owns_sports_adapter = sports_adapter is None
+        self._owns_crypto_adapter = crypto_adapter is None
+        self._owns_macro_adapter = macro_adapter is None
         self._team_directory_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._team_schedule_cache: Dict[str, Dict[str, Any]] = {}
         self._scoreboard_cache: Dict[str, Dict[str, Any]] = {}
@@ -254,6 +266,12 @@ class LiveTradeResearchService(TradingLoggerMixin):
             close_tasks.append(self.kalshi_client.close())
         if self._owns_model_router and self.model_router is not None:
             close_tasks.append(self.model_router.close())
+        if self._owns_sports_adapter:
+            close_tasks.append(self.sports_adapter.aclose())
+        if self._owns_crypto_adapter:
+            close_tasks.append(self.crypto_adapter.aclose())
+        if self._owns_macro_adapter:
+            close_tasks.append(self.macro_adapter.aclose())
 
         if close_tasks:
             await asyncio.gather(*close_tasks, return_exceptions=True)
@@ -593,24 +611,33 @@ class LiveTradeResearchService(TradingLoggerMixin):
         }
 
     async def build_event_research_payload(self, event: Dict[str, Any]) -> Dict[str, Any]:
-        """Add deterministic news, sports, bitcoin, and microstructure context."""
+        """Add deterministic news, adapter context, and microstructure data."""
         microstructure_task = asyncio.create_task(
             self._load_market_microstructure(event.get("markets", []))
         )
         news_task = asyncio.create_task(self._load_news_context(event["title"]))
 
+        focus_type = str(event.get("focus_type") or "general").lower()
         sports_task: Optional[asyncio.Task] = None
-        if event.get("focus_type") == "sports":
-            sports_task = asyncio.create_task(self._load_sports_context(event))
+        if focus_type == "sports":
+            sports_task = asyncio.create_task(self.sports_adapter.fetch_context(event))
 
         bitcoin_task: Optional[asyncio.Task] = None
-        if event.get("focus_type") in {"bitcoin", "crypto"}:
+        crypto_task: Optional[asyncio.Task] = None
+        if focus_type in {"bitcoin", "crypto"}:
             bitcoin_task = asyncio.create_task(self.fetch_bitcoin_context())
+            crypto_task = asyncio.create_task(self.crypto_adapter.fetch_context(event))
+
+        macro_task: Optional[asyncio.Task] = None
+        if focus_type not in {"sports", "bitcoin", "crypto"}:
+            macro_task = asyncio.create_task(self.macro_adapter.fetch_context(event))
 
         microstructure = await microstructure_task
         news_context = await news_task
         sports_context = await sports_task if sports_task else None
         bitcoin_context = await bitcoin_task if bitcoin_task else None
+        crypto_context = await crypto_task if crypto_task else None
+        macro_context = await macro_task if macro_task else None
 
         return {
             "event": event,
@@ -618,6 +645,8 @@ class LiveTradeResearchService(TradingLoggerMixin):
             "news": news_context,
             "sports_context": sports_context,
             "bitcoin_context": bitcoin_context,
+            "crypto_context": crypto_context,
+            "macro_context": macro_context,
         }
 
     async def analyze_event(
@@ -1320,6 +1349,8 @@ class LiveTradeResearchService(TradingLoggerMixin):
             "news": research_payload.get("news", {}),
             "sports_context": research_payload.get("sports_context"),
             "bitcoin_context": research_payload.get("bitcoin_context"),
+            "crypto_context": research_payload.get("crypto_context"),
+            "macro_context": research_payload.get("macro_context"),
         }
 
         return (

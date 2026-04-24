@@ -512,14 +512,25 @@ class UnifiedAdvancedTradingSystem:
             async def _current_position_exposures() -> Dict[str, float]:
                 exposures: Dict[str, float] = {}
                 for existing in await self.db_manager.get_open_positions():
-                    market_key = str(getattr(existing, "market_id", "") or "")
+                    if isinstance(existing, dict):
+                        market_key = str(existing.get("market_id", "") or "")
+                    else:
+                        market_key = str(getattr(existing, "market_id", "") or "")
                     if not market_key:
                         continue
-                    contracts_cost = float(getattr(existing, "contracts_cost", 0.0) or 0.0)
+                    if isinstance(existing, dict):
+                        contracts_cost = float(existing.get("contracts_cost", 0.0) or 0.0)
+                    else:
+                        contracts_cost = float(getattr(existing, "contracts_cost", 0.0) or 0.0)
                     if contracts_cost <= 0:
-                        quantity = float(getattr(existing, "quantity", 0.0) or 0.0)
-                        entry_price = float(getattr(existing, "entry_price", 0.0) or 0.0)
-                        entry_fee = max(float(getattr(existing, "entry_fee", 0.0) or 0.0), 0.0)
+                        if isinstance(existing, dict):
+                            quantity = float(existing.get("quantity", 0.0) or 0.0)
+                            entry_price = float(existing.get("entry_price", 0.0) or 0.0)
+                            entry_fee = max(float(existing.get("entry_fee", 0.0) or 0.0), 0.0)
+                        else:
+                            quantity = float(getattr(existing, "quantity", 0.0) or 0.0)
+                            entry_price = float(getattr(existing, "entry_price", 0.0) or 0.0)
+                            entry_fee = max(float(getattr(existing, "entry_fee", 0.0) or 0.0), 0.0)
                         contracts_cost = max((quantity * entry_price) + entry_fee, 0.0)
                     exposures[market_key] = exposures.get(market_key, 0.0) + contracts_cost
                 return exposures

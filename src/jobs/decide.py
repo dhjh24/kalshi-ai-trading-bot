@@ -62,13 +62,18 @@ def _calculate_dynamic_quantity(
 
 def _estimate_position_cost_basis(position) -> float:
     """Estimate deployed capital for an open position."""
-    contracts_cost = float(getattr(position, "contracts_cost", 0.0) or 0.0)
+    def _field(name: str, default: float = 0.0):
+        if isinstance(position, dict):
+            return position.get(name, default)
+        return getattr(position, name, default)
+
+    contracts_cost = float(_field("contracts_cost", 0.0) or 0.0)
     if contracts_cost > 0:
         return contracts_cost
 
-    quantity = float(getattr(position, "quantity", 0.0) or 0.0)
-    entry_price = float(getattr(position, "entry_price", 0.0) or 0.0)
-    entry_fee = max(float(getattr(position, "entry_fee", 0.0) or 0.0), 0.0)
+    quantity = float(_field("quantity", 0.0) or 0.0)
+    entry_price = float(_field("entry_price", 0.0) or 0.0)
+    entry_fee = max(float(_field("entry_fee", 0.0) or 0.0), 0.0)
     return max((quantity * entry_price) + entry_fee, 0.0)
 
 
@@ -84,7 +89,10 @@ async def _get_current_position_exposures(db_manager: DatabaseManager) -> Dict[s
 
     exposures: Dict[str, float] = {}
     for position in result or []:
-        market_id = str(getattr(position, "market_id", "") or "")
+        if isinstance(position, dict):
+            market_id = str(position.get("market_id", "") or "")
+        else:
+            market_id = str(getattr(position, "market_id", "") or "")
         if not market_id:
             continue
         exposures[market_id] = exposures.get(market_id, 0.0) + _estimate_position_cost_basis(position)

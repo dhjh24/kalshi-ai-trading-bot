@@ -41,5 +41,8 @@ export const serverConfig = {
   dataRefreshMs: Number(process.env.DASHBOARD_REFRESH_MS || 15000),
   newsRefreshMs: Number(process.env.DASHBOARD_NEWS_REFRESH_MS || 120000),
   sportsRefreshMs: Number(process.env.DASHBOARD_SPORTS_REFRESH_MS || 20000),
-  cryptoRefreshMs: Number(process.env.DASHBOARD_CRYPTO_REFRESH_MS || 15000)
+  cryptoRefreshMs: Number(process.env.DASHBOARD_CRYPTO_REFRESH_MS || 15000),
+  liveTradeHeartbeatStaleAfterMs: Number(
+    process.env.DASHBOARD_LIVE_TRADE_STALE_AFTER_MS || 300000
+  )
 } as const;

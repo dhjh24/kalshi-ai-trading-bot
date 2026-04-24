@@ -8,10 +8,264 @@ import { RuntimeModePanel } from "../../components/runtime-mode-panel";
 import { Badge, EmptyState, Panel, StatCard } from "../../components/ui";
 import { getLiveTrade } from "../../lib/api";
 import { formatMoney, formatTimestamp } from "../../lib/format";
+import { LiveTradeDecisionsPanel } from "./live-trade-decisions-panel";
+import { LiveTradeAttentionBoard } from "./live-trade-attention-board";
+import {
+  LiveTradeEventMonitoringStrip,
+  LiveTradeMonitoringRollup,
+} from "./live-trade-monitoring-strip";
+import { LiveTradeRefreshControls } from "./live-trade-refresh-controls";
 
 const CATEGORY_OPTIONS = ["Sports", "Financials", "Crypto", "Economics"];
 const VISIBLE_EVENT_OPTIONS = [12, 24, 36, 48];
 const MAX_HOURS_OPTIONS = [12, 24, 48, 72, 168];
+type RuntimeMode = "paper" | "shadow" | "live" | "unknown";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function parseBoolean(value: unknown): boolean | null {
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  if (typeof value === "number") {
+    return value !== 0;
+  }
+
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["1", "true", "yes", "on", "enabled"].includes(normalized)) {
+      return true;
+    }
+    if (["0", "false", "no", "off", "disabled"].includes(normalized)) {
+      return false;
+    }
+  }
+
+  return null;
+}
+
+function parseMode(value: unknown): Exclude<RuntimeMode, "unknown"> | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (
+    normalized === "paper" ||
+    normalized === "shadow" ||
+    normalized === "live"
+  ) {
+    return normalized;
+  }
+
+  return null;
+}
+
+function readBoolean(
+  record: Record<string, unknown> | null,
+  keys: string[],
+): boolean | null {
+  if (!record) {
+    return null;
+  }
+
+  for (const key of keys) {
+    const parsed = parseBoolean(record[key]);
+    if (parsed !== null) {
+      return parsed;
+    }
+  }
+
+  return null;
+}
+
+function readString(
+  record: Record<string, unknown> | null,
+  keys: string[],
+): string | null {
+  if (!record) {
+    return null;
+  }
+
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+
+  return null;
+}
+
+function readEnvValue(keys: string[]): string | null {
+  for (const key of keys) {
+    const value = process.env[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+
+  return null;
+}
+
+function readEnvBoolean(keys: string[]): boolean | null {
+  return parseBoolean(readEnvValue(keys));
+}
+
+function extractRuntimeRecord(source: unknown): Record<string, unknown> | null {
+  if (!isRecord(source)) {
+    return null;
+  }
+
+  if (isRecord(source.runtime)) {
+    return source.runtime;
+  }
+
+  if (isRecord(source.runtime_mode)) {
+    return source.runtime_mode;
+  }
+
+  if (isRecord(source.config) && isRecord(source.config.runtime)) {
+    return source.config.runtime;
+  }
+
+  if (isRecord(source.config) && isRecord(source.config.runtime_mode)) {
+    return source.config.runtime_mode;
+  }
+
+  return source;
+}
+
+function resolveRuntimeBanner(source: unknown) {
+  const runtimeRecord = extractRuntimeRecord(source);
+  const configuredMode =
+    parseMode(
+      readString(runtimeRecord, [
+        "mode",
+        "runtime_mode",
+        "primaryMode",
+        "configuredMode",
+      ]),
+    ) ?? parseMode(readEnvValue(["TRADING_MODE", "RUNTIME_MODE"]));
+  const live =
+    readBoolean(runtimeRecord, [
+      "live",
+      "liveEnabled",
+      "live_enabled",
+      "liveTradingEnabled",
+      "live_trading_enabled",
+    ]) ??
+    readEnvBoolean(["LIVE_TRADING_ENABLED", "NEXT_PUBLIC_LIVE_TRADING_ENABLED"]);
+  const shadow =
+    readBoolean(runtimeRecord, [
+      "shadow",
+      "shadowEnabled",
+      "shadow_enabled",
+      "shadowModeEnabled",
+      "shadow_mode_enabled",
+    ]) ??
+    readEnvBoolean(["SHADOW_MODE_ENABLED", "NEXT_PUBLIC_SHADOW_MODE_ENABLED"]);
+  const paperFromConfig =
+    readBoolean(runtimeRecord, [
+      "paper",
+      "paperEnabled",
+      "paper_enabled",
+      "paperTradingMode",
+      "paper_trading_mode",
+    ]) ??
+    readEnvBoolean(["PAPER_TRADING_MODE", "NEXT_PUBLIC_PAPER_TRADING_MODE"]);
+  const paper = paperFromConfig ?? (live === null ? null : !live);
+  const exchange =
+    readString(runtimeRecord, [
+      "exchange",
+      "exchangeEnv",
+      "exchange_env",
+      "kalshiEnv",
+      "kalshi_env",
+      "environment",
+    ]) ?? readEnvValue(["KALSHI_ENV", "NEXT_PUBLIC_KALSHI_ENV"]);
+  const sourceLabel =
+    readString(runtimeRecord, ["source", "source_label"]) ||
+    (runtimeRecord ? "runtime payload" : "dashboard env");
+
+  let primaryMode: RuntimeMode = "unknown";
+  if (configuredMode === "live" || live === true) {
+    primaryMode = "live";
+  } else if (configuredMode === "shadow" || shadow === true) {
+    primaryMode = "shadow";
+  } else if (configuredMode === "paper" || paper === true) {
+    primaryMode = "paper";
+  }
+
+  if (primaryMode === "live") {
+    return {
+      primaryMode,
+      exchangeLabel: exchange ?? "Unknown",
+      sourceLabel,
+      eyebrow: "Live Execution Warning",
+      title: "Live trading is enabled for this runtime",
+      description:
+        "Treat this page as production-sensitive. The Python worker may place real Kalshi orders when manual actions or scheduled execution paths fire.",
+      containerClassName:
+        "rounded-[28px] border-2 border-rose-300 bg-rose-50/90 p-6 shadow-panel",
+      titleClassName: "text-2xl font-semibold text-rose-900",
+      bodyClassName: "max-w-3xl text-sm leading-6 text-rose-800",
+      modeTone: "negative" as const,
+    };
+  }
+
+  if (primaryMode === "shadow") {
+    return {
+      primaryMode,
+      exchangeLabel: exchange ?? "Unknown",
+      sourceLabel,
+      eyebrow: "Shadow Runtime",
+      title: "Shadow mode is active",
+      description:
+        "This route is wired to a shadow runtime. It should mirror live-like decisions without sending real orders, but operators should still verify the launched Python job before acting.",
+      containerClassName:
+        "rounded-[28px] border-2 border-amber-300 bg-amber-50/90 p-6 shadow-panel",
+      titleClassName: "text-2xl font-semibold text-amber-900",
+      bodyClassName: "max-w-3xl text-sm leading-6 text-amber-900",
+      modeTone: "warning" as const,
+    };
+  }
+
+  if (primaryMode === "paper") {
+    return {
+      primaryMode,
+      exchangeLabel: exchange ?? "Unknown",
+      sourceLabel,
+      eyebrow: "Paper Runtime",
+      title: "Paper trading mode is active",
+      description:
+        "The dashboard-visible runtime is configured for simulated execution. Keep in mind the currently launched Python process can still differ from what this page sees.",
+      containerClassName:
+        "rounded-[28px] border-2 border-emerald-300 bg-emerald-50/90 p-6 shadow-panel",
+      titleClassName: "text-2xl font-semibold text-emerald-900",
+      bodyClassName: "max-w-3xl text-sm leading-6 text-emerald-900",
+      modeTone: "positive" as const,
+    };
+  }
+
+  return {
+    primaryMode,
+    exchangeLabel: exchange ?? "Unknown",
+    sourceLabel,
+    eyebrow: "Runtime Visibility Gap",
+    title: "Runtime mode is not explicit",
+    description:
+      "The dashboard could not confirm whether this worker is paper, shadow, or live. Confirm the Python launch flags and exchange target before relying on any decision row.",
+    containerClassName:
+      "rounded-[28px] border-2 border-slate-300 bg-slate-100/90 p-6 shadow-panel",
+    titleClassName: "text-2xl font-semibold text-slate-900",
+    bodyClassName: "max-w-3xl text-sm leading-6 text-slate-700",
+    modeTone: "warning" as const,
+  };
+}
 
 function parseNumber(
   value: string | string[] | undefined,
@@ -83,6 +337,7 @@ export default async function LiveTradePage({
         event.hours_to_expiry === null ||
         event.hours_to_expiry > filters.maxHoursToExpiry,
     );
+  const runtimeBanner = resolveRuntimeBanner(payload);
 
   return (
     <div className="space-y-6">
@@ -93,9 +348,51 @@ export default async function LiveTradePage({
         <p className="max-w-3xl text-slate-600">
           This route carries over the Streamlit live-trade view: short-dated
           event ranking, category filters, crypto context, and manual analysis
-          controls for the highest-signal candidates.
+          controls for the highest-signal candidates, plus persisted decision
+          rows streamed from SQLite as they land.
         </p>
       </Panel>
+
+      <section className={runtimeBanner.containerClassName}>
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div className="space-y-3">
+            <p className="text-xs uppercase tracking-[0.32em] text-slate-600">
+              {runtimeBanner.eyebrow}
+            </p>
+            <div className="flex flex-wrap items-center gap-3">
+              <h2 className={runtimeBanner.titleClassName}>
+                {runtimeBanner.title}
+              </h2>
+              <Badge tone={runtimeBanner.modeTone}>
+                {runtimeBanner.primaryMode === "unknown"
+                  ? "Mode unclear"
+                  : `${runtimeBanner.primaryMode} mode`}
+              </Badge>
+            </div>
+            <p className={runtimeBanner.bodyClassName}>
+              {runtimeBanner.description}
+            </p>
+          </div>
+          <div className="grid min-w-[260px] gap-3 sm:grid-cols-2">
+            <div className="rounded-2xl border border-black/10 bg-white/70 p-4">
+              <p className="text-xs uppercase tracking-[0.24em] text-slate-500">
+                Exchange target
+              </p>
+              <p className="mt-2 text-base font-semibold text-steel">
+                {runtimeBanner.exchangeLabel}
+              </p>
+            </div>
+            <div className="rounded-2xl border border-black/10 bg-white/70 p-4">
+              <p className="text-xs uppercase tracking-[0.24em] text-slate-500">
+                Telemetry source
+              </p>
+              <p className="mt-2 text-base font-semibold text-steel">
+                {runtimeBanner.sourceLabel}
+              </p>
+            </div>
+          </div>
+        </div>
+      </section>
 
       <RuntimeModePanel source={payload} title="Configured trading mode" />
 
@@ -153,16 +450,18 @@ export default async function LiveTradePage({
               </div>
             </fieldset>
 
-            <div className="md:col-span-2 xl:col-span-4 flex items-center gap-3">
+            <div className="flex flex-wrap items-center gap-3 md:col-span-2 xl:col-span-4">
               <button
                 type="submit"
                 className="rounded-full bg-steel px-5 py-3 text-sm font-semibold text-white transition hover:bg-signal"
               >
                 Apply Filters
               </button>
-              <span className="text-sm text-slate-500">
-                Snapshot generated {formatTimestamp(payload.generatedAt)}.
-              </span>
+              <LiveTradeRefreshControls
+                generatedAt={payload.generatedAt}
+                latestDecisionAt={payload.decisionFeed.latestRecordedAt}
+                latestAnalysisUpdatedAt={payload.latestAnalysisUpdatedAt}
+              />
             </div>
           </form>
         </Panel>
@@ -206,6 +505,18 @@ export default async function LiveTradePage({
           }
         />
       </div>
+
+      <LiveTradeMonitoringRollup
+        events={payload.events}
+        decisionFeed={payload.decisionFeed}
+      />
+
+      <LiveTradeAttentionBoard
+        events={payload.events}
+        decisionFeed={payload.decisionFeed}
+      />
+
+      <LiveTradeDecisionsPanel initialFeed={payload.decisionFeed} />
 
       {shouldShowBtc && payload.liveBtc ? (
         <section className="space-y-6">
@@ -305,6 +616,11 @@ export default async function LiveTradePage({
                 initialRecord={event.latestAnalysis}
               />
             </div>
+
+            <LiveTradeEventMonitoringStrip
+              event={event}
+              decisionFeed={payload.decisionFeed}
+            />
 
             <div className="mt-6 overflow-hidden rounded-[22px] border border-slate-100">
               <table className="min-w-full divide-y divide-slate-100">

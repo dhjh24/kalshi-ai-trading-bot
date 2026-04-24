@@ -96,7 +96,7 @@ describe("getPortfolioAiSpendByProvider", () => {
           label: "openai",
           costUsd: 2,
           count: 2,
-          tokensUsed: null,
+          tokensUsed: 100,
           shareOfKnownCostPct: 74.1
         },
         {
@@ -104,7 +104,7 @@ describe("getPortfolioAiSpendByProvider", () => {
           label: "anthropic",
           costUsd: 0.5,
           count: 1,
-          tokensUsed: null,
+          tokensUsed: 50,
           shareOfKnownCostPct: 18.5
         },
         {
@@ -120,10 +120,630 @@ describe("getPortfolioAiSpendByProvider", () => {
           label: "Unattributed",
           costUsd: 0.15,
           count: 2,
-          tokensUsed: null,
+          tokensUsed: 30,
           shareOfKnownCostPct: 0
         }
       ]
     });
+  });
+});
+
+describe("getPortfolioAiSpendSummary", () => {
+  it("includes Codex quota windows derived from llm query telemetry", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "dashboard-repository-"));
+    const databasePath = path.join(tempDir, "dashboard.sqlite");
+    const scriptPath = path.join(tempDir, "codex-quota-summary-check.mjs");
+    const repositoryUrl = pathToFileURL(
+      path.join(serverRoot, "src/repositories/dashboardRepository.ts")
+    ).href;
+    const dbUrl = pathToFileURL(path.join(serverRoot, "src/db.ts")).href;
+    const sixHoursAgo = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    const threeDaysAgo = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString();
+    const tenDaysAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+    tempDirs.push(tempDir);
+
+    writeFileSync(
+      scriptPath,
+      `
+        import { getDb } from ${JSON.stringify(dbUrl)};
+        import { getPortfolioAiSpendSummary } from ${JSON.stringify(repositoryUrl)};
+
+        const db = getDb();
+
+        try {
+          db.exec(\`
+            CREATE TABLE llm_queries (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              provider TEXT,
+              cost_usd REAL,
+              tokens_used INTEGER,
+              timestamp TEXT NOT NULL
+            );
+
+            INSERT INTO llm_queries (provider, cost_usd, tokens_used, timestamp)
+            VALUES
+              ('codex', 0.4, 120, ${JSON.stringify(sixHoursAgo)}),
+              ('openai', 0.1, 60, ${JSON.stringify(twoHoursAgo)}),
+              ('codex', 0.2, 80, ${JSON.stringify(threeDaysAgo)}),
+              ('codex', 0.5, 200, ${JSON.stringify(tenDaysAgo)});
+          \`);
+
+          console.log(JSON.stringify(getPortfolioAiSpendSummary()));
+        } finally {
+          db.close();
+        }
+      `
+    );
+
+    const result = JSON.parse(
+      execFileSync(process.execPath, ["--import", "tsx/esm", scriptPath], {
+        cwd: serverRoot,
+        env: {
+          ...process.env,
+          DB_PATH: databasePath
+        },
+        encoding: "utf8"
+      }).trim()
+    );
+
+    expect(result).toEqual({
+      reportedTodayUsd: 0,
+      knownCostLast24hUsd: 0.5,
+      knownCostLast7dUsd: 0.7,
+      knownCostLifetimeUsd: 1.2,
+      llmQueryCount: 4,
+      analysisRequestCount: 0,
+      tokensUsed: 460,
+      latestLlmQueryAt: twoHoursAgo,
+      latestAnalysisRequestAt: null,
+      codexQuota: {
+        available: true,
+        sourceTable: "llm_queries",
+        provider: "codex",
+        last24h: {
+          queryCount: 1,
+          tokensUsed: 120,
+          latestAt: sixHoursAgo
+        },
+        last7d: {
+          queryCount: 2,
+          tokensUsed: 200,
+          latestAt: sixHoursAgo
+        },
+        lifetime: {
+          queryCount: 3,
+          tokensUsed: 400,
+          latestAt: sixHoursAgo
+        }
+      }
+    });
+  });
+});
+
+describe("live_trade_decisions repository helpers", () => {
+  it("returns an empty result when the decision table is missing", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "dashboard-repository-"));
+    const databasePath = path.join(tempDir, "dashboard.sqlite");
+    const scriptPath = path.join(tempDir, "live-trade-decisions-missing.mjs");
+    const repositoryUrl = pathToFileURL(
+      path.join(serverRoot, "src/repositories/dashboardRepository.ts")
+    ).href;
+    const dbUrl = pathToFileURL(path.join(serverRoot, "src/db.ts")).href;
+    tempDirs.push(tempDir);
+
+    writeFileSync(
+      scriptPath,
+      `
+        import { getDb } from ${JSON.stringify(dbUrl)};
+        import {
+          hasLiveTradeDecisionTable,
+          listLiveTradeDecisions
+        } from ${JSON.stringify(repositoryUrl)};
+
+        const db = getDb();
+
+        try {
+          console.log(
+            JSON.stringify({
+              hasTable: hasLiveTradeDecisionTable(),
+              decisions: listLiveTradeDecisions(5)
+            })
+          );
+        } finally {
+          db.close();
+        }
+      `
+    );
+
+    const result = JSON.parse(
+      execFileSync(process.execPath, ["--import", "tsx/esm", scriptPath], {
+        cwd: serverRoot,
+        env: {
+          ...process.env,
+          DB_PATH: databasePath
+        },
+        encoding: "utf8"
+      }).trim()
+    );
+
+    expect(result).toEqual({
+      hasTable: false,
+      decisions: []
+    });
+  });
+
+  it("normalizes sparse decision rows with payload JSON fallbacks", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "dashboard-repository-"));
+    const databasePath = path.join(tempDir, "dashboard.sqlite");
+    const scriptPath = path.join(tempDir, "live-trade-decisions-normalized.mjs");
+    const repositoryUrl = pathToFileURL(
+      path.join(serverRoot, "src/repositories/dashboardRepository.ts")
+    ).href;
+    const dbUrl = pathToFileURL(path.join(serverRoot, "src/db.ts")).href;
+    tempDirs.push(tempDir);
+
+    writeFileSync(
+      scriptPath,
+      `
+        import { getDb } from ${JSON.stringify(dbUrl)};
+        import { listLiveTradeDecisions } from ${JSON.stringify(repositoryUrl)};
+
+        const db = getDb();
+
+        try {
+          db.exec(\`
+            CREATE TABLE live_trade_decisions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              created_at TEXT,
+              run_id TEXT,
+              step TEXT,
+              strategy TEXT,
+              status TEXT,
+              event_ticker TEXT,
+              market_ticker TEXT,
+              title TEXT,
+              focus_type TEXT,
+              provider TEXT,
+              model TEXT,
+              action TEXT,
+              side TEXT,
+              confidence REAL,
+              edge_pct REAL,
+              limit_price REAL,
+              quantity REAL,
+              hold_minutes INTEGER,
+              paper_trade INTEGER,
+              live_trade INTEGER,
+              summary TEXT,
+              rationale TEXT,
+              payload_json TEXT,
+              error TEXT
+            );
+
+            INSERT INTO live_trade_decisions (
+              created_at,
+              run_id,
+              step,
+              strategy,
+              status,
+              event_ticker,
+              market_ticker,
+              title,
+              focus_type,
+              provider,
+              model,
+              action,
+              side,
+              confidence,
+              edge_pct,
+              limit_price,
+              quantity,
+              hold_minutes,
+              paper_trade,
+              live_trade,
+              summary,
+              rationale,
+              payload_json,
+              error
+            )
+            VALUES
+              (
+                '2026-04-20T02:00:00Z',
+                'run-001',
+                'ranked',
+                'quick_flip_scalping',
+                'completed',
+                'BTC-APR',
+                'BTC-ABOVE-94K',
+                'BTC closes above 94k',
+                'bitcoin',
+                'openai',
+                'gpt-5.1-mini',
+                'BUY',
+                'YES',
+                0.83,
+                0.12,
+                0.57,
+                12,
+                45,
+                1,
+                0,
+                'Momentum still beats market pricing.',
+                'Spot momentum is still improving.',
+                '{"market":{"yesPrice":0.52}}',
+                NULL
+              ),
+              (
+                '2026-04-20T03:00:00Z',
+                'run-002',
+                'risk-check',
+                'macro_swing',
+                'blocked',
+                'FED-MAY',
+                NULL,
+                'Fed May decision',
+                'macro',
+                'openrouter',
+                'gpt-4.1',
+                'SKIP',
+                'NO',
+                0.31,
+                0.01,
+                0.44,
+                4,
+                30,
+                0,
+                0,
+                'No durable edge before the meeting.',
+                NULL,
+                '{"market":{"yesPrice":0.41},"decision":{"cost_usd":0.02}}',
+                'Guardrail blocked the order.'
+              );
+          \`);
+
+          console.log(JSON.stringify(listLiveTradeDecisions(5)));
+        } finally {
+          db.close();
+        }
+      `
+    );
+
+    const result = JSON.parse(
+      execFileSync(process.execPath, ["--import", "tsx/esm", scriptPath], {
+        cwd: serverRoot,
+        env: {
+          ...process.env,
+          DB_PATH: databasePath
+        },
+        encoding: "utf8"
+      }).trim()
+    );
+
+    expect(result).toEqual([
+      {
+        id: "2",
+        sequence: 2,
+        recordedAt: "2026-04-20T03:00:00Z",
+        runId: "run-002",
+        step: "risk-check",
+        marketId: null,
+        eventTicker: "FED-MAY",
+        title: "Fed May decision",
+        focusType: "macro",
+        strategy: "macro_swing",
+        provider: "openrouter",
+        model: "gpt-4.1",
+        source: "openrouter",
+        status: "blocked",
+        decision: "SKIP",
+        side: "NO",
+        confidence: 0.31,
+        holdMinutes: 30,
+        paperTrade: false,
+        liveTrade: false,
+        summary: "No durable edge before the meeting.",
+        rationale: "No durable edge before the meeting.",
+        error: "Guardrail blocked the order.",
+        payload: {
+          market: {
+            yesPrice: 0.41
+          },
+          decision: {
+            cost_usd: 0.02
+          }
+        },
+        metrics: {
+          limitPrice: 0.44,
+          yesPrice: 0.41,
+          noPrice: null,
+          edge: 0.01,
+          quantity: 4,
+          contractsCost: null,
+          costUsd: 0.02
+        },
+        feedback: null
+      },
+      {
+        id: "1",
+        sequence: 1,
+        recordedAt: "2026-04-20T02:00:00Z",
+        runId: "run-001",
+        step: "ranked",
+        marketId: "BTC-ABOVE-94K",
+        eventTicker: "BTC-APR",
+        title: "BTC closes above 94k",
+        focusType: "bitcoin",
+        strategy: "quick_flip_scalping",
+        provider: "openai",
+        model: "gpt-5.1-mini",
+        source: "openai",
+        status: "completed",
+        decision: "BUY",
+        side: "YES",
+        confidence: 0.83,
+        holdMinutes: 45,
+        paperTrade: true,
+        liveTrade: false,
+        summary: "Momentum still beats market pricing.",
+        rationale: "Spot momentum is still improving.",
+        error: null,
+        payload: {
+          market: {
+            yesPrice: 0.52
+          }
+        },
+        metrics: {
+          limitPrice: 0.57,
+          yesPrice: 0.52,
+          noPrice: null,
+          edge: 0.12,
+          quantity: 12,
+          contractsCost: null,
+          costUsd: null
+        },
+        feedback: null
+      }
+    ]);
+  });
+});
+
+describe("live_trade_decision_feedback repository helpers", () => {
+  it("returns null when the feedback table is missing", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "dashboard-repository-"));
+    const databasePath = path.join(tempDir, "dashboard.sqlite");
+    const scriptPath = path.join(tempDir, "live-trade-decision-feedback-missing.mjs");
+    const repositoryUrl = pathToFileURL(
+      path.join(serverRoot, "src/repositories/dashboardRepository.ts")
+    ).href;
+    const dbUrl = pathToFileURL(path.join(serverRoot, "src/db.ts")).href;
+    tempDirs.push(tempDir);
+
+    writeFileSync(
+      scriptPath,
+      `
+        import { getDb } from ${JSON.stringify(dbUrl)};
+        import {
+          getLiveTradeDecisionFeedbackByDecisionId,
+          hasLiveTradeDecisionFeedbackTable,
+          listLiveTradeDecisionFeedbackByDecisionIds
+        } from ${JSON.stringify(repositoryUrl)};
+
+        const db = getDb();
+
+        try {
+          console.log(
+            JSON.stringify({
+              hasTable: hasLiveTradeDecisionFeedbackTable(),
+              one: getLiveTradeDecisionFeedbackByDecisionId('decision-1'),
+              many: listLiveTradeDecisionFeedbackByDecisionIds(['decision-1'])
+            })
+          );
+        } finally {
+          db.close();
+        }
+      `
+    );
+
+    const result = JSON.parse(
+      execFileSync(process.execPath, ["--import", "tsx/esm", scriptPath], {
+        cwd: serverRoot,
+        env: {
+          ...process.env,
+          DB_PATH: databasePath
+        },
+        encoding: "utf8"
+      }).trim()
+    );
+
+    expect(result).toEqual({
+      hasTable: false,
+      one: null,
+      many: []
+    });
+  });
+
+  it("normalizes sparse feedback rows with payload JSON fallbacks", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "dashboard-repository-"));
+    const databasePath = path.join(tempDir, "dashboard.sqlite");
+    const scriptPath = path.join(tempDir, "live-trade-decision-feedback-normalized.mjs");
+    const repositoryUrl = pathToFileURL(
+      path.join(serverRoot, "src/repositories/dashboardRepository.ts")
+    ).href;
+    const dbUrl = pathToFileURL(path.join(serverRoot, "src/db.ts")).href;
+    tempDirs.push(tempDir);
+
+    writeFileSync(
+      scriptPath,
+      `
+        import { getDb } from ${JSON.stringify(dbUrl)};
+        import { listLiveTradeDecisionFeedbackByDecisionIds } from ${JSON.stringify(repositoryUrl)};
+
+        const db = getDb();
+
+        try {
+          db.exec(\`
+            CREATE TABLE live_trade_decision_feedback (
+              decision_id TEXT,
+              feedback TEXT,
+              updated_at TEXT,
+              payload_json TEXT
+            );
+
+            INSERT INTO live_trade_decision_feedback (
+              decision_id,
+              feedback,
+              updated_at,
+              payload_json
+            )
+            VALUES
+              (
+                'decision-1',
+                'up',
+                '2026-04-20T05:00:00Z',
+                '{"notes":"Strong call","source":"dashboard-ui","run_id":"run-001","event_ticker":"BTC-APR","market":{"ticker":"BTC-ABOVE-94K"},"created_at":"2026-04-20T04:00:00Z"}'
+              ),
+              (
+                'decision-2',
+                NULL,
+                '2026-04-20T06:00:00Z',
+                '{"feedback":"down","notes":"Too reactive","source":"ops-review","run_id":"run-002","event_ticker":"FED-MAY","market_ticker":"FED-25BP","created_at":"2026-04-20T05:30:00Z"}'
+              );
+          \`);
+
+          console.log(
+            JSON.stringify(
+              listLiveTradeDecisionFeedbackByDecisionIds(['decision-1', 'decision-2'])
+            )
+          );
+        } finally {
+          db.close();
+        }
+      `
+    );
+
+    const result = JSON.parse(
+      execFileSync(process.execPath, ["--import", "tsx/esm", scriptPath], {
+        cwd: serverRoot,
+        env: {
+          ...process.env,
+          DB_PATH: databasePath
+        },
+        encoding: "utf8"
+      }).trim()
+    );
+
+    expect(result).toEqual([
+      {
+        decisionId: "decision-1",
+        runId: "run-001",
+        eventTicker: "BTC-APR",
+        marketId: "BTC-ABOVE-94K",
+        feedback: "up",
+        notes: "Strong call",
+        source: "dashboard-ui",
+        createdAt: "2026-04-20T04:00:00Z",
+        updatedAt: "2026-04-20T05:00:00Z"
+      },
+      {
+        decisionId: "decision-2",
+        runId: "run-002",
+        eventTicker: "FED-MAY",
+        marketId: "FED-25BP",
+        feedback: "down",
+        notes: "Too reactive",
+        source: "ops-review",
+        createdAt: "2026-04-20T05:30:00Z",
+        updatedAt: "2026-04-20T06:00:00Z"
+      }
+    ]);
+  });
+
+  it("upserts feedback rows using the shared SQLite schema", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "dashboard-repository-"));
+    const databasePath = path.join(tempDir, "dashboard.sqlite");
+    const scriptPath = path.join(tempDir, "live-trade-decision-feedback-upsert.mjs");
+    const repositoryUrl = pathToFileURL(
+      path.join(serverRoot, "src/repositories/dashboardRepository.ts")
+    ).href;
+    const dbUrl = pathToFileURL(path.join(serverRoot, "src/db.ts")).href;
+    tempDirs.push(tempDir);
+
+    writeFileSync(
+      scriptPath,
+      `
+        import { getDb } from ${JSON.stringify(dbUrl)};
+        import {
+          getLiveTradeDecisionFeedbackByDecisionId,
+          upsertLiveTradeDecisionFeedback
+        } from ${JSON.stringify(repositoryUrl)};
+
+        const db = getDb();
+
+        try {
+          const first = upsertLiveTradeDecisionFeedback({
+            decisionId: 'decision-9',
+            runId: 'run-009',
+            eventTicker: 'BTC-APR',
+            marketId: 'BTC-ABOVE-94K',
+            feedback: 'up',
+            notes: 'Initial review',
+            source: 'dashboard'
+          });
+          const second = upsertLiveTradeDecisionFeedback({
+            decisionId: 'decision-9',
+            runId: 'run-009',
+            eventTicker: 'BTC-APR',
+            marketId: 'BTC-ABOVE-94K',
+            feedback: 'down',
+            notes: 'Reversed after fill',
+            source: 'dashboard'
+          });
+
+          console.log(
+            JSON.stringify({
+              first,
+              second,
+              stored: getLiveTradeDecisionFeedbackByDecisionId('decision-9')
+            })
+          );
+        } finally {
+          db.close();
+        }
+      `
+    );
+
+    const result = JSON.parse(
+      execFileSync(process.execPath, ["--import", "tsx/esm", scriptPath], {
+        cwd: serverRoot,
+        env: {
+          ...process.env,
+          DB_PATH: databasePath
+        },
+        encoding: "utf8"
+      }).trim()
+    );
+
+    expect(result.first).toMatchObject({
+      decisionId: "decision-9",
+      runId: "run-009",
+      eventTicker: "BTC-APR",
+      marketId: "BTC-ABOVE-94K",
+      feedback: "up",
+      notes: "Initial review",
+      source: "dashboard"
+    });
+    expect(result.second).toMatchObject({
+      decisionId: "decision-9",
+      runId: "run-009",
+      eventTicker: "BTC-APR",
+      marketId: "BTC-ABOVE-94K",
+      feedback: "down",
+      notes: "Reversed after fill",
+      source: "dashboard"
+    });
+    expect(result.second.createdAt).toBe(result.first.createdAt);
+    expect(result.second.updatedAt).not.toBe(result.first.updatedAt);
+    expect(result.stored).toEqual(result.second);
   });
 });

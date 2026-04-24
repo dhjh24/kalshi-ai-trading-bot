@@ -151,6 +151,74 @@ class LLMQuery:
     id: Optional[int] = None
 
 
+@dataclass
+class LiveTradeDecision:
+    """Represents one persisted live-trade loop step or execution outcome."""
+    created_at: datetime
+    run_id: str
+    step: str
+    strategy: str = "live_trade"
+    status: str = "completed"
+    event_ticker: Optional[str] = None
+    market_ticker: Optional[str] = None
+    title: Optional[str] = None
+    focus_type: Optional[str] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    action: Optional[str] = None
+    side: Optional[str] = None
+    confidence: Optional[float] = None
+    edge_pct: Optional[float] = None
+    limit_price: Optional[float] = None
+    quantity: Optional[float] = None
+    hold_minutes: Optional[int] = None
+    paper_trade: bool = True
+    live_trade: bool = False
+    summary: Optional[str] = None
+    rationale: Optional[str] = None
+    payload_json: Optional[str] = None
+    error: Optional[str] = None
+    id: Optional[int] = None
+
+
+@dataclass
+class LiveTradeDecisionFeedback:
+    """Represents one operator feedback vote on a persisted live-trade decision."""
+    decision_id: str
+    feedback: str
+    created_at: datetime
+    updated_at: datetime
+    run_id: Optional[str] = None
+    event_ticker: Optional[str] = None
+    market_ticker: Optional[str] = None
+    notes: Optional[str] = None
+    source: str = "dashboard"
+    id: Optional[int] = None
+
+
+@dataclass
+class LiveTradeRuntimeState:
+    """Represents persisted runtime heartbeat state for the live-trade worker."""
+    heartbeat_at: str
+    strategy: str = "live_trade"
+    worker: str = "decision_loop"
+    runtime_mode: Optional[str] = None
+    exchange_env: Optional[str] = None
+    run_id: Optional[str] = None
+    loop_status: str = "idle"
+    last_started_at: Optional[str] = None
+    last_completed_at: Optional[str] = None
+    last_step: Optional[str] = None
+    last_step_at: Optional[str] = None
+    last_step_status: Optional[str] = None
+    last_summary: Optional[str] = None
+    last_healthy_at: Optional[str] = None
+    last_healthy_step: Optional[str] = None
+    latest_execution_at: Optional[str] = None
+    latest_execution_status: Optional[str] = None
+    error: Optional[str] = None
+
+
 class DatabaseManager(TradingLoggerMixin):
     """Manages database operations for the trading system."""
 
@@ -227,6 +295,22 @@ class DatabaseManager(TradingLoggerMixin):
                 await db.execute("ALTER TABLE trade_logs ADD COLUMN contracts_cost REAL NOT NULL DEFAULT 0")
                 self.logger.info("Added contracts_cost column to trade_logs table")
 
+            cursor = await db.execute("PRAGMA table_info(live_trade_runtime_state)")
+            runtime_state_info = await cursor.fetchall()
+            runtime_state_columns = {col[1] for col in runtime_state_info}
+            required_runtime_state_columns = {
+                "runtime_mode": "TEXT",
+                "exchange_env": "TEXT",
+            }
+            for column_name, column_type in required_runtime_state_columns.items():
+                if column_name not in runtime_state_columns:
+                    await db.execute(
+                        f"ALTER TABLE live_trade_runtime_state ADD COLUMN {column_name} {column_type}"
+                    )
+                    self.logger.info(
+                        f"Added {column_name} column to live_trade_runtime_state table"
+                    )
+
             trade_log_quantity_type = next(
                 (str(col[2]).upper() for col in trade_log_info if col[1] == "quantity"),
                 "",
@@ -284,6 +368,93 @@ class DatabaseManager(TradingLoggerMixin):
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS live_trade_decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    step TEXT NOT NULL,
+                    strategy TEXT NOT NULL DEFAULT 'live_trade',
+                    status TEXT NOT NULL DEFAULT 'completed',
+                    event_ticker TEXT,
+                    market_ticker TEXT,
+                    title TEXT,
+                    focus_type TEXT,
+                    provider TEXT,
+                    model TEXT,
+                    action TEXT,
+                    side TEXT,
+                    confidence REAL,
+                    edge_pct REAL,
+                    limit_price REAL,
+                    quantity REAL,
+                    hold_minutes INTEGER,
+                    paper_trade BOOLEAN NOT NULL DEFAULT 1,
+                    live_trade BOOLEAN NOT NULL DEFAULT 0,
+                    summary TEXT,
+                    rationale TEXT,
+                    payload_json TEXT,
+                    error TEXT
+                )
+            """)
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_live_trade_decisions_created_at "
+                "ON live_trade_decisions(created_at DESC)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_live_trade_decisions_event_step "
+                "ON live_trade_decisions(event_ticker, step, created_at DESC)"
+            )
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS live_trade_decision_feedback (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    decision_id TEXT NOT NULL UNIQUE,
+                    run_id TEXT,
+                    event_ticker TEXT,
+                    market_ticker TEXT,
+                    feedback TEXT NOT NULL CHECK(feedback IN ('up', 'down')),
+                    notes TEXT,
+                    source TEXT NOT NULL DEFAULT 'dashboard',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS live_trade_runtime_state (
+                    strategy TEXT NOT NULL,
+                    worker TEXT NOT NULL DEFAULT 'decision_loop',
+                    heartbeat_at TEXT NOT NULL,
+                    runtime_mode TEXT,
+                    exchange_env TEXT,
+                    run_id TEXT,
+                    loop_status TEXT NOT NULL DEFAULT 'idle',
+                    last_started_at TEXT,
+                    last_completed_at TEXT,
+                    last_step TEXT,
+                    last_step_at TEXT,
+                    last_step_status TEXT,
+                    last_summary TEXT,
+                    last_healthy_at TEXT,
+                    last_healthy_step TEXT,
+                    latest_execution_at TEXT,
+                    latest_execution_status TEXT,
+                    error TEXT,
+                    PRIMARY KEY (strategy, worker)
+                )
+            """)
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_live_trade_decision_feedback_updated_at "
+                "ON live_trade_decision_feedback(updated_at DESC)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_live_trade_decision_feedback_event "
+                "ON live_trade_decision_feedback(event_ticker, updated_at DESC)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_live_trade_runtime_state_heartbeat "
+                "ON live_trade_runtime_state(heartbeat_at DESC)"
+            )
 
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS simulated_orders (
@@ -917,6 +1088,73 @@ class DatabaseManager(TradingLoggerMixin):
         """)
 
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS live_trade_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                step TEXT NOT NULL,
+                strategy TEXT NOT NULL DEFAULT 'live_trade',
+                status TEXT NOT NULL DEFAULT 'completed',
+                event_ticker TEXT,
+                market_ticker TEXT,
+                title TEXT,
+                focus_type TEXT,
+                provider TEXT,
+                model TEXT,
+                action TEXT,
+                side TEXT,
+                confidence REAL,
+                edge_pct REAL,
+                limit_price REAL,
+                quantity REAL,
+                hold_minutes INTEGER,
+                paper_trade BOOLEAN NOT NULL DEFAULT 1,
+                live_trade BOOLEAN NOT NULL DEFAULT 0,
+                summary TEXT,
+                rationale TEXT,
+                payload_json TEXT,
+                error TEXT
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS live_trade_decision_feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                decision_id TEXT NOT NULL UNIQUE,
+                run_id TEXT,
+                event_ticker TEXT,
+                market_ticker TEXT,
+                feedback TEXT NOT NULL CHECK(feedback IN ('up', 'down')),
+                notes TEXT,
+                source TEXT NOT NULL DEFAULT 'dashboard',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS live_trade_runtime_state (
+                strategy TEXT NOT NULL,
+                worker TEXT NOT NULL DEFAULT 'decision_loop',
+                heartbeat_at TEXT NOT NULL,
+                runtime_mode TEXT,
+                exchange_env TEXT,
+                run_id TEXT,
+                loop_status TEXT NOT NULL DEFAULT 'idle',
+                last_started_at TEXT,
+                last_completed_at TEXT,
+                last_step TEXT,
+                last_step_at TEXT,
+                last_step_status TEXT,
+                last_summary TEXT,
+                last_healthy_at TEXT,
+                last_healthy_step TEXT,
+                latest_execution_at TEXT,
+                latest_execution_status TEXT,
+                error TEXT,
+                PRIMARY KEY (strategy, worker)
+            )
+        """)
+
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS blocked_trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ticker TEXT NOT NULL,
@@ -1009,6 +1247,26 @@ class DatabaseManager(TradingLoggerMixin):
         await db.execute("CREATE INDEX IF NOT EXISTS idx_market_analyses_market_id ON market_analyses(market_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_market_analyses_timestamp ON market_analyses(analysis_timestamp)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_daily_cost_date ON daily_cost_tracking(date)")
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_live_trade_decisions_created_at "
+            "ON live_trade_decisions(created_at DESC)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_live_trade_decisions_event_step "
+            "ON live_trade_decisions(event_ticker, step, created_at DESC)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_live_trade_decision_feedback_updated_at "
+            "ON live_trade_decision_feedback(updated_at DESC)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_live_trade_decision_feedback_event "
+            "ON live_trade_decision_feedback(event_ticker, updated_at DESC)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_live_trade_runtime_state_heartbeat "
+            "ON live_trade_runtime_state(heartbeat_at DESC)"
+        )
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_simulated_orders_strategy_status "
             "ON simulated_orders(strategy, status)"
@@ -1601,6 +1859,277 @@ class DatabaseManager(TradingLoggerMixin):
             await db.commit()
             self.logger.info(f"Added trade log for market {trade_log.market_id}.")
 
+    async def add_live_trade_decision(self, decision: LiveTradeDecision) -> int:
+        """Persist one live-trade loop step and return its database id."""
+        decision_dict = asdict(decision)
+        decision_dict["created_at"] = decision.created_at.isoformat()
+        decision_dict["paper_trade"] = int(bool(decision_dict.get("paper_trade", True)))
+        decision_dict["live_trade"] = int(bool(decision_dict.get("live_trade", False)))
+        decision_dict["id"] = None
+
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO live_trade_decisions (
+                    created_at, run_id, step, strategy, status, event_ticker,
+                    market_ticker, title, focus_type, provider, model, action,
+                    side, confidence, edge_pct, limit_price, quantity,
+                    hold_minutes, paper_trade, live_trade, summary, rationale,
+                    payload_json, error
+                ) VALUES (
+                    :created_at, :run_id, :step, :strategy, :status, :event_ticker,
+                    :market_ticker, :title, :focus_type, :provider, :model, :action,
+                    :side, :confidence, :edge_pct, :limit_price, :quantity,
+                    :hold_minutes, :paper_trade, :live_trade, :summary, :rationale,
+                    :payload_json, :error
+                )
+                """,
+                decision_dict,
+            )
+            await db.commit()
+            return int(cursor.lastrowid)
+
+    async def list_live_trade_decisions(
+        self,
+        *,
+        limit: int = 20,
+        step: Optional[str] = None,
+        status: Optional[str] = None,
+        event_ticker: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return recent live-trade decisions in newest-first order."""
+        query = "SELECT * FROM live_trade_decisions WHERE 1=1"
+        params: List[Any] = []
+        if step is not None:
+            query += " AND step = ?"
+            params.append(step)
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status)
+        if event_ticker is not None:
+            query += " AND event_ticker = ?"
+            params.append(event_ticker)
+        query += " ORDER BY datetime(created_at) DESC, id DESC LIMIT ?"
+        params.append(max(int(limit), 1))
+
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(query, tuple(params))
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as exc:
+            self.logger.error(
+                "Failed to list live-trade decisions",
+                error=str(exc),
+            )
+            return []
+
+    async def get_latest_live_trade_decision_timestamp(self) -> Optional[str]:
+        """Return the latest persisted live-trade decision timestamp, if any."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(
+                    "SELECT MAX(created_at) FROM live_trade_decisions"
+                )
+                row = await cursor.fetchone()
+                if not row:
+                    return None
+                return row[0]
+        except Exception as exc:
+            self.logger.error(
+                "Failed to fetch latest live-trade decision timestamp",
+                error=str(exc),
+            )
+            return None
+
+    async def upsert_live_trade_runtime_state(
+        self,
+        runtime_state: LiveTradeRuntimeState,
+    ) -> None:
+        """Persist the latest live-trade worker heartbeat/runtime snapshot."""
+        runtime_state_dict = asdict(runtime_state)
+
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO live_trade_runtime_state (
+                    strategy, worker, heartbeat_at, runtime_mode, exchange_env,
+                    run_id, loop_status,
+                    last_started_at, last_completed_at, last_step, last_step_at,
+                    last_step_status, last_summary, last_healthy_at,
+                    last_healthy_step, latest_execution_at,
+                    latest_execution_status, error
+                ) VALUES (
+                    :strategy, :worker, :heartbeat_at, :runtime_mode, :exchange_env,
+                    :run_id, :loop_status,
+                    :last_started_at, :last_completed_at, :last_step, :last_step_at,
+                    :last_step_status, :last_summary, :last_healthy_at,
+                    :last_healthy_step, :latest_execution_at,
+                    :latest_execution_status, :error
+                )
+                ON CONFLICT(strategy, worker) DO UPDATE SET
+                    heartbeat_at = excluded.heartbeat_at,
+                    runtime_mode = excluded.runtime_mode,
+                    exchange_env = excluded.exchange_env,
+                    run_id = excluded.run_id,
+                    loop_status = excluded.loop_status,
+                    last_started_at = excluded.last_started_at,
+                    last_completed_at = excluded.last_completed_at,
+                    last_step = excluded.last_step,
+                    last_step_at = excluded.last_step_at,
+                    last_step_status = excluded.last_step_status,
+                    last_summary = excluded.last_summary,
+                    last_healthy_at = excluded.last_healthy_at,
+                    last_healthy_step = excluded.last_healthy_step,
+                    latest_execution_at = excluded.latest_execution_at,
+                    latest_execution_status = excluded.latest_execution_status,
+                    error = excluded.error
+                """,
+                runtime_state_dict,
+            )
+            await db.commit()
+
+    async def get_live_trade_runtime_state(
+        self,
+        *,
+        strategy: str = "live_trade",
+        worker: str = "decision_loop",
+    ) -> Optional[Dict[str, Any]]:
+        """Return the persisted runtime state for the live-trade worker."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    """
+                    SELECT *
+                    FROM live_trade_runtime_state
+                    WHERE strategy = ? AND worker = ?
+                    LIMIT 1
+                    """,
+                    (strategy, worker),
+                )
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+        except Exception as exc:
+            self.logger.error(
+                "Failed to fetch live-trade runtime state",
+                strategy=strategy,
+                worker=worker,
+                error=str(exc),
+            )
+            return None
+
+    async def upsert_live_trade_decision_feedback(
+        self,
+        feedback: LiveTradeDecisionFeedback,
+    ) -> int:
+        """Create or replace dashboard feedback for one persisted decision."""
+        normalized_feedback = str(feedback.feedback or "").strip().lower()
+        if normalized_feedback not in {"up", "down"}:
+            raise ValueError("feedback must be 'up' or 'down'")
+
+        feedback_dict = asdict(feedback)
+        feedback_dict["feedback"] = normalized_feedback
+        feedback_dict["created_at"] = feedback.created_at.isoformat()
+        feedback_dict["updated_at"] = feedback.updated_at.isoformat()
+        feedback_dict["id"] = None
+
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO live_trade_decision_feedback (
+                    decision_id, run_id, event_ticker, market_ticker, feedback,
+                    notes, source, created_at, updated_at
+                ) VALUES (
+                    :decision_id, :run_id, :event_ticker, :market_ticker, :feedback,
+                    :notes, :source, :created_at, :updated_at
+                )
+                ON CONFLICT(decision_id) DO UPDATE SET
+                    run_id = COALESCE(excluded.run_id, live_trade_decision_feedback.run_id),
+                    event_ticker = COALESCE(
+                        excluded.event_ticker,
+                        live_trade_decision_feedback.event_ticker
+                    ),
+                    market_ticker = COALESCE(
+                        excluded.market_ticker,
+                        live_trade_decision_feedback.market_ticker
+                    ),
+                    feedback = excluded.feedback,
+                    notes = excluded.notes,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at
+                """,
+                feedback_dict,
+            )
+            await db.commit()
+            cursor = await db.execute(
+                """
+                SELECT id
+                FROM live_trade_decision_feedback
+                WHERE decision_id = ?
+                LIMIT 1
+                """,
+                (feedback.decision_id,),
+            )
+            row = await cursor.fetchone()
+            return int(row[0]) if row else 0
+
+    async def get_live_trade_decision_feedback(
+        self,
+        decision_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the stored feedback row for one live-trade decision."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    """
+                    SELECT *
+                    FROM live_trade_decision_feedback
+                    WHERE decision_id = ?
+                    LIMIT 1
+                    """,
+                    (decision_id,),
+                )
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+        except Exception as exc:
+            self.logger.error(
+                "Failed to fetch live-trade decision feedback",
+                decision_id=decision_id,
+                error=str(exc),
+            )
+            return None
+
+    async def list_live_trade_decision_feedback(
+        self,
+        *,
+        limit: int = 100,
+        event_ticker: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return recent decision-feedback rows in newest-first order."""
+        query = "SELECT * FROM live_trade_decision_feedback WHERE 1=1"
+        params: List[Any] = []
+        if event_ticker is not None:
+            query += " AND event_ticker = ?"
+            params.append(event_ticker)
+        query += " ORDER BY datetime(updated_at) DESC, id DESC LIMIT ?"
+        params.append(max(int(limit), 1))
+
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(query, tuple(params))
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as exc:
+            self.logger.error(
+                "Failed to list live-trade decision feedback",
+                error=str(exc),
+            )
+            return []
+
     async def add_simulated_order(self, order: SimulatedOrder) -> int:
         """Persist a simulated paper order and return its database id."""
         order_dict = self._serialize_order_record(order)
@@ -1982,6 +2511,7 @@ class DatabaseManager(TradingLoggerMixin):
         cutoff_time = (datetime.now() - timedelta(days=window_days)).isoformat()
         provider_totals: Dict[str, float] = {}
         provider_counts: Dict[str, int] = {}
+        provider_tokens: Dict[str, int] = {}
 
         try:
             async with aiosqlite.connect(self.db_path) as db:
@@ -2000,15 +2530,25 @@ class DatabaseManager(TradingLoggerMixin):
 
                     cursor = await db.execute(f"PRAGMA table_info({table})")
                     columns = {row["name"] for row in await cursor.fetchall()}
-                    if provider_field not in columns or timestamp_field not in columns:
+                    if (
+                        provider_field not in columns
+                        or timestamp_field not in columns
+                        or "cost_usd" not in columns
+                    ):
                         continue
+                    token_select = (
+                        "COALESCE(SUM(COALESCE(tokens_used, 0)), 0) AS total_tokens"
+                        if "tokens_used" in columns
+                        else "0 AS total_tokens"
+                    )
 
                     cursor = await db.execute(
                         f"""
                         SELECT
                             COALESCE(NULLIF(TRIM(COALESCE({provider_field}, '')), ''), 'unattributed') AS provider,
                             COUNT(*) AS request_count,
-                            COALESCE(SUM(COALESCE(cost_usd, 0)), 0) AS total_cost
+                            COALESCE(SUM(COALESCE(cost_usd, 0)), 0) AS total_cost,
+                            {token_select}
                         FROM {table}
                         WHERE datetime({timestamp_field}) >= datetime(?)
                         GROUP BY provider
@@ -2024,6 +2564,9 @@ class DatabaseManager(TradingLoggerMixin):
                         provider_counts[provider] = provider_counts.get(provider, 0) + int(
                             row["request_count"] or 0
                         )
+                        provider_tokens[provider] = provider_tokens.get(provider, 0) + int(
+                            row["total_tokens"] or 0
+                        )
         except Exception as exc:
             self.logger.debug(
                 "Could not summarize analysis-request provider spend",
@@ -2036,6 +2579,7 @@ class DatabaseManager(TradingLoggerMixin):
                     "provider": provider,
                     "request_count": provider_counts[provider],
                     "total_cost": cost,
+                    "total_tokens": provider_tokens.get(provider, 0),
                 }
                 for provider, cost in provider_totals.items()
             ],
@@ -2067,12 +2611,26 @@ class DatabaseManager(TradingLoggerMixin):
             recent_days=window_days
         )
 
-        provider_bits = [
-            f"{str(row.get('provider') or 'unattributed')} ${float(row.get('total_cost') or 0.0):.2f}"
-            for row in provider_rows
-            if float(row.get("total_cost") or 0.0) > 0
-            or int(row.get("request_count") or 0) > 0
-        ]
+        provider_bits = []
+        for row in provider_rows:
+            provider = str(row.get("provider") or "unattributed").strip() or "unattributed"
+            request_count = int(row.get("request_count") or 0)
+            total_cost = float(row.get("total_cost") or 0.0)
+            total_tokens = int(row.get("total_tokens") or 0)
+            if total_cost <= 0 and request_count <= 0 and total_tokens <= 0:
+                continue
+
+            provider_bit = f"{provider} ${total_cost:.2f}"
+            if provider.casefold() == "codex":
+                quota_bits = []
+                if request_count > 0:
+                    quota_bits.append(f"{request_count} req")
+                if total_tokens > 0:
+                    quota_bits.append(f"{total_tokens:,} tok")
+                if quota_bits:
+                    provider_bit = f"{provider_bit} ({', '.join(quota_bits)})"
+            provider_bits.append(provider_bit)
+
         if provider_bits:
             provider_summary = ", ".join(provider_bits)
         else:
@@ -2747,6 +3305,6 @@ if __name__ == "__main__":
         manager = DatabaseManager(db_path=db_path)
         await manager.initialize()
         print(f"✅ Database initialized at {os.path.abspath(db_path)}")
-        print("   Tables: markets, positions, trade_logs, market_analyses, daily_cost_tracking, llm_queries, analysis_reports, blocked_trades")
+        print("   Tables: markets, positions, trade_logs, market_analyses, daily_cost_tracking, llm_queries, analysis_reports, live_trade_decisions, blocked_trades")
 
     asyncio.run(_init())

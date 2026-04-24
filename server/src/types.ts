@@ -315,6 +315,24 @@ export interface PortfolioOrderDriftMetrics {
   liveMinusPaperStaleResting: number;
 }
 
+export interface PortfolioFeeDriftMetrics {
+  available: boolean;
+  sourceTable: string | null;
+  trailingHours: number;
+  driftEvents: number;
+  marketsImpacted: number;
+  entryDriftEvents: number;
+  exitDriftEvents: number;
+  estimatedFeesUsd: number;
+  actualFeesUsd: number;
+  actualMinusEstimatedFeesUsd: number;
+  absoluteDriftUsd: number;
+  avgDriftUsd: number;
+  avgAbsDriftUsd: number;
+  maxAbsDriftUsd: number;
+  latestRecordedAt: string | null;
+}
+
 export interface PortfolioDivergenceMetrics {
   summary: {
     openPositions: PortfolioModeSplit;
@@ -325,6 +343,25 @@ export interface PortfolioDivergenceMetrics {
     last7d: PortfolioDivergenceRollup;
   };
   recentOrderDrift: PortfolioOrderDriftMetrics;
+  feeDivergence: PortfolioFeeDriftMetrics;
+}
+
+export interface PortfolioStrategyPnlRow {
+  strategy: string;
+  openPositions: number;
+  openExposure: number;
+  realizedPnl: number;
+  totalTrades: number;
+  paperTrades: number;
+  liveTrades: number;
+  paperPnl: number;
+  livePnl: number;
+}
+
+export interface PortfolioStrategyPnlBreakdown {
+  available: boolean;
+  sourceTables: string[];
+  items: PortfolioStrategyPnlRow[];
 }
 
 export interface PortfolioAiSpendBucket {
@@ -346,6 +383,21 @@ export interface PortfolioAiSpendBreakdown {
   items: PortfolioAiSpendBucket[];
 }
 
+export interface PortfolioQuotaWindowSummary {
+  queryCount: number;
+  tokensUsed: number;
+  latestAt: string | null;
+}
+
+export interface PortfolioCodexQuotaSummary {
+  available: boolean;
+  sourceTable: string | null;
+  provider: "codex";
+  last24h: PortfolioQuotaWindowSummary;
+  last7d: PortfolioQuotaWindowSummary;
+  lifetime: PortfolioQuotaWindowSummary;
+}
+
 export interface PortfolioAiSpendSummary {
   reportedTodayUsd: number;
   knownCostLast24hUsd: number;
@@ -356,6 +408,7 @@ export interface PortfolioAiSpendSummary {
   tokensUsed: number;
   latestLlmQueryAt: string | null;
   latestAnalysisRequestAt: string | null;
+  codexQuota: PortfolioCodexQuotaSummary;
 }
 
 export interface PortfolioAiSpendMetrics {
@@ -365,7 +418,30 @@ export interface PortfolioAiSpendMetrics {
   byRole: PortfolioAiSpendBreakdown;
 }
 
+export interface RuntimeModeVisibility {
+  mode?: "paper" | "shadow" | "live" | string | null;
+  paper?: boolean | number | string | null;
+  shadow?: boolean | number | string | null;
+  live?: boolean | number | string | null;
+  exchange?: string | null;
+  source?: string | null;
+  worker?: string | null;
+  workerStatus?: string | null;
+  heartbeatAt?: string | null;
+  runId?: string | null;
+  lastStartedAt?: string | null;
+  lastCompletedAt?: string | null;
+  lastStep?: string | null;
+  lastStepAt?: string | null;
+  lastStepStatus?: string | null;
+  latestExecutionAt?: string | null;
+  latestExecutionStatus?: string | null;
+  error?: string | null;
+  [key: string]: unknown;
+}
+
 export interface PortfolioPayload {
+  generatedAt: string;
   positions: PositionRow[];
   trades: TradeLogRow[];
   metrics: {
@@ -374,8 +450,123 @@ export interface PortfolioPayload {
     realizedPnl: number;
     todayAiCost: number;
   };
+  runtime: RuntimeModeVisibility;
   divergence: PortfolioDivergenceMetrics;
+  strategyPnl: PortfolioStrategyPnlBreakdown;
   aiSpend: PortfolioAiSpendMetrics;
+}
+
+export interface LiveTradeDecisionMetrics {
+  limitPrice: number | null;
+  yesPrice: number | null;
+  noPrice: number | null;
+  edge: number | null;
+  quantity: number | null;
+  contractsCost: number | null;
+  costUsd: number | null;
+}
+
+export type LiveTradeDecisionFeedbackValue = "up" | "down";
+
+export interface LiveTradeDecisionFeedbackInput {
+  feedback: LiveTradeDecisionFeedbackValue;
+  notes?: string | null;
+  source?: string | null;
+}
+
+export interface LiveTradeDecisionFeedbackRecord {
+  decisionId: string;
+  runId: string | null;
+  eventTicker: string | null;
+  marketId: string | null;
+  feedback: LiveTradeDecisionFeedbackValue;
+  notes: string | null;
+  source: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+}
+
+export interface LiveTradeRuntimeStateRecord {
+  strategy: string;
+  worker: string;
+  heartbeatAt: string | null;
+  runtimeMode: string | null;
+  exchangeEnv: string | null;
+  runId: string | null;
+  loopStatus: string | null;
+  lastStartedAt: string | null;
+  lastCompletedAt: string | null;
+  lastStep: string | null;
+  lastStepAt: string | null;
+  lastStepStatus: string | null;
+  lastSummary: string | null;
+  lastHealthyAt: string | null;
+  lastHealthyStep: string | null;
+  latestExecutionAt: string | null;
+  latestExecutionStatus: string | null;
+  error: string | null;
+}
+
+export interface LiveTradeDecisionRecord {
+  id: string;
+  sequence: number | null;
+  recordedAt: string | null;
+  runId: string | null;
+  step: string | null;
+  marketId: string | null;
+  eventTicker: string | null;
+  title: string | null;
+  focusType: string | null;
+  strategy: string | null;
+  provider: string | null;
+  model: string | null;
+  source: string | null;
+  status: string | null;
+  decision: string | null;
+  side: string | null;
+  confidence: number | null;
+  holdMinutes: number | null;
+  paperTrade: boolean | null;
+  liveTrade: boolean | null;
+  summary: string | null;
+  rationale: string | null;
+  error: string | null;
+  payload: Record<string, unknown> | null;
+  metrics: LiveTradeDecisionMetrics;
+  feedback: LiveTradeDecisionFeedbackRecord | null;
+}
+
+export interface LiveTradeDecisionHeartbeat {
+  status: "fresh" | "stale" | "idle" | "unavailable";
+  staleAfterSeconds: number;
+  lastSeenAt: string | null;
+  ageSeconds: number | null;
+  latestRunId: string | null;
+  latestStep: string | null;
+  latestStatus: string | null;
+  latestSummary: string | null;
+  lastHealthyAt: string | null;
+  lastHealthyStep: string | null;
+  latestExecutionAt: string | null;
+  latestExecutionStatus: string | null;
+  recentDecisionCount: number;
+  recentRunCount: number;
+  errorCount: number;
+}
+
+export interface LiveTradeDecisionFeedPayload {
+  available: boolean;
+  generatedAt: string;
+  limit: number;
+  latestRecordedAt: string | null;
+  heartbeat: LiveTradeDecisionHeartbeat;
+  decisions: LiveTradeDecisionRecord[];
+}
+
+export interface LiveTradeDecisionFeedbackPayload {
+  available: boolean;
+  decisionId: string;
+  feedback: LiveTradeDecisionFeedbackRecord | null;
 }
 
 export interface LiveTradePayload {
@@ -393,6 +584,8 @@ export interface LiveTradePayload {
     averageHoursToExpiry: number | null;
   };
   liveBtc: CryptoSnapshot | null;
+  runtime?: RuntimeModeVisibility | null;
+  decisionFeed: LiveTradeDecisionFeedPayload;
   events: Array<
     LiveTradeEventSnapshot & {
       latestAnalysis: {

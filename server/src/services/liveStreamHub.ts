@@ -1,16 +1,24 @@
 import { EventEmitter } from "node:events";
 import { listAnalysisRequests, listMarkets } from "../repositories/dashboardRepository.js";
-import { getOverviewPayload } from "./dashboardService.js";
+import {
+  getLiveTradeDecisionFeedPayload,
+  getOverviewPayload,
+  LIVE_TRADE_DECISION_FEED_LIMIT
+} from "./dashboardService.js";
 import { getBitcoinSnapshot } from "./external/cryptoService.js";
 import { resolveSportsContext } from "./external/sportsDataService.js";
 import { serverConfig } from "../config.js";
 
-type Topic = "markets" | "btc" | "scores" | "analysis";
+type Topic = "markets" | "btc" | "scores" | "analysis" | "live-trade-decisions";
 
 class LiveStreamHub {
   private readonly emitter = new EventEmitter();
   private readonly snapshots = new Map<string, unknown>();
   private started = false;
+
+  refreshLiveTradeDecisions(limit = LIVE_TRADE_DECISION_FEED_LIMIT): void {
+    this.publish("live-trade-decisions", getLiveTradeDecisionFeedPayload(limit));
+  }
 
   subscribe(topic: Topic, listener: (payload: unknown) => void) {
     this.emitter.on(topic, listener);
@@ -63,6 +71,7 @@ class LiveStreamHub {
     void refreshBtc();
     void refreshScores();
     refreshAnalysis();
+    this.refreshLiveTradeDecisions();
 
     setInterval(() => {
       void refreshMarkets();
@@ -75,6 +84,9 @@ class LiveStreamHub {
     }, serverConfig.sportsRefreshMs);
     setInterval(() => {
       refreshAnalysis();
+    }, serverConfig.dataRefreshMs);
+    setInterval(() => {
+      this.refreshLiveTradeDecisions();
     }, serverConfig.dataRefreshMs);
   }
 }

@@ -1,7 +1,9 @@
 """Tests for live trade research data shaping and parsing."""
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from src.data.live_trade_research import LiveTradeResearchService
 
@@ -96,3 +98,132 @@ class TestLiveTradeResearchService:
         assert parsed["recommended_markets"][0]["confidence"] == 1.0
         assert parsed["recommended_markets"][0]["fair_yes_probability"] == 1.0
         assert parsed["recommended_markets"][0]["market_yes_midpoint"] == 0.0
+
+
+class StubAdapter:
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = []
+
+    async def fetch_context(self, market):
+        self.calls.append(market)
+        return self.payload
+
+    async def aclose(self):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_build_event_research_payload_uses_sports_adapter():
+    sports_adapter = StubAdapter({"source": "sports-adapter", "signals": {"league": "NBA"}})
+    crypto_adapter = StubAdapter({"source": "crypto-adapter"})
+    macro_adapter = StubAdapter({"source": "macro-adapter"})
+    service = LiveTradeResearchService(
+        kalshi_client=MagicMock(),
+        news_aggregator=MagicMock(),
+        http_client=MagicMock(),
+        sports_adapter=sports_adapter,
+        crypto_adapter=crypto_adapter,
+        macro_adapter=macro_adapter,
+    )
+    service._load_market_microstructure = AsyncMock(return_value={"book": "tight"})
+    service._load_news_context = AsyncMock(return_value={"article_count": 1})
+    service.fetch_bitcoin_context = AsyncMock(return_value={"price_usd": 78000.0})
+
+    event = {
+        "event_ticker": "NBA-TEST",
+        "title": "Will Team A win tonight?",
+        "focus_type": "sports",
+        "markets": [_sample_market(ticker="NBA-TEST-M1")],
+    }
+
+    payload = await service.build_event_research_payload(event)
+
+    assert payload["sports_context"] == {"source": "sports-adapter", "signals": {"league": "NBA"}}
+    assert payload["crypto_context"] is None
+    assert payload["macro_context"] is None
+    assert payload["bitcoin_context"] is None
+    assert sports_adapter.calls == [event]
+    assert crypto_adapter.calls == []
+    assert macro_adapter.calls == []
+
+
+@pytest.mark.asyncio
+async def test_build_event_research_payload_uses_crypto_adapter_for_crypto_focus():
+    sports_adapter = StubAdapter({"source": "sports-adapter"})
+    crypto_adapter = StubAdapter({"source": "crypto-adapter", "signals": {"asset": "BTC"}})
+    macro_adapter = StubAdapter({"source": "macro-adapter"})
+    service = LiveTradeResearchService(
+        kalshi_client=MagicMock(),
+        news_aggregator=MagicMock(),
+        http_client=MagicMock(),
+        sports_adapter=sports_adapter,
+        crypto_adapter=crypto_adapter,
+        macro_adapter=macro_adapter,
+    )
+    service._load_market_microstructure = AsyncMock(return_value={"book": "tight"})
+    service._load_news_context = AsyncMock(return_value={"article_count": 2})
+    service.fetch_bitcoin_context = AsyncMock(return_value={"price_usd": 78500.0})
+
+    event = {
+        "event_ticker": "BTC-TEST",
+        "title": "Will Bitcoin close above $80k today?",
+        "focus_type": "bitcoin",
+        "markets": [_sample_market()],
+    }
+
+    payload = await service.build_event_research_payload(event)
+
+    assert payload["sports_context"] is None
+    assert payload["bitcoin_context"] == {"price_usd": 78500.0}
+    assert payload["crypto_context"] == {
+        "source": "crypto-adapter",
+        "signals": {"asset": "BTC"},
+    }
+    assert payload["macro_context"] is None
+    assert sports_adapter.calls == []
+    assert crypto_adapter.calls == [event]
+    assert macro_adapter.calls == []
+
+
+@pytest.mark.asyncio
+async def test_build_event_research_payload_uses_macro_adapter_for_general_focus():
+    sports_adapter = StubAdapter({"source": "sports-adapter"})
+    crypto_adapter = StubAdapter({"source": "crypto-adapter"})
+    macro_adapter = StubAdapter(
+        {
+            "source": "macro-adapter",
+            "signals": {"detected_categories": ["fomc"]},
+        }
+    )
+    service = LiveTradeResearchService(
+        kalshi_client=MagicMock(),
+        news_aggregator=MagicMock(),
+        http_client=MagicMock(),
+        sports_adapter=sports_adapter,
+        crypto_adapter=crypto_adapter,
+        macro_adapter=macro_adapter,
+    )
+    service._load_market_microstructure = AsyncMock(return_value={"book": "thin"})
+    service._load_news_context = AsyncMock(return_value={"article_count": 3})
+    service.fetch_bitcoin_context = AsyncMock(return_value={"price_usd": 0.0})
+
+    event = {
+        "event_ticker": "FED-TEST",
+        "title": "Will the Fed cut rates by June?",
+        "focus_type": "general",
+        "markets": [_sample_market(ticker="FED-TEST-M1", title="Fed decision")],
+    }
+
+    payload = await service.build_event_research_payload(event)
+
+    assert payload["sports_context"] is None
+    assert payload["bitcoin_context"] is None
+    assert payload["crypto_context"] is None
+    assert payload["macro_context"] == {
+        "source": "macro-adapter",
+        "signals": {"detected_categories": ["fomc"]},
+    }
+    assert sports_adapter.calls == []
+    assert crypto_adapter.calls == []
+    assert macro_adapter.calls == [event]

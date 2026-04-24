@@ -4,15 +4,30 @@ import os
 import pytest
 import aiosqlite
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import List
+from uuid import uuid4
 
-from src.utils.database import DatabaseManager, Market, Position, TradeLog
+from src.utils.database import (
+    DatabaseManager,
+    LiveTradeDecisionFeedback,
+    LiveTradeRuntimeState,
+    Market,
+    Position,
+    TradeLog,
+)
 
 # Mark all tests in this file as async
 pytestmark = pytest.mark.asyncio
 
 TEST_DB = "test_trading_system.db"
 FIXTURE_PATH = "tests/fixtures/markets.json"
+
+
+def _local_test_db_path(prefix: str) -> Path:
+    local_tmp = Path("codex_test_tmp")
+    local_tmp.mkdir(exist_ok=True)
+    return local_tmp / f"{prefix}_{uuid4().hex}.db"
 
 
 def load_and_prepare_markets(fixture_path: str) -> List[Market]:
@@ -76,9 +91,9 @@ async def test_get_eligible_markets():
             os.remove(db_path)
 
 
-async def test_initialize_migrates_legacy_database(tmp_path):
+async def test_initialize_migrates_legacy_database():
     """Legacy databases should gain missing columns and support tables."""
-    db_path = tmp_path / "legacy_trading_system.db"
+    db_path = _local_test_db_path("legacy_trading_system")
 
     async with aiosqlite.connect(db_path) as db:
         await db.execute("""
@@ -133,7 +148,13 @@ async def test_initialize_migrates_legacy_database(tmp_path):
         assert "live" in trade_log_columns
         assert next(row[2] for row in trade_log_info if row[1] == "quantity").upper() == "REAL"
 
-        for table_name in ("llm_queries", "blocked_trades", "analysis_reports"):
+        for table_name in (
+            "llm_queries",
+            "blocked_trades",
+            "analysis_reports",
+            "live_trade_decision_feedback",
+            "live_trade_runtime_state",
+        ):
             cursor = await db.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
                 (table_name,),
@@ -141,9 +162,110 @@ async def test_initialize_migrates_legacy_database(tmp_path):
             assert await cursor.fetchone() is not None
 
 
-async def test_fractional_quantity_round_trips_through_positions_and_trade_logs(tmp_path):
+async def test_live_trade_runtime_state_upsert_round_trips():
+    """Runtime heartbeat state should upsert as a single worker row."""
+    db_path = _local_test_db_path("live_trade_runtime_state")
+    manager = DatabaseManager(db_path=str(db_path))
+    await manager.initialize()
+
+    await manager.upsert_live_trade_runtime_state(
+        LiveTradeRuntimeState(
+            heartbeat_at="2026-04-24T10:00:00+00:00",
+            runtime_mode="paper",
+            exchange_env="demo",
+            run_id="run-100",
+            loop_status="running",
+            last_started_at="2026-04-24T09:59:00+00:00",
+            last_step="specialist",
+            last_step_at="2026-04-24T10:00:00+00:00",
+            last_step_status="completed",
+            last_summary="Specialist pass completed.",
+            last_healthy_at="2026-04-24T10:00:00+00:00",
+            last_healthy_step="specialist",
+        )
+    )
+    await manager.upsert_live_trade_runtime_state(
+        LiveTradeRuntimeState(
+            heartbeat_at="2026-04-24T10:05:00+00:00",
+            runtime_mode="shadow",
+            exchange_env="prod",
+            run_id="run-101",
+            loop_status="completed",
+            last_started_at="2026-04-24T10:04:00+00:00",
+            last_completed_at="2026-04-24T10:05:00+00:00",
+            last_step="execution",
+            last_step_at="2026-04-24T10:05:00+00:00",
+            last_step_status="executed",
+            last_summary="Paper live-trade position opened.",
+            last_healthy_at="2026-04-24T10:05:00+00:00",
+            last_healthy_step="execution",
+            latest_execution_at="2026-04-24T10:05:00+00:00",
+            latest_execution_status="executed",
+        )
+    )
+
+    stored = await manager.get_live_trade_runtime_state()
+    assert stored is not None
+    assert stored["run_id"] == "run-101"
+    assert stored["runtime_mode"] == "shadow"
+    assert stored["exchange_env"] == "prod"
+    assert stored["loop_status"] == "completed"
+    assert stored["last_step"] == "execution"
+    assert stored["last_step_status"] == "executed"
+    assert stored["latest_execution_status"] == "executed"
+    assert stored["heartbeat_at"] == "2026-04-24T10:05:00+00:00"
+
+
+async def test_live_trade_decision_feedback_upsert_round_trips():
+    """Decision feedback should upsert by decision id without duplicating rows."""
+    db_path = _local_test_db_path("live_trade_feedback")
+    manager = DatabaseManager(db_path=str(db_path))
+    await manager.initialize()
+
+    created_at = datetime.now()
+    first_id = await manager.upsert_live_trade_decision_feedback(
+        LiveTradeDecisionFeedback(
+            decision_id="decision-1",
+            feedback="up",
+            created_at=created_at,
+            updated_at=created_at,
+            run_id="run-1",
+            event_ticker="EVENT-1",
+            market_ticker="MARKET-1",
+            notes="worth tracking",
+        )
+    )
+
+    updated_at = created_at + timedelta(minutes=5)
+    second_id = await manager.upsert_live_trade_decision_feedback(
+        LiveTradeDecisionFeedback(
+            decision_id="decision-1",
+            feedback="down",
+            created_at=created_at,
+            updated_at=updated_at,
+            notes="edge faded",
+        )
+    )
+
+    assert first_id == second_id
+
+    stored = await manager.get_live_trade_decision_feedback("decision-1")
+    assert stored is not None
+    assert stored["feedback"] == "down"
+    assert stored["notes"] == "edge faded"
+    assert stored["run_id"] == "run-1"
+    assert stored["event_ticker"] == "EVENT-1"
+    assert stored["market_ticker"] == "MARKET-1"
+
+    rows = await manager.list_live_trade_decision_feedback(limit=10)
+    assert len(rows) == 1
+    assert rows[0]["decision_id"] == "decision-1"
+    assert rows[0]["feedback"] == "down"
+
+
+async def test_fractional_quantity_round_trips_through_positions_and_trade_logs():
     """Fractional live fills should survive DB writes and reads unchanged."""
-    db_path = tmp_path / "fractional_trading_system.db"
+    db_path = _local_test_db_path("fractional_trading_system")
     manager = DatabaseManager(db_path=str(db_path))
     await manager.initialize()
 
@@ -185,9 +307,9 @@ async def test_fractional_quantity_round_trips_through_positions_and_trade_logs(
     assert logs[0].live is True
 
 
-async def test_update_position_status_clears_market_has_position_when_last_position_closes(tmp_path):
+async def test_update_position_status_clears_market_has_position_when_last_position_closes():
     """Closing the last position on a market should release the market for future scans."""
-    db_path = tmp_path / "status_reset_trading_system.db"
+    db_path = _local_test_db_path("status_reset_trading_system")
     manager = DatabaseManager(db_path=str(db_path))
     await manager.initialize()
 

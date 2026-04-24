@@ -2,11 +2,15 @@ import { RuntimeModePanel } from "../../components/runtime-mode-panel";
 import { EmptyState, Panel, StatCard } from "../../components/ui";
 import { getPortfolio } from "../../lib/api";
 import { formatMoney, formatTimestamp } from "../../lib/format";
+import { PortfolioOperatorStrip } from "./portfolio-operator-strip";
+import { PortfolioRefreshControls } from "./portfolio-refresh-controls";
 import type {
   PortfolioAiSpendBreakdown,
+  PortfolioCodexQuotaSummary,
   PortfolioDivergenceRollup,
   PortfolioFeeDivergenceMetrics,
   PortfolioModeSplit,
+  PortfolioStrategyPnlBreakdown,
 } from "../../lib/types";
 
 const integerFormatter = new Intl.NumberFormat("en-US", {
@@ -517,6 +521,165 @@ function BreakdownList({
   );
 }
 
+function StrategyPnlList({
+  breakdown,
+}: {
+  breakdown: PortfolioStrategyPnlBreakdown;
+}) {
+  if (!breakdown.available) {
+    return (
+      <div className="mt-4 rounded-2xl border border-dashed border-slate-200 bg-slate-50/70 px-4 py-5 text-sm text-slate-500">
+        Strategy-level P&amp;L telemetry is not available yet on this database.
+      </div>
+    );
+  }
+
+  if (breakdown.items.length === 0) {
+    return (
+      <div className="mt-4 rounded-2xl border border-dashed border-slate-200 bg-slate-50/70 px-4 py-5 text-sm text-slate-500">
+        No open positions or closed trades have been logged by strategy yet.
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-4 grid gap-3 xl:grid-cols-2">
+      {breakdown.items.map((item) => (
+        <div
+          key={item.strategy}
+          className="rounded-2xl border border-slate-100 bg-slate-50/80 p-4"
+        >
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <p className="font-medium text-steel">
+                {humanizeBreakdownLabel(item.strategy)}
+              </p>
+              <p className="mt-1 text-sm text-slate-500">
+                {formatCount(item.totalTrades)} closed trades /{" "}
+                {formatCount(item.openPositions)} open positions
+              </p>
+            </div>
+            <p
+              className={`text-sm font-semibold ${pnlDeltaClass(item.realizedPnl)}`}
+            >
+              {formatSignedMoney(item.realizedPnl)}
+            </p>
+          </div>
+
+          <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            <SummaryTile
+              label="Realized P&L"
+              value={formatMoney(item.realizedPnl)}
+            />
+            <SummaryTile
+              label="Open Exposure"
+              value={formatMoney(item.openExposure)}
+            />
+            <SummaryTile
+              label="Paper / Live"
+              value={`${formatCount(item.paperTrades)} / ${formatCount(item.liveTrades)}`}
+              helpText="Closed trade counts"
+            />
+            <SummaryTile
+              label="Paper / Live P&L"
+              value={`${formatMoney(item.paperPnl)} / ${formatMoney(item.livePnl)}`}
+            />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function CodexQuotaWindow({
+  label,
+  queryCount,
+  tokensUsed,
+  latestAt,
+}: {
+  label: string;
+  queryCount: number;
+  tokensUsed: number;
+  latestAt: string | null;
+}) {
+  return (
+    <div className="rounded-2xl border border-slate-100 bg-white/80 px-4 py-4">
+      <p className="text-xs uppercase tracking-[0.2em] text-slate-500">
+        {label}
+      </p>
+      <p className="mt-3 text-xl font-semibold text-steel">
+        {formatCount(queryCount)} queries
+      </p>
+      <p className="mt-1 text-sm text-slate-500">
+        {formatCount(tokensUsed)} tokens
+      </p>
+      <p className="mt-3 text-xs uppercase tracking-[0.18em] text-slate-400">
+        Latest {formatTimestamp(latestAt)}
+      </p>
+    </div>
+  );
+}
+
+function CodexQuotaCard({
+  quota,
+}: {
+  quota: PortfolioCodexQuotaSummary;
+}) {
+  return (
+    <div className="rounded-3xl border border-amber-200/80 bg-gradient-to-br from-amber-50 via-white to-orange-50 p-5">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h3 className="font-medium text-steel">Codex quota</h3>
+          <p className="mt-1 text-sm text-slate-500">
+            Runtime usage pulled from <code>llm_queries</code> where provider is{" "}
+            <code>codex</code>.
+          </p>
+        </div>
+        <div className="text-right">
+          <p className="text-xs uppercase tracking-[0.2em] text-slate-500">
+            Lifetime
+          </p>
+          <p className="mt-1 text-lg font-semibold text-amber-700">
+            {formatCount(quota.lifetime.tokensUsed)} tokens
+          </p>
+        </div>
+      </div>
+
+      {!quota.available ? (
+        <div className="mt-4 rounded-2xl border border-dashed border-amber-200 bg-white/70 px-4 py-4 text-sm text-slate-500">
+          Codex quota telemetry is not available yet on this deployment.
+        </div>
+      ) : quota.lifetime.queryCount === 0 ? (
+        <div className="mt-4 rounded-2xl border border-dashed border-amber-200 bg-white/70 px-4 py-4 text-sm text-slate-500">
+          Codex usage has not been logged yet, so these quota windows are still
+          empty.
+        </div>
+      ) : (
+        <div className="mt-4 grid gap-3 md:grid-cols-3">
+          <CodexQuotaWindow
+            label="Last 24h"
+            queryCount={quota.last24h.queryCount}
+            tokensUsed={quota.last24h.tokensUsed}
+            latestAt={quota.last24h.latestAt}
+          />
+          <CodexQuotaWindow
+            label="Last 7d"
+            queryCount={quota.last7d.queryCount}
+            tokensUsed={quota.last7d.tokensUsed}
+            latestAt={quota.last7d.latestAt}
+          />
+          <CodexQuotaWindow
+            label="Lifetime"
+            queryCount={quota.lifetime.queryCount}
+            tokensUsed={quota.lifetime.tokensUsed}
+            latestAt={quota.lifetime.latestAt}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default async function PortfolioPage() {
   const payload = await getPortfolio();
   const orderDrift = payload.divergence.recentOrderDrift;
@@ -545,6 +708,15 @@ export default async function PortfolioPage() {
           faster route-based lens into positions, P&L, divergence between paper
           and live activity, and the spend footprint behind the AI stack.
         </p>
+      </Panel>
+
+      <PortfolioOperatorStrip payload={payload} />
+
+      <Panel title="Monitoring cadence">
+        <PortfolioRefreshControls
+          generatedAt={payload.generatedAt ?? payload.generated_at ?? new Date().toISOString()}
+          heartbeatAt={payload.runtime?.heartbeatAt ?? null}
+        />
       </Panel>
 
       <RuntimeModePanel source={payload} title="Configured trading mode" />
@@ -651,9 +823,9 @@ export default async function PortfolioPage() {
 
         <Panel title="AI spend breakdown">
           <p className="max-w-3xl text-sm text-slate-500">
-            Provider attribution currently comes from manual analysis requests.
-            Strategy and role rollups come from runtime <code>llm_queries</code>
-            cost logs.
+            Provider attribution combines manual analysis requests with runtime{" "}
+            <code>llm_queries</code> logs. Codex quota windows below are sourced
+            from runtime rows where the provider is <code>codex</code>.
           </p>
 
           <div className="mt-4 grid gap-3 md:grid-cols-2">
@@ -673,6 +845,10 @@ export default async function PortfolioPage() {
               label="Lifetime Known"
               value={formatMoney(payload.aiSpend.summary.knownCostLifetimeUsd)}
             />
+          </div>
+
+          <div className="mt-4">
+            <CodexQuotaCard quota={payload.aiSpend.summary.codexQuota} />
           </div>
 
           <div className="mt-4 rounded-2xl border border-slate-100 bg-slate-50/80 px-4 py-4 text-sm text-slate-500">
@@ -696,7 +872,7 @@ export default async function PortfolioPage() {
           <div className="mt-4 space-y-4">
             <BreakdownList
               title="By provider"
-              description="Manual analysis provider routing and any cost captured there."
+              description="Combined manual and runtime provider routing, with token counts when llm query telemetry includes them."
               breakdown={payload.aiSpend.byProvider}
             />
             <BreakdownList
@@ -844,6 +1020,14 @@ export default async function PortfolioPage() {
           )}
         </Panel>
       ) : null}
+
+      <Panel title="Per-strategy P&L">
+        <p className="max-w-3xl text-sm text-slate-500">
+          Closed-trade P&amp;L is grouped by strategy, with open-position exposure
+          alongside it so quick-flip and live-trade lanes are visible at a glance.
+        </p>
+        <StrategyPnlList breakdown={payload.strategyPnl} />
+      </Panel>
 
       <section className="grid gap-6 xl:grid-cols-2">
         <Panel title="Open positions">
