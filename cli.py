@@ -261,6 +261,63 @@ def cmd_dashboard(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+async def _print_strategy_budget_status(portfolio_value: float) -> None:
+    """W7: Print per-strategy daily-loss budget remaining line.
+
+    Silently no-ops if the enforcer cannot initialize (e.g. fresh DB on a
+    machine that never ran the bot). We don't want status to crash on
+    missing state.
+    """
+    try:
+        from src.strategies.portfolio_enforcer import (
+            PortfolioEnforcer,
+            STRATEGY_QUICK_FLIP,
+            STRATEGY_LIVE_TRADE,
+        )
+    except ImportError:
+        return
+
+    db_path = str(Path(__file__).parent / "trading_system.db")
+    if not Path(db_path).exists():
+        return
+
+    try:
+        enforcer = PortfolioEnforcer(
+            db_path=db_path,
+            portfolio_value=portfolio_value,
+        )
+        await enforcer.initialize()
+        print()
+        print("  Strategy Risk Budgets (daily):")
+        print(f"  {'Strategy':<14} {'Status':>10} {'Loss':>10} {'Budget':>10} {'Remaining':>12} {'Trades/hr':>10}")
+        print(f"  {'-'*14} {'-'*10} {'-'*10} {'-'*10} {'-'*12} {'-'*10}")
+        for strategy in (STRATEGY_QUICK_FLIP, STRATEGY_LIVE_TRADE):
+            status = await enforcer.get_strategy_status(strategy)
+            state = "HALTED" if status["halted"] else "active"
+            loss = f"${status['daily_loss_dollars']:.2f}"
+            budget = (
+                f"${status['daily_loss_budget_dollars']:.2f}"
+                if status["daily_loss_budget_dollars"] is not None
+                else "n/a"
+            )
+            remaining = (
+                f"${status['daily_loss_budget_remaining_dollars']:.2f}"
+                if status["daily_loss_budget_remaining_dollars"] is not None
+                else "n/a"
+            )
+            rate = (
+                f"{status['trades_last_hour']}/{status['max_trades_per_hour']}"
+                if status["max_trades_per_hour"] is not None
+                else f"{status['trades_last_hour']}"
+            )
+            print(
+                f"  {status['strategy']:<14} {state:>10} "
+                f"{loss:>10} {budget:>10} {remaining:>12} {rate:>10}"
+            )
+    except Exception as exc:
+        print(f"  (strategy budgets unavailable: {exc})")
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     """Show current portfolio status: balance, positions, and P&L."""
 
@@ -324,6 +381,10 @@ def cmd_status(args: argparse.Namespace) -> None:
                 print(f"  Total Exposure:     ${total_exposure:>10,.2f}")
                 print(f"  Total Realized P&L: ${total_realized_pnl:>10,.2f}")
                 print(f"  Total Fees Paid:    ${total_fees:>10,.2f}")
+
+            # W7: per-strategy daily-loss budget remaining
+            total_portfolio = balance_usd + portfolio_value_usd
+            await _print_strategy_budget_status(total_portfolio)
 
             print("=" * 56)
         finally:
