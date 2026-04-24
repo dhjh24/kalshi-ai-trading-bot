@@ -206,7 +206,9 @@ cp env.template .env   # fill in your keys
 | `KALSHI_ENV` | `prod` for the live exchange or `demo` for the demo environment |
 | `KALSHI_API_BASE_URL` | Optional override for custom Kalshi API endpoints |
 | `KALSHI_PRIVATE_KEY_PATH` | Path to your PEM private key file (default auto-detects `kalshi_private_key.pem` or `kalshi_private_key`) |
-| `LLM_PROVIDER` | `auto` (default), `openai`, or `openrouter` |
+| `LLM_PROVIDER` | `auto` (default), `codex`, `openai`, or `openrouter` |
+| `CODEX_CLI_PATH` | Optional explicit path to the `codex` CLI binary (defaults to `which codex`) |
+| `CODEX_PLAN_TIER` | ChatGPT plan tier the CLI is signed in under (`free` / `plus` / `pro` / `team` / `business`) — informational, used for quota display |
 | `OPENAI_API_KEY` | Direct OpenAI API key used when `LLM_PROVIDER` resolves to `openai` |
 | `OPENROUTER_API_KEY` | OpenRouter key used when `LLM_PROVIDER` resolves to `openrouter` |
 | `OPENROUTER_HTTP_REFERER` | Optional app/site URL for OpenRouter attribution headers |
@@ -214,8 +216,7 @@ cp env.template .env   # fill in your keys
 
 Place your Kalshi private key as `kalshi_private_key.pem` in the project root, or point `KALSHI_PRIVATE_KEY_PATH` at your PEM file. The runtime also supports the legacy `kalshi_private_key` name. Download it from [Kalshi Settings → API](https://kalshi.com/account/settings). This file is git-ignored.
 
-`LLM_PROVIDER=auto` prefers direct OpenAI access when `OPENAI_API_KEY` is present, and otherwise falls back to OpenRouter.
-ChatGPT/Codex plan access is separate from API-key billing, so this bot still uses API credentials rather than a ChatGPT web-session login.
+`LLM_PROVIDER=auto` (the default) picks the first available provider in this order: **Codex CLI → direct OpenAI → OpenRouter**. Codex is preferred when the `codex` CLI is both on `PATH` and signed in (`codex login`), which lets the bot draw agent calls from your ChatGPT plan quota instead of metered OpenAI / OpenRouter billing. When the CLI is missing or logged out, `auto` silently falls back to `OPENAI_API_KEY` (if set) and finally `OPENROUTER_API_KEY`. Forcing `LLM_PROVIDER=codex` makes the bot hard-require a signed-in CLI on startup — useful in production to avoid accidentally charging an API key.
 
 Common trading and dashboard env vars:
 
