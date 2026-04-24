@@ -1171,6 +1171,121 @@ class DatabaseManager(TradingLoggerMixin):
             )
             return []
 
+    async def summarize_fee_divergence(
+        self,
+        *,
+        hours_back: Optional[int] = None,
+        market_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Summarize fee-drift telemetry for dashboards and compact CLI helpers.
+
+        When `hours_back` is provided, only rows inside that trailing window are
+        included.
+        """
+        trailing_hours: Optional[int] = None
+        if hours_back is not None:
+            try:
+                trailing_hours = max(int(hours_back), 0)
+            except (TypeError, ValueError):
+                trailing_hours = None
+
+        summary: Dict[str, Any] = {
+            "available": False,
+            "source_table": None,
+            "hours_back": trailing_hours,
+            "drift_events": 0,
+            "markets_impacted": 0,
+            "entry_drift_events": 0,
+            "exit_drift_events": 0,
+            "estimated_fees_usd": 0.0,
+            "actual_fees_usd": 0.0,
+            "net_drift_usd": 0.0,
+            "abs_drift_usd": 0.0,
+            "avg_drift_usd": 0.0,
+            "avg_abs_drift_usd": 0.0,
+            "max_abs_drift_usd": 0.0,
+            "latest_recorded_at": None,
+        }
+
+        filters: List[str] = []
+        params: List[Any] = []
+        if market_id is not None:
+            filters.append("market_id = ?")
+            params.append(market_id)
+        if trailing_hours is not None:
+            cutoff_time = datetime.now() - timedelta(hours=trailing_hours)
+            filters.append("julianday(recorded_at) >= julianday(?)")
+            params.append(cutoff_time.isoformat())
+        where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
+
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+
+                cursor = await db.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name='fee_divergence_log'"
+                )
+                table_exists = await cursor.fetchone()
+                if not table_exists:
+                    return summary
+
+                summary["available"] = True
+                summary["source_table"] = "fee_divergence_log"
+
+                cursor = await db.execute(
+                    f"""
+                    SELECT
+                        COUNT(*) AS drift_events,
+                        COUNT(DISTINCT market_id) AS markets_impacted,
+                        SUM(CASE WHEN leg = 'entry' THEN 1 ELSE 0 END) AS entry_drift_events,
+                        SUM(CASE WHEN leg = 'exit' THEN 1 ELSE 0 END) AS exit_drift_events,
+                        COALESCE(SUM(COALESCE(estimated_fee, 0)), 0) AS estimated_fees_usd,
+                        COALESCE(SUM(COALESCE(actual_fee, 0)), 0) AS actual_fees_usd,
+                        COALESCE(SUM(COALESCE(divergence, 0)), 0) AS net_drift_usd,
+                        COALESCE(SUM(ABS(COALESCE(divergence, 0))), 0) AS abs_drift_usd,
+                        COALESCE(AVG(COALESCE(divergence, 0)), 0) AS avg_drift_usd,
+                        COALESCE(AVG(ABS(COALESCE(divergence, 0))), 0) AS avg_abs_drift_usd,
+                        COALESCE(MAX(ABS(COALESCE(divergence, 0))), 0) AS max_abs_drift_usd,
+                        MAX(recorded_at) AS latest_recorded_at
+                    FROM fee_divergence_log
+                    {where_clause}
+                    """,
+                    tuple(params),
+                )
+                row = await cursor.fetchone()
+                if not row:
+                    return summary
+
+                summary["drift_events"] = int(row["drift_events"] or 0)
+                summary["markets_impacted"] = int(row["markets_impacted"] or 0)
+                summary["entry_drift_events"] = int(row["entry_drift_events"] or 0)
+                summary["exit_drift_events"] = int(row["exit_drift_events"] or 0)
+                summary["estimated_fees_usd"] = float(
+                    row["estimated_fees_usd"] or 0.0
+                )
+                summary["actual_fees_usd"] = float(
+                    row["actual_fees_usd"] or 0.0
+                )
+                summary["net_drift_usd"] = float(row["net_drift_usd"] or 0.0)
+                summary["abs_drift_usd"] = float(row["abs_drift_usd"] or 0.0)
+                summary["avg_drift_usd"] = float(row["avg_drift_usd"] or 0.0)
+                summary["avg_abs_drift_usd"] = float(
+                    row["avg_abs_drift_usd"] or 0.0
+                )
+                summary["max_abs_drift_usd"] = float(
+                    row["max_abs_drift_usd"] or 0.0
+                )
+                summary["latest_recorded_at"] = row["latest_recorded_at"]
+                return summary
+        except Exception as exc:
+            self.logger.error(
+                "Failed to summarize fee divergence telemetry",
+                error=str(exc),
+            )
+            return summary
+
     async def upsert_markets(self, markets: List[Market]):
         """
         Upsert a list of markets into the database.
@@ -1804,13 +1919,24 @@ class DatabaseManager(TradingLoggerMixin):
         paper_open = len(await self.get_open_non_live_positions())
         live_open = len(await self.get_open_live_positions())
         shadow_summary = await self.summarize_shadow_order_divergence()
+        fee_summary = await self.summarize_fee_divergence()
+
+        fee_events = int(fee_summary.get("drift_events") or 0)
+        fee_segment = ""
+        if fee_events > 0:
+            fee_segment = (
+                f" | fee drift {fee_events} legs "
+                f"net ${float(fee_summary.get('net_drift_usd') or 0.0):+.4f} "
+                f"avg abs ${float(fee_summary.get('avg_abs_drift_usd') or 0.0):.4f} "
+                f"max abs ${float(fee_summary.get('max_abs_drift_usd') or 0.0):.4f}"
+            )
 
         total_orders = int(shadow_summary.get("total_orders") or 0)
         if total_orders <= 0:
             return {
                 "summary": (
                     f"open paper {paper_open} / live {live_open} | "
-                    "shadow telemetry pending"
+                    f"shadow telemetry pending{fee_segment}"
                 )
             }
 
@@ -1830,6 +1956,7 @@ class DatabaseManager(TradingLoggerMixin):
                 f"matched entries {matched_entries} "
                 f"avg delta ${avg_delta:.4f} "
                 f"cost drift ${total_cost_delta:.2f}"
+                f"{fee_segment}"
             )
         }
 

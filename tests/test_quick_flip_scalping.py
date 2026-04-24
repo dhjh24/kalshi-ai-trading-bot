@@ -986,6 +986,109 @@ async def test_execute_single_quick_flip_rejects_negative_indicator_before_db_wr
 
 
 @pytest.mark.asyncio
+async def test_execute_single_quick_flip_blocks_when_portfolio_enforcer_rejects():
+    fake_db = SimpleNamespace(
+        db_path="quick_flip_guardrails.db",
+        add_position=AsyncMock(),
+        update_position_execution_details=AsyncMock(),
+    )
+    fake_client = SimpleNamespace(
+        get_balance=AsyncMock(return_value={"balance": "5000", "portfolio_value": "2500"})
+    )
+    strategy = QuickFlipScalpingStrategy(
+        db_manager=fake_db,
+        kalshi_client=fake_client,
+        xai_client=object(),
+        config=QuickFlipConfig(),
+    )
+    opportunity = QuickFlipOpportunity(
+        market_id="TEST-MKT",
+        market_title="Test market",
+        side="YES",
+        entry_price=0.05,
+        exit_price=0.07,
+        quantity=10,
+        expected_profit=0.10,
+        confidence_score=0.95,
+        movement_indicator="short-term momentum",
+        max_hold_time=30,
+    )
+    fake_enforcer = SimpleNamespace(
+        initialize=AsyncMock(),
+        check_trade=AsyncMock(return_value=(False, "trade-rate cap hit")),
+        portfolio_value=0.0,
+    )
+
+    with patch(
+        "src.strategies.portfolio_enforcer.PortfolioEnforcer",
+        return_value=fake_enforcer,
+    ) as enforcer_cls:
+        result = await strategy._execute_single_quick_flip(opportunity)
+
+    assert result is False
+    fake_enforcer.initialize.assert_awaited_once()
+    fake_enforcer.check_trade.assert_awaited_once()
+    fake_db.add_position.assert_not_awaited()
+    assert enforcer_cls.call_args.kwargs["portfolio_value"] == pytest.approx(75.0)
+    assert fake_enforcer.check_trade.await_args.kwargs["strategy"] == "quick_flip"
+    assert fake_enforcer.check_trade.await_args.kwargs["amount"] == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_execute_single_quick_flip_persists_when_portfolio_enforcer_allows():
+    fake_db = SimpleNamespace(
+        db_path="quick_flip_guardrails.db",
+        add_position=AsyncMock(return_value=99),
+        update_position_execution_details=AsyncMock(),
+    )
+    fake_client = SimpleNamespace(
+        get_balance=AsyncMock(return_value={"balance": "5000", "portfolio_value": "2500"})
+    )
+    strategy = QuickFlipScalpingStrategy(
+        db_manager=fake_db,
+        kalshi_client=fake_client,
+        xai_client=object(),
+        config=QuickFlipConfig(max_hold_minutes=30),
+    )
+    opportunity = QuickFlipOpportunity(
+        market_id="TEST-MKT",
+        market_title="Test market",
+        side="YES",
+        entry_price=0.05,
+        exit_price=0.07,
+        quantity=10,
+        expected_profit=0.10,
+        confidence_score=0.95,
+        movement_indicator="short-term momentum",
+        max_hold_time=30,
+        tick_size=0.001,
+    )
+    fake_enforcer = SimpleNamespace(
+        initialize=AsyncMock(),
+        check_trade=AsyncMock(return_value=(True, "allowed")),
+        portfolio_value=0.0,
+    )
+
+    with (
+        patch(
+            "src.strategies.portfolio_enforcer.PortfolioEnforcer",
+            return_value=fake_enforcer,
+        ),
+        patch(
+            "src.strategies.quick_flip_scalping.execute_position",
+            AsyncMock(return_value=True),
+        ),
+    ):
+        result = await strategy._execute_single_quick_flip(opportunity)
+
+    assert result is True
+    fake_enforcer.initialize.assert_awaited_once()
+    fake_enforcer.check_trade.assert_awaited_once()
+    fake_db.add_position.assert_awaited_once()
+    fake_db.update_position_execution_details.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_execute_single_quick_flip_in_paper_mode_persists_exit_plan(tmp_path):
     db_path = tmp_path / "quick_flip_execute_paper.db"
     db_manager = DatabaseManager(db_path=str(db_path))
@@ -1031,9 +1134,18 @@ async def test_execute_single_quick_flip_in_paper_mode_persists_exit_plan(tmp_pa
     )
 
     previous_live_mode = settings.trading.live_trading_enabled
+    fake_enforcer = SimpleNamespace(
+        initialize=AsyncMock(),
+        check_trade=AsyncMock(return_value=(True, "allowed")),
+        portfolio_value=0.0,
+    )
     try:
         settings.trading.live_trading_enabled = False
-        result = await strategy._execute_single_quick_flip(opportunity)
+        with patch(
+            "src.strategies.portfolio_enforcer.PortfolioEnforcer",
+            return_value=fake_enforcer,
+        ):
+            result = await strategy._execute_single_quick_flip(opportunity)
     finally:
         settings.trading.live_trading_enabled = previous_live_mode
 

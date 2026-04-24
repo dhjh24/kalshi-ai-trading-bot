@@ -109,6 +109,44 @@ function emptyOrderDriftMetrics(trailingHours = 24): PortfolioOrderDriftMetrics 
   };
 }
 
+interface PortfolioFeeDriftMetrics {
+  available: boolean;
+  sourceTable: string | null;
+  trailingHours: number;
+  driftEvents: number;
+  marketsImpacted: number;
+  entryDriftEvents: number;
+  exitDriftEvents: number;
+  estimatedFeesUsd: number;
+  actualFeesUsd: number;
+  actualMinusEstimatedFeesUsd: number;
+  absoluteDriftUsd: number;
+  avgDriftUsd: number;
+  avgAbsDriftUsd: number;
+  maxAbsDriftUsd: number;
+  latestRecordedAt: string | null;
+}
+
+function emptyFeeDriftMetrics(trailingHours = 168): PortfolioFeeDriftMetrics {
+  return {
+    available: false,
+    sourceTable: null,
+    trailingHours,
+    driftEvents: 0,
+    marketsImpacted: 0,
+    entryDriftEvents: 0,
+    exitDriftEvents: 0,
+    estimatedFeesUsd: 0,
+    actualFeesUsd: 0,
+    actualMinusEstimatedFeesUsd: 0,
+    absoluteDriftUsd: 0,
+    avgDriftUsd: 0,
+    avgAbsDriftUsd: 0,
+    maxAbsDriftUsd: 0,
+    latestRecordedAt: null
+  };
+}
+
 function emptyAiSpendBreakdown(
   sourceField: PortfolioAiSpendBreakdown["sourceField"],
   sourceTable: string | null = null
@@ -771,6 +809,76 @@ export function getPortfolioOrderDriftMetrics(trailingHours = 24): PortfolioOrde
     paperStaleResting,
     liveStaleResting,
     liveMinusPaperStaleResting: liveStaleResting - paperStaleResting
+  };
+}
+
+export function getPortfolioFeeDriftMetrics(trailingHours = 168): PortfolioFeeDriftMetrics {
+  if (!tableExists("fee_divergence_log")) {
+    return emptyFeeDriftMetrics(trailingHours);
+  }
+
+  const hasRecordedAtColumn = columnExists("fee_divergence_log", "recorded_at");
+  const intervalValue = `-${trailingHours} hours`;
+  const queryParams = hasRecordedAtColumn ? [intervalValue] : [];
+  const whereClause = hasRecordedAtColumn
+    ? "WHERE julianday(recorded_at) >= julianday('now', ?)"
+    : "";
+  const latestRecordedAtExpression = hasRecordedAtColumn
+    ? "MAX(recorded_at) AS latest_recorded_at"
+    : "NULL AS latest_recorded_at";
+  const row = db
+    .prepare(
+      `
+        SELECT
+          COUNT(*) AS drift_events,
+          COUNT(DISTINCT market_id) AS markets_impacted,
+          COALESCE(SUM(CASE WHEN leg = 'entry' THEN 1 ELSE 0 END), 0) AS entry_drift_events,
+          COALESCE(SUM(CASE WHEN leg = 'exit' THEN 1 ELSE 0 END), 0) AS exit_drift_events,
+          COALESCE(SUM(COALESCE(estimated_fee, 0)), 0) AS estimated_fees_usd,
+          COALESCE(SUM(COALESCE(actual_fee, 0)), 0) AS actual_fees_usd,
+          COALESCE(SUM(COALESCE(divergence, 0)), 0) AS net_drift_usd,
+          COALESCE(SUM(ABS(COALESCE(divergence, 0))), 0) AS abs_drift_usd,
+          COALESCE(AVG(COALESCE(divergence, 0)), 0) AS avg_drift_usd,
+          COALESCE(AVG(ABS(COALESCE(divergence, 0))), 0) AS avg_abs_drift_usd,
+          COALESCE(MAX(ABS(COALESCE(divergence, 0))), 0) AS max_abs_drift_usd,
+          ${latestRecordedAtExpression}
+        FROM fee_divergence_log
+        ${whereClause}
+      `
+    )
+    .get(...queryParams) as
+    | {
+        drift_events?: number;
+        markets_impacted?: number;
+        entry_drift_events?: number;
+        exit_drift_events?: number;
+        estimated_fees_usd?: number;
+        actual_fees_usd?: number;
+        net_drift_usd?: number;
+        abs_drift_usd?: number;
+        avg_drift_usd?: number;
+        avg_abs_drift_usd?: number;
+        max_abs_drift_usd?: number;
+        latest_recorded_at?: string | null;
+      }
+    | undefined;
+
+  return {
+    available: true,
+    sourceTable: "fee_divergence_log",
+    trailingHours,
+    driftEvents: toCount(row?.drift_events),
+    marketsImpacted: toCount(row?.markets_impacted),
+    entryDriftEvents: toCount(row?.entry_drift_events),
+    exitDriftEvents: toCount(row?.exit_drift_events),
+    estimatedFeesUsd: toNumber(row?.estimated_fees_usd, 4),
+    actualFeesUsd: toNumber(row?.actual_fees_usd, 4),
+    actualMinusEstimatedFeesUsd: toNumber(row?.net_drift_usd, 4),
+    absoluteDriftUsd: toNumber(row?.abs_drift_usd, 4),
+    avgDriftUsd: toNumber(row?.avg_drift_usd, 4),
+    avgAbsDriftUsd: toNumber(row?.avg_abs_drift_usd, 4),
+    maxAbsDriftUsd: toNumber(row?.max_abs_drift_usd, 4),
+    latestRecordedAt: row?.latest_recorded_at ?? null
   };
 }
 

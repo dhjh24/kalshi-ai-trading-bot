@@ -31,6 +31,7 @@ from src.jobs.execute import (
 )
 from src.utils.database import DatabaseManager, Market, Position, TradeLog
 from src.utils.kalshi_normalization import (
+    get_balance_dollars,
     build_limit_order_price_fields,
     find_fill_price_for_order,
     get_fill_count,
@@ -43,6 +44,7 @@ from src.utils.kalshi_normalization import (
     get_market_status,
     get_market_tick_size,
     get_market_volume,
+    get_portfolio_value_dollars,
     get_order_average_fill_price,
     get_order_fill_count,
     get_position_exposure_dollars,
@@ -160,6 +162,7 @@ class QuickFlipScalpingStrategy:
             if disable_ai is not None
             else _env_flag_is_truthy(os.environ.get("QUICK_FLIP_DISABLE_AI"))
         )
+        self._portfolio_enforcer: Optional[Any] = None
 
     def _snapshot_prices_in_entry_band(self, market: Market) -> Tuple[float, ...]:
         """
@@ -180,6 +183,77 @@ class QuickFlipScalpingStrategy:
     def _snapshot_candidate_matches(self, market: Market) -> bool:
         """Quickly reject markets whose stored snapshot is nowhere near the entry band."""
         return bool(self._snapshot_prices_in_entry_band(market))
+
+    async def _resolve_portfolio_value(self, *, fallback_trade_value: float) -> float:
+        """Build a total portfolio value for guardrails from the live balance snapshot."""
+        if not hasattr(self.kalshi_client, "get_balance"):
+            return max(float(fallback_trade_value), 0.0)
+
+        try:
+            balance_response = await self.kalshi_client.get_balance()
+        except Exception as exc:
+            self.logger.warning(
+                f"Could not fetch quick flip balance for portfolio guardrails: {exc}"
+            )
+            return max(float(fallback_trade_value), 0.0)
+
+        available_cash = get_balance_dollars(balance_response)
+        marked_position_value = get_portfolio_value_dollars(balance_response)
+        total_portfolio_value = available_cash + marked_position_value
+
+        if total_portfolio_value > 0:
+            return total_portfolio_value
+        return max(available_cash, float(fallback_trade_value), 0.0)
+
+    async def _get_portfolio_enforcer(self, *, portfolio_value: float) -> Optional[Any]:
+        """Lazily initialize a shared PortfolioEnforcer for quick-flip entries."""
+        db_path = getattr(self.db_manager, "db_path", None)
+        if not db_path:
+            return None
+
+        if self._portfolio_enforcer is None:
+            from src.strategies.portfolio_enforcer import PortfolioEnforcer
+
+            self._portfolio_enforcer = PortfolioEnforcer(
+                db_path=db_path,
+                portfolio_value=portfolio_value,
+            )
+            await self._portfolio_enforcer.initialize()
+
+        self._portfolio_enforcer.portfolio_value = portfolio_value
+        return self._portfolio_enforcer
+
+    async def _passes_portfolio_enforcer(self, opportunity: QuickFlipOpportunity) -> bool:
+        """Check the existing PortfolioEnforcer before persisting a quick-flip entry."""
+        from src.strategies.portfolio_enforcer import (
+            MODE_LIVE,
+            MODE_PAPER,
+            STRATEGY_QUICK_FLIP,
+        )
+
+        trade_value = float(opportunity.quantity) * float(opportunity.entry_price)
+        portfolio_value = await self._resolve_portfolio_value(
+            fallback_trade_value=trade_value
+        )
+        enforcer = await self._get_portfolio_enforcer(portfolio_value=portfolio_value)
+        if enforcer is None:
+            return True
+
+        live_mode = getattr(settings.trading, "live_trading_enabled", False)
+        allowed, reason = await enforcer.check_trade(
+            ticker=opportunity.market_id,
+            side=opportunity.side.lower(),
+            amount=trade_value,
+            title=opportunity.market_title,
+            strategy=STRATEGY_QUICK_FLIP,
+            mode=MODE_LIVE if live_mode else MODE_PAPER,
+        )
+        if not allowed:
+            self.logger.warning(
+                f"Portfolio enforcer blocked quick flip entry for {opportunity.market_id}: "
+                f"{reason}"
+            )
+        return allowed
 
     @staticmethod
     def _estimate_kalshi_fee(price: float, quantity: float, *, maker: bool) -> float:
@@ -1465,6 +1539,9 @@ Respond with JSON only:
                 return False
 
             live_mode = getattr(settings.trading, "live_trading_enabled", False)
+            if not await self._passes_portfolio_enforcer(opportunity):
+                return False
+
             position = Position(
                 market_id=opportunity.market_id,
                 side=opportunity.side,

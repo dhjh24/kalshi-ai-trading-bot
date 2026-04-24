@@ -6,6 +6,7 @@ import {
   getPortfolioAiSpendByProvider,
   getPortfolioAiSpendByRole,
   getPortfolioAiSpendByStrategy,
+  getPortfolioFeeDriftMetrics,
   getPortfolioAiSpendSummary,
   getPortfolioOpenModeSummary,
   getPortfolioOrderDriftMetrics,
@@ -54,6 +55,12 @@ const liveTradeBridgeInflight = new Map<
     generated_at?: string;
   }>
 >();
+
+type PortfolioPayloadWithFeeDrift = PortfolioPayload & {
+  divergence: PortfolioPayload["divergence"] & {
+    feeDivergence: ReturnType<typeof getPortfolioFeeDriftMetrics>;
+  };
+};
 
 function normalizeLiveTradeCategories(categories: string[]): string[] {
   return Array.from(
@@ -361,7 +368,7 @@ export async function getEventDetailPayload(eventTicker: string) {
   };
 }
 
-export function getPortfolioPayload(): PortfolioPayload {
+export function getPortfolioPayload(): PortfolioPayloadWithFeeDrift {
   const positions = getOpenPositions();
   const trades = getRecentTrades(50);
   const exposure = positions.reduce(
@@ -385,7 +392,8 @@ export function getPortfolioPayload(): PortfolioPayload {
         last24h: getPortfolioTradeDivergenceRollup("24h"),
         last7d: getPortfolioTradeDivergenceRollup("7d")
       },
-      recentOrderDrift: getPortfolioOrderDriftMetrics(24)
+      recentOrderDrift: getPortfolioOrderDriftMetrics(24),
+      feeDivergence: getPortfolioFeeDriftMetrics(24 * 7)
     },
     aiSpend: {
       summary: getPortfolioAiSpendSummary(),

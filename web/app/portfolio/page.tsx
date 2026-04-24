@@ -1,14 +1,16 @@
+import { RuntimeModePanel } from "../../components/runtime-mode-panel";
 import { EmptyState, Panel, StatCard } from "../../components/ui";
 import { getPortfolio } from "../../lib/api";
 import { formatMoney, formatTimestamp } from "../../lib/format";
 import type {
   PortfolioAiSpendBreakdown,
   PortfolioDivergenceRollup,
-  PortfolioModeSplit
+  PortfolioFeeDivergenceMetrics,
+  PortfolioModeSplit,
 } from "../../lib/types";
 
 const integerFormatter = new Intl.NumberFormat("en-US", {
-  maximumFractionDigits: 0
+  maximumFractionDigits: 0,
 });
 
 function formatCount(value: number): string {
@@ -59,7 +61,7 @@ function humanizeBreakdownLabel(value: string): string {
     market_making: "Market Making",
     directional_trading: "Directional Trading",
     portfolio_optimization: "Portfolio Optimization",
-    unattributed: "Unattributed"
+    unattributed: "Unattributed",
   };
 
   if (exactLabels[normalized]) {
@@ -69,6 +71,82 @@ function humanizeBreakdownLabel(value: string): string {
   return value
     .replace(/[_-]+/g, " ")
     .replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function readNumber(
+  record: Record<string, unknown> | null,
+  keys: string[],
+): number | null {
+  if (!record) {
+    return null;
+  }
+
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value;
+    }
+    if (typeof value === "string" && value.trim()) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+  }
+
+  return null;
+}
+
+function readString(
+  record: Record<string, unknown> | null,
+  keys: string[],
+): string | null {
+  if (!record) {
+    return null;
+  }
+
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+
+  return null;
+}
+
+function readBoolean(
+  record: Record<string, unknown> | null,
+  keys: string[],
+): boolean | null {
+  if (!record) {
+    return null;
+  }
+
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "boolean") {
+      return value;
+    }
+    if (typeof value === "number") {
+      return value !== 0;
+    }
+    if (typeof value === "string") {
+      const normalized = value.trim().toLowerCase();
+      if (["1", "true", "yes", "on", "enabled"].includes(normalized)) {
+        return true;
+      }
+      if (["0", "false", "no", "off", "disabled"].includes(normalized)) {
+        return false;
+      }
+    }
+  }
+
+  return null;
 }
 
 function divergenceDeltaClass(value: number): string {
@@ -87,10 +165,149 @@ function pnlDeltaClass(value: number): string {
   return "text-slate-500";
 }
 
+function feeDivergenceDeltaClass(value: number): string {
+  if (value > 0) {
+    return "text-rose-700";
+  }
+
+  if (value < 0) {
+    return "text-emerald-700";
+  }
+
+  return "text-slate-500";
+}
+
+type FeeDivergenceEntryView = {
+  id: string;
+  marketId: string;
+  leg: string;
+  side: string | null;
+  estimatedFee: number | null;
+  actualFee: number | null;
+  divergence: number;
+  quantity: number | null;
+  price: number | null;
+  recordedAt: string | null;
+};
+
+type FeeDivergenceView = {
+  available: boolean;
+  sourceTable: string | null;
+  trailingHours: number | null;
+  lastRecordedAt: string | null;
+  totalEntries: number;
+  entryCount: number | null;
+  exitCount: number | null;
+  totalNetDivergence: number;
+  totalAbsoluteDivergence: number;
+  averageAbsoluteDivergence: number | null;
+  entries: FeeDivergenceEntryView[];
+};
+
+function normalizeFeeDivergenceEntry(
+  entry: unknown,
+  index: number,
+): FeeDivergenceEntryView | null {
+  if (!isRecord(entry)) {
+    return null;
+  }
+
+  const marketId =
+    readString(entry, ["marketId", "market_id"]) || "Unknown market";
+  const leg = (readString(entry, ["leg"]) || "unknown").toLowerCase();
+  const divergence = readNumber(entry, ["divergence"]) || 0;
+  const orderId = readString(entry, ["orderId", "order_id"]);
+
+  return {
+    id: orderId || `${marketId}-${leg}-${index}`,
+    marketId,
+    leg,
+    side: readString(entry, ["side"]),
+    estimatedFee: readNumber(entry, ["estimatedFee", "estimated_fee"]),
+    actualFee: readNumber(entry, ["actualFee", "actual_fee"]),
+    divergence,
+    quantity: readNumber(entry, ["quantity"]),
+    price: readNumber(entry, ["price"]),
+    recordedAt: readString(entry, ["recordedAt", "recorded_at"]),
+  };
+}
+
+function normalizeFeeDivergence(
+  metrics: PortfolioFeeDivergenceMetrics | null | undefined,
+): FeeDivergenceView | null {
+  if (!isRecord(metrics)) {
+    return null;
+  }
+
+  const summary = isRecord(metrics.summary) ? metrics.summary : null;
+  const entries = Array.isArray(metrics.entries)
+    ? metrics.entries
+        .map((entry, index) => normalizeFeeDivergenceEntry(entry, index))
+        .filter((entry): entry is FeeDivergenceEntryView => Boolean(entry))
+    : [];
+  const totalEntries =
+    readNumber(summary, ["totalEntries", "total_entries"]) ??
+    readNumber(metrics, ["driftEvents", "drift_events"]) ??
+    entries.length;
+  const entryCount =
+    readNumber(summary, ["entryCount", "entry_count"]) ??
+    readNumber(metrics, ["entryDriftEvents", "entry_drift_events"]) ??
+    (entries.length > 0
+      ? entries.filter((entry) => entry.leg === "entry").length
+      : null);
+  const exitCount =
+    readNumber(summary, ["exitCount", "exit_count"]) ??
+    readNumber(metrics, ["exitDriftEvents", "exit_drift_events"]) ??
+    (entries.length > 0
+      ? entries.filter((entry) => entry.leg === "exit").length
+      : null);
+  const totalNetDivergence =
+    readNumber(summary, ["totalDivergenceUsd", "total_divergence_usd"]) ??
+    readNumber(metrics, [
+      "actualMinusEstimatedFeesUsd",
+      "actual_minus_estimated_fees_usd",
+    ]) ??
+    entries.reduce((sum, entry) => sum + entry.divergence, 0);
+  const totalAbsoluteDivergence =
+    readNumber(summary, [
+      "totalAbsoluteDivergenceUsd",
+      "total_absolute_divergence_usd",
+    ]) ??
+    readNumber(metrics, ["absoluteDriftUsd", "absolute_drift_usd"]) ??
+    entries.reduce((sum, entry) => sum + Math.abs(entry.divergence), 0);
+  const averageAbsoluteDivergence =
+    readNumber(summary, [
+      "averageAbsoluteDivergenceUsd",
+      "average_absolute_divergence_usd",
+    ]) ??
+    readNumber(metrics, ["avgAbsDriftUsd", "avg_abs_drift_usd"]) ??
+    (totalEntries > 0 ? totalAbsoluteDivergence / totalEntries : null);
+
+  return {
+    available:
+      readBoolean(metrics, ["available"]) ??
+      (totalEntries > 0 || entries.length > 0),
+    sourceTable: readString(metrics, ["sourceTable", "source_table"]),
+    trailingHours: readNumber(metrics, ["trailingHours", "trailing_hours"]),
+    lastRecordedAt:
+      readString(summary, ["lastRecordedAt", "last_recorded_at"]) ??
+      readString(metrics, ["lastRecordedAt", "last_recorded_at"]) ??
+      entries[0]?.recordedAt ??
+      null,
+    totalEntries,
+    entryCount,
+    exitCount,
+    totalNetDivergence,
+    totalAbsoluteDivergence,
+    averageAbsoluteDivergence,
+    entries,
+  };
+}
+
 function SummaryTile({
   label,
   value,
-  helpText
+  helpText,
 }: {
   label: string;
   value: string;
@@ -98,9 +315,13 @@ function SummaryTile({
 }) {
   return (
     <div className="rounded-2xl border border-slate-100 bg-slate-50/90 p-4">
-      <p className="text-xs uppercase tracking-[0.28em] text-slate-500">{label}</p>
+      <p className="text-xs uppercase tracking-[0.28em] text-slate-500">
+        {label}
+      </p>
       <p className="mt-3 text-2xl font-semibold text-steel">{value}</p>
-      {helpText ? <p className="mt-2 text-sm text-slate-500">{helpText}</p> : null}
+      {helpText ? (
+        <p className="mt-2 text-sm text-slate-500">{helpText}</p>
+      ) : null}
     </div>
   );
 }
@@ -108,7 +329,7 @@ function SummaryTile({
 function SplitCard({
   label,
   split,
-  currency = false
+  currency = false,
 }: {
   label: string;
   split: PortfolioModeSplit;
@@ -122,20 +343,26 @@ function SplitCard({
     <div className="rounded-2xl border border-slate-100 bg-slate-50/80 p-4">
       <div className="flex items-start justify-between gap-4">
         <p className="font-medium text-steel">{label}</p>
-        <p className={`text-sm font-semibold ${divergenceDeltaClass(split.liveMinusPaper)}`}>
+        <p
+          className={`text-sm font-semibold ${divergenceDeltaClass(split.liveMinusPaper)}`}
+        >
           Live - paper {deltaText}
         </p>
       </div>
 
       <div className="mt-4 grid gap-3 sm:grid-cols-2">
         <div>
-          <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Paper</p>
+          <p className="text-xs uppercase tracking-[0.2em] text-slate-500">
+            Paper
+          </p>
           <p className="mt-1 text-lg font-semibold text-steel">
             {formatSplitValue(split.paper, currency)}
           </p>
         </div>
         <div>
-          <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Live</p>
+          <p className="text-xs uppercase tracking-[0.2em] text-slate-500">
+            Live
+          </p>
           <p className="mt-1 text-lg font-semibold text-steel">
             {formatSplitValue(split.live, currency)}
           </p>
@@ -150,31 +377,45 @@ function RollupCard({ rollup }: { rollup: PortfolioDivergenceRollup }) {
     <div className="rounded-2xl border border-slate-100 bg-slate-50/80 p-4">
       <div className="flex items-start justify-between gap-4">
         <p className="font-medium text-steel">{rollup.label} closed trades</p>
-        <p className={`text-sm font-semibold ${divergenceDeltaClass(rollup.liveMinusPaperTrades)}`}>
+        <p
+          className={`text-sm font-semibold ${divergenceDeltaClass(rollup.liveMinusPaperTrades)}`}
+        >
           Trade delta {formatSignedCount(rollup.liveMinusPaperTrades)}
         </p>
       </div>
 
       <div className="mt-4 grid gap-3 sm:grid-cols-2">
         <div>
-          <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Paper</p>
+          <p className="text-xs uppercase tracking-[0.2em] text-slate-500">
+            Paper
+          </p>
           <p className="mt-1 text-lg font-semibold text-steel">
             {formatCount(rollup.paperTrades)} trades
           </p>
-          <p className="mt-1 text-sm text-slate-500">{formatMoney(rollup.paperPnl)} PnL</p>
+          <p className="mt-1 text-sm text-slate-500">
+            {formatMoney(rollup.paperPnl)} PnL
+          </p>
         </div>
         <div>
-          <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Live</p>
+          <p className="text-xs uppercase tracking-[0.2em] text-slate-500">
+            Live
+          </p>
           <p className="mt-1 text-lg font-semibold text-steel">
             {formatCount(rollup.liveTrades)} trades
           </p>
-          <p className="mt-1 text-sm text-slate-500">{formatMoney(rollup.livePnl)} PnL</p>
+          <p className="mt-1 text-sm text-slate-500">
+            {formatMoney(rollup.livePnl)} PnL
+          </p>
         </div>
       </div>
 
       <div className="mt-4 border-t border-slate-200 pt-4">
-        <p className="text-xs uppercase tracking-[0.2em] text-slate-500">PnL delta</p>
-        <p className={`mt-1 text-lg font-semibold ${pnlDeltaClass(rollup.liveMinusPaperPnl)}`}>
+        <p className="text-xs uppercase tracking-[0.2em] text-slate-500">
+          PnL delta
+        </p>
+        <p
+          className={`mt-1 text-lg font-semibold ${pnlDeltaClass(rollup.liveMinusPaperPnl)}`}
+        >
           {formatSignedMoney(rollup.liveMinusPaperPnl)}
         </p>
       </div>
@@ -186,7 +427,7 @@ function OrderDriftTile({
   label,
   paper,
   live,
-  delta
+  delta,
 }: {
   label: string;
   paper: number;
@@ -195,11 +436,15 @@ function OrderDriftTile({
 }) {
   return (
     <div className="rounded-2xl border border-slate-100 bg-slate-50/80 p-4">
-      <p className="text-xs uppercase tracking-[0.2em] text-slate-500">{label}</p>
+      <p className="text-xs uppercase tracking-[0.2em] text-slate-500">
+        {label}
+      </p>
       <p className="mt-3 text-lg font-semibold text-steel">
         {formatCount(live)} live / {formatCount(paper)} paper
       </p>
-      <p className={`mt-2 text-sm font-semibold ${divergenceDeltaClass(delta)}`}>
+      <p
+        className={`mt-2 text-sm font-semibold ${divergenceDeltaClass(delta)}`}
+      >
         Delta {formatSignedCount(delta)}
       </p>
     </div>
@@ -209,7 +454,7 @@ function OrderDriftTile({
 function BreakdownList({
   title,
   description,
-  breakdown
+  breakdown,
 }: {
   title: string;
   description: string;
@@ -222,13 +467,19 @@ function BreakdownList({
           <h3 className="font-medium text-steel">{title}</h3>
           <p className="mt-1 text-sm text-slate-500">{description}</p>
         </div>
-        <p className="text-sm font-semibold text-slate-600">{formatMoney(breakdown.totalCostUsd)}</p>
+        <p className="text-sm font-semibold text-slate-600">
+          {formatMoney(breakdown.totalCostUsd)}
+        </p>
       </div>
 
       {!breakdown.available ? (
-        <p className="mt-4 text-sm text-slate-500">Telemetry for this breakdown is not available yet.</p>
+        <p className="mt-4 text-sm text-slate-500">
+          Telemetry for this breakdown is not available yet.
+        </p>
       ) : breakdown.items.length === 0 ? (
-        <p className="mt-4 text-sm text-slate-500">No spend rows have been logged for this slice yet.</p>
+        <p className="mt-4 text-sm text-slate-500">
+          No spend rows have been logged for this slice yet.
+        </p>
       ) : (
         <div className="mt-4 space-y-3">
           {breakdown.items.map((item) => (
@@ -237,14 +488,20 @@ function BreakdownList({
               className="flex items-start justify-between gap-4 rounded-xl border border-white/80 bg-white/80 px-4 py-3"
             >
               <div>
-                <p className="font-medium text-steel">{humanizeBreakdownLabel(item.label)}</p>
+                <p className="font-medium text-steel">
+                  {humanizeBreakdownLabel(item.label)}
+                </p>
                 <p className="mt-1 text-sm text-slate-500">
                   {formatCount(item.count)} rows
-                  {item.tokensUsed !== null ? ` / ${formatCount(item.tokensUsed)} tokens` : ""}
+                  {item.tokensUsed !== null
+                    ? ` / ${formatCount(item.tokensUsed)} tokens`
+                    : ""}
                   {` / ${item.shareOfKnownCostPct.toFixed(1)}% of known cost`}
                 </p>
               </div>
-              <p className="text-sm font-semibold text-slate-700">{formatMoney(item.costUsd)}</p>
+              <p className="text-sm font-semibold text-slate-700">
+                {formatMoney(item.costUsd)}
+              </p>
             </div>
           ))}
         </div>
@@ -264,38 +521,68 @@ export default async function PortfolioPage() {
   const payload = await getPortfolio();
   const orderDrift = payload.divergence.recentOrderDrift;
   const orderDriftSource = orderDrift.sourceTable?.trim();
+  const payloadRecord = payload as unknown as Record<string, unknown>;
+  const divergenceRecord = isRecord(payloadRecord.divergence)
+    ? payloadRecord.divergence
+    : null;
+  const feeDivergence = normalizeFeeDivergence(
+    (payloadRecord.feeDivergence ??
+      payloadRecord.fee_divergence ??
+      divergenceRecord?.feeDivergence ??
+      divergenceRecord?.fee_divergence ??
+      null) as PortfolioFeeDivergenceMetrics | null,
+  );
 
   return (
     <div className="space-y-6">
-      <Panel eyebrow="Portfolio" title="Positions, trades, and deployed capital">
+      <Panel
+        eyebrow="Portfolio"
+        title="Positions, trades, and deployed capital"
+      >
         <p className="max-w-3xl text-slate-600">
-          This page stays focused on monitoring rather than control. Trading jobs
-          continue to run in Python, while the Node site gives you the faster
-          route-based lens into positions, P&L, divergence between paper and
-          live activity, and the spend footprint behind the AI stack.
+          This page stays focused on monitoring rather than control. Trading
+          jobs continue to run in Python, while the Node site gives you the
+          faster route-based lens into positions, P&L, divergence between paper
+          and live activity, and the spend footprint behind the AI stack.
         </p>
       </Panel>
 
+      <RuntimeModePanel source={payload} title="Configured trading mode" />
+
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-        <StatCard label="Active Positions" value={String(payload.metrics.activePositions)} />
-        <StatCard label="Open Exposure" value={formatMoney(payload.metrics.exposure)} tone="warning" />
+        <StatCard
+          label="Active Positions"
+          value={String(payload.metrics.activePositions)}
+        />
+        <StatCard
+          label="Open Exposure"
+          value={formatMoney(payload.metrics.exposure)}
+          tone="warning"
+        />
         <StatCard
           label="Realized P&L"
           value={formatMoney(payload.metrics.realizedPnl)}
           tone={payload.metrics.realizedPnl >= 0 ? "positive" : "negative"}
         />
-        <StatCard label="AI Spend Today" value={formatMoney(payload.metrics.todayAiCost)} tone="warning" />
+        <StatCard
+          label="AI Spend Today"
+          value={formatMoney(payload.metrics.todayAiCost)}
+          tone="warning"
+        />
       </div>
 
       <section className="grid gap-6 xl:grid-cols-2">
         <Panel title="Paper vs live divergence">
           <p className="max-w-3xl text-sm text-slate-500">
-            Delta values are live minus paper. Zeroed windows mean nothing closed
-            in that span, not necessarily that both modes matched.
+            Delta values are live minus paper. Zeroed windows mean nothing
+            closed in that span, not necessarily that both modes matched.
           </p>
 
           <div className="mt-4 grid gap-3 md:grid-cols-2">
-            <SplitCard label="Open positions" split={payload.divergence.summary.openPositions} />
+            <SplitCard
+              label="Open positions"
+              split={payload.divergence.summary.openPositions}
+            />
             <SplitCard
               label="Open exposure"
               split={payload.divergence.summary.openExposure}
@@ -312,10 +599,16 @@ export default async function PortfolioPage() {
             <div className="mt-5 border-t border-slate-200 pt-5">
               <div className="flex items-start justify-between gap-4">
                 <div>
-                  <h3 className="font-medium text-steel">Shadow and order drift</h3>
+                  <h3 className="font-medium text-steel">
+                    Shadow and order drift
+                  </h3>
                   <p className="mt-1 text-sm text-slate-500">
                     Tracked from{" "}
-                    {orderDriftSource ? <code>{orderDriftSource}</code> : "shadow-order telemetry"}{" "}
+                    {orderDriftSource ? (
+                      <code>{orderDriftSource}</code>
+                    ) : (
+                      "shadow-order telemetry"
+                    )}{" "}
                     over the last {orderDrift.trailingHours} hours.
                   </p>
                 </div>
@@ -350,7 +643,8 @@ export default async function PortfolioPage() {
             </div>
           ) : (
             <div className="mt-5 rounded-2xl border border-dashed border-slate-200 bg-slate-50/70 px-4 py-5 text-sm text-slate-500">
-              No recent order-drift telemetry is available yet, so this panel will populate after the next paper or shadow execution cycle.
+              No recent order-drift telemetry is available yet, so this panel
+              will populate after the next paper or shadow execution cycle.
             </div>
           )}
         </Panel>
@@ -383,12 +677,15 @@ export default async function PortfolioPage() {
 
           <div className="mt-4 rounded-2xl border border-slate-100 bg-slate-50/80 px-4 py-4 text-sm text-slate-500">
             <p>
-              Logged {formatCount(payload.aiSpend.summary.llmQueryCount)} runtime
-              queries, {formatCount(payload.aiSpend.summary.analysisRequestCount)} manual
-              analysis requests, and {formatCount(payload.aiSpend.summary.tokensUsed)} tokens.
+              Logged {formatCount(payload.aiSpend.summary.llmQueryCount)}{" "}
+              runtime queries,{" "}
+              {formatCount(payload.aiSpend.summary.analysisRequestCount)} manual
+              analysis requests, and{" "}
+              {formatCount(payload.aiSpend.summary.tokensUsed)} tokens.
             </p>
             <p className="mt-2">
-              Last runtime query: {formatTimestamp(payload.aiSpend.summary.latestLlmQueryAt)}
+              Last runtime query:{" "}
+              {formatTimestamp(payload.aiSpend.summary.latestLlmQueryAt)}
             </p>
             <p className="mt-1">
               Last manual analysis:{" "}
@@ -416,6 +713,138 @@ export default async function PortfolioPage() {
         </Panel>
       </section>
 
+      {feeDivergence ? (
+        <Panel title="Fee divergence">
+          <p className="max-w-3xl text-sm text-slate-500">
+            Tracks the gap between estimated fees and actual live fill fees
+            whenever reconciliation telemetry is present.
+          </p>
+
+          {!feeDivergence.available ? (
+            <div className="mt-4 rounded-2xl border border-dashed border-slate-200 bg-slate-50/70 px-4 py-5 text-sm text-slate-500">
+              Fee-divergence telemetry is supported by the payload but has not
+              produced any rows yet.
+            </div>
+          ) : (
+            <>
+              <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                <SummaryTile
+                  label="Logged fills"
+                  value={formatCount(feeDivergence.totalEntries)}
+                />
+                <SummaryTile
+                  label="Net delta"
+                  value={formatSignedMoney(feeDivergence.totalNetDivergence)}
+                  helpText="Actual fee minus estimated fee."
+                />
+                <SummaryTile
+                  label="Absolute delta"
+                  value={formatMoney(feeDivergence.totalAbsoluteDivergence)}
+                />
+                <SummaryTile
+                  label="Avg abs / fill"
+                  value={
+                    feeDivergence.averageAbsoluteDivergence === null
+                      ? "N/A"
+                      : formatMoney(feeDivergence.averageAbsoluteDivergence)
+                  }
+                />
+              </div>
+
+              <div className="mt-4 rounded-2xl border border-slate-100 bg-slate-50/80 px-4 py-4 text-sm text-slate-500">
+                <p>
+                  Source{" "}
+                  {feeDivergence.sourceTable ? (
+                    <code>{feeDivergence.sourceTable}</code>
+                  ) : (
+                    "fee-divergence telemetry"
+                  )}
+                  {feeDivergence.trailingHours !== null
+                    ? ` over the last ${feeDivergence.trailingHours} hours.`
+                    : "."}
+                </p>
+                <p className="mt-2">
+                  Entry rows{" "}
+                  {feeDivergence.entryCount === null
+                    ? "N/A"
+                    : formatCount(feeDivergence.entryCount)}
+                  {" / "}
+                  Exit rows{" "}
+                  {feeDivergence.exitCount === null
+                    ? "N/A"
+                    : formatCount(feeDivergence.exitCount)}
+                </p>
+                <p className="mt-1">
+                  Last recorded {formatTimestamp(feeDivergence.lastRecordedAt)}
+                </p>
+              </div>
+
+              {feeDivergence.entries.length > 0 ? (
+                <div className="mt-4 space-y-3">
+                  {feeDivergence.entries.slice(0, 6).map((entry) => (
+                    <div
+                      key={entry.id}
+                      className="rounded-2xl border border-slate-100 p-4"
+                    >
+                      <div className="flex items-start justify-between gap-4">
+                        <div>
+                          <p className="font-medium text-steel">
+                            {entry.marketId}
+                          </p>
+                          <p className="mt-1 text-sm text-slate-500">
+                            {entry.leg.toUpperCase()}
+                            {entry.side ? ` / ${entry.side}` : ""}
+                            {entry.quantity !== null
+                              ? ` / ${formatCount(entry.quantity)} contracts`
+                              : ""}
+                            {entry.price !== null
+                              ? ` / ${formatMoney(entry.price)}`
+                              : ""}
+                          </p>
+                        </div>
+                        <p
+                          className={`text-sm font-semibold ${feeDivergenceDeltaClass(entry.divergence)}`}
+                        >
+                          {formatSignedMoney(entry.divergence)}
+                        </p>
+                      </div>
+
+                      <div className="mt-3 grid gap-3 text-sm text-slate-500 md:grid-cols-3">
+                        <p>
+                          Estimated{" "}
+                          {entry.estimatedFee === null
+                            ? "N/A"
+                            : formatMoney(entry.estimatedFee)}
+                        </p>
+                        <p>
+                          Actual{" "}
+                          {entry.actualFee === null
+                            ? "N/A"
+                            : formatMoney(entry.actualFee)}
+                        </p>
+                        <p>Recorded {formatTimestamp(entry.recordedAt)}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="mt-4 rounded-2xl border border-dashed border-slate-200 bg-slate-50/70 px-4 py-5 text-sm text-slate-500">
+                  Summary stats are available, but no recent per-fill fee rows
+                  were included in this payload.
+                </div>
+              )}
+
+              {feeDivergence.entries.length > 6 ? (
+                <p className="mt-3 text-sm text-slate-500">
+                  Showing the 6 most recent fee-divergence rows out of{" "}
+                  {feeDivergence.entries.length}.
+                </p>
+              ) : null}
+            </>
+          )}
+        </Panel>
+      ) : null}
+
       <section className="grid gap-6 xl:grid-cols-2">
         <Panel title="Open positions">
           {payload.positions.length === 0 ? (
@@ -432,7 +861,9 @@ export default async function PortfolioPage() {
                 >
                   <div className="flex items-start justify-between gap-4">
                     <div>
-                      <p className="font-medium text-steel">{position.market_id}</p>
+                      <p className="font-medium text-steel">
+                        {position.market_id}
+                      </p>
                       <p className="mt-1 text-sm text-slate-500">
                         {position.side} / {position.strategy || "strategy n/a"}
                       </p>
@@ -462,7 +893,9 @@ export default async function PortfolioPage() {
                 >
                   <div className="flex items-start justify-between gap-4">
                     <div>
-                      <p className="font-medium text-steel">{trade.market_id}</p>
+                      <p className="font-medium text-steel">
+                        {trade.market_id}
+                      </p>
                       <p className="mt-1 text-sm text-slate-500">
                         {trade.side} / {trade.strategy || "strategy n/a"}
                       </p>
