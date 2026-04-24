@@ -89,6 +89,44 @@ class SimulatedOrder:
     id: Optional[int] = None
 
 @dataclass
+class MarketSnapshot:
+    """
+    A point-in-time snapshot of a market's order book top and last trade.
+
+    Written by `src/jobs/ingest.py` on each quick-flip scan tick so that
+    `scripts/replay_paper.py` can reconstruct the order book we saw at every
+    decision point without hitting the live Kalshi API.
+
+    Fields:
+      timestamp: ISO-8601 wall-clock time the snapshot was captured.
+      ticker: Kalshi market ticker.
+      yes_bid, yes_ask, no_bid, no_ask: top-of-book prices in dollars (0.0-1.0).
+      book_top_5_json: JSON-encoded list of up to 5 price levels per side in the
+        shape {"yes_bids": [[p, sz], ...], "yes_asks": [...], "no_bids": [...],
+        "no_asks": [...]}. This is the payload the replay harness replays.
+      last_trade_json: JSON-encoded most recent trade
+        ({"price_dollars": float, "count": int, "ts": int, "side": "yes"|"no"})
+        or null if no trade has been observed yet.
+      market_status: Kalshi market status (`open`, `closed`, `settled`, etc.).
+      volume: Cumulative contract volume at snapshot time.
+      market_result: Settlement outcome when the market is closed (`YES`/`NO`/``).
+    """
+
+    timestamp: datetime
+    ticker: str
+    yes_bid: float
+    yes_ask: float
+    no_bid: float
+    no_ask: float
+    book_top_5_json: str
+    last_trade_json: Optional[str] = None
+    market_status: Optional[str] = None
+    volume: Optional[int] = None
+    market_result: Optional[str] = None
+    id: Optional[int] = None
+
+
+@dataclass
 class LLMQuery:
     """Represents an LLM query and response for analysis."""
     timestamp: datetime
@@ -257,6 +295,33 @@ class DatabaseManager(TradingLoggerMixin):
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_simulated_orders_market "
                 "ON simulated_orders(market_id)"
+            )
+
+            # W3 replay harness - market_snapshots is additive-only. Back-fill on
+            # existing DBs so ingest.py has somewhere to write from day one.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS market_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    yes_bid REAL NOT NULL DEFAULT 0,
+                    yes_ask REAL NOT NULL DEFAULT 0,
+                    no_bid REAL NOT NULL DEFAULT 0,
+                    no_ask REAL NOT NULL DEFAULT 0,
+                    book_top_5_json TEXT NOT NULL,
+                    last_trade_json TEXT,
+                    market_status TEXT,
+                    volume INTEGER,
+                    market_result TEXT
+                )
+            """)
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_market_snapshots_ts "
+                "ON market_snapshots(timestamp)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_market_snapshots_ticker_ts "
+                "ON market_snapshots(ticker, timestamp)"
             )
 
             await self._migrate_existing_strategy_data(db)
@@ -672,6 +737,25 @@ class DatabaseManager(TradingLoggerMixin):
             )
         """)
 
+        # Replay harness (W3): point-in-time snapshots of order book + last trade.
+        # Additive only - nothing else in the app reads from this table.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS market_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                ticker TEXT NOT NULL,
+                yes_bid REAL NOT NULL DEFAULT 0,
+                yes_ask REAL NOT NULL DEFAULT 0,
+                no_bid REAL NOT NULL DEFAULT 0,
+                no_ask REAL NOT NULL DEFAULT 0,
+                book_top_5_json TEXT NOT NULL,
+                last_trade_json TEXT,
+                market_status TEXT,
+                volume INTEGER,
+                market_result TEXT
+            )
+        """)
+
         # Create indices for performance
         await db.execute("CREATE INDEX IF NOT EXISTS idx_market_analyses_market_id ON market_analyses(market_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_market_analyses_timestamp ON market_analyses(analysis_timestamp)")
@@ -683,6 +767,14 @@ class DatabaseManager(TradingLoggerMixin):
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_simulated_orders_market "
             "ON simulated_orders(market_id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_market_snapshots_ts "
+            "ON market_snapshots(timestamp)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_market_snapshots_ticker_ts "
+            "ON market_snapshots(ticker, timestamp)"
         )
 
         self.logger.info("Tables created or already exist.")
@@ -1077,6 +1169,133 @@ class DatabaseManager(TradingLoggerMixin):
                 tuple(params),
             )
             await db.commit()
+
+    async def add_market_snapshot(self, snapshot: "MarketSnapshot") -> int:
+        """
+        Persist a `MarketSnapshot` to the `market_snapshots` table.
+
+        Used by `src/jobs/ingest.py` to record the top-of-book and last trade
+        for each market we scan. Returns the new row id. Additive-only - this
+        never touches `markets`, `positions`, `trade_logs`, or any live path.
+        """
+        snapshot_dict = {
+            "timestamp": snapshot.timestamp.isoformat()
+            if isinstance(snapshot.timestamp, datetime)
+            else str(snapshot.timestamp),
+            "ticker": snapshot.ticker,
+            "yes_bid": float(snapshot.yes_bid or 0.0),
+            "yes_ask": float(snapshot.yes_ask or 0.0),
+            "no_bid": float(snapshot.no_bid or 0.0),
+            "no_ask": float(snapshot.no_ask or 0.0),
+            "book_top_5_json": snapshot.book_top_5_json,
+            "last_trade_json": snapshot.last_trade_json,
+            "market_status": snapshot.market_status,
+            "volume": (
+                int(snapshot.volume)
+                if snapshot.volume is not None
+                else None
+            ),
+            "market_result": snapshot.market_result,
+        }
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO market_snapshots (
+                    timestamp, ticker, yes_bid, yes_ask, no_bid, no_ask,
+                    book_top_5_json, last_trade_json, market_status, volume,
+                    market_result
+                ) VALUES (
+                    :timestamp, :ticker, :yes_bid, :yes_ask, :no_bid, :no_ask,
+                    :book_top_5_json, :last_trade_json, :market_status, :volume,
+                    :market_result
+                )
+                """,
+                snapshot_dict,
+            )
+            await db.commit()
+            return int(cursor.lastrowid)
+
+    async def add_market_snapshots(self, snapshots: List["MarketSnapshot"]) -> int:
+        """Bulk-insert snapshots in a single transaction (returns row count)."""
+        if not snapshots:
+            return 0
+        rows = [
+            {
+                "timestamp": s.timestamp.isoformat()
+                if isinstance(s.timestamp, datetime)
+                else str(s.timestamp),
+                "ticker": s.ticker,
+                "yes_bid": float(s.yes_bid or 0.0),
+                "yes_ask": float(s.yes_ask or 0.0),
+                "no_bid": float(s.no_bid or 0.0),
+                "no_ask": float(s.no_ask or 0.0),
+                "book_top_5_json": s.book_top_5_json,
+                "last_trade_json": s.last_trade_json,
+                "market_status": s.market_status,
+                "volume": int(s.volume) if s.volume is not None else None,
+                "market_result": s.market_result,
+            }
+            for s in snapshots
+        ]
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.executemany(
+                """
+                INSERT INTO market_snapshots (
+                    timestamp, ticker, yes_bid, yes_ask, no_bid, no_ask,
+                    book_top_5_json, last_trade_json, market_status, volume,
+                    market_result
+                ) VALUES (
+                    :timestamp, :ticker, :yes_bid, :yes_ask, :no_bid, :no_ask,
+                    :book_top_5_json, :last_trade_json, :market_status, :volume,
+                    :market_result
+                )
+                """,
+                rows,
+            )
+            await db.commit()
+        return len(rows)
+
+    async def get_market_snapshots(
+        self,
+        *,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        ticker: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List["MarketSnapshot"]:
+        """
+        Fetch market snapshots ordered by (timestamp ASC, id ASC).
+
+        Deterministic ordering is important for the replay harness: given the
+        same DB, the same inputs must always produce the same report.
+        """
+        query = "SELECT * FROM market_snapshots WHERE 1=1"
+        params: List[Any] = []
+        if since is not None:
+            query += " AND timestamp >= ?"
+            params.append(since.isoformat())
+        if until is not None:
+            query += " AND timestamp <= ?"
+            params.append(until.isoformat())
+        if ticker is not None:
+            query += " AND ticker = ?"
+            params.append(ticker)
+        query += " ORDER BY timestamp ASC, id ASC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(int(limit))
+
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(query, tuple(params))
+            rows = await cursor.fetchall()
+
+        snapshots: List[MarketSnapshot] = []
+        for row in rows:
+            row_dict = dict(row)
+            row_dict["timestamp"] = datetime.fromisoformat(row_dict["timestamp"])
+            snapshots.append(MarketSnapshot(**row_dict))
+        return snapshots
 
     async def get_performance_by_strategy(self) -> Dict[str, Dict]:
         """

@@ -8,12 +8,13 @@ queues eligible markets for downstream analysis.
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from src.clients.kalshi_client import KalshiClient
 from src.config.settings import settings
-from src.utils.database import DatabaseManager, Market
+from src.utils.database import DatabaseManager, Market, MarketSnapshot
 from src.utils.market_preferences import (
     is_live_wagering_market,
     normalize_market_category,
@@ -21,12 +22,254 @@ from src.utils.market_preferences import (
 from src.utils.kalshi_normalization import (
     get_market_expiration_ts,
     get_market_prices,
+    get_market_result,
     get_market_status,
     get_market_volume,
     is_active_market_status,
     is_tradeable_market,
 )
 from src.utils.logging_setup import get_trading_logger
+
+
+# ---------------------------------------------------------------------------
+# W3 replay snapshot writer
+# ---------------------------------------------------------------------------
+
+_SNAPSHOT_DEPTH = 5  # top N levels captured per side
+
+
+def _coerce_book_level(level: Any) -> Optional[List[float]]:
+    """Return a `[price_dollars, size]` pair, or None if unparseable."""
+    if not isinstance(level, (list, tuple)) or len(level) < 2:
+        return None
+    try:
+        price = float(level[0])
+        size = float(level[1])
+    except (TypeError, ValueError):
+        return None
+    if price > 1.0:
+        # Kalshi sometimes returns cents
+        price = price / 100.0
+    if price <= 0 or size <= 0:
+        return None
+    return [round(price, 4), round(size, 4)]
+
+
+def _normalize_book_side(raw_levels: Any, *, descending: bool) -> List[List[float]]:
+    """Normalize one side of an orderbook into sorted `[price, size]` rows."""
+    levels: List[List[float]] = []
+    for raw in raw_levels or []:
+        parsed = _coerce_book_level(raw)
+        if parsed is not None:
+            levels.append(parsed)
+    levels.sort(key=lambda row: row[0], reverse=descending)
+    return levels[:_SNAPSHOT_DEPTH]
+
+
+def build_market_snapshot(
+    *,
+    ticker: str,
+    market_info: Dict[str, Any],
+    orderbook: Optional[Dict[str, Any]] = None,
+    last_trade: Optional[Dict[str, Any]] = None,
+    captured_at: Optional[datetime] = None,
+) -> MarketSnapshot:
+    """
+    Build a `MarketSnapshot` dataclass from raw Kalshi API payloads.
+
+    This is the single point of truth for how the replay harness serializes
+    market state. It intentionally drops everything except top-5 levels and
+    the latest trade so the row stays small and deterministic.
+    """
+    yes_bid, yes_ask, no_bid, no_ask = get_market_prices(market_info)
+
+    if orderbook is None:
+        orderbook = {}
+
+    # Kalshi returns "yes"/"no" at level-1 with bid and ask both implicit:
+    # historically each side's `*_dollars` array is the resting bids for that
+    # side. We capture both sides' bids; the implied ask on YES is 1 - best NO
+    # bid and vice versa. Replay consumers derive asks from the paired side.
+    yes_bids_raw = orderbook.get("yes_dollars", orderbook.get("yes", []))
+    no_bids_raw = orderbook.get("no_dollars", orderbook.get("no", []))
+    yes_asks_raw = orderbook.get(
+        "yes_ask_dollars",
+        orderbook.get("yes_asks", orderbook.get("asks_yes", [])),
+    )
+    no_asks_raw = orderbook.get(
+        "no_ask_dollars",
+        orderbook.get("no_asks", orderbook.get("asks_no", [])),
+    )
+
+    book_top_5 = {
+        "yes_bids": _normalize_book_side(yes_bids_raw, descending=True),
+        "no_bids": _normalize_book_side(no_bids_raw, descending=True),
+        "yes_asks": _normalize_book_side(yes_asks_raw, descending=False),
+        "no_asks": _normalize_book_side(no_asks_raw, descending=False),
+    }
+
+    # If the API did not return explicit asks, synthesize the best ask level
+    # from top-of-book market info so replay consumers always have something.
+    if not book_top_5["yes_asks"] and yes_ask > 0:
+        book_top_5["yes_asks"] = [[round(yes_ask, 4), 0.0]]
+    if not book_top_5["no_asks"] and no_ask > 0:
+        book_top_5["no_asks"] = [[round(no_ask, 4), 0.0]]
+
+    last_trade_payload: Optional[str] = None
+    if isinstance(last_trade, dict) and last_trade:
+        minimal = {
+            "ts": last_trade.get("ts") or last_trade.get("created_time"),
+            "yes_price_dollars": last_trade.get("yes_price_dollars"),
+            "no_price_dollars": last_trade.get("no_price_dollars"),
+            "count": last_trade.get("count"),
+            "taker_side": last_trade.get("taker_side") or last_trade.get("side"),
+        }
+        last_trade_payload = json.dumps(minimal, sort_keys=True)
+
+    return MarketSnapshot(
+        timestamp=captured_at or datetime.now(),
+        ticker=ticker,
+        yes_bid=float(yes_bid or 0.0),
+        yes_ask=float(yes_ask or 0.0),
+        no_bid=float(no_bid or 0.0),
+        no_ask=float(no_ask or 0.0),
+        book_top_5_json=json.dumps(book_top_5, sort_keys=True),
+        last_trade_json=last_trade_payload,
+        market_status=get_market_status(market_info) or None,
+        volume=get_market_volume(market_info),
+        market_result=(get_market_result(market_info) or "").upper() or None,
+    )
+
+
+async def write_market_snapshots(
+    *,
+    db_manager: DatabaseManager,
+    kalshi_client: KalshiClient,
+    tickers: Iterable[str],
+    captured_at: Optional[datetime] = None,
+) -> int:
+    """
+    Fetch per-ticker market + orderbook + last trade payloads and persist a
+    `market_snapshots` row for each. Intended to be called on every
+    quick-flip scan tick; safe to call outside that context too.
+
+    Returns the number of snapshots persisted. Best-effort: any per-ticker
+    error is logged and skipped so one bad ticker cannot block the rest.
+    """
+    logger = get_trading_logger("market_snapshots")
+    captured_at = captured_at or datetime.now()
+
+    snapshots: List[MarketSnapshot] = []
+    for ticker in tickers:
+        if not ticker:
+            continue
+        try:
+            market_response = await kalshi_client.get_market(ticker)
+            market_info = (
+                market_response.get("market", {})
+                if isinstance(market_response, dict)
+                else {}
+            )
+            if not market_info:
+                continue
+
+            orderbook_payload: Dict[str, Any] = {}
+            try:
+                ob_response = await kalshi_client.get_orderbook(
+                    ticker, depth=_SNAPSHOT_DEPTH
+                )
+                if isinstance(ob_response, dict):
+                    orderbook_payload = (
+                        ob_response.get("orderbook_fp")
+                        or ob_response.get("orderbook")
+                        or {}
+                    )
+            except Exception as exc:  # pragma: no cover - network flaky
+                logger.debug(
+                    f"Skipping orderbook for {ticker}: {exc}"
+                )
+
+            last_trade: Optional[Dict[str, Any]] = None
+            try:
+                trades_response = await kalshi_client.get_market_trades(ticker, limit=1)
+                trades = (
+                    trades_response.get("trades", [])
+                    if isinstance(trades_response, dict)
+                    else []
+                )
+                if trades:
+                    last_trade = trades[0]
+            except Exception as exc:  # pragma: no cover - network flaky
+                logger.debug(
+                    f"Skipping trades for {ticker}: {exc}"
+                )
+
+            snapshots.append(
+                build_market_snapshot(
+                    ticker=ticker,
+                    market_info=market_info,
+                    orderbook=orderbook_payload,
+                    last_trade=last_trade,
+                    captured_at=captured_at,
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                f"Could not capture snapshot for {ticker}: {exc}"
+            )
+
+    if not snapshots:
+        return 0
+
+    try:
+        written = await db_manager.add_market_snapshots(snapshots)
+        logger.info(
+            f"Wrote {written} market_snapshots rows at {captured_at.isoformat()}"
+        )
+        return written
+    except Exception as exc:
+        logger.error(f"Failed to persist market_snapshots batch: {exc}")
+        return 0
+
+
+async def _persist_inline_snapshots(
+    markets_data: List[dict],
+    db_manager: DatabaseManager,
+    logger,
+) -> None:
+    """
+    Capture market_snapshots rows inline from the raw /events payloads we
+    already have, without issuing extra HTTP requests.
+
+    This is the "cheap" path used during normal ingestion. A heavier per-ticker
+    writer (`write_market_snapshots`) is available when the caller wants
+    orderbook + last-trade depth as well.
+    """
+    try:
+        snapshots: List[MarketSnapshot] = []
+        captured_at = datetime.now()
+        for market_data in markets_data:
+            ticker = market_data.get("ticker")
+            if not ticker:
+                continue
+            try:
+                snapshots.append(
+                    build_market_snapshot(
+                        ticker=ticker,
+                        market_info=market_data,
+                        orderbook=None,
+                        last_trade=None,
+                        captured_at=captured_at,
+                    )
+                )
+            except Exception as exc:
+                logger.debug(
+                    f"Skipping inline snapshot for {ticker}: {exc}"
+                )
+        if snapshots:
+            await db_manager.add_market_snapshots(snapshots)
+    except Exception as exc:
+        logger.warning(f"Could not persist inline market snapshots: {exc}")
 
 
 async def process_and_queue_markets(
@@ -92,6 +335,12 @@ async def process_and_queue_markets(
 
     await db_manager.upsert_markets(markets_to_upsert)
     logger.info(f"Successfully upserted {len(markets_to_upsert)} markets.")
+
+    # W3 replay: always persist a per-tick snapshot of what we just saw so the
+    # replay harness can reconstruct the book at every scan. We use the cheap
+    # inline path (no extra HTTP calls) so ingestion stays fast; callers that
+    # want orderbook depth + last trade can invoke `write_market_snapshots`.
+    await _persist_inline_snapshots(markets_data, db_manager, logger)
 
     eligible_markets = [
         market
