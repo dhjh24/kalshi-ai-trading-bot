@@ -61,9 +61,15 @@ class BeastModeBot:
     - Risk management and rebalancing
     """
     
-    def __init__(self, live_mode: bool = False, dashboard_mode: bool = False):
+    def __init__(
+        self,
+        live_mode: bool = False,
+        dashboard_mode: bool = False,
+        shadow_mode: bool = False,
+    ):
         self.live_mode = live_mode
         self.dashboard_mode = dashboard_mode
+        self.shadow_mode = shadow_mode
         self.logger = get_trading_logger("beast_mode_bot")
         self.shutdown_event = asyncio.Event()
         self.background_tasks: list[asyncio.Task] = []
@@ -72,6 +78,21 @@ class BeastModeBot:
         # Set live trading in settings
         settings.trading.live_trading_enabled = live_mode
         settings.trading.paper_trading_mode = not live_mode
+        settings.trading.shadow_mode_enabled = shadow_mode
+        mode_label = (
+            "LIVE TRADING"
+            if live_mode
+            else "SHADOW TRADING"
+            if shadow_mode
+            else "PAPER TRADING"
+        )
+        self.logger.info("Resolved runtime mode", mode=mode_label)
+        self.logger.info(
+            "Resolved trading settings",
+            live_trading_enabled=settings.trading.live_trading_enabled,
+            paper_trading_mode=settings.trading.paper_trading_mode,
+            shadow_mode_enabled=getattr(settings.trading, "shadow_mode_enabled", False),
+        )
         
         # Add detailed logging for debugging
         self.logger.info(
@@ -85,6 +106,10 @@ class BeastModeBot:
         if live_mode:
             self.logger.warning("⚠️ LIVE TRADING MODE ENABLED - REAL MONEY WILL BE USED")
             self.logger.warning("⚠️ All orders will be placed on the Kalshi exchange")
+        elif shadow_mode:
+            self.logger.info(
+                "Shadow mode enabled - paper orders will execute while live counterparts are logged"
+            )
         else:
             self.logger.info("📝 Paper trading mode - orders will be simulated")
 
@@ -121,7 +146,7 @@ class BeastModeBot:
         self.logger.info("ðŸ“¥ Running single ingestion pass before trading")
         await run_ingestion(db_manager, market_queue)
 
-        results = await run_trading_job()
+        results = await run_trading_job(shadow_mode=self.shadow_mode)
         self.logger.info("âœ… Single-cycle safety run complete")
         return results
 
@@ -271,7 +296,7 @@ class BeastModeBot:
                 self.logger.info(f"🔄 Starting Beast Mode Trading Cycle #{cycle_count}")
                 
                 # Run the Beast Mode unified trading system
-                results = await run_trading_job()
+                results = await run_trading_job(shadow_mode=self.shadow_mode)
                 
                 if results and results.total_positions > 0:
                     self.logger.info(
@@ -352,7 +377,7 @@ class BeastModeBot:
         while not self.shutdown_event.is_set():
             try:
                 # ✅ FIXED: Pass the shared database manager
-                await run_tracking(db_manager)
+                await run_tracking(db_manager, shadow_mode=self.shadow_mode)
                 await asyncio.sleep(120)  # Check positions every 2 minutes (slower to reduce API load)
             except Exception as e:
                 self.logger.error(f"Error in position tracking: {e}")

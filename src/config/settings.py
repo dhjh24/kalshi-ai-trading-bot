@@ -329,6 +329,7 @@ class TradingConfig:
     # Live trading mode control
     live_trading_enabled: bool = field(default_factory=lambda: _get_bool_env("LIVE_TRADING_ENABLED"))
     paper_trading_mode: bool = field(default_factory=lambda: not _get_bool_env("LIVE_TRADING_ENABLED"))
+    shadow_mode_enabled: bool = field(default_factory=lambda: _get_bool_env("SHADOW_MODE_ENABLED"))
     
     # Trading frequency - MORE FREQUENT
     market_scan_interval: int = 30          # DECREASED: Scan every 30 seconds (was 60)

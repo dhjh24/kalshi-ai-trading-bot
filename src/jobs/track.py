@@ -150,7 +150,11 @@ async def calculate_dynamic_exit_levels(position: Position) -> dict:
     )
 
 
-async def run_tracking(db_manager: Optional[DatabaseManager] = None):
+async def run_tracking(
+    db_manager: Optional[DatabaseManager] = None,
+    *,
+    shadow_mode: Optional[bool] = None,
+):
     """
     Enhanced position tracking with smart exit strategies and sell limit orders.
 
@@ -168,6 +172,11 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
 
     try:
         live_mode = bool(getattr(settings.trading, "live_trading_enabled", False))
+        shadow_mode = (
+            bool(getattr(settings.trading, "shadow_mode_enabled", False))
+            if shadow_mode is None
+            else bool(shadow_mode)
+        )
 
         quick_flip_results = await manage_live_quick_flip_positions(
             db_manager=db_manager,
@@ -233,6 +242,7 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
             kalshi_client=kalshi_client,
             profit_threshold=0.20,
             live_mode=live_mode,
+            shadow_mode=shadow_mode,
         )
 
         logger.info("Checking for stop-loss protection.")
@@ -241,6 +251,7 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
             kalshi_client=kalshi_client,
             stop_loss_threshold=-0.15,
             live_mode=live_mode,
+            shadow_mode=shadow_mode,
         )
 
         total_sell_orders = profit_results["orders_placed"] + stop_loss_results["orders_placed"]

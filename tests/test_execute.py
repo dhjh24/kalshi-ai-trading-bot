@@ -111,6 +111,7 @@ async def test_execute_position_places_live_order():
         assert updated_position.live == True, "Position should be marked as live."
         assert updated_position.id == position_id
         assert updated_position.quantity == pytest.approx(10.95)
+        assert await db_manager.get_shadow_orders(market_id="LIVE-TEST-1") == []
 
     finally:
         # Teardown
@@ -164,6 +165,198 @@ async def test_execute_position_paper_mode_keeps_position_non_live():
         assert updated_position.live is False
         assert updated_position.quantity == pytest.approx(4)
         assert updated_position.entry_price == pytest.approx(0.27)
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+async def test_execute_position_live_mode_records_shadow_entry_order_when_requested():
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+
+    test_position = Position(
+        market_id="LIVE-SHADOW-ENTRY-1",
+        side="YES",
+        entry_price=0.60,
+        quantity=10,
+        timestamp=datetime.now(),
+        rationale="Live trade with shadow entry logging",
+        confidence=0.80,
+        live=False,
+    )
+    position_id = await db_manager.add_position(test_position)
+    test_position.id = position_id
+
+    from unittest.mock import Mock
+    mock_kalshi_client = Mock()
+    mock_kalshi_client.get_market = AsyncMock(
+        return_value={
+            "market": {
+                "ticker": "LIVE-SHADOW-ENTRY-1",
+                "yes_bid_dollars": 0.58,
+                "yes_ask_dollars": 0.60,
+                "yes_ask_size_fp": "20.00",
+                "no_bid_dollars": 0.40,
+                "no_ask_dollars": 0.42,
+            }
+        }
+    )
+    mock_kalshi_client.get_orderbook = AsyncMock(
+        return_value={
+            "orderbook": {
+                "yes": [[0.60, 4], [0.61, 6], [0.62, 20]],
+                "no": [[0.40, 30]],
+            }
+        }
+    )
+    mock_kalshi_client.place_order = AsyncMock(
+        return_value={
+            "order": {
+                "order_id": "shadow-live-entry-1",
+                "status": "filled",
+                "fill_count_fp": "10.00",
+                "yes_price_dollars": "0.6000",
+            }
+        }
+    )
+    mock_kalshi_client.get_fills = AsyncMock(
+        return_value={
+            "fills": [
+                {
+                    "ticker": "LIVE-SHADOW-ENTRY-1",
+                    "client_order_id": "ignored",
+                    "order_id": "shadow-live-entry-1",
+                    "count_fp": "10.00",
+                    "yes_price_dollars": "0.6000",
+                    "purchased_side": "yes",
+                }
+            ]
+        }
+    )
+    mock_kalshi_client.close = AsyncMock()
+
+    try:
+        result = await execute_position(
+            position=test_position,
+            live_mode=True,
+            shadow_mode=True,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+        )
+
+        assert result is True
+        updated_position = await db_manager.get_position_by_market_id("LIVE-SHADOW-ENTRY-1")
+        assert updated_position is not None
+        assert updated_position.live is True
+        assert updated_position.entry_price == pytest.approx(0.60)
+
+        shadow_orders = await db_manager.get_shadow_orders(
+            market_id="LIVE-SHADOW-ENTRY-1",
+            action="buy",
+        )
+        assert len(shadow_orders) == 1
+        shadow_order = shadow_orders[0]
+        assert shadow_order.status == "filled"
+        assert shadow_order.live is True
+        assert shadow_order.price == pytest.approx(0.60)
+        assert shadow_order.filled_price == pytest.approx(0.606)
+        assert shadow_order.quantity == pytest.approx(10.0)
+        assert shadow_order.position_id == position_id
+
+        summary = await db_manager.summarize_shadow_order_divergence(
+            market_id="LIVE-SHADOW-ENTRY-1"
+        )
+        assert summary["total_orders"] == 1
+        assert summary["entry_orders"] == 1
+        assert summary["matched_position_entries"] == 1
+        assert summary["matched_live_entries"] == 1
+        assert summary["avg_entry_price_delta"] == pytest.approx(-0.006)
+        assert summary["total_entry_cost_delta"] == pytest.approx(-0.06)
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+async def test_execute_position_paper_mode_records_shadow_entry_order_when_requested():
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+
+    test_position = Position(
+        market_id="PAPER-SHADOW-ENTRY-1",
+        side="YES",
+        entry_price=0.60,
+        quantity=10,
+        timestamp=datetime.now(),
+        rationale="Paper trade with shadow entry logging",
+        confidence=0.80,
+        live=False,
+    )
+    position_id = await db_manager.add_position(test_position)
+    test_position.id = position_id
+
+    mock_kalshi_client = AsyncMock()
+    mock_kalshi_client.get_market.return_value = {
+        "market": {
+            "ticker": "PAPER-SHADOW-ENTRY-1",
+            "yes_bid_dollars": 0.58,
+            "yes_ask_dollars": 0.60,
+            "yes_ask_size_fp": "20.00",
+            "no_bid_dollars": 0.40,
+            "no_ask_dollars": 0.42,
+        }
+    }
+    mock_kalshi_client.get_orderbook.return_value = {
+        "orderbook": {
+            "yes": [[0.60, 4], [0.61, 6], [0.62, 20]],
+            "no": [[0.40, 30]],
+        }
+    }
+
+    try:
+        result = await execute_position(
+            position=test_position,
+            live_mode=False,
+            shadow_mode=True,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+        )
+
+        assert result is True
+        updated_position = await db_manager.get_position_by_market_id("PAPER-SHADOW-ENTRY-1")
+        assert updated_position is not None
+        assert updated_position.live is False
+        assert updated_position.entry_price == pytest.approx(0.606)
+
+        shadow_orders = await db_manager.get_shadow_orders(
+            market_id="PAPER-SHADOW-ENTRY-1",
+            action="buy",
+        )
+        assert len(shadow_orders) == 1
+        shadow_order = shadow_orders[0]
+        assert shadow_order.status == "filled"
+        assert shadow_order.live is True
+        assert shadow_order.price == pytest.approx(0.60)
+        assert shadow_order.filled_price == pytest.approx(0.606)
+        assert shadow_order.quantity == pytest.approx(10.0)
+        assert shadow_order.position_id == position_id
+
+        summary = await db_manager.summarize_shadow_order_divergence(
+            market_id="PAPER-SHADOW-ENTRY-1"
+        )
+        assert summary["total_orders"] == 1
+        assert summary["entry_orders"] == 1
+        assert summary["matched_position_entries"] == 1
+        assert summary["matched_live_entries"] == 1
+        assert summary["avg_entry_price_delta"] == pytest.approx(0.0)
+        assert summary["total_entry_cost_delta"] == pytest.approx(0.0)
     finally:
         if os.path.exists(db_path):
             os.remove(db_path)
@@ -400,6 +593,156 @@ async def test_place_profit_taking_orders_paper_mode_books_fee_aware_exit():
         expected_exit_fee = estimate_kalshi_fee(0.52, 10, maker=False)
         expected_pnl = ((0.52 - 0.40) * 10) - expected_entry_fee - expected_exit_fee
         assert trade_logs[0].pnl == pytest.approx(expected_pnl)
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+async def test_place_sell_limit_order_live_mode_records_shadow_exit_order_when_requested():
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+
+    test_position = Position(
+        market_id="LIVE-SHADOW-EXIT-1",
+        side="YES",
+        entry_price=0.40,
+        quantity=10,
+        timestamp=datetime.now(),
+        rationale="Live trade with shadow exit logging",
+        confidence=0.75,
+        live=True,
+        strategy="directional_trading",
+    )
+    position_id = await db_manager.add_position(test_position)
+    test_position.id = position_id
+
+    mock_kalshi_client = AsyncMock()
+    mock_kalshi_client.get_market.return_value = {
+        "market": {
+            "ticker": "LIVE-SHADOW-EXIT-1",
+            "yes_bid_dollars": 0.56,
+            "yes_ask_dollars": 0.57,
+            "no_bid_dollars": 0.43,
+            "no_ask_dollars": 0.44,
+        }
+    }
+    mock_kalshi_client.place_order.return_value = {
+        "order": {
+            "order_id": "shadow-live-exit-1",
+            "status": "resting",
+        }
+    }
+
+    try:
+        success = await place_sell_limit_order(
+            position=test_position,
+            limit_price=0.55,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+            live_mode=True,
+            shadow_mode=True,
+        )
+
+        assert success is True
+        mock_kalshi_client.place_order.assert_called_once()
+
+        refreshed_position = await db_manager.get_position_by_id(position_id)
+        assert refreshed_position is not None
+        assert refreshed_position.status == "open"
+        assert refreshed_position.live is True
+
+        shadow_orders = await db_manager.get_shadow_orders(
+            market_id="LIVE-SHADOW-EXIT-1",
+            action="sell",
+        )
+        assert len(shadow_orders) == 1
+        shadow_order = shadow_orders[0]
+        assert shadow_order.status == "filled"
+        assert shadow_order.live is True
+        assert shadow_order.price == pytest.approx(0.55)
+        assert shadow_order.filled_price == pytest.approx(0.56)
+        assert shadow_order.position_id == position_id
+
+        summary = await db_manager.summarize_shadow_order_divergence(
+            market_id="LIVE-SHADOW-EXIT-1"
+        )
+        assert summary["total_orders"] == 1
+        assert summary["exit_orders"] == 1
+        assert summary["filled_exit_orders"] == 1
+        assert summary["matched_live_entries"] == 0
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+async def test_place_sell_limit_order_paper_mode_records_shadow_exit_order_when_requested():
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+
+    test_position = Position(
+        market_id="PAPER-SHADOW-EXIT-1",
+        side="YES",
+        entry_price=0.40,
+        quantity=10,
+        timestamp=datetime.now(),
+        rationale="Paper trade with shadow exit logging",
+        confidence=0.75,
+        live=False,
+        strategy="directional_trading",
+    )
+    position_id = await db_manager.add_position(test_position)
+    test_position.id = position_id
+
+    market_snapshot = {
+        "market": {
+            "ticker": "PAPER-SHADOW-EXIT-1",
+            "yes_bid_dollars": 0.56,
+            "yes_ask_dollars": 0.57,
+            "no_bid_dollars": 0.43,
+            "no_ask_dollars": 0.44,
+        }
+    }
+    mock_kalshi_client = AsyncMock()
+    mock_kalshi_client.get_market.side_effect = [market_snapshot, market_snapshot]
+
+    try:
+        success = await place_sell_limit_order(
+            position=test_position,
+            limit_price=0.55,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+            live_mode=False,
+            shadow_mode=True,
+        )
+
+        assert success is True
+
+        shadow_orders = await db_manager.get_shadow_orders(
+            market_id="PAPER-SHADOW-EXIT-1",
+            action="sell",
+        )
+        assert len(shadow_orders) == 1
+        shadow_order = shadow_orders[0]
+        assert shadow_order.status == "filled"
+        assert shadow_order.live is True
+        assert shadow_order.price == pytest.approx(0.55)
+        assert shadow_order.filled_price == pytest.approx(0.56)
+        assert shadow_order.position_id == position_id
+
+        summary = await db_manager.summarize_shadow_order_divergence(
+            market_id="PAPER-SHADOW-EXIT-1"
+        )
+        assert summary["total_orders"] == 1
+        assert summary["exit_orders"] == 1
+        assert summary["filled_exit_orders"] == 1
     finally:
         if os.path.exists(db_path):
             os.remove(db_path)

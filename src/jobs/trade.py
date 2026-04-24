@@ -54,7 +54,7 @@ def _resolve_quick_flip_runtime_config() -> tuple[bool, float, str | None]:
     return True, allocation, None
 
 
-async def run_trading_job() -> Optional[TradingSystemResults]:
+async def run_trading_job(*, shadow_mode: Optional[bool] = None) -> Optional[TradingSystemResults]:
     """
     Enhanced trading job using the Unified Advanced Trading System.
     
@@ -73,7 +73,14 @@ async def run_trading_job() -> Optional[TradingSystemResults]:
     xai_client: Optional[XAIClient] = None
 
     try:
+        shadow_mode = (
+            bool(getattr(settings.trading, "shadow_mode_enabled", False))
+            if shadow_mode is None
+            else bool(shadow_mode)
+        )
         logger.info("ðŸš€ Starting Enhanced Trading Job - Beast Mode Activated!")
+        if shadow_mode:
+            logger.info("ðŸ‘¥ Shadow mode active - paper executions will log live-side counterparts")
         
         # Initialize clients
         db_manager = DatabaseManager()
@@ -150,7 +157,7 @@ async def run_trading_job() -> Optional[TradingSystemResults]:
         logger.error(f"Error in enhanced trading job: {e}")
         # Fallback to legacy system if unified system fails
         logger.warning("ðŸ”„ Falling back to legacy decision-making system")
-        return await _fallback_legacy_trading()
+        return await _fallback_legacy_trading(shadow_mode=shadow_mode)
     finally:
         if xai_client is not None:
             await xai_client.close()
@@ -158,7 +165,10 @@ async def run_trading_job() -> Optional[TradingSystemResults]:
             await kalshi_client.close()
 
 
-async def _fallback_legacy_trading() -> Optional[TradingSystemResults]:
+async def _fallback_legacy_trading(
+    *,
+    shadow_mode: Optional[bool] = None,
+) -> Optional[TradingSystemResults]:
     """
     Fallback to the original sequential decision-making if unified system fails.
     """
@@ -174,6 +184,11 @@ async def _fallback_legacy_trading() -> Optional[TradingSystemResults]:
         kalshi_client = KalshiClient()
         xai_client = XAIClient()
         live_mode = bool(getattr(settings.trading, "live_trading_enabled", False))
+        shadow_mode = (
+            bool(getattr(settings.trading, "shadow_mode_enabled", False))
+            if shadow_mode is None
+            else bool(shadow_mode)
+        )
         
         # Get eligible markets
         markets = await db_manager.get_eligible_markets(
@@ -200,6 +215,7 @@ async def _fallback_legacy_trading() -> Optional[TradingSystemResults]:
                     success = await execute_position(
                         position=position,
                         live_mode=live_mode,
+                        shadow_mode=shadow_mode,
                         db_manager=db_manager,
                         kalshi_client=kalshi_client,
                     )

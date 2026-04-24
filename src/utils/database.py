@@ -89,6 +89,11 @@ class SimulatedOrder:
     id: Optional[int] = None
 
 @dataclass
+class ShadowOrder(SimulatedOrder):
+    """Represents a locally persisted shadow order captured during live execution."""
+    pass
+
+@dataclass
 class MarketSnapshot:
     """
     A point-in-time snapshot of a market's order book top and last trade.
@@ -305,6 +310,40 @@ class DatabaseManager(TradingLoggerMixin):
                 "ON simulated_orders(position_id, action) "
                 "WHERE status = 'resting' AND position_id IS NOT NULL"
             )
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS shadow_orders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    strategy TEXT NOT NULL,
+                    market_id TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    quantity REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'resting',
+                    live BOOLEAN NOT NULL DEFAULT 0,
+                    order_id TEXT,
+                    placed_at TEXT NOT NULL,
+                    filled_at TEXT,
+                    filled_price REAL,
+                    expected_profit REAL,
+                    target_price REAL,
+                    position_id INTEGER
+                )
+            """)
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_shadow_orders_strategy_status "
+                "ON shadow_orders(strategy, status)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_shadow_orders_market "
+                "ON shadow_orders(market_id)"
+            )
+            await self._migrate_shadow_orders_resting_uniqueness(db)
+            await db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_shadow_orders_resting_position_action "
+                "ON shadow_orders(position_id, action) "
+                "WHERE status = 'resting' AND position_id IS NOT NULL"
+            )
             # W2 Gap 3: track live-vs-estimated fee divergence per fill so the
             # dashboard can surface drift. See fee_reconciliation table below.
             await db.execute(
@@ -421,6 +460,48 @@ class DatabaseManager(TradingLoggerMixin):
         except Exception as exc:
             self.logger.warning(
                 "Could not run simulated_orders resting-uniqueness migration",
+                error=str(exc),
+            )
+
+    async def _migrate_shadow_orders_resting_uniqueness(
+        self, db: aiosqlite.Connection
+    ) -> None:
+        """
+        One-shot cleanup so the shadow resting-order unique partial index can be
+        created on databases that already logged duplicate shadow exits.
+        """
+        try:
+            cursor = await db.execute(
+                """
+                SELECT position_id, action, COUNT(*) AS dupes
+                FROM shadow_orders
+                WHERE status = 'resting' AND position_id IS NOT NULL
+                GROUP BY position_id, action
+                HAVING dupes > 1
+                """
+            )
+            duplicate_groups = await cursor.fetchall()
+            for position_id, action, _count in duplicate_groups:
+                await db.execute(
+                    """
+                    UPDATE shadow_orders
+                    SET status = 'cancelled'
+                    WHERE id NOT IN (
+                        SELECT MIN(id) FROM shadow_orders
+                        WHERE position_id = ? AND action = ? AND status = 'resting'
+                    )
+                    AND position_id = ? AND action = ? AND status = 'resting'
+                    """,
+                    (position_id, action, position_id, action),
+                )
+            if duplicate_groups:
+                self.logger.info(
+                    "Cancelled duplicate resting shadow_orders",
+                    duplicate_groups=len(duplicate_groups),
+                )
+        except Exception as exc:
+            self.logger.warning(
+                "Could not run shadow_orders resting-uniqueness migration",
                 error=str(exc),
             )
 
@@ -597,8 +678,24 @@ class DatabaseManager(TradingLoggerMixin):
         )
         return TradeLog(**trade_log_dict)
 
-    def _hydrate_simulated_order(self, row: aiosqlite.Row) -> SimulatedOrder:
-        """Convert a database row into a SimulatedOrder dataclass."""
+    def _serialize_order_record(self, order: SimulatedOrder) -> Dict[str, Any]:
+        """Convert a simulated or shadow order into a DB-ready payload."""
+        order_dict = asdict(order)
+        order_dict["placed_at"] = (
+            order.placed_at.isoformat()
+            if isinstance(order.placed_at, datetime)
+            else datetime.now().isoformat()
+        )
+        order_dict["filled_at"] = (
+            order.filled_at.isoformat() if isinstance(order.filled_at, datetime) else None
+        )
+        order_dict["live"] = int(bool(order_dict.get("live", False)))
+        return order_dict
+
+    def _hydrate_order_record(
+        self, row: aiosqlite.Row, order_cls: type[SimulatedOrder]
+    ) -> SimulatedOrder:
+        """Convert a database row into an order dataclass."""
         order_dict = dict(row)
         order_dict["quantity"] = self._normalize_quantity(order_dict.get("quantity"))
         order_dict["live"] = bool(order_dict.get("live", False))
@@ -610,7 +707,15 @@ class DatabaseManager(TradingLoggerMixin):
         order_dict["filled_at"] = (
             datetime.fromisoformat(filled_at) if filled_at else None
         )
-        return SimulatedOrder(**order_dict)
+        return order_cls(**order_dict)
+
+    def _hydrate_simulated_order(self, row: aiosqlite.Row) -> SimulatedOrder:
+        """Convert a database row into a SimulatedOrder dataclass."""
+        return self._hydrate_order_record(row, SimulatedOrder)
+
+    def _hydrate_shadow_order(self, row: aiosqlite.Row) -> ShadowOrder:
+        """Convert a database row into a ShadowOrder dataclass."""
+        return self._hydrate_order_record(row, ShadowOrder)
 
     async def _migrate_existing_strategy_data(self, db: aiosqlite.Connection) -> None:
         """Migrate existing position data to include strategy information."""
@@ -832,6 +937,27 @@ class DatabaseManager(TradingLoggerMixin):
             )
         """)
 
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS shadow_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                strategy TEXT NOT NULL,
+                market_id TEXT NOT NULL,
+                side TEXT NOT NULL,
+                action TEXT NOT NULL,
+                price REAL NOT NULL,
+                quantity REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'resting',
+                live BOOLEAN NOT NULL DEFAULT 0,
+                order_id TEXT,
+                placed_at TEXT NOT NULL,
+                filled_at TEXT,
+                filled_price REAL,
+                expected_profit REAL,
+                target_price REAL,
+                position_id INTEGER
+            )
+        """)
+
         # Replay harness (W3): point-in-time snapshots of order book + last trade.
         # Additive only - nothing else in the app reads from this table.
         await db.execute("""
@@ -879,6 +1005,14 @@ class DatabaseManager(TradingLoggerMixin):
             "ON simulated_orders(market_id)"
         )
         await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_shadow_orders_strategy_status "
+            "ON shadow_orders(strategy, status)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_shadow_orders_market "
+            "ON shadow_orders(market_id)"
+        )
+        await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_market_snapshots_ts "
             "ON market_snapshots(timestamp)"
         )
@@ -896,6 +1030,11 @@ class DatabaseManager(TradingLoggerMixin):
         await db.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_simulated_orders_resting_position_action "
             "ON simulated_orders(position_id, action) "
+            "WHERE status = 'resting' AND position_id IS NOT NULL"
+        )
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_shadow_orders_resting_position_action "
+            "ON shadow_orders(position_id, action) "
             "WHERE status = 'resting' AND position_id IS NOT NULL"
         )
 
@@ -1336,18 +1475,34 @@ class DatabaseManager(TradingLoggerMixin):
 
     async def add_simulated_order(self, order: SimulatedOrder) -> int:
         """Persist a simulated paper order and return its database id."""
-        order_dict = asdict(order)
-        order_dict["placed_at"] = (
-            order.placed_at.isoformat() if isinstance(order.placed_at, datetime) else datetime.now().isoformat()
-        )
-        order_dict["filled_at"] = (
-            order.filled_at.isoformat() if isinstance(order.filled_at, datetime) else None
-        )
+        order_dict = self._serialize_order_record(order)
 
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 """
                 INSERT INTO simulated_orders (
+                    strategy, market_id, side, action, price, quantity, status, live,
+                    order_id, placed_at, filled_at, filled_price, expected_profit,
+                    target_price, position_id
+                ) VALUES (
+                    :strategy, :market_id, :side, :action, :price, :quantity, :status, :live,
+                    :order_id, :placed_at, :filled_at, :filled_price, :expected_profit,
+                    :target_price, :position_id
+                )
+                """,
+                order_dict,
+            )
+            await db.commit()
+            return int(cursor.lastrowid)
+
+    async def add_shadow_order(self, order: ShadowOrder) -> int:
+        """Persist a shadow order and return its database id."""
+        order_dict = self._serialize_order_record(order)
+
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO shadow_orders (
                     strategy, market_id, side, action, price, quantity, status, live,
                     order_id, placed_at, filled_at, filled_price, expected_profit,
                     target_price, position_id
@@ -1399,6 +1554,43 @@ class DatabaseManager(TradingLoggerMixin):
             rows = await cursor.fetchall()
             return [self._hydrate_simulated_order(row) for row in rows]
 
+    async def get_shadow_orders(
+        self,
+        *,
+        strategy: Optional[str] = None,
+        market_id: Optional[str] = None,
+        side: Optional[str] = None,
+        action: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[ShadowOrder]:
+        """Return shadow orders filtered by the provided attributes."""
+        query = "SELECT * FROM shadow_orders WHERE 1=1"
+        params: List[Any] = []
+
+        if strategy is not None:
+            query += " AND strategy = ?"
+            params.append(strategy)
+        if market_id is not None:
+            query += " AND market_id = ?"
+            params.append(market_id)
+        if side is not None:
+            query += " AND side = ?"
+            params.append(side)
+        if action is not None:
+            query += " AND action = ?"
+            params.append(action)
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status)
+
+        query += " ORDER BY placed_at"
+
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(query, tuple(params))
+            rows = await cursor.fetchall()
+            return [self._hydrate_shadow_order(row) for row in rows]
+
     async def update_simulated_order(
         self,
         order_id: int,
@@ -1435,6 +1627,268 @@ class DatabaseManager(TradingLoggerMixin):
                 tuple(params),
             )
             await db.commit()
+
+    async def update_shadow_order(
+        self,
+        order_id: int,
+        *,
+        status: Optional[str] = None,
+        filled_price: Optional[float] = None,
+        filled_at: Optional[datetime] = None,
+        position_id: Optional[int] = None,
+    ) -> None:
+        """Update a shadow order."""
+        updates: List[str] = []
+        params: List[Any] = []
+
+        if status is not None:
+            updates.append("status = ?")
+            params.append(status)
+        if filled_price is not None:
+            updates.append("filled_price = ?")
+            params.append(filled_price)
+        if filled_at is not None:
+            updates.append("filled_at = ?")
+            params.append(filled_at.isoformat())
+        if position_id is not None:
+            updates.append("position_id = ?")
+            params.append(position_id)
+
+        if not updates:
+            return
+
+        params.append(order_id)
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                f"UPDATE shadow_orders SET {', '.join(updates)} WHERE id = ?",
+                tuple(params),
+            )
+            await db.commit()
+
+    async def summarize_shadow_order_divergence(
+        self,
+        *,
+        strategy: Optional[str] = None,
+        market_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Summarize shadow-order coverage and entry-price drift versus positions.
+
+        Entry drift is calculated as `position_entry_price - shadow_entry_price`
+        for shadow buy orders that can be paired to a stored position via
+        `position_id`.
+        """
+        filters: List[str] = []
+        params: List[Any] = []
+        if strategy is not None:
+            filters.append("strategy = ?")
+            params.append(strategy)
+        if market_id is not None:
+            filters.append("market_id = ?")
+            params.append(market_id)
+        where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
+
+        summary: Dict[str, Any] = {
+            "total_orders": 0,
+            "entry_orders": 0,
+            "exit_orders": 0,
+            "filled_orders": 0,
+            "resting_orders": 0,
+            "rejected_orders": 0,
+            "filled_exit_orders": 0,
+            "resting_exit_orders": 0,
+            "matched_position_entries": 0,
+            "matched_live_entries": 0,
+            "shadow_rejected_entries": 0,
+            "avg_entry_price_delta": 0.0,
+            "avg_abs_entry_price_delta": 0.0,
+            "max_abs_entry_price_delta": 0.0,
+            "total_entry_cost_delta": 0.0,
+        }
+
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+
+            cursor = await db.execute(
+                f"""
+                SELECT
+                    COUNT(*) AS total_orders,
+                    SUM(CASE WHEN action = 'buy' THEN 1 ELSE 0 END) AS entry_orders,
+                    SUM(CASE WHEN action = 'sell' THEN 1 ELSE 0 END) AS exit_orders,
+                    SUM(CASE WHEN status = 'filled' THEN 1 ELSE 0 END) AS filled_orders,
+                    SUM(CASE WHEN status = 'resting' THEN 1 ELSE 0 END) AS resting_orders,
+                    SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected_orders,
+                    SUM(CASE WHEN action = 'sell' AND status = 'filled' THEN 1 ELSE 0 END) AS filled_exit_orders,
+                    SUM(CASE WHEN action = 'sell' AND status = 'resting' THEN 1 ELSE 0 END) AS resting_exit_orders
+                FROM shadow_orders
+                {where_clause}
+                """,
+                tuple(params),
+            )
+            aggregate_row = await cursor.fetchone()
+            if aggregate_row:
+                for key in (
+                    "total_orders",
+                    "entry_orders",
+                    "exit_orders",
+                    "filled_orders",
+                    "resting_orders",
+                    "rejected_orders",
+                    "filled_exit_orders",
+                    "resting_exit_orders",
+                ):
+                    summary[key] = int(aggregate_row[key] or 0)
+
+            entry_filters = [
+                filter_clause.replace("strategy", "s.strategy").replace("market_id", "s.market_id")
+                for filter_clause in filters
+            ]
+            entry_params = list(params)
+            entry_filters.append("s.action = 'buy'")
+            entry_filters.append("s.position_id IS NOT NULL")
+            entry_where_clause = f"WHERE {' AND '.join(entry_filters)}"
+
+            cursor = await db.execute(
+                f"""
+                SELECT
+                    s.status AS shadow_status,
+                    COALESCE(s.filled_price, s.price) AS shadow_price,
+                    COALESCE(NULLIF(p.quantity, 0), s.quantity) AS position_quantity,
+                    p.entry_price AS position_entry_price
+                FROM shadow_orders s
+                INNER JOIN positions p
+                    ON p.id = s.position_id
+                {entry_where_clause}
+                """,
+                tuple(entry_params),
+            )
+            matched_rows = await cursor.fetchall()
+
+        entry_price_deltas: List[float] = []
+        entry_cost_deltas: List[float] = []
+        shadow_rejected_entries = 0
+
+        for row in matched_rows:
+            if row["shadow_status"] != "filled":
+                shadow_rejected_entries += 1
+                continue
+
+            try:
+                shadow_price = float(row["shadow_price"] or 0.0)
+                position_price = float(row["position_entry_price"] or 0.0)
+                position_quantity = float(row["position_quantity"] or 0.0)
+            except (TypeError, ValueError):
+                continue
+
+            delta = position_price - shadow_price
+            entry_price_deltas.append(delta)
+            entry_cost_deltas.append(delta * position_quantity)
+
+        summary["matched_position_entries"] = len(entry_price_deltas)
+        summary["matched_live_entries"] = len(entry_price_deltas)
+        summary["shadow_rejected_entries"] = shadow_rejected_entries
+        if entry_price_deltas:
+            summary["avg_entry_price_delta"] = sum(entry_price_deltas) / len(entry_price_deltas)
+            summary["avg_abs_entry_price_delta"] = (
+                sum(abs(delta) for delta in entry_price_deltas) / len(entry_price_deltas)
+            )
+            summary["max_abs_entry_price_delta"] = max(
+                abs(delta) for delta in entry_price_deltas
+            )
+            summary["total_entry_cost_delta"] = sum(entry_cost_deltas)
+
+        return summary
+
+    async def get_paper_live_divergence_summary(self) -> Dict[str, str]:
+        """Return a compact paper-vs-live divergence line for the CLI."""
+        paper_open = len(await self.get_open_non_live_positions())
+        live_open = len(await self.get_open_live_positions())
+        shadow_summary = await self.summarize_shadow_order_divergence()
+
+        total_orders = int(shadow_summary.get("total_orders") or 0)
+        if total_orders <= 0:
+            return {
+                "summary": (
+                    f"open paper {paper_open} / live {live_open} | "
+                    "shadow telemetry pending"
+                )
+            }
+
+        matched_entries = int(
+            shadow_summary.get("matched_position_entries")
+            or shadow_summary.get("matched_live_entries")
+            or 0
+        )
+        avg_delta = float(shadow_summary.get("avg_entry_price_delta") or 0.0)
+        total_cost_delta = float(shadow_summary.get("total_entry_cost_delta") or 0.0)
+        return {
+            "summary": (
+                f"open paper {paper_open} / live {live_open} | "
+                f"shadow {total_orders} orders "
+                f"({int(shadow_summary.get('entry_orders') or 0)} entry, "
+                f"{int(shadow_summary.get('exit_orders') or 0)} exit) | "
+                f"matched entries {matched_entries} "
+                f"avg delta ${avg_delta:.4f} "
+                f"cost drift ${total_cost_delta:.2f}"
+            )
+        }
+
+    async def get_ai_spend_provider_breakdown(self) -> Dict[str, str]:
+        """Return a compact AI spend/provider line for the CLI."""
+        today_cost = float(await self.get_daily_ai_cost())
+        llm_stats = await self.get_llm_stats_by_strategy()
+        runtime_query_count = 0
+        runtime_cost = 0.0
+        for stats in llm_stats.values():
+            if not isinstance(stats, dict):
+                continue
+            runtime_query_count += int(stats.get("query_count") or 0)
+            runtime_cost += float(stats.get("total_cost") or 0.0)
+
+        provider_rows: List[Dict[str, Any]] = []
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='analysis_requests'"
+                )
+                if await cursor.fetchone():
+                    cursor = await db.execute(
+                        """
+                        SELECT
+                            COALESCE(NULLIF(TRIM(provider), ''), 'unattributed') AS provider,
+                            COUNT(*) AS request_count,
+                            COALESCE(SUM(COALESCE(cost_usd, 0)), 0) AS total_cost
+                        FROM analysis_requests
+                        GROUP BY provider
+                        ORDER BY total_cost DESC, request_count DESC, provider ASC
+                        LIMIT 3
+                        """
+                    )
+                    provider_rows = [dict(row) for row in await cursor.fetchall()]
+        except Exception as exc:
+            self.logger.debug(
+                "Could not summarize analysis-request provider spend",
+                error=str(exc),
+            )
+
+        provider_bits = [
+            f"{str(row.get('provider') or 'unattributed')} ${float(row.get('total_cost') or 0.0):.2f}"
+            for row in provider_rows
+            if float(row.get("total_cost") or 0.0) > 0
+        ]
+        if provider_bits:
+            provider_summary = ", ".join(provider_bits)
+        else:
+            provider_summary = "provider attribution pending"
+
+        return {
+            "summary": (
+                f"today ${today_cost:.2f} | "
+                f"{provider_summary} | "
+                f"runtime ${runtime_cost:.2f} across {runtime_query_count} queries"
+            )
+        }
 
     async def add_market_snapshot(self, snapshot: "MarketSnapshot") -> int:
         """

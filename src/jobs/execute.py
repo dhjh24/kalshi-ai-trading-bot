@@ -11,7 +11,13 @@ from typing import Any, Dict, Optional
 
 from src.clients.kalshi_client import KalshiAPIError, KalshiClient
 from src.config.settings import settings
-from src.utils.database import DatabaseManager, Position, SimulatedOrder, TradeLog
+from src.utils.database import (
+    DatabaseManager,
+    Position,
+    ShadowOrder,
+    SimulatedOrder,
+    TradeLog,
+)
 from src.utils.kalshi_normalization import (
     build_limit_order_price_fields,
     dollars_to_cents,
@@ -95,6 +101,13 @@ def _get_simulated_order_id(*, prefix: str, position: Position) -> str:
     return f"{prefix}_{position.market_id}_{position.side}_{uuid.uuid4().hex[:12]}"
 
 
+def _resolve_shadow_mode(shadow_mode: Optional[bool]) -> bool:
+    """Resolve an explicit shadow-mode override against runtime settings."""
+    if shadow_mode is None:
+        return bool(getattr(settings.trading, "shadow_mode_enabled", False))
+    return bool(shadow_mode)
+
+
 async def _resolve_market_fee_metadata(
     *,
     kalshi_client: KalshiClient,
@@ -159,6 +172,138 @@ async def _record_filled_paper_entry_order(
             placed_at=filled_at,
             filled_at=filled_at,
             filled_price=fill_price,
+            position_id=position.id,
+        )
+    )
+
+
+async def _record_shadow_entry_order(
+    *,
+    position: Position,
+    db_manager: DatabaseManager,
+    top_of_book_price: float,
+    quantity: float,
+    market_info: Dict[str, Any],
+    placed_at: datetime,
+    orderbook: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Persist a shadow comparison entry order for a position."""
+    shadow_fill_price: Optional[float] = top_of_book_price
+    shadow_status = "filled"
+    effective_orderbook = orderbook or {}
+
+    if market_info and effective_orderbook:
+        tick_size = get_market_tick_size(market_info, top_of_book_price)
+        depth_summary = _simulate_fok_depth_walk(
+            orderbook=effective_orderbook,
+            side=position.side,
+            quantity=quantity,
+            max_slippage_ticks=1,
+            tick_size=tick_size,
+            best_ask=top_of_book_price,
+        )
+        if depth_summary["can_fill"]:
+            shadow_fill_price = float(depth_summary["average_price"])
+        else:
+            shadow_status = "rejected"
+            shadow_fill_price = None
+
+    await db_manager.add_shadow_order(
+        ShadowOrder(
+            strategy=position.strategy or "directional_trading",
+            market_id=position.market_id,
+            side=position.side,
+            action="buy",
+            price=top_of_book_price,
+            quantity=quantity,
+            status=shadow_status,
+            live=True,
+            order_id=_get_simulated_order_id(prefix="shadow_buy", position=position),
+            placed_at=placed_at,
+            filled_at=placed_at if shadow_status == "filled" else None,
+            filled_price=shadow_fill_price,
+            target_price=top_of_book_price,
+            position_id=position.id,
+        )
+    )
+
+
+async def _record_shadow_sell_limit_order(
+    *,
+    position: Position,
+    limit_price: float,
+    db_manager: DatabaseManager,
+    market_info: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Persist a shadow comparison sell-limit order for a position."""
+    strategy = position.strategy or "directional_trading"
+    now = datetime.now()
+
+    if position.id is not None:
+        resting_orders_same_position = [
+            order
+            for order in await db_manager.get_shadow_orders(
+                strategy=strategy,
+                market_id=position.market_id,
+                side=position.side,
+                action="sell",
+                status="resting",
+            )
+            if order.position_id == position.id
+        ]
+
+        for order in resting_orders_same_position:
+            if (
+                abs(float(order.price) - limit_price) < 1e-9
+                and abs(float(order.quantity) - position.quantity) < 1e-9
+            ):
+                return
+
+        for order in resting_orders_same_position:
+            await db_manager.update_shadow_order(int(order.id), status="cancelled")
+
+    effective_market_info = market_info or {}
+    best_bid = (
+        get_best_bid_price(effective_market_info, position.side)
+        if effective_market_info
+        else 0.0
+    )
+    shadow_order_id = _get_simulated_order_id(prefix="shadow_sell", position=position)
+
+    if best_bid > 0 and best_bid + 1e-9 >= limit_price:
+        await db_manager.add_shadow_order(
+            ShadowOrder(
+                strategy=strategy,
+                market_id=position.market_id,
+                side=position.side,
+                action="sell",
+                price=limit_price,
+                quantity=position.quantity,
+                status="filled",
+                live=True,
+                order_id=shadow_order_id,
+                placed_at=now,
+                filled_at=now,
+                filled_price=best_bid,
+                target_price=limit_price,
+                position_id=position.id,
+            )
+        )
+        return
+
+    await db_manager.add_shadow_order(
+        ShadowOrder(
+            strategy=strategy,
+            market_id=position.market_id,
+            side=position.side,
+            action="sell",
+            price=limit_price,
+            quantity=position.quantity,
+            status="resting",
+            live=True,
+            order_id=shadow_order_id,
+            placed_at=now,
+            target_price=limit_price,
             position_id=position.id,
         )
     )
@@ -836,6 +981,8 @@ async def execute_position(
     live_mode: bool,
     db_manager: DatabaseManager,
     kalshi_client: KalshiClient,
+    *,
+    shadow_mode: Optional[bool] = None,
 ) -> bool:
     """
     Execute a single trade position.
@@ -846,6 +993,7 @@ async def execute_position(
     logger = get_trading_logger("trade_execution")
     logger.info(f"Executing position for market: {position.market_id}")
     logger.info(f"Live mode: {live_mode}")
+    shadow_mode = _resolve_shadow_mode(shadow_mode)
 
     if not live_mode:
         try:
@@ -879,6 +1027,7 @@ async def execute_position(
         # Kalshi would.
         paper_entry_price = top_of_book_price
         depth_summary: Optional[Dict[str, Any]] = None
+        orderbook: Optional[Dict[str, Any]] = None
         if market_info:
             orderbook = await _fetch_entry_orderbook(
                 kalshi_client=kalshi_client,
@@ -943,6 +1092,23 @@ async def execute_position(
             contracts_cost=position.contracts_cost,
             entry_order_id=position.entry_order_id,
         )
+        if shadow_mode:
+            try:
+                await _record_shadow_entry_order(
+                    position=position,
+                    db_manager=db_manager,
+                    top_of_book_price=top_of_book_price,
+                    quantity=position.quantity,
+                    market_info=market_info,
+                    placed_at=filled_at,
+                    orderbook=orderbook,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not persist shadow entry order for %s; paper entry remains unchanged.",
+                    position.market_id,
+                    error=str(exc),
+                )
         if depth_summary and depth_summary.get("levels"):
             walk_trail = ", ".join(
                 f"{qty:.2f}@${price:.4f}" for price, qty in depth_summary["levels"]
@@ -982,6 +1148,13 @@ async def execute_position(
             quantity=position.quantity,
             available_quantity=displayed_ask_size,
         )
+        shadow_orderbook: Optional[Dict[str, Any]] = None
+        shadow_placed_at = datetime.now()
+        if shadow_mode:
+            shadow_orderbook = await _fetch_entry_orderbook(
+                kalshi_client=kalshi_client,
+                ticker=position.market_id,
+            )
 
         client_order_id = str(uuid.uuid4())
         order_params = {
@@ -1091,6 +1264,23 @@ async def execute_position(
         logger.info(
             f"Real money used: ${position.contracts_cost:.2f} + fees ${position.entry_fee:.2f}"
         )
+        if shadow_mode:
+            try:
+                await _record_shadow_entry_order(
+                    position=position,
+                    db_manager=db_manager,
+                    top_of_book_price=ask_dollars,
+                    quantity=fill_quantity,
+                    market_info=market_info,
+                    placed_at=shadow_placed_at,
+                    orderbook=shadow_orderbook,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not persist shadow entry order for %s; live entry remains unchanged.",
+                    position.market_id,
+                    error=str(exc),
+                )
         return True
 
     except ValueError as exc:
@@ -1109,6 +1299,7 @@ async def place_sell_limit_order(
     *,
     live_mode: Optional[bool] = None,
     reduce_only: bool = False,
+    shadow_mode: Optional[bool] = None,
 ) -> bool:
     """
     Place a limit order to close an existing position.
@@ -1121,6 +1312,7 @@ async def place_sell_limit_order(
     logger = get_trading_logger("sell_limit_order")
     if live_mode is None:
         live_mode = getattr(settings.trading, "live_trading_enabled", False)
+    shadow_mode = _resolve_shadow_mode(shadow_mode)
 
     try:
         side = position.side.lower()
@@ -1145,6 +1337,34 @@ async def place_sell_limit_order(
                 db_manager=db_manager,
                 kalshi_client=kalshi_client,
             )
+            if shadow_mode:
+                shadow_market_info: Dict[str, Any] = {}
+                try:
+                    shadow_market_response = await kalshi_client.get_market(position.market_id)
+                    shadow_market_info = (
+                        shadow_market_response.get("market", {})
+                        if isinstance(shadow_market_response, dict)
+                        else {}
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Could not fetch market snapshot for shadow paper exit on %s; storing best-effort shadow telemetry.",
+                        position.market_id,
+                        error=str(exc),
+                    )
+                try:
+                    await _record_shadow_sell_limit_order(
+                        position=position,
+                        limit_price=limit_price,
+                        db_manager=db_manager,
+                        market_info=shadow_market_info,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Could not persist shadow sell order for %s; paper sell order remains unchanged.",
+                        position.market_id,
+                        error=str(exc),
+                    )
             logger.info(
                 f"SIMULATED SELL LIMIT order: {position.quantity} {side.upper()} "
                 f"at ${limit_price:.4f} for {position.market_id}"
@@ -1154,6 +1374,21 @@ async def place_sell_limit_order(
         logger.info(
             f"Placing SELL LIMIT order: {position.quantity} {side.upper()} at ${limit_price:.4f} for {position.market_id}"
         )
+        shadow_market_info: Dict[str, Any] = {}
+        if shadow_mode:
+            try:
+                shadow_market_response = await kalshi_client.get_market(position.market_id)
+                shadow_market_info = (
+                    shadow_market_response.get("market", {})
+                    if isinstance(shadow_market_response, dict)
+                    else {}
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not fetch market snapshot for shadow exit on %s; placing live order without it.",
+                    position.market_id,
+                    error=str(exc),
+                )
         response = await kalshi_client.place_order(**order_params)
 
         if response and "order" in response:
@@ -1163,6 +1398,20 @@ async def place_sell_limit_order(
             logger.info(f"Side: {side.upper()} (selling {position.quantity} shares)")
             logger.info(f"Limit Price: ${limit_price:.4f}")
             logger.info(f"Expected Proceeds: ${limit_price * position.quantity:.2f}")
+            if shadow_mode:
+                try:
+                    await _record_shadow_sell_limit_order(
+                        position=position,
+                        limit_price=limit_price,
+                        db_manager=db_manager,
+                        market_info=shadow_market_info,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Could not persist shadow sell order for %s; live sell order remains unchanged.",
+                        position.market_id,
+                        error=str(exc),
+                    )
             return True
 
         logger.error(f"Failed to place sell limit order: {response}")
@@ -1178,11 +1427,13 @@ async def place_profit_taking_orders(
     profit_threshold: float = 0.25,
     *,
     live_mode: Optional[bool] = None,
+    shadow_mode: Optional[bool] = None,
 ) -> Dict[str, int]:
     """Place sell limits for positions that have reached profit targets."""
     logger = get_trading_logger("profit_taking")
     if live_mode is None:
         live_mode = getattr(settings.trading, "live_trading_enabled", False)
+    shadow_mode = _resolve_shadow_mode(shadow_mode)
 
     results = {"orders_placed": 0, "positions_processed": 0, "positions_closed": 0}
 
@@ -1237,6 +1488,7 @@ async def place_profit_taking_orders(
                             db_manager=db_manager,
                             kalshi_client=kalshi_client,
                             live_mode=True,
+                            shadow_mode=shadow_mode,
                         )
                         if success:
                             results["orders_placed"] += 1
@@ -1250,6 +1502,20 @@ async def place_profit_taking_orders(
                             db_manager=db_manager,
                             kalshi_client=kalshi_client,
                         )
+                        if shadow_mode and paper_result.get("success"):
+                            try:
+                                await _record_shadow_sell_limit_order(
+                                    position=position,
+                                    limit_price=sell_price,
+                                    db_manager=db_manager,
+                                    market_info=market_data,
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "Could not persist shadow profit-taking order for %s.",
+                                    position.market_id,
+                                    error=str(exc),
+                                )
                         if paper_result.get("success"):
                             results["orders_placed"] += int(paper_result.get("orders_placed", 0))
                             results["positions_closed"] += int(paper_result.get("positions_closed", 0))
@@ -1282,11 +1548,13 @@ async def place_stop_loss_orders(
     stop_loss_threshold: float = -0.10,
     *,
     live_mode: Optional[bool] = None,
+    shadow_mode: Optional[bool] = None,
 ) -> Dict[str, int]:
     """Place sell limits for positions that need stop-loss protection."""
     logger = get_trading_logger("stop_loss_orders")
     if live_mode is None:
         live_mode = getattr(settings.trading, "live_trading_enabled", False)
+    shadow_mode = _resolve_shadow_mode(shadow_mode)
 
     results = {"orders_placed": 0, "positions_processed": 0, "positions_closed": 0}
 
@@ -1336,6 +1604,7 @@ async def place_stop_loss_orders(
                             db_manager=db_manager,
                             kalshi_client=kalshi_client,
                             live_mode=True,
+                            shadow_mode=shadow_mode,
                         )
                         if success:
                             results["orders_placed"] += 1
@@ -1349,6 +1618,20 @@ async def place_stop_loss_orders(
                             db_manager=db_manager,
                             kalshi_client=kalshi_client,
                         )
+                        if shadow_mode and paper_result.get("success"):
+                            try:
+                                await _record_shadow_sell_limit_order(
+                                    position=position,
+                                    limit_price=stop_price,
+                                    db_manager=db_manager,
+                                    market_info=market_data,
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "Could not persist shadow stop-loss order for %s.",
+                                    position.market_id,
+                                    error=str(exc),
+                                )
                         if paper_result.get("success"):
                             results["orders_placed"] += int(paper_result.get("orders_placed", 0))
                             results["positions_closed"] += int(paper_result.get("positions_closed", 0))

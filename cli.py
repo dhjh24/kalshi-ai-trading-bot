@@ -12,6 +12,7 @@ Provides a single entry point for all bot operations:
 
 import argparse
 import asyncio
+import inspect
 import os
 import sys
 from pathlib import Path
@@ -81,6 +82,288 @@ async def _run_bot_entrypoint(
         on_timeout=getattr(bot, "request_shutdown", None),
     )
 
+
+def _resolve_db_path() -> Path:
+    """Return the primary trading database path for CLI status/health helpers."""
+    return Path(__file__).parent / "trading_system.db"
+
+
+def _resolve_run_mode(args: argparse.Namespace) -> str:
+    """Normalize mutually-exclusive run-mode flags to a single mode string."""
+    live = bool(getattr(args, "live", False))
+    paper = bool(getattr(args, "paper", False))
+    shadow = bool(getattr(args, "shadow", False))
+
+    selected_modes = [
+        mode_name
+        for mode_name, enabled in (
+            ("live", live),
+            ("paper", paper),
+            ("shadow", shadow),
+        )
+        if enabled
+    ]
+    if len(selected_modes) > 1:
+        print("Error: choose only one of --live, --paper, or --shadow.")
+        sys.exit(1)
+
+    if live:
+        return "live"
+    if shadow:
+        return "shadow"
+    return "paper"
+
+
+def _class_accepts_kwarg(cls, arg_name: str) -> bool:
+    """Return True when a class constructor explicitly accepts `arg_name`."""
+    try:
+        parameters = inspect.signature(cls).parameters
+    except (TypeError, ValueError):
+        return False
+    return arg_name in parameters
+
+
+def _construct_runtime(cls, **kwargs):
+    """Instantiate a runtime object using only supported keyword arguments."""
+    supported_kwargs = {
+        key: value
+        for key, value in kwargs.items()
+        if _class_accepts_kwarg(cls, key)
+    }
+    return cls(**supported_kwargs)
+
+
+def _format_currency_or_placeholder(
+    value: float | None,
+    *,
+    width: int = 10,
+    placeholder: str = "unavailable",
+) -> str:
+    """Format dollars for status output, or a placeholder if unavailable."""
+    if value is None:
+        return f"{placeholder:>{width}}"
+    return f"${value:>{width},.2f}"
+
+
+def _format_summary_payload(summary) -> str | None:
+    """Normalize helper output into a one-line status summary string."""
+    if summary is None:
+        return None
+    if isinstance(summary, str):
+        text = summary.strip()
+        return text or None
+    if isinstance(summary, dict):
+        for key in ("summary", "line", "text", "message"):
+            value = summary.get(key)
+            if value:
+                text = str(value).strip()
+                if text:
+                    return text
+        return None
+    text = str(summary).strip()
+    return text or None
+
+
+async def _maybe_call_db_summary_helper(
+    db_manager,
+    helper_names: tuple[str, ...],
+) -> tuple[str | None, str | None]:
+    """Call the first available DB helper that returns a printable summary."""
+    for helper_name in helper_names:
+        helper = getattr(db_manager, helper_name, None)
+        if not callable(helper):
+            continue
+        try:
+            result = helper()
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception:
+            continue
+        summary = _format_summary_payload(result)
+        if summary:
+            return summary, helper_name
+    return None, None
+
+
+async def _load_status_db_manager(db_path: Path):
+    """Best-effort DB manager loader for resilient status output."""
+    if not db_path.exists():
+        return None
+
+    try:
+        from src.utils.database import DatabaseManager
+    except ImportError:
+        return None
+
+    db_manager = DatabaseManager(db_path=str(db_path))
+    initialize = getattr(db_manager, "initialize", None)
+    if callable(initialize):
+        try:
+            result = initialize()
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            # Status is read-mostly; a partial DB failure should not prevent
+            # placeholder rendering for the rest of the command.
+            return db_manager
+    return db_manager
+
+
+async def _close_async_resource(resource) -> None:
+    """Close an async resource if it exposes a close coroutine/method."""
+    if resource is None:
+        return
+    close = getattr(resource, "close", None)
+    if not callable(close):
+        return
+    try:
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        return
+
+
+async def _get_local_open_position_count(db_manager) -> int | None:
+    """Return the locally persisted open-position count if available."""
+    getter = getattr(db_manager, "get_open_positions", None)
+    if not callable(getter):
+        return None
+    try:
+        result = getter()
+        if inspect.isawaitable(result):
+            result = await result
+        return len(result or [])
+    except Exception:
+        return None
+
+
+async def _build_paper_live_summary_line(db_manager) -> str:
+    """Render a paper-vs-live divergence line using helper hooks or a proxy."""
+    helper_summary, _helper_name = await _maybe_call_db_summary_helper(
+        db_manager,
+        (
+            "get_paper_live_divergence_summary",
+            "get_paper_vs_live_divergence_summary",
+            "get_status_paper_live_divergence_summary",
+        ),
+    )
+    if helper_summary:
+        return helper_summary
+
+    get_fee_divergence_entries = getattr(db_manager, "get_fee_divergence_entries", None)
+    if not callable(get_fee_divergence_entries):
+        return "pending DB helper"
+
+    try:
+        entries = get_fee_divergence_entries(limit=25)
+        if inspect.isawaitable(entries):
+            entries = await entries
+    except Exception:
+        return "pending DB helper"
+
+    divergences = []
+    for entry in entries or []:
+        try:
+            divergences.append(abs(float((entry or {}).get("divergence", 0.0) or 0.0)))
+        except (AttributeError, TypeError, ValueError):
+            continue
+
+    if not divergences:
+        return "pending DB helper"
+
+    avg_abs_divergence = sum(divergences) / len(divergences)
+    worst_divergence = max(divergences)
+    return (
+        "helper pending | "
+        f"fee-drift proxy avg abs ${avg_abs_divergence:.4f} "
+        f"across {len(divergences)} recent fills "
+        f"(worst ${worst_divergence:.4f})"
+    )
+
+
+async def _build_ai_spend_summary_line(db_manager) -> str:
+    """Render an AI spend/provider line using helper hooks or local DB stats."""
+    helper_summary, _helper_name = await _maybe_call_db_summary_helper(
+        db_manager,
+        (
+            "get_ai_spend_provider_breakdown",
+            "get_ai_spend_provider_summary",
+            "get_status_ai_spend_provider_summary",
+        ),
+    )
+    if helper_summary:
+        return helper_summary
+
+    today_cost = None
+    get_daily_ai_cost = getattr(db_manager, "get_daily_ai_cost", None)
+    if callable(get_daily_ai_cost):
+        try:
+            today_cost = get_daily_ai_cost()
+            if inspect.isawaitable(today_cost):
+                today_cost = await today_cost
+            today_cost = float(today_cost or 0.0)
+        except Exception:
+            today_cost = None
+
+    llm_stats = {}
+    get_llm_stats_by_strategy = getattr(db_manager, "get_llm_stats_by_strategy", None)
+    if callable(get_llm_stats_by_strategy):
+        try:
+            llm_stats = get_llm_stats_by_strategy()
+            if inspect.isawaitable(llm_stats):
+                llm_stats = await llm_stats
+            llm_stats = llm_stats or {}
+        except Exception:
+            llm_stats = {}
+
+    total_queries = 0
+    total_cost = 0.0
+    for stats in llm_stats.values():
+        if not isinstance(stats, dict):
+            continue
+        try:
+            total_queries += int(stats.get("query_count") or 0)
+        except (TypeError, ValueError):
+            pass
+        try:
+            total_cost += float(stats.get("total_cost") or 0.0)
+        except (TypeError, ValueError):
+            pass
+
+    if llm_stats:
+        today_display = (
+            f"today ${today_cost:.2f}"
+            if today_cost is not None
+            else "today unavailable"
+        )
+        return (
+            f"{today_display} | "
+            f"7d logged ${total_cost:.2f} across {total_queries} queries / {len(llm_stats)} strategies | "
+            "provider breakdown pending DB helper"
+        )
+
+    if today_cost is not None:
+        return f"today ${today_cost:.2f} | provider breakdown pending DB helper"
+
+    return "pending DB helper"
+
+
+async def _print_status_local_analytics(db_manager) -> None:
+    """Print helper-backed or placeholder local analytics for `status`."""
+    print()
+    print("  Local Analytics:")
+    if db_manager is None:
+        print("  Paper vs Live:    local DB unavailable")
+        print("  AI Spend:         local DB unavailable")
+        return
+
+    paper_live_summary = await _build_paper_live_summary_line(db_manager)
+    ai_spend_summary = await _build_ai_spend_summary_line(db_manager)
+    print(f"  Paper vs Live:    {paper_live_summary}")
+    print(f"  AI Spend:         {ai_spend_summary}")
+
+
 def cmd_run(args: argparse.Namespace) -> None:
     """Start the trading bot (disciplined mode by default)."""
     from src.utils.logging_setup import setup_logging
@@ -88,18 +371,15 @@ def cmd_run(args: argparse.Namespace) -> None:
     log_level = getattr(args, "log_level", "INFO")
     setup_logging(log_level=log_level)
 
-    live = getattr(args, "live", False)
-    paper = getattr(args, "paper", False)
+    run_mode = _resolve_run_mode(args)
+    live = run_mode == "live"
+    shadow = run_mode == "shadow"
     beast = getattr(args, "beast", False)
     disciplined = getattr(args, "disciplined", False)
     safe_compounder = getattr(args, "safe_compounder", False)
     once = getattr(args, "once", False)
     smoke = getattr(args, "smoke", False)
     max_runtime_seconds = getattr(args, "max_runtime_seconds", None)
-
-    if live and paper:
-        print("Error: --live and --paper are mutually exclusive.")
-        sys.exit(1)
 
     if smoke and live:
         print("Error: --smoke cannot be combined with --live.")
@@ -109,18 +389,22 @@ def cmd_run(args: argparse.Namespace) -> None:
         print("Error: --max-runtime-seconds must be greater than 0.")
         sys.exit(1)
 
-    live_mode = live and not paper
+    live_mode = live
     if smoke:
         once = True
 
     if live_mode:
         print("⚠️  WARNING: LIVE TRADING MODE ENABLED")
         print("   This will use real money and place actual trades.")
+    elif shadow:
+        print("👥  SHADOW MODE ENABLED")
+        print("   No real orders will be placed.")
 
     # --safe-compounder mode: edge-based NO-side only
     if safe_compounder:
         _run_safe_compounder(
             live_mode=live_mode,
+            shadow_mode=shadow,
             max_runtime_seconds=max_runtime_seconds,
         )
         return
@@ -134,7 +418,13 @@ def cmd_run(args: argparse.Namespace) -> None:
         elif once:
             print("   Single-pass safety mode enabled: one cycle, then exit.")
         from beast_mode_bot import BeastModeBot
-        bot = BeastModeBot(live_mode=live_mode)
+        if shadow and not _class_accepts_kwarg(BeastModeBot, "shadow_mode"):
+            print("   Shadow runtime hook not available yet; falling back to paper execution semantics.")
+        bot = _construct_runtime(
+            BeastModeBot,
+            live_mode=live_mode,
+            shadow_mode=shadow,
+        )
         try:
             asyncio.run(
                 _run_bot_entrypoint(
@@ -171,7 +461,13 @@ def cmd_run(args: argparse.Namespace) -> None:
     cfg.max_drawdown = 0.15
     cfg.max_sector_exposure = 0.30
 
-    bot = BeastModeBot(live_mode=live_mode)
+    if shadow and not _class_accepts_kwarg(BeastModeBot, "shadow_mode"):
+        print("   Shadow runtime hook not available yet; falling back to paper execution semantics.")
+    bot = _construct_runtime(
+        BeastModeBot,
+        live_mode=live_mode,
+        shadow_mode=shadow,
+    )
     try:
         asyncio.run(
             _run_bot_entrypoint(
@@ -187,6 +483,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 
 def _run_safe_compounder(
     live_mode: bool = False,
+    shadow_mode: bool = False,
     max_runtime_seconds: int | None = None,
 ) -> None:
     """Run the Safe Compounder strategy."""
@@ -195,15 +492,19 @@ def _run_safe_compounder(
 
     print("🔒 SAFE COMPOUNDER MODE")
     print("   NO-side only | Edge-based | Near-certain outcomes")
-    if not live_mode:
+    if shadow_mode:
+        print("   SHADOW RUN — dry-run execution until the strategy adds explicit shadow hooks")
+    elif not live_mode:
         print("   DRY RUN — no real orders will be placed")
 
     async def _run():
         client = KalshiClient()
         try:
-            compounder = SafeCompounder(
+            compounder = _construct_runtime(
+                SafeCompounder,
                 client=client,
                 dry_run=not live_mode,
+                shadow_mode=shadow_mode,
             )
             stats = await compounder.run()
             return stats
@@ -277,7 +578,7 @@ async def _print_strategy_budget_status(portfolio_value: float) -> None:
     except ImportError:
         return
 
-    db_path = str(Path(__file__).parent / "trading_system.db")
+    db_path = str(_resolve_db_path())
     if not Path(db_path).exists():
         return
 
@@ -329,13 +630,23 @@ def cmd_status(args: argparse.Namespace) -> None:
             get_position_exposure_dollars,
         )
 
-        client = KalshiClient()
+        db_path = _resolve_db_path()
+        db_manager = await _load_status_db_manager(db_path)
+        local_open_positions = await _get_local_open_position_count(db_manager)
+
+        client = None
+        api_error = None
+        balance_usd = None
+        portfolio_value_usd = None
+        active_positions = []
+        total_exposure = 0.0
+        total_realized_pnl = 0.0
+        total_fees = 0.0
         try:
-            # Fetch balance
+            client = KalshiClient()
             balance_resp = await client.get_balance()
             balance_usd = get_balance_dollars(balance_resp)
 
-            # Fetch positions — Kalshi API v2 returns event_positions and market_positions
             portfolio_value_usd = get_portfolio_value_dollars(balance_resp)
 
             positions_resp = await client.get_positions()
@@ -344,51 +655,72 @@ def cmd_status(args: argparse.Namespace) -> None:
                 p for p in event_positions
                 if get_position_exposure_dollars(p) > 0
             ]
-
-            # Display
-            print("=" * 56)
-            print("  PORTFOLIO STATUS")
-            print("=" * 56)
-            print(f"  Available Cash:     ${balance_usd:>10,.2f}")
-            print(f"  Position Value:     ${portfolio_value_usd:>10,.2f}")
-            print(f"  Total Portfolio:    ${balance_usd + portfolio_value_usd:>10,.2f}")
-            print(f"  Active Positions:   {len(active_positions):>10}")
-
-            total_exposure = 0.0
-            total_realized_pnl = 0.0
-            total_fees = 0.0
-
-            if active_positions:
-                print()
-                print(f"  {'Event':<30} {'Exposure':>10} {'Cost':>10} {'P&L':>10} {'Fees':>8}")
-                print(f"  {'-'*30} {'-'*10} {'-'*10} {'-'*10} {'-'*8}")
-
-                for pos in active_positions:
-                    ticker = pos.get("event_ticker", "???")
-                    exposure = get_position_exposure_dollars(pos)
-                    cost = float(pos.get("total_cost_dollars", "0"))
-                    pnl = float(pos.get("realized_pnl_dollars", "0"))
-                    fees = float(pos.get("fees_paid_dollars", "0"))
-                    total_exposure += exposure
-                    total_realized_pnl += pnl
-                    total_fees += fees
-                    print(
-                        f"  {ticker:<30} ${exposure:>8.2f} ${cost:>8.2f} "
-                        f"${pnl:>8.2f} ${fees:>6.2f}"
-                    )
-
-                print()
-                print(f"  Total Exposure:     ${total_exposure:>10,.2f}")
-                print(f"  Total Realized P&L: ${total_realized_pnl:>10,.2f}")
-                print(f"  Total Fees Paid:    ${total_fees:>10,.2f}")
-
-            # W7: per-strategy daily-loss budget remaining
-            total_portfolio = balance_usd + portfolio_value_usd
-            await _print_strategy_budget_status(total_portfolio)
-
-            print("=" * 56)
+        except Exception as exc:
+            api_error = exc
         finally:
-            await client.close()
+            await _close_async_resource(client)
+
+        print("=" * 56)
+        print("  PORTFOLIO STATUS")
+        print("=" * 56)
+        print(
+            "  Kalshi API:        "
+            + (
+                "connected"
+                if api_error is None
+                else f"unavailable ({api_error})"
+            )
+        )
+        total_portfolio = (
+            balance_usd + portfolio_value_usd
+            if balance_usd is not None and portfolio_value_usd is not None
+            else None
+        )
+        print(f"  Available Cash:     {_format_currency_or_placeholder(balance_usd)}")
+        print(f"  Position Value:     {_format_currency_or_placeholder(portfolio_value_usd)}")
+        print(f"  Total Portfolio:    {_format_currency_or_placeholder(total_portfolio)}")
+        if api_error is None:
+            print(f"  Active Positions:   {len(active_positions):>10}")
+        else:
+            local_positions_display = (
+                f"{local_open_positions:>10}"
+                if local_open_positions is not None
+                else f"{'n/a':>10}"
+            )
+            print(f"  Active Positions:   {'API unavailable':>10}")
+            print(f"  Local Open Positions:{local_positions_display}")
+
+        if active_positions:
+            print()
+            print(f"  {'Event':<30} {'Exposure':>10} {'Cost':>10} {'P&L':>10} {'Fees':>8}")
+            print(f"  {'-'*30} {'-'*10} {'-'*10} {'-'*10} {'-'*8}")
+
+            for pos in active_positions:
+                ticker = pos.get("event_ticker", "???")
+                exposure = get_position_exposure_dollars(pos)
+                cost = float(pos.get("total_cost_dollars", "0"))
+                pnl = float(pos.get("realized_pnl_dollars", "0"))
+                fees = float(pos.get("fees_paid_dollars", "0"))
+                total_exposure += exposure
+                total_realized_pnl += pnl
+                total_fees += fees
+                print(
+                    f"  {ticker:<30} ${exposure:>8.2f} ${cost:>8.2f} "
+                    f"${pnl:>8.2f} ${fees:>6.2f}"
+                )
+
+            print()
+            print(f"  Total Exposure:     ${total_exposure:>10,.2f}")
+            print(f"  Total Realized P&L: ${total_realized_pnl:>10,.2f}")
+            print(f"  Total Fees Paid:    ${total_fees:>10,.2f}")
+        elif api_error is not None:
+            print()
+            print("  Open-position detail unavailable from Kalshi; showing local analytics below.")
+
+        await _print_strategy_budget_status(total_portfolio or 0.0)
+        await _print_status_local_analytics(db_manager)
+        print("=" * 56)
+        await _close_async_resource(db_manager)
 
     try:
         asyncio.run(_status())
@@ -681,6 +1013,7 @@ def build_parser() -> argparse.ArgumentParser:
             "examples:\n"
             "  python cli.py run                      Start AI Ensemble mode (default, paper)\n"
             "  python cli.py run --live               AI Ensemble with real capital\n"
+            "  python cli.py run --shadow             Shadow mode (dry-run execution, live-like analytics)\n"
             "  python cli.py run --safe-compounder    Safe Compounder: conservative, math-only\n"
             "  python cli.py run --safe-compounder --live  Safe Compounder live\n"
             "  python cli.py run --once               Run one ingest/trade cycle and exit\n"
@@ -717,6 +1050,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--paper",
         action="store_true",
         help="Run in paper-trading mode (no real orders)",
+    )
+    live_group.add_argument(
+        "--shadow",
+        action="store_true",
+        help="Run in shadow mode: dry-run execution with live-vs-paper parity hooks",
     )
     strategy_group = p_run.add_mutually_exclusive_group()
     strategy_group.add_argument(

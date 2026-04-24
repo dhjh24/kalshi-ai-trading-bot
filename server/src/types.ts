@@ -36,11 +36,16 @@ export interface PositionRow {
   timestamp: string;
   rationale: string | null;
   confidence: number | null;
-  live: number;
+  live?: number;
   status: string;
   strategy: string | null;
   stop_loss_price: number | null;
   take_profit_price: number | null;
+  max_hold_hours?: number | null;
+  target_confidence_change?: number | null;
+  entry_fee?: number;
+  contracts_cost?: number;
+  entry_order_id?: string | null;
 }
 
 export interface TradeLogRow {
@@ -55,6 +60,11 @@ export interface TradeLogRow {
   exit_timestamp: string;
   rationale: string | null;
   strategy: string | null;
+  live?: number;
+  entry_fee?: number;
+  exit_fee?: number;
+  fees_paid?: number;
+  contracts_cost?: number;
 }
 
 export interface AnalysisRequestRow {
@@ -269,6 +279,103 @@ export interface OverviewPayload {
     requestedAt: string;
     completedAt: string | null;
   }>;
+}
+
+export interface PortfolioModeSplit {
+  paper: number;
+  live: number;
+  liveMinusPaper: number;
+}
+
+export interface PortfolioDivergenceRollup {
+  label: "24h" | "7d";
+  paperTrades: number;
+  liveTrades: number;
+  liveMinusPaperTrades: number;
+  paperPnl: number;
+  livePnl: number;
+  liveMinusPaperPnl: number;
+}
+
+export interface PortfolioOrderDriftMetrics {
+  available: boolean;
+  sourceTable: string | null;
+  trailingHours: number;
+  paperResting: number;
+  liveResting: number;
+  liveMinusPaperResting: number;
+  paperPlacedRecent: number;
+  livePlacedRecent: number;
+  liveMinusPaperPlacedRecent: number;
+  paperFilledRecent: number;
+  liveFilledRecent: number;
+  liveMinusPaperFilledRecent: number;
+  paperStaleResting: number;
+  liveStaleResting: number;
+  liveMinusPaperStaleResting: number;
+}
+
+export interface PortfolioDivergenceMetrics {
+  summary: {
+    openPositions: PortfolioModeSplit;
+    openExposure: PortfolioModeSplit;
+  };
+  rollups: {
+    last24h: PortfolioDivergenceRollup;
+    last7d: PortfolioDivergenceRollup;
+  };
+  recentOrderDrift: PortfolioOrderDriftMetrics;
+}
+
+export interface PortfolioAiSpendBucket {
+  key: string;
+  label: string;
+  costUsd: number;
+  count: number;
+  tokensUsed: number | null;
+  shareOfKnownCostPct: number;
+}
+
+export interface PortfolioAiSpendBreakdown {
+  available: boolean;
+  sourceTable: string | null;
+  sourceField: "provider" | "strategy" | "query_type" | null;
+  totalCostUsd: number;
+  attributedCostUsd: number;
+  unattributedCostUsd: number;
+  items: PortfolioAiSpendBucket[];
+}
+
+export interface PortfolioAiSpendSummary {
+  reportedTodayUsd: number;
+  knownCostLast24hUsd: number;
+  knownCostLast7dUsd: number;
+  knownCostLifetimeUsd: number;
+  llmQueryCount: number;
+  analysisRequestCount: number;
+  tokensUsed: number;
+  latestLlmQueryAt: string | null;
+  latestAnalysisRequestAt: string | null;
+}
+
+export interface PortfolioAiSpendMetrics {
+  summary: PortfolioAiSpendSummary;
+  byProvider: PortfolioAiSpendBreakdown;
+  byStrategy: PortfolioAiSpendBreakdown;
+  byRole: PortfolioAiSpendBreakdown;
+}
+
+export interface PortfolioPayload {
+  positions: PositionRow[];
+  trades: TradeLogRow[];
+  metrics: {
+    activePositions: number;
+    exposure: number;
+    realizedPnl: number;
+    todayAiCost: number;
+  };
+  divergence: PortfolioDivergenceMetrics;
+  aiSpend: PortfolioAiSpendMetrics;
 }
 
 export interface LiveTradePayload {

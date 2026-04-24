@@ -3,6 +3,13 @@ import {
   getDailyAiCost,
   getLatestAnalysisForTarget,
   getOpenPositions,
+  getPortfolioAiSpendByProvider,
+  getPortfolioAiSpendByRole,
+  getPortfolioAiSpendByStrategy,
+  getPortfolioAiSpendSummary,
+  getPortfolioOpenModeSummary,
+  getPortfolioOrderDriftMetrics,
+  getPortfolioTradeDivergenceRollup,
   getRealizedPnl,
   getRecentTrades,
   getTotalTrades,
@@ -19,6 +26,7 @@ import type {
   LiveTradePayload,
   MarketRow,
   OverviewPayload,
+  PortfolioPayload,
   SportsContext
 } from "../types.js";
 import { parseJson } from "../utils/helpers.js";
@@ -353,13 +361,14 @@ export async function getEventDetailPayload(eventTicker: string) {
   };
 }
 
-export function getPortfolioPayload() {
+export function getPortfolioPayload(): PortfolioPayload {
   const positions = getOpenPositions();
   const trades = getRecentTrades(50);
   const exposure = positions.reduce(
     (sum, position) => sum + position.entry_price * position.quantity,
     0
   );
+  const divergenceSummary = getPortfolioOpenModeSummary();
 
   return {
     positions,
@@ -369,6 +378,20 @@ export function getPortfolioPayload() {
       exposure: Number(exposure.toFixed(2)),
       realizedPnl: getRealizedPnl(),
       todayAiCost: getDailyAiCost()
+    },
+    divergence: {
+      summary: divergenceSummary,
+      rollups: {
+        last24h: getPortfolioTradeDivergenceRollup("24h"),
+        last7d: getPortfolioTradeDivergenceRollup("7d")
+      },
+      recentOrderDrift: getPortfolioOrderDriftMetrics(24)
+    },
+    aiSpend: {
+      summary: getPortfolioAiSpendSummary(),
+      byProvider: getPortfolioAiSpendByProvider(),
+      byStrategy: getPortfolioAiSpendByStrategy(),
+      byRole: getPortfolioAiSpendByRole()
     }
   };
 }

@@ -1,15 +1,17 @@
 import asyncio
 import os
+import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import aiosqlite
 import pytest
 
-from cli import _run_bot_entrypoint, build_parser
+import cli
+from cli import _run_bot_entrypoint, build_parser, cmd_status
 
 
 def test_run_parser_accepts_safety_flags():
@@ -33,6 +35,27 @@ def test_run_parser_accepts_smoke_flag():
     assert args.command == "run"
     assert args.smoke is True
     assert args.paper is True
+
+
+def test_run_parser_accepts_shadow_flag():
+    parser = build_parser()
+
+    args = parser.parse_args(["run", "--shadow", "--once"])
+
+    assert args.command == "run"
+    assert args.shadow is True
+    assert args.once is True
+    assert args.live is False
+    assert args.paper is False
+
+
+def test_run_parser_rejects_shadow_with_live_flag():
+    parser = build_parser()
+
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(["run", "--shadow", "--live"])
+
+    assert excinfo.value.code == 2
 
 
 @pytest.mark.asyncio
@@ -453,6 +476,172 @@ async def test_shadow_mode_parity_all_modes_share_limits(ephemeral_db):
 
 
 # --- Status reporting for CLI ---
+
+
+def _install_status_stubs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    api_error: Exception | None = None,
+    use_helper_summaries: bool = False,
+) -> None:
+    db_path = tmp_path / "trading_system.db"
+    db_path.touch()
+    monkeypatch.setattr(cli, "_resolve_db_path", lambda: db_path)
+
+    kalshi_module = ModuleType("src.clients.kalshi_client")
+
+    class FakeKalshiClient:
+        async def get_balance(self):
+            if api_error is not None:
+                raise api_error
+            return {"balance": "100.0", "portfolio_value": "40.0"}
+
+        async def get_positions(self):
+            return {"event_positions": []}
+
+        async def close(self):
+            return None
+
+    kalshi_module.KalshiClient = FakeKalshiClient
+    monkeypatch.setitem(sys.modules, "src.clients.kalshi_client", kalshi_module)
+
+    normalization_module = ModuleType("src.utils.kalshi_normalization")
+    normalization_module.get_balance_dollars = lambda resp: 100.0
+    normalization_module.get_portfolio_value_dollars = lambda resp: 40.0
+    normalization_module.get_position_exposure_dollars = (
+        lambda pos: float(pos.get("exposure", 0.0))
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "src.utils.kalshi_normalization",
+        normalization_module,
+    )
+
+    database_module = ModuleType("src.utils.database")
+
+    class FakeDatabaseManager:
+        def __init__(self, db_path):
+            self.db_path = db_path
+
+        async def initialize(self):
+            return None
+
+        async def get_open_positions(self):
+            return [{"market_id": "TEST-1"}, {"market_id": "TEST-2"}]
+
+        async def get_fee_divergence_entries(self, limit=25):
+            return [
+                {"divergence": 0.01},
+                {"divergence": -0.02},
+            ]
+
+        async def get_daily_ai_cost(self):
+            return 1.23
+
+        async def get_llm_stats_by_strategy(self):
+            return {
+                "quick_flip": {"query_count": 4, "total_cost": 0.50},
+                "live_trade": {"query_count": 2, "total_cost": 0.25},
+            }
+
+        async def close(self):
+            return None
+
+    if use_helper_summaries:
+        async def get_paper_live_divergence_summary(self):
+            return "paper/live delta +1.2% vs replay"
+
+        async def get_ai_spend_provider_breakdown(self):
+            return {"summary": "OpenAI $1.00 | OpenRouter $0.50"}
+
+        FakeDatabaseManager.get_paper_live_divergence_summary = (
+            get_paper_live_divergence_summary
+        )
+        FakeDatabaseManager.get_ai_spend_provider_breakdown = (
+            get_ai_spend_provider_breakdown
+        )
+
+    database_module.DatabaseManager = FakeDatabaseManager
+    monkeypatch.setitem(sys.modules, "src.utils.database", database_module)
+
+    enforcer_module = ModuleType("src.strategies.portfolio_enforcer")
+    enforcer_module.STRATEGY_QUICK_FLIP = "quick_flip"
+    enforcer_module.STRATEGY_LIVE_TRADE = "live_trade"
+
+    class FakePortfolioEnforcer:
+        def __init__(self, db_path, portfolio_value):
+            self.portfolio_value = portfolio_value
+
+        async def initialize(self):
+            return None
+
+        async def get_strategy_status(self, strategy):
+            return {
+                "strategy": strategy,
+                "halted": False,
+                "daily_loss_dollars": 12.5 if strategy == "quick_flip" else 7.0,
+                "daily_loss_budget_dollars": (
+                    50.0 if self.portfolio_value > 0 else None
+                ),
+                "daily_loss_budget_remaining_dollars": (
+                    37.5 if self.portfolio_value > 0 else None
+                ),
+                "trades_last_hour": 3,
+                "max_trades_per_hour": 20,
+            }
+
+    enforcer_module.PortfolioEnforcer = FakePortfolioEnforcer
+    monkeypatch.setitem(sys.modules, "src.strategies.portfolio_enforcer", enforcer_module)
+
+
+def test_cmd_status_surfaces_local_fallbacks_when_kalshi_api_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+):
+    _install_status_stubs(
+        monkeypatch,
+        tmp_path,
+        api_error=RuntimeError("kalshi auth unavailable"),
+    )
+
+    cmd_status(SimpleNamespace())
+
+    output = capsys.readouterr().out
+    assert "Kalshi API:" in output
+    assert "unavailable (kalshi auth unavailable)" in output
+    assert "Available Cash:" in output
+    assert "Position Value:" in output
+    assert "Total Portfolio:" in output
+    assert "Local Open Positions:" in output
+    assert "Strategy Risk Budgets (daily):" in output
+    assert "Paper vs Live:" in output
+    assert "fee-drift proxy" in output
+    assert "AI Spend:" in output
+    assert "provider breakdown pending DB helper" in output
+    assert "Error fetching status" not in output
+
+
+def test_cmd_status_prefers_db_helper_summaries_when_available(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+):
+    _install_status_stubs(
+        monkeypatch,
+        tmp_path,
+        api_error=RuntimeError("kalshi auth unavailable"),
+        use_helper_summaries=True,
+    )
+
+    cmd_status(SimpleNamespace())
+
+    output = capsys.readouterr().out
+    assert "paper/live delta +1.2% vs replay" in output
+    assert "OpenAI $1.00 | OpenRouter $0.50" in output
+    assert "fee-drift proxy" not in output
+    assert "provider breakdown pending DB helper" not in output
 
 
 @pytest.mark.asyncio
