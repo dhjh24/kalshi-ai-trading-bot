@@ -1,5 +1,7 @@
 """Alignment tests for OpenRouter-facing config and structured-output parsing."""
 
+from unittest.mock import patch
+
 from src.agents.debate import DebateRunner
 from src.config.settings import EnsembleConfig, settings
 from src.data.sentiment_analyzer import SentimentAnalyzer
@@ -23,7 +25,9 @@ def test_ensemble_config_normalizes_legacy_roles_and_adds_trader():
         trader_model="x-ai/grok-4.1-fast",
     )
 
-    role_map = config.get_role_model_map()
+    with patch.object(settings.api, "resolve_llm_provider", return_value="openrouter"):
+        role_map = config.get_role_model_map()
+
     assert role_map["news_analyst"] == "anthropic/claude-sonnet-4.5"
     assert role_map["trader"] == "x-ai/grok-4.1-fast"
     assert "lead_analyst" not in role_map

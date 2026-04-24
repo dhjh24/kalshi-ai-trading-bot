@@ -10,10 +10,10 @@
 [![Last Commit](https://img.shields.io/github/last-commit/ryanfrigo/kalshi-ai-trading-bot)](https://github.com/ryanfrigo/kalshi-ai-trading-bot/commits/main)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
-**Multi-Model AI Ensemble with selectable OpenAI/OpenRouter routing for [Kalshi](https://kalshi.com) prediction markets.**
+**Multi-model Kalshi trading stack with selectable Codex CLI, OpenAI, and OpenRouter routing.**
 
 Five frontier LLMs debate every trade. The system only enters when they agree.  
-Choose direct OpenAI, OpenRouter, or auto-selection. Swap models with one config change.
+Use a signed-in Codex CLI first, or fall back to direct OpenAI / OpenRouter billing. Swap models with one config change.
 
 [Quick Start](#-quick-start) · [Features](#-features) · [How It Works](#-how-it-works) · [Configuration](#configuration-reference) · [Contributing](CONTRIBUTING.md) · [Kalshi API Docs](https://docs.kalshi.com/welcome)
 
@@ -41,11 +41,12 @@ source .venv/bin/activate        # macOS / Linux
 pip install -r requirements.txt
 npm install
 
-# 2. Add your API keys
+# 2. Configure provider access
 cp env.template .env   # then open .env and fill in:
                        # - KALSHI_API_KEY
                        # - KALSHI_PRIVATE_KEY_PATH
-                       # - OPENAI_API_KEY and/or OPENROUTER_API_KEY
+                       # - either run `codex login`
+                       # - or set OPENAI_API_KEY / OPENROUTER_API_KEY
 
 # 3. Run the AI ensemble (default — 5-model debate on every trade)
 python cli.py run --paper
@@ -68,7 +69,8 @@ This launches the current dashboard stack:
 
 > **Need API keys?**
 > - Kalshi key + private key → [kalshi.com/account/settings](https://kalshi.com/account/settings) ([API docs](https://docs.kalshi.com/welcome))
-> - OpenAI API key → [platform.openai.com/api-keys](https://platform.openai.com/api-keys) (used directly when `LLM_PROVIDER=openai`, or preferred by `auto` when present)
+> - Codex CLI → install `codex`, then run `codex login` so `LLM_PROVIDER=auto` can use your ChatGPT plan quota first
+> - OpenAI API key → [platform.openai.com/api-keys](https://platform.openai.com/api-keys) (used directly when `LLM_PROVIDER=openai`, or as the second `auto` fallback after Codex)
 > - Optional OpenRouter key → [openrouter.ai](https://openrouter.ai/) (for Anthropic, Gemini, DeepSeek, Grok, or mixed-provider ensembles)
 
 ---
@@ -78,8 +80,8 @@ This launches the current dashboard stack:
 ### Multi-Model AI Ensemble
 - ✅ **Five frontier LLMs** collaborate on every decision — Claude Sonnet 4.5, GPT-5.4, Gemini 3.1 Pro Preview, DeepSeek V3.2, Grok 4.1 Fast
 - ✅ **Role-based specialization** — each model plays a distinct analytical role (news analyst, forecaster, risk manager, bull/bear researcher)
-- ✅ **Provider selection** — choose direct OpenAI, OpenRouter, or auto-selection via `LLM_PROVIDER`
-- ✅ **Docs-aligned request layer** — strict structured outputs, shared cost accounting, and capped OpenRouter native fallbacks
+- ✅ **Provider selection** — choose Codex CLI, direct OpenAI, OpenRouter, or `auto` via `LLM_PROVIDER`
+- ✅ **Unified request layer** — strict structured outputs, shared cost accounting, Codex quota tracking, and capped OpenRouter native fallbacks
 - ✅ **Consensus gating** — positions are skipped when models diverge beyond a configurable confidence threshold
 - ✅ **Deterministic outputs** — temperature=0 for reproducible AI reasoning
 
@@ -130,7 +132,7 @@ The bot runs a four-stage pipeline on a continuous loop:
   Feeds               ├────────────────────────────────────┤              Drawdown
                       │  Grok 4.1 Fast   (Bear Case     10%)│     Kelly    Cost
   Volume &  ────────► └────────────────────────────────────┘     Sizing   Budget
-  Price Data              Provider-selected routing (OpenAI/OpenRouter)
+  Price Data              Provider-selected routing (Codex/OpenAI/OpenRouter)
                           Debate → Consensus → Confidence
 ```
 
@@ -167,7 +169,8 @@ Every decision is written to a local SQLite database. The dashboard and CLI comm
 - Python 3.12 or later
 - Node.js 24 or later for the dashboard workspace
 - A [Kalshi](https://kalshi.com) account with API access ([API docs](https://docs.kalshi.com/welcome))
-- At least one LLM credential:
+- At least one LLM path:
+  - a signed-in `codex` CLI for ChatGPT-plan-backed routing
   - `OPENAI_API_KEY` for direct OpenAI routing
   - `OPENROUTER_API_KEY` for the full multi-provider model fleet
 
@@ -329,7 +332,7 @@ kalshi-ai-trading-bot/
 │
 ├── src/
 │   ├── agents/                # Multi-model ensemble (lead analyst, bull/bear, risk, forecaster)
-│   ├── clients/               # API clients (Kalshi, OpenRouter, model router, legacy compatibility shims)
+│   ├── clients/               # API clients (Kalshi, Codex, OpenAI, OpenRouter, routing)
 │   ├── config/                # Settings and trading parameters
 │   ├── data/                  # News aggregation and sentiment analysis
 │   ├── events/                # Async event bus for real-time streaming
@@ -348,7 +351,7 @@ Current 2.x additions not shown in the legacy tree above:
 - `server/` — Fastify API + SSE streams
 - `python_bridge/` — FastAPI bridge for manual market and event analysis
 
-`src/clients/openai_client.py`, `src/clients/openrouter_client.py`, and `src/clients/model_router.py` now share the active provider-routing path.
+`src/clients/codex_client.py`, `src/clients/openai_client.py`, `src/clients/openrouter_client.py`, and `src/clients/model_router.py` now share the active provider-routing path.
 
 ---
 
@@ -368,8 +371,8 @@ max_time_to_expiry_days = 14     # Trade contracts up to 14 days out
 min_confidence_to_trade = 0.45   # Minimum ensemble confidence to enter
 
 # AI settings
-llm_provider           = "auto"   # auto prefers OpenAI, else OpenRouter
-primary_model          = "openai/gpt-5.4"
+llm_provider           = "auto"   # auto prefers Codex CLI, then OpenAI, then OpenRouter
+primary_model          = "codex/gpt-5-codex"  # default when Codex is available
 ai_temperature         = 0       # Deterministic outputs
 ai_max_tokens          = 8000
 
@@ -389,7 +392,8 @@ daily_ai_cost_limit    = 10.0    # Max daily AI API spend (USD) — default $10/
 ```
 
 Provider request behavior:
-- `LLM_PROVIDER=auto` prefers direct OpenAI access when available and otherwise uses OpenRouter.
+- `LLM_PROVIDER=auto` prefers a signed-in Codex CLI first, then direct OpenAI, then OpenRouter.
+- `LLM_PROVIDER=codex` hard-requires the CLI, which prevents accidental fallback to metered API billing.
 - OpenRouter-native fallback arrays are capped to the API-supported maximum before requests are sent.
 - JSON-critical calls use strict `response_format` schemas and provider parameter checks.
 - Optional attribution headers come from `OPENROUTER_HTTP_REFERER` and `OPENROUTER_TITLE`.
@@ -437,8 +441,8 @@ Strategy rules:
 - **NO side ONLY** — never buys YES
 - YES last price must be ≤ 20¢ (near-certain NO outcome)
 - NO ask must be > 80¢
-- Edge (EV - price) must be > 5¢
-- Places resting maker orders at `lowest_ask - 1¢` (near-zero fees)
+- Edge (EV - price) must be > 3¢
+- Places resting maker orders at `lowest_no_ask - 1¢` (near-zero fees)
 - Max 10% of portfolio per position (half-Kelly sizing)
 - Skips all sports, entertainment, and "mention" markets
 

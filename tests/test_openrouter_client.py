@@ -312,7 +312,11 @@ class TestModelRouter:
             actual_model="deepseek/deepseek-v3.2"
         )
 
-        router = ModelRouter(openrouter_client=openrouter_client)
+        with patch("src.clients.model_router.settings") as mock_settings:
+            mock_settings.api.resolve_llm_provider.return_value = "openrouter"
+            mock_settings.trading.daily_ai_cost_limit = 50.0
+            router = ModelRouter(openrouter_client=openrouter_client)
+
         result = await router.get_completion("hello", model="openai/gpt-5.4")
 
         assert result == "ok"
