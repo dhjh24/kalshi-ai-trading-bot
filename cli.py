@@ -84,7 +84,7 @@ async def _run_bot_entrypoint(
 
 
 def _format_live_trade_loop_summary(summary) -> str:
-    """Render a compact one-line summary for the paper live-trade loop."""
+    """Render a compact one-line summary for the live-trade loop."""
     skipped_reason = getattr(summary, "skipped_reason", None)
     line = (
         "Live-trade cycle "
@@ -103,8 +103,10 @@ async def _run_live_trade_loop_entrypoint(
     *,
     once: bool = False,
     max_runtime_seconds: int | None = None,
+    live_mode: bool = False,
+    shadow_mode: bool = False,
 ):
-    """Run the paper-first live-trade decision loop directly from the CLI."""
+    """Run the live-trade decision loop directly from the CLI."""
     from src.clients.kalshi_client import KalshiClient
     from src.config.settings import settings as runtime_settings
     from src.jobs.live_trade import LiveTradeDecisionLoop
@@ -115,7 +117,12 @@ async def _run_live_trade_loop_entrypoint(
     loop = LiveTradeDecisionLoop(
         db_manager=db_manager,
         kalshi_client=kalshi_client,
+        manage_quick_flip_positions_each_cycle=True,
     )
+    previous_live_mode = bool(getattr(runtime_settings.trading, "live_trading_enabled", False))
+    previous_shadow_mode = bool(getattr(runtime_settings.trading, "shadow_mode_enabled", False))
+    runtime_settings.trading.live_trading_enabled = bool(live_mode)
+    runtime_settings.trading.shadow_mode_enabled = bool(shadow_mode) and not bool(live_mode)
     interval_seconds = max(
         int(getattr(runtime_settings.trading, "market_scan_interval", 30) or 30),
         5,
@@ -147,6 +154,8 @@ async def _run_live_trade_loop_entrypoint(
             max_runtime_seconds=max_runtime_seconds,
         )
     finally:
+        runtime_settings.trading.live_trading_enabled = previous_live_mode
+        runtime_settings.trading.shadow_mode_enabled = previous_shadow_mode
         await _close_async_resource(loop)
         await _close_async_resource(kalshi_client)
         await _close_async_resource(db_manager)
@@ -156,6 +165,8 @@ def _run_live_trade_loop_command(
     *,
     once: bool = False,
     max_runtime_seconds: int | None = None,
+    live_mode: bool = False,
+    shadow_mode: bool = False,
 ) -> None:
     """Synchronous wrapper for the dedicated live-trade CLI path."""
     try:
@@ -163,6 +174,8 @@ def _run_live_trade_loop_command(
             _run_live_trade_loop_entrypoint(
                 once=once,
                 max_runtime_seconds=max_runtime_seconds,
+                live_mode=live_mode,
+                shadow_mode=shadow_mode,
             )
         )
     except KeyboardInterrupt:
@@ -525,9 +538,6 @@ def cmd_run(args: argparse.Namespace) -> None:
         once = True
 
     if live_trade_only:
-        if run_mode != "paper":
-            print("Error: --live-trade currently supports paper mode only.")
-            sys.exit(1)
         if smoke:
             print("Error: --live-trade does not support --smoke.")
             sys.exit(1)
@@ -535,10 +545,18 @@ def cmd_run(args: argparse.Namespace) -> None:
             print("Error: --live-trade cannot be combined with other runtime modes.")
             sys.exit(1)
         print("📡  LIVE-TRADE LOOP MODE")
-        print("   Paper-first scout/specialist/synth loop with SQLite decision logging.")
+        if live_mode:
+            print("   Live execution enabled for generic intents.")
+            print("   Quick-flip live intents still require ENABLE_LIVE_QUICK_FLIP.")
+        elif shadow:
+            print("   Shadow mode enabled: paper execution plus shadow-side telemetry.")
+        else:
+            print("   Paper execution with SQLite decision logging.")
         _run_live_trade_loop_command(
             once=once,
             max_runtime_seconds=max_runtime_seconds,
+            live_mode=live_mode,
+            shadow_mode=shadow,
         )
         return
 
@@ -1174,7 +1192,9 @@ def build_parser() -> argparse.ArgumentParser:
             "examples:\n"
             "  python cli.py run                      Start AI Ensemble mode (default, paper)\n"
             "  python cli.py run --live               AI Ensemble with real capital\n"
-            "  python cli.py run --live-trade         Paper-only live-trade decision loop\n"
+            "  python cli.py run --live-trade         Loop-only live-trade runtime (paper by default)\n"
+            "  python cli.py run --live-trade --shadow  Loop-only live-trade runtime with shadow telemetry\n"
+            "  python cli.py run --live-trade --live  Loop-only live-trade runtime with live execution\n"
             "  python cli.py run --shadow             Shadow mode (dry-run execution, live-like analytics)\n"
             "  python cli.py run --safe-compounder    Safe Compounder: conservative, math-only\n"
             "  python cli.py run --safe-compounder --live  Safe Compounder live\n"
@@ -1240,7 +1260,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--live-trade",
         action="store_true",
         dest="live_trade",
-        help="Run only the paper-first live-trade decision loop",
+        help="Run only the live-trade decision loop in paper, shadow, or live mode",
     )
     p_run.add_argument(
         "--log-level",

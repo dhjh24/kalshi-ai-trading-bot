@@ -225,6 +225,14 @@ function normalizeLiveTradeDecision(row: SqlRow): LiveTradeDecisionRecord {
     ),
     runId: toNullableText(firstValue(sources, [["run_id"], ["runId"]])),
     step: toNullableText(firstValue(sources, [["step"]])),
+    runtimeMode: toNullableText(
+      firstValue(sources, [
+        ["runtime_mode"],
+        ["runtimeMode"],
+        ["execution_mode"],
+        ["executionMode"]
+      ])
+    ),
     marketId: toNullableText(
       firstValue(sources, [
         ["market_ticker"],
@@ -1714,6 +1722,33 @@ function getLiveTradeDecisionOrderColumn(columns: Set<string>): string {
   );
 }
 
+function buildMaxTextExpression(columns: Set<string>, candidates: string[]): string | null {
+  const presentColumns = candidates.filter((column) => columns.has(column));
+  if (presentColumns.length === 0) {
+    return null;
+  }
+
+  return `MAX(COALESCE(${presentColumns.map((column) => `CAST(${column} AS TEXT)`).join(", ")}, ''))`;
+}
+
+function buildConcatenatedTextExpression(columns: Set<string>, candidates: string[]): string | null {
+  const presentColumns = candidates.filter((column) => columns.has(column));
+  if (presentColumns.length === 0) {
+    return null;
+  }
+
+  return presentColumns
+    .map((column) => `COALESCE(CAST(${column} AS TEXT), '')`)
+    .join(" || '|' || ");
+}
+
+export interface LiveTradeDecisionRefreshCursor {
+  decisionFingerprint: string;
+  feedbackFingerprint: string;
+  runtimeFingerprint: string;
+  signature: string;
+}
+
 export function hasLiveTradeDecisionTable(): boolean {
   return tableExists("live_trade_decisions");
 }
@@ -1743,6 +1778,128 @@ function ensureLiveTradeDecisionFeedbackTable(): void {
     CREATE INDEX IF NOT EXISTS idx_live_trade_decision_feedback_updated_at
       ON live_trade_decision_feedback(updated_at DESC);
   `);
+}
+
+export function getLiveTradeDecisionRefreshCursor(): LiveTradeDecisionRefreshCursor {
+  let decisionFingerprint = "decisions:missing";
+  if (hasLiveTradeDecisionTable()) {
+    const columns = new Set(getTableColumns("live_trade_decisions"));
+    const latestTimestampExpression = buildMaxTextExpression(columns, [
+      "updated_at",
+      "created_at",
+      "recorded_at",
+      "decision_timestamp",
+      "timestamp"
+    ]);
+    const row = db
+      .prepare(
+        `
+          SELECT
+            COUNT(*) AS row_count,
+            COALESCE(MAX(rowid), 0) AS max_rowid
+            ${latestTimestampExpression ? `, ${latestTimestampExpression} AS latest_timestamp` : ""}
+          FROM live_trade_decisions
+        `
+      )
+      .get() as
+      | {
+          row_count?: number;
+          max_rowid?: number;
+          latest_timestamp?: string | null;
+        }
+      | undefined;
+
+    decisionFingerprint = [
+      "decisions",
+      String(toCount(row?.row_count)),
+      String(toCount(row?.max_rowid)),
+      row?.latest_timestamp ?? ""
+    ].join(":");
+  }
+
+  let feedbackFingerprint = "feedback:missing";
+  if (hasLiveTradeDecisionFeedbackTable()) {
+    const columns = new Set(getTableColumns("live_trade_decision_feedback"));
+    const latestTimestampExpression = buildMaxTextExpression(columns, ["updated_at", "created_at"]);
+    const row = db
+      .prepare(
+        `
+          SELECT
+            COUNT(*) AS row_count,
+            COALESCE(MAX(rowid), 0) AS max_rowid
+            ${latestTimestampExpression ? `, ${latestTimestampExpression} AS latest_timestamp` : ""}
+          FROM live_trade_decision_feedback
+        `
+      )
+      .get() as
+      | {
+          row_count?: number;
+          max_rowid?: number;
+          latest_timestamp?: string | null;
+        }
+      | undefined;
+
+    feedbackFingerprint = [
+      "feedback",
+      String(toCount(row?.row_count)),
+      String(toCount(row?.max_rowid)),
+      row?.latest_timestamp ?? ""
+    ].join(":");
+  }
+
+  let runtimeFingerprint = "runtime:missing";
+  if (hasLiveTradeRuntimeStateTable()) {
+    const columns = new Set(getTableColumns("live_trade_runtime_state"));
+    const latestTimestampExpression = buildMaxTextExpression(columns, [
+      "heartbeat_at",
+      "last_step_at",
+      "last_completed_at",
+      "last_started_at",
+      "latest_execution_at"
+    ]);
+    const stateSignatureExpression = buildConcatenatedTextExpression(columns, [
+      "run_id",
+      "loop_status",
+      "last_step",
+      "last_step_status",
+      "latest_execution_status",
+      "error"
+    ]);
+    const row = db
+      .prepare(
+        `
+          SELECT
+            COUNT(*) AS row_count,
+            COALESCE(MAX(rowid), 0) AS max_rowid
+            ${latestTimestampExpression ? `, ${latestTimestampExpression} AS latest_timestamp` : ""}
+            ${stateSignatureExpression ? `, MAX(${stateSignatureExpression}) AS state_signature` : ""}
+          FROM live_trade_runtime_state
+        `
+      )
+      .get() as
+      | {
+          row_count?: number;
+          max_rowid?: number;
+          latest_timestamp?: string | null;
+          state_signature?: string | null;
+        }
+      | undefined;
+
+    runtimeFingerprint = [
+      "runtime",
+      String(toCount(row?.row_count)),
+      String(toCount(row?.max_rowid)),
+      row?.latest_timestamp ?? "",
+      row?.state_signature ?? ""
+    ].join(":");
+  }
+
+  return {
+    decisionFingerprint,
+    feedbackFingerprint,
+    runtimeFingerprint,
+    signature: [decisionFingerprint, feedbackFingerprint, runtimeFingerprint].join("|")
+  };
 }
 
 export function listLiveTradeDecisions(limit = 20): LiveTradeDecisionRecord[] {

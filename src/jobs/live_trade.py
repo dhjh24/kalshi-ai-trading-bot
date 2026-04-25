@@ -1,10 +1,10 @@
 """
-Paper-first live-trade decision loop for short-dated markets.
+Runtime-aware live-trade decision loop for short-dated markets.
 
 This module adds a small W5 foundation inside the existing trading cycle:
 1. Scout ranked live-trade events.
 2. Run focus-aware specialist analysis on a short list.
-3. Synthesize one paper-first trade intent.
+3. Synthesize one trade intent.
 4. Execute only if the existing live-trade guardrails allow it.
 """
 
@@ -28,6 +28,7 @@ from src.strategies.quick_flip_scalping import (
     QuickFlipConfig,
     QuickFlipOpportunity,
     QuickFlipScalpingStrategy,
+    manage_live_quick_flip_positions,
 )
 from src.utils.database import (
     DatabaseManager,
@@ -268,6 +269,14 @@ def _build_quick_flip_config(*, hold_minutes: int) -> QuickFlipConfig:
     )
 
 
+def _resolve_quick_flip_runtime_label() -> str:
+    if bool(getattr(settings.trading, "live_trading_enabled", False)):
+        return "live"
+    if bool(getattr(settings.trading, "shadow_mode_enabled", False)):
+        return "shadow"
+    return "paper"
+
+
 async def _execute_quick_flip_paper_intent(
     *,
     db_manager: DatabaseManager,
@@ -277,6 +286,7 @@ async def _execute_quick_flip_paper_intent(
     final_intent: Dict[str, Any],
     quantity: int,
 ) -> Dict[str, Any]:
+    runtime_label = _resolve_quick_flip_runtime_label()
     hold_minutes = max(_safe_int(final_intent.get("hold_minutes"), 0), 1)
     entry_price = _clamp(_safe_float(final_intent.get("limit_price"), 0.5), lo=0.01, hi=0.99)
     config = _build_quick_flip_config(hold_minutes=hold_minutes)
@@ -345,13 +355,14 @@ async def _execute_quick_flip_paper_intent(
         return {
             "executed": False,
             "status": "error",
-            "summary": "Quick-flip entry did not fill for the live-trade intent.",
+            "summary": f"Quick-flip {runtime_label} entry did not fill for the live-trade intent.",
             "error": "quick_flip_entry_failed",
             "quantity": quantity,
             "payload": {
                 "entry_price": entry_price,
                 "target_exit_price": exit_price,
                 "expected_profit": opportunity.expected_profit,
+                "execution_mode": runtime_label,
             },
         }
 
@@ -360,13 +371,14 @@ async def _execute_quick_flip_paper_intent(
         "entry_price": entry_price,
         "target_exit_price": exit_price,
         "expected_profit": opportunity.expected_profit,
+        "execution_mode": runtime_label,
         "exit_order": sell_result,
     }
     if sell_result.get("success"):
         summary = (
-            "Quick-flip paper position opened and closed immediately."
+            f"Quick-flip {runtime_label} position opened and closed immediately."
             if sell_result.get("filled")
-            else "Quick-flip paper position opened with a resting exit order."
+            else f"Quick-flip {runtime_label} position opened with a resting exit order."
         )
         return {
             "executed": True,
@@ -379,7 +391,9 @@ async def _execute_quick_flip_paper_intent(
     return {
         "executed": True,
         "status": "executed",
-        "summary": "Quick-flip paper entry filled, but the exit order did not post cleanly.",
+        "summary": (
+            f"Quick-flip {runtime_label} entry filled, but the exit order did not post cleanly."
+        ),
         "error": "quick_flip_exit_order_failed",
         "quantity": quantity,
         "payload": payload,
@@ -640,7 +654,7 @@ def _debate_final_payload(
         "hold_minutes": candidate.get("hold_minutes"),
     }
     summary = (
-        f"Debate selected {candidate.get('market_ticker') or candidate.get('title') or 'the candidate'} for a paper entry."
+        f"Debate selected {candidate.get('market_ticker') or candidate.get('title') or 'the candidate'} for entry."
         if action == "BUY"
         else str(candidate.get("summary") or "Debate skipped the strongest live-trade specialist candidate.")
     )
@@ -679,7 +693,7 @@ class LiveTradeLoopSummary:
 
 
 class LiveTradeDecisionLoop:
-    """Paper-first W5 decision loop for the existing trading cycle."""
+    """Runtime-aware W5 decision loop for the existing trading cycle."""
 
     def __init__(
         self,
@@ -691,6 +705,7 @@ class LiveTradeDecisionLoop:
         execute_position_fn: Optional[Callable[..., Awaitable[bool]]] = None,
         guardrail_fn: Optional[Callable[..., Awaitable[tuple[bool, Optional[str]]]]] = None,
         quick_flip_executor_fn: Optional[Callable[..., Awaitable[Dict[str, Any]]]] = None,
+        manage_quick_flip_positions_each_cycle: bool = False,
         shortlist_size: int = 3,
     ) -> None:
         self.db_manager = db_manager
@@ -703,6 +718,7 @@ class LiveTradeDecisionLoop:
         self.execute_position_fn = execute_position_fn or execute_position
         self.guardrail_fn = guardrail_fn
         self.quick_flip_executor_fn = quick_flip_executor_fn or _execute_quick_flip_paper_intent
+        self.manage_quick_flip_positions_each_cycle = manage_quick_flip_positions_each_cycle
         self.shortlist_size = max(1, shortlist_size)
         self.logger = get_trading_logger("live_trade_loop")
         self._owns_model_router = model_router is None
@@ -716,6 +732,20 @@ class LiveTradeDecisionLoop:
             return "shadow"
         return "paper"
 
+    def _is_live_execution_mode(self) -> bool:
+        return self._resolve_runtime_mode() == "live"
+
+    def _new_decision_record(self, **kwargs: Any) -> LiveTradeDecision:
+        runtime_mode = self._resolve_runtime_mode()
+        is_live_trade = runtime_mode == "live"
+        return LiveTradeDecision(
+            created_at=datetime.now(timezone.utc),
+            runtime_mode=runtime_mode,
+            paper_trade=not is_live_trade,
+            live_trade=is_live_trade,
+            **kwargs,
+        )
+
     def _resolve_exchange_env(self) -> Optional[str]:
         exchange_env = getattr(getattr(settings, "api", None), "kalshi_env", None)
         if isinstance(exchange_env, str) and exchange_env.strip():
@@ -727,6 +757,32 @@ class LiveTradeDecisionLoop:
             await self.research_service.close()
         if self._owns_model_router:
             await self.model_router.close()
+
+    async def _manage_quick_flip_positions_for_cycle(self) -> None:
+        if not self.manage_quick_flip_positions_each_cycle:
+            return
+
+        results = await manage_live_quick_flip_positions(
+            db_manager=self.db_manager,
+            kalshi_client=self.kalshi_client,
+            config=_build_quick_flip_config(
+                hold_minutes=int(getattr(settings.trading, "quick_flip_max_hold_minutes", 30) or 30)
+            ),
+        )
+        if any(
+            [
+                int(results.get("positions_closed", 0)),
+                int(results.get("positions_voided", 0)),
+                int(results.get("positions_synced", 0)),
+                int(results.get("orders_cancelled", 0)),
+                int(results.get("orders_adjusted", 0)),
+                int(results.get("losses_cut", 0)),
+            ]
+        ):
+            self.logger.info(
+                "Quick-flip manager processed standalone live-trade loop positions",
+                results=results,
+            )
 
     async def _hydrate_runtime_state(self) -> LiveTradeRuntimeState:
         if self._runtime_state is not None:
@@ -819,20 +875,7 @@ class LiveTradeDecisionLoop:
         )
 
         try:
-            live_mode = bool(getattr(settings.trading, "live_trading_enabled", False))
-            if live_mode:
-                summary.skipped_reason = "live mode is not wired for the W5 loop yet"
-                self.logger.info("Skipping live-trade loop in live mode")
-                await self._persist_runtime_state(
-                    run_id=run_id,
-                    loop_status="completed",
-                    step="startup",
-                    step_status="skipped",
-                    summary=summary.skipped_reason,
-                    completed=True,
-                    healthy=True,
-                )
-                return summary
+            await self._manage_quick_flip_positions_for_cycle()
 
             daily_ai_cost = await self.db_manager.get_daily_ai_cost()
             if daily_ai_cost >= float(getattr(settings.trading, "daily_ai_budget", 0.0) or 0.0):
@@ -943,7 +986,11 @@ class LiveTradeDecisionLoop:
             )
             summary.executed_positions = 1 if executed else 0
             if not executed and summary.skipped_reason is None:
-                summary.skipped_reason = "paper execution did not fill"
+                summary.skipped_reason = (
+                    "live execution did not fill"
+                    if self._is_live_execution_mode()
+                    else "paper execution did not fill"
+                )
             return summary
         except Exception as exc:
             await self._persist_runtime_state(
@@ -978,7 +1025,7 @@ class LiveTradeDecisionLoop:
             for event in candidates
         ]
         prompt = (
-            "You are the scout in a paper-only live prediction-market trading loop.\n"
+            f"You are the scout in a {_resolve_quick_flip_runtime_label()} live prediction-market trading loop.\n"
             "Rank the best short-dated events to send to specialists.\n"
             "Prefer in-play catalysts, tight spreads, real volume, and actionable time windows.\n"
             "Return only JSON.\n\n"
@@ -1019,8 +1066,7 @@ class LiveTradeDecisionLoop:
             event for event in events if str(event.get("event_ticker")) in set(selected_ids[: self.shortlist_size])
         ]
         await self.db_manager.add_live_trade_decision(
-            LiveTradeDecision(
-                created_at=datetime.now(timezone.utc),
+            self._new_decision_record(
                 run_id=run_id,
                 step="scout",
                 title="Live-trade scout shortlist",
@@ -1066,7 +1112,7 @@ class LiveTradeDecisionLoop:
         }.get(focus_type, "macro specialist")
         prompt = (
             f"You are the {specialist_label} for a short-dated prediction-market bot.\n"
-            "Review the event packet and decide whether there is an actionable paper trade right now.\n"
+            f"Review the event packet and decide whether there is an actionable {_resolve_quick_flip_runtime_label()} trade right now.\n"
             "Trade only when liquidity, catalyst, and edge are all present. Use QUICK_FLIP only for sub-30-minute holds.\n"
             "Return only JSON.\n\n"
             f"Event packet:\n{json.dumps(_trim_research_payload(payload), default=str)}"
@@ -1083,8 +1129,7 @@ class LiveTradeDecisionLoop:
         normalized = _normalize_specialist_payload(parsed, event=event)
         metadata = _extract_router_metadata(self.model_router) if parsed else {"provider": "heuristic", "model": None}
         await self.db_manager.add_live_trade_decision(
-            LiveTradeDecision(
-                created_at=datetime.now(timezone.utc),
+            self._new_decision_record(
                 run_id=run_id,
                 step="specialist",
                 event_ticker=event.get("event_ticker"),
@@ -1124,8 +1169,7 @@ class LiveTradeDecisionLoop:
         if not candidates:
             final = _normalize_final_payload(None, candidates=[])
             await self.db_manager.add_live_trade_decision(
-                LiveTradeDecision(
-                    created_at=datetime.now(timezone.utc),
+                self._new_decision_record(
                     run_id=run_id,
                     step="final",
                     status="skipped",
@@ -1150,8 +1194,7 @@ class LiveTradeDecisionLoop:
         if selected_candidate is None:
             final = _normalize_final_payload(None, candidates=candidates)
             await self.db_manager.add_live_trade_decision(
-                LiveTradeDecision(
-                    created_at=datetime.now(timezone.utc),
+                self._new_decision_record(
                     run_id=run_id,
                     step="final",
                     status="skipped",
@@ -1217,8 +1260,7 @@ class LiveTradeDecisionLoop:
         final = _normalize_final_payload(debate_payload, candidates=candidates)
         metadata = _extract_router_metadata(self.model_router) if debate_result else {"provider": "heuristic", "model": None}
         await self.db_manager.add_live_trade_decision(
-            LiveTradeDecision(
-                created_at=datetime.now(timezone.utc),
+            self._new_decision_record(
                 run_id=run_id,
                 step="final",
                 event_ticker=final.get("event_ticker"),
@@ -1391,7 +1433,18 @@ class LiveTradeDecisionLoop:
             return False
 
         execution_style = str(final_intent.get("execution_style") or "NONE").upper()
+        live_mode = self._is_live_execution_mode()
         if execution_style == "QUICK_FLIP" and _safe_int(final_intent.get("hold_minutes"), 0) <= 30:
+            if live_mode and not bool(getattr(settings.trading, "enable_live_quick_flip", False)):
+                await self._record_execution_status(
+                    run_id=run_id,
+                    final_intent=final_intent,
+                    status="blocked",
+                    summary="Quick-flip live execution requires ENABLE_LIVE_QUICK_FLIP opt-in.",
+                    error="quick_flip_live_opt_in_required",
+                    quantity=quantity,
+                )
+                return False
             quick_flip_result = await self.quick_flip_executor_fn(
                 db_manager=self.db_manager,
                 kalshi_client=self.kalshi_client,
@@ -1430,10 +1483,10 @@ class LiveTradeDecisionLoop:
             quantity=quantity,
             timestamp=datetime.now(),
             rationale=(
-                f"W5 live-trade loop | {final_intent.get('summary') or 'paper-only live-trade entry'}"
+                f"W5 live-trade loop | {final_intent.get('summary') or 'live-trade entry'}"
             ),
             confidence=_safe_float(final_intent.get("confidence"), 0.0),
-            live=False,
+            live=live_mode,
             strategy="live_trade",
             stop_loss_price=exit_plan["stop_loss_price"],
             take_profit_price=exit_plan["take_profit_price"],
@@ -1456,7 +1509,7 @@ class LiveTradeDecisionLoop:
         position.id = position_id
         success = await self.execute_position_fn(
             position=position,
-            live_mode=False,
+            live_mode=live_mode,
             db_manager=self.db_manager,
             kalshi_client=self.kalshi_client,
         )
@@ -1465,7 +1518,7 @@ class LiveTradeDecisionLoop:
                 position.id,
                 entry_price=position.entry_price,
                 quantity=position.quantity,
-                live=False,
+                live=live_mode,
                 stop_loss_price=position.stop_loss_price,
                 take_profit_price=position.take_profit_price,
                 max_hold_hours=position.max_hold_hours,
@@ -1477,10 +1530,15 @@ class LiveTradeDecisionLoop:
                 run_id=run_id,
                 final_intent=final_intent,
                 status="executed",
-                summary="Paper live-trade position opened.",
+                summary=(
+                    "Live-trade position opened in live mode."
+                    if live_mode
+                    else "Paper live-trade position opened."
+                ),
                 quantity=position.quantity,
                 payload={
                     "position_id": position.id,
+                    "execution_mode": "live" if live_mode else "paper",
                     "entry_fee": position.entry_fee,
                     "contracts_cost": position.contracts_cost,
                     "stop_loss_price": position.stop_loss_price,
@@ -1494,7 +1552,11 @@ class LiveTradeDecisionLoop:
             run_id=run_id,
             final_intent=final_intent,
             status="error",
-            summary="Paper execution did not fill the selected live-trade intent.",
+            summary=(
+                "Live execution did not fill the selected live-trade intent."
+                if live_mode
+                else "Paper execution did not fill the selected live-trade intent."
+            ),
             error="execution_failed",
             quantity=quantity,
         )
@@ -1512,8 +1574,7 @@ class LiveTradeDecisionLoop:
         payload: Optional[Dict[str, Any]] = None,
     ) -> None:
         await self.db_manager.add_live_trade_decision(
-            LiveTradeDecision(
-                created_at=datetime.now(timezone.utc),
+            self._new_decision_record(
                 run_id=run_id,
                 step="execution",
                 event_ticker=final_intent.get("event_ticker"),
@@ -1550,7 +1611,7 @@ async def run_live_trade_loop_cycle(
     db_manager: DatabaseManager,
     kalshi_client: KalshiClient,
 ) -> LiveTradeLoopSummary:
-    """Execute one paper-only live-trade cycle inside the existing runtime."""
+    """Execute one live-trade cycle inside the existing runtime."""
     loop = LiveTradeDecisionLoop(
         db_manager=db_manager,
         kalshi_client=kalshi_client,

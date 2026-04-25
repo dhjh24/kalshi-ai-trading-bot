@@ -27,13 +27,13 @@ caps. Shadow-mode parity: every limit is configured identically regardless of
 
 import asyncio
 import logging
-import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import aiosqlite
 
+from src.config.settings import settings
 from src.strategies.category_scorer import CategoryScorer, infer_category, BLOCK_THRESHOLD, get_allocation_pct
 
 logger = logging.getLogger(__name__)
@@ -62,28 +62,6 @@ MODE_LIVE = "live"
 KNOWN_MODES = (MODE_PAPER, MODE_SHADOW, MODE_LIVE)
 
 
-def _env_float(name: str, default: float) -> float:
-    """Parse a float env var with a fallback."""
-    raw = os.getenv(name)
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return default
-
-
-def _env_int(name: str, default: int) -> int:
-    """Parse an int env var with a fallback."""
-    raw = os.getenv(name)
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        return int(float(raw))
-    except (TypeError, ValueError):
-        return default
-
-
 @dataclass
 class StrategyLimits:
     """
@@ -107,21 +85,39 @@ def _default_limits_for(strategy: str) -> StrategyLimits:
       - live_trade: 5% daily-loss budget, 5 open positions, 20 trades/hr
       - default:    all None (backwards compat — legacy behavior preserved)
 
-    Env overrides exist so we can tighten in production without code changes.
-    TODO: promote these envs to TradingConfig fields after W1 merges.
+    Limits come from `settings.trading` so the CLI/runtime and the enforcer
+    share one configuration surface.
     """
+    trading = settings.trading
     if strategy == STRATEGY_QUICK_FLIP:
         return StrategyLimits(
-            daily_loss_budget_pct=_env_float("QUICK_FLIP_DAILY_LOSS_BUDGET_PCT", 0.05),
-            max_open_positions=_env_int("QUICK_FLIP_MAX_OPEN_POSITIONS", 10),
-            max_trades_per_hour=_env_int("QUICK_FLIP_MAX_TRADES_PER_HOUR", 60),
+            daily_loss_budget_pct=float(
+                getattr(trading, "quick_flip_daily_loss_budget_pct", 0.05) or 0.05
+            ),
+            max_open_positions=int(
+                getattr(trading, "quick_flip_max_open_positions", 10) or 10
+            ),
+            max_trades_per_hour=int(
+                getattr(trading, "quick_flip_max_trades_per_hour", 60) or 60
+            ),
         )
     if strategy == STRATEGY_LIVE_TRADE:
         # Mirror `TradingConfig.max_trades_per_hour` default of 20 for live_trade.
         return StrategyLimits(
-            daily_loss_budget_pct=_env_float("LIVE_TRADE_DAILY_LOSS_BUDGET_PCT", 0.05),
-            max_open_positions=_env_int("LIVE_TRADE_MAX_OPEN_POSITIONS", 5),
-            max_trades_per_hour=_env_int("LIVE_TRADE_MAX_TRADES_PER_HOUR", 20),
+            daily_loss_budget_pct=float(
+                getattr(trading, "live_trade_daily_loss_budget_pct", 0.05) or 0.05
+            ),
+            max_open_positions=int(
+                getattr(trading, "live_trade_max_open_positions", 5) or 5
+            ),
+            max_trades_per_hour=int(
+                getattr(
+                    trading,
+                    "live_trade_max_trades_per_hour",
+                    getattr(trading, "max_trades_per_hour", 20),
+                )
+                or 20
+            ),
         )
     # Legacy / unknown / None → no per-strategy circuit breakers.
     return StrategyLimits()

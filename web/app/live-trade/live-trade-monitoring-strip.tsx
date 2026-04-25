@@ -20,8 +20,12 @@ type EventMonitoringSnapshot = {
   latestErrorAt: string | null;
   latestErrorMessage: string | null;
   liveTagged: boolean;
+  shadowTagged: boolean;
   paperTagged: boolean;
+  heartbeatMismatch: boolean;
 };
+
+type RuntimeMode = "paper" | "shadow" | "live";
 
 function getTimestampValue(value: string | null): number {
   if (!value) {
@@ -123,11 +127,65 @@ function getLatestErrorRecord(
   );
 }
 
+function normalizeRuntimeMode(value: string | null | undefined): RuntimeMode | null {
+  const normalized = value?.trim().toLowerCase();
+  if (
+    normalized === "paper" ||
+    normalized === "shadow" ||
+    normalized === "live"
+  ) {
+    return normalized;
+  }
+
+  return null;
+}
+
+function getRecordRuntimeMode(record: LiveTradeDecisionRecord): RuntimeMode | null {
+  const explicitMode = normalizeRuntimeMode(record.runtimeMode);
+  if (explicitMode) {
+    return explicitMode;
+  }
+
+  if (record.liveTrade === true) {
+    return "live";
+  }
+
+  if (record.paperTrade === true) {
+    return "paper";
+  }
+
+  return null;
+}
+
+function describeObservedModes(snapshot: EventMonitoringSnapshot): string {
+  const modes: RuntimeMode[] = [];
+  if (snapshot.paperTagged) {
+    modes.push("paper");
+  }
+  if (snapshot.shadowTagged) {
+    modes.push("shadow");
+  }
+  if (snapshot.liveTagged) {
+    modes.push("live");
+  }
+
+  if (modes.length === 0) {
+    return "No verified runtime-mode tags were visible in the current feed.";
+  }
+
+  if (modes.length === 1) {
+    return `Recent rows stayed in ${modes[0]} mode.`;
+  }
+
+  return `Recent rows mixed ${modes.join(", ")} runtime tags.`;
+}
+
 function summarizeEventMonitoring(
   events: LiveTradeEventSnapshot[],
   decisionFeed: LiveTradeDecisionFeedPayload,
 ): Map<string, EventMonitoringSnapshot> {
   const decisionsByEvent = new Map<string, LiveTradeDecisionRecord[]>();
+  const heartbeatMode = normalizeRuntimeMode(decisionFeed.heartbeat.runtimeMode);
 
   for (const record of decisionFeed.decisions) {
     if (!record.eventTicker) {
@@ -148,6 +206,11 @@ function summarizeEventMonitoring(
       const records = decisionsByEvent.get(event.event_ticker) ?? [];
       const latestRecord = records[0] ?? null;
       const latestError = getLatestErrorRecord(records);
+      const observedModes = new Set(
+        records
+          .map((record) => getRecordRuntimeMode(record))
+          .filter((mode): mode is RuntimeMode => mode !== null),
+      );
 
       return [
         event.event_ticker,
@@ -164,8 +227,13 @@ function summarizeEventMonitoring(
             null,
           latestErrorAt: latestError?.recordedAt ?? null,
           latestErrorMessage: latestError?.error?.trim() || null,
-          liveTagged: records.some((record) => record.liveTrade === true),
-          paperTagged: records.some((record) => record.paperTrade === true),
+          liveTagged: observedModes.has("live"),
+          shadowTagged: observedModes.has("shadow"),
+          paperTagged: observedModes.has("paper"),
+          heartbeatMismatch:
+            heartbeatMode !== null &&
+            observedModes.size > 0 &&
+            Array.from(observedModes).some((mode) => mode !== heartbeatMode),
         } satisfies EventMonitoringSnapshot,
       ];
     }),
@@ -239,7 +307,11 @@ export function LiveTradeMonitoringRollup({
   const coveredEvents = snapshots.filter((snapshot) => snapshot.decisionCount > 0);
   const errorEvents = snapshots.filter((snapshot) => snapshot.latestErrorAt);
   const liveTaggedEvents = snapshots.filter((snapshot) => snapshot.liveTagged);
+  const shadowTaggedEvents = snapshots.filter((snapshot) => snapshot.shadowTagged);
   const paperTaggedEvents = snapshots.filter((snapshot) => snapshot.paperTagged);
+  const heartbeatMismatchEvents = snapshots.filter(
+    (snapshot) => snapshot.heartbeatMismatch,
+  );
 
   return (
     <Panel eyebrow="Decision Monitoring" title="Visible event coverage rollup">
@@ -271,10 +343,20 @@ export function LiveTradeMonitoringRollup({
           tone={liveTaggedEvents.length ? "warning" : "neutral"}
         />
         <MonitoringMiniCard
-          label="Paper tags"
-          value={String(paperTaggedEvents.length)}
-          caption="Visible events with at least one paper-tagged decision row."
-          tone={paperTaggedEvents.length ? "positive" : "neutral"}
+          label="Paper / Shadow"
+          value={`${paperTaggedEvents.length} / ${shadowTaggedEvents.length}`}
+          caption={
+            heartbeatMismatchEvents.length
+              ? `${heartbeatMismatchEvents.length} visible events disagree with the current worker mode.`
+              : "Counts show paper-tagged vs shadow-tagged events in the loaded feed."
+          }
+          tone={
+            heartbeatMismatchEvents.length || shadowTaggedEvents.length
+              ? "warning"
+              : paperTaggedEvents.length
+                ? "positive"
+                : "neutral"
+          }
         />
       </div>
 
@@ -339,10 +421,16 @@ export function LiveTradeEventMonitoringStrip({
       <EventMonitoringCard
         label="Execution tags"
         tone={
-          monitoring.liveTagged && monitoring.paperTagged
+          monitoring.heartbeatMismatch ||
+          Number(monitoring.liveTagged) +
+            Number(monitoring.shadowTagged) +
+            Number(monitoring.paperTagged) >
+            1
             ? "warning"
             : monitoring.liveTagged
               ? "warning"
+              : monitoring.shadowTagged
+                ? "warning"
               : monitoring.paperTagged
                 ? "positive"
                 : "neutral"
@@ -352,24 +440,28 @@ export function LiveTradeEventMonitoringStrip({
           {monitoring.liveTagged ? (
             <Badge tone="warning">Recent live tag</Badge>
           ) : null}
+          {monitoring.shadowTagged ? (
+            <Badge tone="warning">Recent shadow tag</Badge>
+          ) : null}
           {monitoring.paperTagged ? (
             <Badge tone="positive">Recent paper tag</Badge>
           ) : null}
-          {!monitoring.liveTagged && !monitoring.paperTagged ? (
-            <Badge tone="neutral">No live/paper flags</Badge>
+          {monitoring.heartbeatMismatch ? (
+            <Badge tone="negative">Heartbeat mismatch</Badge>
+          ) : null}
+          {!monitoring.liveTagged &&
+          !monitoring.shadowTagged &&
+          !monitoring.paperTagged ? (
+            <Badge tone="neutral">No runtime tags</Badge>
           ) : null}
         </div>
         <p className="text-sm font-medium text-steel">
-          {monitoring.liveTagged && monitoring.paperTagged
-            ? "Both execution modes appeared in the current feed."
-            : monitoring.liveTagged
-              ? "At least one recent row is marked for live execution."
-              : monitoring.paperTagged
-                ? "Recent rows stayed in paper execution."
-                : "Recent rows do not expose execution tags."}
+          {describeObservedModes(monitoring)}
         </p>
         <p className="text-sm text-slate-500">
-          Use this strip to spot event-level drift between paper and live routing before acting on the ranked feed.
+          {monitoring.heartbeatMismatch
+            ? "Recent event rows disagree with the worker heartbeat. Confirm whether the active Python loop changed mode mid-run or the feed is mixing historical rows."
+            : "Use this strip to spot event-level drift between paper, shadow, and live routing before acting on the ranked feed."}
         </p>
       </EventMonitoringCard>
 

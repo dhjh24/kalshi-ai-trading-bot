@@ -172,6 +172,7 @@ class LiveTradeDecision:
     limit_price: Optional[float] = None
     quantity: Optional[float] = None
     hold_minutes: Optional[int] = None
+    runtime_mode: Optional[str] = None
     paper_trade: bool = True
     live_trade: bool = False
     summary: Optional[str] = None
@@ -311,6 +312,21 @@ class DatabaseManager(TradingLoggerMixin):
                         f"Added {column_name} column to live_trade_runtime_state table"
                     )
 
+            cursor = await db.execute("PRAGMA table_info(live_trade_decisions)")
+            live_trade_decision_info = await cursor.fetchall()
+            live_trade_decision_columns = {col[1] for col in live_trade_decision_info}
+            required_live_trade_decision_columns = {
+                "runtime_mode": "TEXT",
+            }
+            for column_name, column_type in required_live_trade_decision_columns.items():
+                if column_name not in live_trade_decision_columns:
+                    await db.execute(
+                        f"ALTER TABLE live_trade_decisions ADD COLUMN {column_name} {column_type}"
+                    )
+                    self.logger.info(
+                        f"Added {column_name} column to live_trade_decisions table"
+                    )
+
             trade_log_quantity_type = next(
                 (str(col[2]).upper() for col in trade_log_info if col[1] == "quantity"),
                 "",
@@ -390,6 +406,7 @@ class DatabaseManager(TradingLoggerMixin):
                     limit_price REAL,
                     quantity REAL,
                     hold_minutes INTEGER,
+                    runtime_mode TEXT,
                     paper_trade BOOLEAN NOT NULL DEFAULT 1,
                     live_trade BOOLEAN NOT NULL DEFAULT 0,
                     summary TEXT,
@@ -1108,6 +1125,7 @@ class DatabaseManager(TradingLoggerMixin):
                 limit_price REAL,
                 quantity REAL,
                 hold_minutes INTEGER,
+                runtime_mode TEXT,
                 paper_trade BOOLEAN NOT NULL DEFAULT 1,
                 live_trade BOOLEAN NOT NULL DEFAULT 0,
                 summary TEXT,
@@ -1874,13 +1892,13 @@ class DatabaseManager(TradingLoggerMixin):
                     created_at, run_id, step, strategy, status, event_ticker,
                     market_ticker, title, focus_type, provider, model, action,
                     side, confidence, edge_pct, limit_price, quantity,
-                    hold_minutes, paper_trade, live_trade, summary, rationale,
+                    hold_minutes, runtime_mode, paper_trade, live_trade, summary, rationale,
                     payload_json, error
                 ) VALUES (
                     :created_at, :run_id, :step, :strategy, :status, :event_ticker,
                     :market_ticker, :title, :focus_type, :provider, :model, :action,
                     :side, :confidence, :edge_pct, :limit_price, :quantity,
-                    :hold_minutes, :paper_trade, :live_trade, :summary, :rationale,
+                    :hold_minutes, :runtime_mode, :paper_trade, :live_trade, :summary, :rationale,
                     :payload_json, :error
                 )
                 """,

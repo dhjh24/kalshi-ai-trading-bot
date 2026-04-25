@@ -20,6 +20,18 @@ const CATEGORY_OPTIONS = ["Sports", "Financials", "Crypto", "Economics"];
 const VISIBLE_EVENT_OPTIONS = [12, 24, 36, 48];
 const MAX_HOURS_OPTIONS = [12, 24, 48, 72, 168];
 type RuntimeMode = "paper" | "shadow" | "live" | "unknown";
+type RuntimeBanner = {
+  primaryMode: RuntimeMode;
+  exchangeLabel: string;
+  sourceLabel: string;
+  eyebrow: string;
+  title: string;
+  description: string;
+  containerClassName: string;
+  titleClassName: string;
+  bodyClassName: string;
+  modeTone: "negative" | "warning" | "positive" | "neutral";
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -139,7 +151,7 @@ function extractRuntimeRecord(source: unknown): Record<string, unknown> | null {
   return source;
 }
 
-function resolveRuntimeBanner(source: unknown) {
+function resolveRuntimeBanner(source: unknown): RuntimeBanner {
   const runtimeRecord = extractRuntimeRecord(source);
   const configuredMode =
     parseMode(
@@ -190,6 +202,7 @@ function resolveRuntimeBanner(source: unknown) {
   const sourceLabel =
     readString(runtimeRecord, ["source", "source_label"]) ||
     (runtimeRecord ? "runtime payload" : "dashboard env");
+  const isVerifiedWorkerMode = sourceLabel !== "dashboard env";
 
   let primaryMode: RuntimeMode = "unknown";
   if (configuredMode === "live" || live === true) {
@@ -205,15 +218,19 @@ function resolveRuntimeBanner(source: unknown) {
       primaryMode,
       exchangeLabel: exchange ?? "Unknown",
       sourceLabel,
-      eyebrow: "Live Execution Warning",
-      title: "Live trading is enabled for this runtime",
+      eyebrow: isVerifiedWorkerMode ? "Live Execution Warning" : "Runtime Defaults",
+      title: isVerifiedWorkerMode
+        ? "Live trading is enabled for this runtime"
+        : "Dashboard defaults point to live mode",
       description:
-        "Treat this page as production-sensitive. The Python worker may place real Kalshi orders when manual actions or scheduled execution paths fire.",
+        isVerifiedWorkerMode
+          ? "Treat this page as production-sensitive. The Python worker may place real Kalshi orders when manual actions or scheduled execution paths fire."
+          : "This page is inferring live mode from dashboard environment defaults, not a verified worker heartbeat. Confirm the active Python process before assuming real orders are enabled.",
       containerClassName:
         "rounded-[28px] border-2 border-rose-300 bg-rose-50/90 p-6 shadow-panel",
       titleClassName: "text-2xl font-semibold text-rose-900",
       bodyClassName: "max-w-3xl text-sm leading-6 text-rose-800",
-      modeTone: "negative" as const,
+      modeTone: isVerifiedWorkerMode ? "negative" : "warning",
     };
   }
 
@@ -222,10 +239,14 @@ function resolveRuntimeBanner(source: unknown) {
       primaryMode,
       exchangeLabel: exchange ?? "Unknown",
       sourceLabel,
-      eyebrow: "Shadow Runtime",
-      title: "Shadow mode is active",
+      eyebrow: isVerifiedWorkerMode ? "Shadow Runtime" : "Runtime Defaults",
+      title: isVerifiedWorkerMode
+        ? "Shadow mode is active"
+        : "Dashboard defaults point to shadow mode",
       description:
-        "This route is wired to a shadow runtime. It should mirror live-like decisions without sending real orders, but operators should still verify the launched Python job before acting.",
+        isVerifiedWorkerMode
+          ? "This route is wired to a shadow runtime. It should mirror live-like decisions without sending real orders, but operators should still verify the launched Python job before acting."
+          : "This page is inferring shadow mode from dashboard environment defaults. Confirm the launched Python worker before treating the queue as shadow-only telemetry.",
       containerClassName:
         "rounded-[28px] border-2 border-amber-300 bg-amber-50/90 p-6 shadow-panel",
       titleClassName: "text-2xl font-semibold text-amber-900",
@@ -239,10 +260,14 @@ function resolveRuntimeBanner(source: unknown) {
       primaryMode,
       exchangeLabel: exchange ?? "Unknown",
       sourceLabel,
-      eyebrow: "Paper Runtime",
-      title: "Paper trading mode is active",
+      eyebrow: isVerifiedWorkerMode ? "Paper Runtime" : "Runtime Defaults",
+      title: isVerifiedWorkerMode
+        ? "Paper trading mode is active"
+        : "Dashboard defaults point to paper mode",
       description:
-        "The dashboard-visible runtime is configured for simulated execution. Keep in mind the currently launched Python process can still differ from what this page sees.",
+        isVerifiedWorkerMode
+          ? "The dashboard-visible runtime is configured for simulated execution. Keep in mind the currently launched Python process can still differ from what this page sees."
+          : "This page is inferring paper mode from dashboard environment defaults, not a verified worker heartbeat. Confirm the running Python worker before treating the queue as paper-only.",
       containerClassName:
         "rounded-[28px] border-2 border-emerald-300 bg-emerald-50/90 p-6 shadow-panel",
       titleClassName: "text-2xl font-semibold text-emerald-900",

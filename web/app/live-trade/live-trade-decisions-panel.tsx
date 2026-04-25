@@ -1,10 +1,26 @@
 "use client";
 
 import Link from "next/link";
-import { useDeferredValue, useEffect, useState } from "react";
+import {
+  useDeferredValue,
+  useEffect,
+  useEffectEvent,
+  useRef,
+  useState
+} from "react";
 import { useMutation } from "@tanstack/react-query";
-import { API_BASE_URL, createStreamUrl } from "../../lib/api";
+import {
+  API_BASE_URL,
+  createStreamUrl,
+  getLiveTradeDecisionFeed
+} from "../../lib/api";
 import { formatMoney, formatTimestamp } from "../../lib/format";
+import {
+  parseTimestampMs,
+  selectLatestDecisionFeed,
+  shouldUseDecisionFeedFallback,
+  type LiveTradeDecisionFeedStreamStatus
+} from "../../lib/live-trade-decision-feed";
 import type {
   LiveTradeDecisionFeedPayload,
   LiveTradeDecisionFeedbackRecord,
@@ -12,9 +28,49 @@ import type {
 } from "../../lib/types";
 import { Badge, EmptyState, Panel } from "../../components/ui";
 
-type StreamStatus = "connecting" | "live" | "error";
+const STREAM_STALE_AFTER_MS = 45_000;
+const FALLBACK_POLL_INTERVAL_MS = 15_000;
+
+type StreamDisplayStatus = LiveTradeDecisionFeedStreamStatus | "stale";
+type FallbackStatus = "idle" | "syncing" | "active" | "error";
 type FeedbackValue = "up" | "down";
 type DecisionFilter = "all" | "actionable" | "live" | "paper" | "errors";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function extractEnvelopePayload(value: unknown): unknown {
+  if (isRecord(value) && "payload" in value) {
+    return value.payload;
+  }
+
+  return null;
+}
+
+function extractEnvelopeTimestamp(value: unknown): string | null {
+  if (
+    isRecord(value) &&
+    typeof value.timestamp === "string" &&
+    value.timestamp.trim()
+  ) {
+    return value.timestamp;
+  }
+
+  return null;
+}
+
+function isLiveTradeDecisionFeedPayload(
+  value: unknown
+): value is LiveTradeDecisionFeedPayload {
+  return (
+    isRecord(value) &&
+    typeof value.generatedAt === "string" &&
+    typeof value.available === "boolean" &&
+    Array.isArray(value.decisions) &&
+    isRecord(value.heartbeat)
+  );
+}
 
 function formatAgeSeconds(value: number | null): string {
   if (value === null || value === undefined) {
@@ -58,36 +114,115 @@ function formatPrice(value: number | null): string {
   return value.toFixed(3);
 }
 
-function getDecisionTone(record: LiveTradeDecisionRecord): "neutral" | "positive" | "warning" | "negative" {
-  const value = `${record.decision ?? ""} ${record.status ?? ""}`.trim().toUpperCase();
-  if (value.includes("BUY") || value.includes("ENTER") || value.includes("EXECUTE")) {
+function getDecisionTone(
+  record: LiveTradeDecisionRecord
+): "neutral" | "positive" | "warning" | "negative" {
+  const value = `${record.decision ?? ""} ${record.status ?? ""}`
+    .trim()
+    .toUpperCase();
+  if (
+    value.includes("BUY") ||
+    value.includes("ENTER") ||
+    value.includes("EXECUTE")
+  ) {
     return "positive";
   }
 
-  if (value.includes("SELL") || value.includes("EXIT") || value.includes("CLOSE")) {
+  if (
+    value.includes("SELL") ||
+    value.includes("EXIT") ||
+    value.includes("CLOSE")
+  ) {
     return "warning";
   }
 
-  if (value.includes("SKIP") || value.includes("BLOCK") || value.includes("HALT") || value.includes("REJECT")) {
+  if (
+    value.includes("SKIP") ||
+    value.includes("BLOCK") ||
+    value.includes("HALT") ||
+    value.includes("REJECT")
+  ) {
     return "negative";
   }
 
   return "neutral";
 }
 
-function getStreamTone(status: StreamStatus): "neutral" | "positive" | "warning" {
+function getStreamTone(
+  status: StreamDisplayStatus
+): "neutral" | "positive" | "warning" | "negative" {
   if (status === "live") {
     return "positive";
   }
 
-  if (status === "error") {
+  if (status === "stale" || status === "reconnecting") {
     return "warning";
+  }
+
+  if (status === "error") {
+    return "negative";
   }
 
   return "neutral";
 }
 
-function getHeartbeatTone(status: LiveTradeDecisionFeedPayload["heartbeat"]["status"]): "neutral" | "positive" | "warning" {
+function getStreamLabel(status: StreamDisplayStatus): string {
+  if (status === "live") {
+    return "SSE live";
+  }
+
+  if (status === "stale") {
+    return "SSE stale";
+  }
+
+  if (status === "reconnecting") {
+    return "SSE reconnecting";
+  }
+
+  if (status === "error") {
+    return "SSE error";
+  }
+
+  return "SSE connecting";
+}
+
+function getFallbackTone(
+  status: FallbackStatus
+): "neutral" | "positive" | "warning" | "negative" {
+  if (status === "active") {
+    return "positive";
+  }
+
+  if (status === "syncing") {
+    return "warning";
+  }
+
+  if (status === "error") {
+    return "negative";
+  }
+
+  return "neutral";
+}
+
+function getFallbackLabel(status: FallbackStatus): string {
+  if (status === "active") {
+    return "HTTP fallback active";
+  }
+
+  if (status === "syncing") {
+    return "HTTP fallback syncing";
+  }
+
+  if (status === "error") {
+    return "HTTP fallback failed";
+  }
+
+  return "HTTP fallback queued";
+}
+
+function getHeartbeatTone(
+  status: LiveTradeDecisionFeedPayload["heartbeat"]["status"]
+): "neutral" | "positive" | "warning" {
   if (status === "fresh") {
     return "positive";
   }
@@ -99,7 +234,9 @@ function getHeartbeatTone(status: LiveTradeDecisionFeedPayload["heartbeat"]["sta
   return "neutral";
 }
 
-function getHeartbeatLabel(status: LiveTradeDecisionFeedPayload["heartbeat"]["status"]): string {
+function getHeartbeatLabel(
+  status: LiveTradeDecisionFeedPayload["heartbeat"]["status"]
+): string {
   if (status === "fresh") {
     return "Worker fresh";
   }
@@ -115,8 +252,54 @@ function getHeartbeatLabel(status: LiveTradeDecisionFeedPayload["heartbeat"]["st
   return "Heartbeat unavailable";
 }
 
+function getRuntimeModeTone(
+  mode: string | null | undefined
+): "neutral" | "positive" | "warning" | "negative" {
+  if (mode === "paper") {
+    return "positive";
+  }
+
+  if (mode === "shadow") {
+    return "warning";
+  }
+
+  if (mode === "live") {
+    return "negative";
+  }
+
+  return "neutral";
+}
+
+function getRuntimeModeLabel(mode: string | null | undefined): string {
+  if (mode === "paper" || mode === "shadow" || mode === "live") {
+    return `${mode} mode`;
+  }
+
+  return "Mode unverified";
+}
+
+function buildRuntimeVisibilitySummary(
+  heartbeat: LiveTradeDecisionFeedPayload["heartbeat"]
+): string {
+  const modeLabel = getRuntimeModeLabel(heartbeat.runtimeMode);
+  const exchangeLabel = heartbeat.exchangeEnv ?? "unknown exchange";
+  const sourceLabel = heartbeat.runtimeSource ?? "unknown source";
+
+  if (heartbeat.runtimeSource === "dashboard env") {
+    return `Worker mode is inferred from ${sourceLabel}. Treat ${modeLabel} on ${exchangeLabel} as dashboard defaults until the Python worker writes live_trade_runtime_state.`;
+  }
+
+  if (heartbeat.status === "stale") {
+    return `The latest worker snapshot reported ${modeLabel} on ${exchangeLabel} from ${sourceLabel}, but that heartbeat is stale. Confirm the active Python worker before placing trust in the queue.`;
+  }
+
+  return `The latest worker snapshot reported ${modeLabel} on ${exchangeLabel} from ${sourceLabel}.`;
+}
+
 function getDecisionLabel(record: LiveTradeDecisionRecord): string {
-  return `${record.decision ?? ""} ${record.status ?? ""}`.trim().toUpperCase();
+  return `${record.decision ?? ""} ${record.status ?? ""}`
+    .trim()
+    .toUpperCase();
 }
 
 function isActionableDecision(record: LiveTradeDecisionRecord): boolean {
@@ -159,6 +342,34 @@ function renderMetricPills(record: LiveTradeDecisionRecord): string[] {
   }
 
   return items;
+}
+
+function buildTransportSummary({
+  streamStatus,
+  fallbackStatus
+}: {
+  streamStatus: StreamDisplayStatus;
+  fallbackStatus: FallbackStatus;
+}): string {
+  if (streamStatus === "live") {
+    return "SSE is healthy and should deliver decision snapshots within a few seconds of each dashboard publish.";
+  }
+
+  if (streamStatus === "stale") {
+    return "The decision stream has gone quiet longer than expected, so the panel is leaning on the HTTP snapshot endpoint until SSE catches up.";
+  }
+
+  if (streamStatus === "reconnecting") {
+    return "The browser lost the SSE connection and is retrying automatically. HTTP snapshot sync fills the gap so the queue stays readable.";
+  }
+
+  if (streamStatus === "error") {
+    return fallbackStatus === "error"
+      ? "Both SSE and the HTTP fallback are failing right now. The visible queue may be stale until one transport recovers."
+      : "SSE closed unexpectedly. The panel switched to the HTTP snapshot endpoint while you reconnect the stream.";
+  }
+
+  return "Opening the decision-feed stream. If it stays quiet too long, the panel will automatically poll the existing HTTP endpoint.";
 }
 
 async function submitDecisionFeedback(
@@ -222,7 +433,9 @@ async function submitDecisionFeedback(
     const resolvedUpdatedAt =
       typeof feedbackRecord?.updatedAt === "string"
         ? feedbackRecord.updatedAt
-        : typeof (feedbackRecord as { updated_at?: unknown } | null)?.updated_at === "string"
+        : typeof (
+              feedbackRecord as { updated_at?: unknown } | null
+            )?.updated_at === "string"
           ? String((feedbackRecord as { updated_at?: unknown }).updated_at)
           : typeof payload.updatedAt === "string"
             ? payload.updatedAt
@@ -321,56 +534,96 @@ export function LiveTradeDecisionsPanel({
   initialFeed: LiveTradeDecisionFeedPayload;
 }) {
   const [feed, setFeed] = useState(initialFeed);
-  const [streamStatus, setStreamStatus] = useState<StreamStatus>("connecting");
+  const [streamStatus, setStreamStatus] =
+    useState<LiveTradeDecisionFeedStreamStatus>("connecting");
+  const [streamGeneration, setStreamGeneration] = useState(0);
+  const [fallbackStatus, setFallbackStatus] =
+    useState<FallbackStatus>("idle");
+  const [fallbackError, setFallbackError] = useState<string | null>(null);
+  const [lastFallbackSyncAt, setLastFallbackSyncAt] = useState<string | null>(
+    null
+  );
+  const [lastStreamEventAt, setLastStreamEventAt] = useState<string | null>(
+    () => initialFeed.generatedAt
+  );
+  const [lastStreamErrorAt, setLastStreamErrorAt] = useState<string | null>(
+    null
+  );
+  const [reconnectAttempts, setReconnectAttempts] = useState(0);
   const [activeFilter, setActiveFilter] = useState<DecisionFilter>("all");
   const [query, setQuery] = useState("");
   const [now, setNow] = useState(() => Date.now());
+  const fallbackInFlightRef = useRef(false);
   const deferredQuery = useDeferredValue(query);
 
   useEffect(() => {
-    setFeed((previous) => {
-      const previousTimestamp = Date.parse(previous.generatedAt);
-      const nextTimestamp = Date.parse(initialFeed.generatedAt);
-
-      if (
-        Number.isFinite(previousTimestamp) &&
-        Number.isFinite(nextTimestamp) &&
-        nextTimestamp < previousTimestamp
-      ) {
-        return previous;
-      }
-
-      return initialFeed;
-    });
+    setFeed((previous) => selectLatestDecisionFeed(previous, initialFeed));
   }, [initialFeed]);
 
   useEffect(() => {
+    let cancelled = false;
+    let countedDisconnect = false;
     const stream = new EventSource(createStreamUrl("live-trade-decisions"));
 
+    setStreamStatus("connecting");
+
     stream.onopen = () => {
+      if (cancelled) {
+        return;
+      }
+
+      countedDisconnect = false;
       setStreamStatus("live");
+      setLastStreamErrorAt(null);
     };
 
     stream.onmessage = (event) => {
+      if (cancelled) {
+        return;
+      }
+
+      const receivedAt = new Date().toISOString();
+
       try {
-        const message = JSON.parse(event.data) as { payload?: LiveTradeDecisionFeedPayload };
-        if (message.payload) {
-          setFeed(message.payload);
-          setStreamStatus("live");
+        const envelope = JSON.parse(event.data) as unknown;
+        const nextEventAt = extractEnvelopeTimestamp(envelope) ?? receivedAt;
+        const payload = extractEnvelopePayload(envelope);
+
+        setLastStreamEventAt(nextEventAt);
+        if (isLiveTradeDecisionFeedPayload(payload)) {
+          setFeed((previous) => selectLatestDecisionFeed(previous, payload));
         }
+
+        countedDisconnect = false;
+        setStreamStatus("live");
+        setLastStreamErrorAt(null);
       } catch {
+        setLastStreamErrorAt(receivedAt);
         setStreamStatus("error");
       }
     };
 
     stream.onerror = () => {
-      setStreamStatus("error");
+      if (cancelled) {
+        return;
+      }
+
+      if (!countedDisconnect) {
+        countedDisconnect = true;
+        setReconnectAttempts((previous) => previous + 1);
+      }
+
+      setLastStreamErrorAt(new Date().toISOString());
+      setStreamStatus(
+        stream.readyState === EventSource.CLOSED ? "error" : "reconnecting"
+      );
     };
 
     return () => {
+      cancelled = true;
       stream.close();
     };
-  }, []);
+  }, [streamGeneration]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -382,6 +635,99 @@ export function LiveTradeDecisionsPanel({
     };
   }, []);
 
+  const syncDecisionFeed = useEffectEvent(async () => {
+    if (fallbackInFlightRef.current) {
+      return;
+    }
+
+    fallbackInFlightRef.current = true;
+    setFallbackStatus("syncing");
+
+    try {
+      const payload = await getLiveTradeDecisionFeed(feed.limit);
+      setFeed((previous) => selectLatestDecisionFeed(previous, payload));
+      setLastFallbackSyncAt(new Date().toISOString());
+      setFallbackError(null);
+      setFallbackStatus("active");
+    } catch (error) {
+      setFallbackError(
+        error instanceof Error
+          ? error.message
+          : "Failed to sync the decision feed."
+      );
+      setFallbackStatus("error");
+    } finally {
+      fallbackInFlightRef.current = false;
+    }
+  });
+
+  const reconnectStream = useEffectEvent(() => {
+    setFallbackError(null);
+    setStreamStatus("connecting");
+    setStreamGeneration((previous) => previous + 1);
+    void syncDecisionFeed();
+  });
+
+  const shouldUseFallback = shouldUseDecisionFeedFallback({
+    streamStatus,
+    lastStreamEventAt,
+    now,
+    staleAfterMs: STREAM_STALE_AFTER_MS
+  });
+
+  useEffect(() => {
+    if (!shouldUseFallback) {
+      setFallbackStatus("idle");
+      setFallbackError(null);
+      return;
+    }
+
+    void syncDecisionFeed();
+
+    const interval = window.setInterval(() => {
+      if (document.visibilityState !== "visible") {
+        return;
+      }
+
+      void syncDecisionFeed();
+    }, FALLBACK_POLL_INTERVAL_MS);
+
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, [shouldUseFallback, syncDecisionFeed]);
+
+  useEffect(() => {
+    if (!shouldUseFallback) {
+      return;
+    }
+
+    const syncWhenVisible = () => {
+      if (document.visibilityState !== "visible") {
+        return;
+      }
+
+      void syncDecisionFeed();
+    };
+
+    window.addEventListener("focus", syncWhenVisible);
+    document.addEventListener("visibilitychange", syncWhenVisible);
+
+    return () => {
+      window.removeEventListener("focus", syncWhenVisible);
+      document.removeEventListener("visibilitychange", syncWhenVisible);
+    };
+  }, [shouldUseFallback, syncDecisionFeed]);
+
+  const displayStreamStatus: StreamDisplayStatus =
+    shouldUseFallback &&
+    (streamStatus === "live" || streamStatus === "connecting")
+      ? "stale"
+      : streamStatus;
+  const transportSummary = buildTransportSummary({
+    streamStatus: displayStreamStatus,
+    fallbackStatus
+  });
   const normalizedQuery = deferredQuery.trim().toLowerCase();
   const filteredDecisions = feed.decisions.filter((record) => {
     if (activeFilter === "actionable" && !isActionableDecision(record)) {
@@ -422,10 +768,15 @@ export function LiveTradeDecisionsPanel({
 
     return searchableValue.includes(normalizedQuery);
   });
-  const liveCount = feed.decisions.filter((record) => record.liveTrade === true).length;
-  const paperCount = feed.decisions.filter((record) => record.paperTrade === true).length;
+  const liveCount = feed.decisions.filter(
+    (record) => record.liveTrade === true
+  ).length;
+  const paperCount = feed.decisions.filter(
+    (record) => record.paperTrade === true
+  ).length;
   const actionableCount = feed.decisions.filter(isActionableDecision).length;
-  const errorCount = feed.decisions.filter((record) => Boolean(record.error)).length;
+  const errorCount = feed.decisions.filter((record) => Boolean(record.error))
+    .length;
   const heartbeatAgeSeconds = (() => {
     if (feed.heartbeat.lastSeenAt) {
       const parsed = Date.parse(feed.heartbeat.lastSeenAt);
@@ -436,25 +787,107 @@ export function LiveTradeDecisionsPanel({
 
     return feed.heartbeat.ageSeconds;
   })();
+  const streamAgeSeconds = (() => {
+    const parsed = parseTimestampMs(lastStreamEventAt);
+    if (parsed === null) {
+      return null;
+    }
+
+    return Math.max(0, Math.round((now - parsed) / 1000));
+  })();
+  const fallbackAgeSeconds = (() => {
+    const parsed = parseTimestampMs(lastFallbackSyncAt);
+    if (parsed === null) {
+      return null;
+    }
+
+    return Math.max(0, Math.round((now - parsed) / 1000));
+  })();
+  const runtimeSummary = buildRuntimeVisibilitySummary(feed.heartbeat);
 
   return (
     <Panel eyebrow="Decision Feed" title="Recent live-trade decisions">
-      <div className="flex flex-wrap items-center gap-3 text-sm text-slate-500">
-        <span>Snapshot {formatTimestamp(feed.generatedAt)}.</span>
-        <span>Latest write {formatTimestamp(feed.latestRecordedAt)}.</span>
-        <Badge tone={getStreamTone(streamStatus)}>
-          {streamStatus === "live"
-            ? "Streaming"
-            : streamStatus === "error"
-              ? "Reconnect pending"
-              : "Connecting"}
-        </Badge>
+      <div className="rounded-[24px] border border-slate-200 bg-white/90 p-4">
+        <div className="flex flex-wrap items-center gap-2 text-sm text-slate-500">
+          <Badge tone={getStreamTone(displayStreamStatus)}>
+            {getStreamLabel(displayStreamStatus)}
+          </Badge>
+          {shouldUseFallback ? (
+            <Badge tone={getFallbackTone(fallbackStatus)}>
+              {getFallbackLabel(fallbackStatus)}
+            </Badge>
+          ) : null}
+          <span>Snapshot {formatTimestamp(feed.generatedAt)}.</span>
+          <span>Latest write {formatTimestamp(feed.latestRecordedAt)}.</span>
+        </div>
+
+        <p className="mt-3 text-sm text-slate-600">{transportSummary}</p>
+        <p className="mt-2 text-sm text-slate-600">{runtimeSummary}</p>
+
+        <div className="mt-3 flex flex-wrap items-center gap-2 text-sm text-slate-500">
+          <Badge tone={getRuntimeModeTone(feed.heartbeat.runtimeMode)}>
+            {getRuntimeModeLabel(feed.heartbeat.runtimeMode)}
+          </Badge>
+          <span>Exchange {feed.heartbeat.exchangeEnv ?? "unknown"}.</span>
+          <span>Source {feed.heartbeat.runtimeSource ?? "unknown"}.</span>
+          {feed.heartbeat.worker ? <span>Worker {feed.heartbeat.worker}.</span> : null}
+          {feed.heartbeat.workerStatus ? (
+            <span>Status {feed.heartbeat.workerStatus}.</span>
+          ) : null}
+          {feed.heartbeat.latestRunId ? (
+            <span>Run {feed.heartbeat.latestRunId}.</span>
+          ) : null}
+        </div>
+
+        <div className="mt-3 flex flex-wrap items-center gap-3 text-sm text-slate-500">
+          <span>Last SSE snapshot {formatTimestamp(lastStreamEventAt)}.</span>
+          <span>{formatAgeSeconds(streamAgeSeconds)}.</span>
+          {lastFallbackSyncAt ? (
+            <span>
+              Last HTTP sync {formatTimestamp(lastFallbackSyncAt)} (
+              {formatAgeSeconds(fallbackAgeSeconds)}).
+            </span>
+          ) : null}
+          <span>
+            {reconnectAttempts} reconnect attempt
+            {reconnectAttempts === 1 ? "" : "s"}.
+          </span>
+          {lastStreamErrorAt ? (
+            <span>Last stream error {formatTimestamp(lastStreamErrorAt)}.</span>
+          ) : null}
+        </div>
+
+        <div className="mt-4 flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={() => reconnectStream()}
+            className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-steel transition hover:border-signal hover:text-signal"
+          >
+            Reconnect stream
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              void syncDecisionFeed();
+            }}
+            disabled={fallbackStatus === "syncing"}
+            className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-steel transition hover:border-signal hover:text-signal disabled:cursor-not-allowed disabled:border-slate-200 disabled:text-slate-400"
+          >
+            {fallbackStatus === "syncing" ? "Syncing feed..." : "Sync feed now"}
+          </button>
+        </div>
+
+        {fallbackError ? (
+          <p className="mt-3 text-sm text-rose-700">{fallbackError}</p>
+        ) : null}
       </div>
 
       <div className="mt-5 grid gap-3 xl:grid-cols-4">
         <div className="rounded-2xl border border-slate-100 bg-slate-50/90 p-4">
           <div className="flex flex-wrap items-center gap-2">
-            <p className="text-xs uppercase tracking-[0.24em] text-slate-500">Worker heartbeat</p>
+            <p className="text-xs uppercase tracking-[0.24em] text-slate-500">
+              Worker heartbeat
+            </p>
             <Badge tone={getHeartbeatTone(feed.heartbeat.status)}>
               {getHeartbeatLabel(feed.heartbeat.status)}
             </Badge>
@@ -468,7 +901,9 @@ export function LiveTradeDecisionsPanel({
           </p>
         </div>
         <div className="rounded-2xl border border-slate-100 bg-slate-50/90 p-4">
-          <p className="text-xs uppercase tracking-[0.24em] text-slate-500">Latest step</p>
+          <p className="text-xs uppercase tracking-[0.24em] text-slate-500">
+            Latest step
+          </p>
           <p className="mt-2 text-2xl font-semibold text-steel">
             {feed.heartbeat.latestStep ?? "n/a"}
           </p>
@@ -478,7 +913,9 @@ export function LiveTradeDecisionsPanel({
           </p>
         </div>
         <div className="rounded-2xl border border-slate-100 bg-slate-50/90 p-4">
-          <p className="text-xs uppercase tracking-[0.24em] text-slate-500">Last healthy step</p>
+          <p className="text-xs uppercase tracking-[0.24em] text-slate-500">
+            Last healthy step
+          </p>
           <p className="mt-2 text-2xl font-semibold text-steel">
             {feed.heartbeat.lastHealthyStep ?? "n/a"}
           </p>
@@ -487,7 +924,9 @@ export function LiveTradeDecisionsPanel({
           </p>
         </div>
         <div className="rounded-2xl border border-slate-100 bg-slate-50/90 p-4">
-          <p className="text-xs uppercase tracking-[0.24em] text-slate-500">Recent runs / errors</p>
+          <p className="text-xs uppercase tracking-[0.24em] text-slate-500">
+            Recent runs / errors
+          </p>
           <p className="mt-2 text-2xl font-semibold text-steel">
             {feed.heartbeat.recentRunCount}
             <span className="ml-2 text-sm font-medium text-slate-500">
@@ -495,14 +934,17 @@ export function LiveTradeDecisionsPanel({
             </span>
           </p>
           <p className="mt-2 text-sm text-slate-500">
-            {feed.heartbeat.recentDecisionCount} decision rows in the heartbeat window.
+            {feed.heartbeat.recentDecisionCount} decision rows in the heartbeat
+            window.
           </p>
         </div>
       </div>
 
       <div className="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
         <div className="rounded-2xl border border-slate-100 bg-slate-50/90 p-4">
-          <p className="text-xs uppercase tracking-[0.24em] text-slate-500">Visible</p>
+          <p className="text-xs uppercase tracking-[0.24em] text-slate-500">
+            Visible
+          </p>
           <p className="mt-2 text-2xl font-semibold text-steel">
             {filteredDecisions.length}
             <span className="ml-2 text-sm font-medium text-slate-500">
@@ -511,16 +953,28 @@ export function LiveTradeDecisionsPanel({
           </p>
         </div>
         <div className="rounded-2xl border border-slate-100 bg-slate-50/90 p-4">
-          <p className="text-xs uppercase tracking-[0.24em] text-slate-500">Actionable</p>
-          <p className="mt-2 text-2xl font-semibold text-signal">{actionableCount}</p>
+          <p className="text-xs uppercase tracking-[0.24em] text-slate-500">
+            Actionable
+          </p>
+          <p className="mt-2 text-2xl font-semibold text-signal">
+            {actionableCount}
+          </p>
         </div>
         <div className="rounded-2xl border border-slate-100 bg-slate-50/90 p-4">
-          <p className="text-xs uppercase tracking-[0.24em] text-slate-500">Tagged live</p>
-          <p className="mt-2 text-2xl font-semibold text-rose-700">{liveCount}</p>
+          <p className="text-xs uppercase tracking-[0.24em] text-slate-500">
+            Tagged live
+          </p>
+          <p className="mt-2 text-2xl font-semibold text-rose-700">
+            {liveCount}
+          </p>
         </div>
         <div className="rounded-2xl border border-slate-100 bg-slate-50/90 p-4">
-          <p className="text-xs uppercase tracking-[0.24em] text-slate-500">Tagged paper</p>
-          <p className="mt-2 text-2xl font-semibold text-amber-700">{paperCount}</p>
+          <p className="text-xs uppercase tracking-[0.24em] text-slate-500">
+            Tagged paper
+          </p>
+          <p className="mt-2 text-2xl font-semibold text-amber-700">
+            {paperCount}
+          </p>
         </div>
       </div>
 
@@ -551,7 +1005,9 @@ export function LiveTradeDecisionsPanel({
         </div>
         <div className="mt-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
           <label className="flex-1 text-sm text-slate-500">
-            <span className="mb-2 block">Search title, ticker, summary, strategy, or run id</span>
+            <span className="mb-2 block">
+              Search title, ticker, summary, strategy, or run id
+            </span>
             <input
               type="search"
               value={query}
@@ -570,8 +1026,9 @@ export function LiveTradeDecisionsPanel({
 
       {!feed.available ? (
         <div className="mt-5 rounded-[24px] border border-dashed border-slate-200 bg-slate-50/80 px-5 py-6 text-sm text-slate-500">
-          `live_trade_decisions` is not present in the active SQLite database yet.
-          The panel will start filling as soon as Python creates and writes the table.
+          `live_trade_decisions` is not present in the active SQLite database
+          yet. The panel will start filling as soon as Python creates and writes
+          the table.
         </div>
       ) : null}
 
@@ -609,13 +1066,26 @@ export function LiveTradeDecisionsPanel({
                       <Badge tone={getDecisionTone(record)}>
                         {getDecisionLabel(record) || "Unknown"}
                       </Badge>
-                      {record.side ? <Badge tone="neutral">{record.side}</Badge> : null}
-                      {record.focusType ? <Badge tone="neutral">{record.focusType}</Badge> : null}
+                      {record.side ? (
+                        <Badge tone="neutral">{record.side}</Badge>
+                      ) : null}
+                      {record.focusType ? (
+                        <Badge tone="neutral">{record.focusType}</Badge>
+                      ) : null}
+                      {record.runtimeMode ? (
+                        <Badge tone={getRuntimeModeTone(record.runtimeMode)}>
+                          {getRuntimeModeLabel(record.runtimeMode)}
+                        </Badge>
+                      ) : null}
                       {record.confidence !== null ? (
-                        <Badge tone="neutral">{formatConfidence(record.confidence)}</Badge>
+                        <Badge tone="neutral">
+                          {formatConfidence(record.confidence)}
+                        </Badge>
                       ) : null}
                       {record.paperTrade !== null ? (
-                        <Badge tone={record.paperTrade ? "warning" : "neutral"}>
+                        <Badge
+                          tone={record.paperTrade ? "warning" : "neutral"}
+                        >
                           {record.paperTrade ? "Paper" : "No paper"}
                         </Badge>
                       ) : null}
@@ -626,11 +1096,16 @@ export function LiveTradeDecisionsPanel({
                       ) : null}
                     </div>
                     <h3 className="text-base font-semibold text-steel">
-                      {record.title ?? record.marketId ?? record.eventTicker ?? "Unlabeled decision"}
+                      {record.title ??
+                        record.marketId ??
+                        record.eventTicker ??
+                        "Unlabeled decision"}
                     </h3>
                     <div className="flex flex-wrap gap-3 text-sm text-slate-500">
                       <span>{record.marketId ?? "No market id"}</span>
-                      {record.eventTicker ? <span>{record.eventTicker}</span> : null}
+                      {record.eventTicker ? (
+                        <span>{record.eventTicker}</span>
+                      ) : null}
                     </div>
                     <div className="flex flex-wrap gap-3 text-sm">
                       {record.marketId ? (
@@ -670,11 +1145,15 @@ export function LiveTradeDecisionsPanel({
                 </div>
 
                 {record.summary ? (
-                  <p className="mt-4 text-sm font-medium text-steel">{record.summary}</p>
+                  <p className="mt-4 text-sm font-medium text-steel">
+                    {record.summary}
+                  </p>
                 ) : null}
 
                 {record.rationale && record.rationale !== record.summary ? (
-                  <p className="mt-4 text-sm leading-6 text-slate-600">{record.rationale}</p>
+                  <p className="mt-4 text-sm leading-6 text-slate-600">
+                    {record.rationale}
+                  </p>
                 ) : null}
 
                 <div className="mt-4 grid gap-3 sm:grid-cols-2">

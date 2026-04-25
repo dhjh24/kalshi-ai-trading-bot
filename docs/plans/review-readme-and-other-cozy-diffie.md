@@ -5,11 +5,13 @@
 > when they complete, block, or reshape work. If this file gets too long, link out to
 > per-workstream files under `docs/plans/` rather than deleting context.
 >
-> Last updated: 2026-04-24 by Codex - repo review confirmed the W5 paper-first live-trade loop and W9 dashboard decision-feed foundations already exist in-tree; live-trade regression hardening and dashboard acceptance-fixture fixes landed locally, and live execution wiring plus broader parity coverage remain.
+> Last updated: 2026-04-24 by Codex - the dedicated W5 CLI loop now supports paper, shadow, and live runtimes; generic live-trade intents execute in live mode; live quick-flip intents route through the existing quick-flip machinery when `ENABLE_LIVE_QUICK_FLIP=1`; the main AI-ensemble `python cli.py run --live` path now also embeds the live-trade loop; and the `/live-trade` decision feed now combines low-latency SQLite-backed SSE refresh with client-side reconnect / HTTP sync fallback. Broader parity coverage still remains.
 
 > 2026-04-23 local follow-up: W7 guardrails are now wired through the directional decision path in `src/jobs/decide.py` and the unified allocation path in `src/strategies/unified_trading_system.py`; mixed-schema spend summaries were hardened in both Python and Node; regression coverage was added for the new alias/summary cases. W5/W10/W11 remain open.
 >
 > 2026-04-24 local follow-up: W5 is no longer "not started" in practice. The repo already contains `src/jobs/live_trade.py`, the `python cli.py run --live-trade` entrypoint, persisted `live_trade_decisions` / `live_trade_runtime_state` / `live_trade_decision_feedback` tables, and the `/live-trade` dashboard decision feed with SSE + feedback actions. This pass added focused regression coverage for the no-events skip path and specialist-payload fallback (`tests/test_live_trade_loop_regressions.py`) and hardened the Node acceptance fixtures in `server/tests/liveTradeFeedbackSse.test.ts` and `server/tests/dashboardRepository.test.ts`. Remaining W5/W10 gaps are live-mode execution wiring, optional write-triggered decision-feed refresh, and broader parity/shadow coverage.
+>
+> 2026-04-24 local follow-up: the W5 live-mode startup skip is gone for non-`QUICK_FLIP` intents. `src/jobs/live_trade.py` now drives the existing generic execution path with `live_mode=True`, persists truthful `paper_trade` / `live_trade` flags on decision rows, and records live-specific execution summaries. Dedicated `python cli.py run --live-trade` now supports `paper`, `shadow`, and `live` runtimes, and live `QUICK_FLIP` intents now route through the existing quick-flip machinery when `ENABLE_LIVE_QUICK_FLIP=1`, with the standalone loop also running the quick-flip manager each cycle so exits, repricing, and reconciliation stay active. On the dashboard side, `server/src/repositories/dashboardRepository.ts` now exposes a lightweight live-trade decision refresh cursor, `server/src/services/liveStreamHub.ts` polls that cursor every <=1s, and the web client now falls back to explicit reconnect / HTTP sync when the SSE feed goes stale. A follow-up visibility pass now persists explicit per-decision `runtime_mode`, threads verified worker-mode / exchange-source metadata through the decision-feed heartbeat, and softens the live-trade banners when the UI is only seeing `dashboard env` defaults instead of `live_trade_runtime_state`. Focused regression coverage landed in `tests/test_live_trade_job.py`, `tests/test_cli_safety.py`, `server/tests/dashboardRepository.test.ts`, `server/tests/liveTradeFeedbackSse.test.ts`, and `web/lib/live-trade-decision-feed.test.ts`. Remaining W9/W10 gaps are broader parity coverage and any future fully push-based Python -> Node refresh hook if we decide to remove cursor polling entirely.
 
 ---
 
@@ -116,11 +118,11 @@ Each workstream is sized for **one subagent** working in parallel with the other
   - Auto-pause if drift exceeds a configurable threshold.
 - **Done when:** dashboard shows a "Paper vs Live divergence" panel with rolling 24h / 7d windows, and `cli.py status` prints a one-line drift summary.
 
-### W5 — Live-Trade Multi-Agent Decision Loop  *(Status: in progress - paper-first scout/specialist/final-synth loop, persisted decision logging, CLI entrypoint, and dashboard feed are already in-tree; live execution wiring remains)*
+### W5 — Live-Trade Multi-Agent Decision Loop  *(Status: in progress - paper-first scout/specialist/final-synth loop, persisted decision logging, dedicated CLI runtime, dashboard feed, safe generic live execution, opt-in live quick-flip execution, and main `run --live` integration are in-tree; broader parity coverage remains)*
 - **Follow-ups flagged by 2026-04-24 review:**
-  - `src/jobs/live_trade.py` already runs scout -> specialist -> final synth -> paper execution and persists each step, but it still hard-skips when `live_trading_enabled` is on. The remaining product gap is the live-mode order-placement path, not the paper-first loop skeleton.
-  - `python cli.py run --live-trade --once` and `run_live_trade_loop_cycle()` are already the clean scheduler-safe entrypoints. If we want cron-like in-process scheduling, add a thin scheduler wrapper instead of moving schedule logic into the research or agent layers.
-  - `/live-trade` already renders the decision queue and feedback controls over the `live-trade-decisions` SSE topic. Remaining observability gap: the server currently refreshes that feed on its timer cadence (and immediately on feedback writes), but the Python loop does not directly nudge the Node SSE hub after each DB write.
+  - `src/jobs/live_trade.py` now runs scout -> specialist -> final synth in paper and live modes. Non-`QUICK_FLIP` intents call the existing generic executor with `live_mode=True`, and persisted decision rows now mark `paper_trade` / `live_trade` truthfully.
+  - Dedicated `python cli.py run --live-trade` now supports paper, shadow, and live runtimes; the standalone loop also runs the quick-flip manager each cycle so quick-flip exits / repricing stay active when the loop is run on its own.
+  - Live `QUICK_FLIP` intents now require `ENABLE_LIVE_QUICK_FLIP=1` and route through the existing quick-flip machinery. `src/jobs/trade.py` now runs `run_live_trade_loop_cycle()` inside the main AI-ensemble runtime for paper, shadow, and live modes, so the embedded and dedicated paths share the same W5 loop. The remaining product gap is broader parity proof.
 - **Owner:** AI Engineer (lead) + Sales Engineer–style subagent for prompt design
 - **Depends on:** **W1** preferred (so Codex powers the loop) but can prototype on OpenAI/OpenRouter first
 - **Goal:** Replace the single-shot LLM call inside [src/data/live_trade_research.py](src/data/live_trade_research.py) with a real multi-agent loop tuned for short-dated, in-play markets.
@@ -133,7 +135,7 @@ Each workstream is sized for **one subagent** working in parallel with the other
   3. **Risk gate** — re-uses [src/agents/risk_manager_agent.py](src/agents/risk_manager_agent.py); enforces category-confidence multipliers ([settings.py:256-261](src/config/settings.py#L256-L261)).
   4. **Trader synth** — re-uses [src/agents/trader_agent.py](src/agents/trader_agent.py) and [src/agents/ensemble.py](src/agents/ensemble.py) for the final decision; emits a structured order intent.
 - **Wire-up:**
-  - New job module: `src/jobs/live_trade.py`. Cron-driven from [cli.py](cli.py) under a new `python cli.py run --live-trade` flag. Initially paper-only.
+  - New job module: `src/jobs/live_trade.py`. Cron-driven from [cli.py](cli.py) under a new `python cli.py run --live-trade` flag. Supports paper, shadow, or live execution semantics on the dedicated loop path.
   - Persist every agent step to a new `live_trade_decisions` table for replay/debugging.
   - Surface the active decision queue on the existing `/live-trade` Next.js route ([web/app/live-trade/page.tsx](web/app/live-trade/page.tsx)) via a new SSE topic.
 - **Done when:** the loop runs end-to-end in paper mode, executes via `quick_flip_scalping` order machinery when the trader's intent is a sub-30-min flip, and the `/live-trade` page shows live decisions streaming in.
@@ -185,23 +187,28 @@ Each workstream is sized for **one subagent** working in parallel with the other
   - New panel on `/portfolio` (or a new `/spend` page) consuming the data.
 - **Done when:** dashboard panel renders with at least 24h of real data and `cli.py status` prints today's spend per provider.
 
-### W9 — Dashboard Live-Trade Polish  *(Status: in progress — configured-mode banner, analysis freshness, decision-feed SSE, and feedback actions are in-tree; direct write-triggered refresh and broader UX polish remain)*
+### W9 — Dashboard Live-Trade Polish  *(Status: in progress — configured-mode banner, analysis freshness, decision-feed SSE, feedback actions, low-latency SQLite-backed refresh, and client reconnect / fallback behavior are in-tree; broader UX polish remains)*
 - **Follow-ups flagged by 2026-04-24 review:**
   - `/live-trade` already mounts `LiveTradeDecisionsPanel`, subscribes to the `live-trade-decisions` SSE topic, and exposes thumbs-up / down feedback writes. The old "live SSE/feedback work remains" note is stale.
-  - The current remaining polish is mostly about freshness and ergonomics: reconnect/fallback behavior in the client, optional migration onto the shared stream hook, and lower-latency refresh from the Python loop into the Node SSE hub.
+  - `server/src/services/liveStreamHub.ts` now polls a lightweight decision/runtime/feedback cursor every <=1s and refreshes the SSE snapshot when SQLite state changes, with the existing slower full-refresh interval still acting as fallback.
+  - The current remaining polish is mostly about optional migration onto the shared stream hook and any future push-based Python -> Node refresh hook if cursor polling proves insufficient.
 - **Owner:** Frontend Developer
 - **Depends on:** W5 (data shape) and W8 (cost panel)
 - **Goal:** Make `/live-trade` and `/portfolio` actually useful for monitoring the new flow.
 - **Specifics:**
   - `/live-trade` ([web/app/live-trade/page.tsx](web/app/live-trade/page.tsx)) — show live agent decisions streaming in (new SSE topic from W5), with action buttons to thumbs-up / down a decision (writes to a feedback table for later evaluation).
   - `/portfolio` ([web/app/portfolio/page.tsx](web/app/portfolio/page.tsx)) — paper-vs-live divergence panel from W4, AI-spend panel from W8, per-strategy P&L breakdown.
-  - Mark the page "Paper Mode" or "LIVE" with a giant unmistakable banner so we don't ship the wrong button into prod.
+  - Keep decision-feed heartbeat metadata and page banners aligned so operators can tell whether the visible mode comes from verified worker telemetry (`live_trade_runtime_state`) or dashboard defaults.
 - **Done when:** A user can sit on `/live-trade` and `/portfolio` for 10 minutes and confidently say what the bot is doing and how it's doing.
 
-### W10 — Test Coverage Gaps  *(Status: in progress — live-trade regression hardening landed locally on 2026-04-24; broader parity/shadow coverage remains)*
+### W10 — Test Coverage Gaps  *(Status: in progress — live-trade regression hardening, live-mode execution coverage, shadow-mode loop coverage, and dashboard refresh-cursor acceptance coverage landed locally on 2026-04-24; broader parity coverage remains)*
 - **Follow-ups flagged by 2026-04-24 review:**
   - Added `tests/test_live_trade_loop_regressions.py` to cover the no-events skip branch and the specialist-payload fallback branch without modifying the existing dirty `tests/test_live_trade_job.py`.
-  - Hardened the Node acceptance harness so `server/tests/liveTradeFeedbackSse.test.ts` parses the intended JSON payload even when child-process logs/warnings are present, and repaired the new quota/strategy-P&L fixtures in `server/tests/dashboardRepository.test.ts`.
+  - Added live-mode execution assertions in `tests/test_live_trade_job.py` so the loop now proves it reaches the safe generic live executor, marks persisted decision rows with truthful paper/live flags, and stores live positions when `live_trading_enabled` is on.
+  - Added dedicated-loop quick-flip coverage in `tests/test_live_trade_job.py` for live quick-flip opt-in blocking, opted-in live quick-flip routing, and the standalone loop's per-cycle quick-flip manager behavior.
+  - Added a loop-level shadow-mode success case in `tests/test_live_trade_job.py` that uses the real `execute_position` path, preserves `runtime_mode="shadow"`, and verifies `shadow_orders` divergence telemetry is written for the executed entry.
+  - Added a repeated-cycle regression in `tests/test_live_trade_job.py` so the same market cannot be reopened on the next loop pass while an earlier position is still open; the newest execution row now stays auditable as `status="skipped"` / `error="existing_position"`.
+  - Hardened the Node acceptance harness so `server/tests/liveTradeFeedbackSse.test.ts` parses the intended JSON payload even when child-process logs/warnings are present, added SSE coverage for external SQLite writes that change the decision feed, repaired the new quota/strategy-P&L fixtures plus the refresh-cursor repository coverage in `server/tests/dashboardRepository.test.ts`, and added focused web-side feed precedence / fallback coverage in `web/lib/live-trade-decision-feed.test.ts`.
 - **Owner:** API Tester or Test Results Analyzer
 - **Depends on:** W1, W2, W4, W5 (tests live alongside the code they cover)
 - **Goal:** Fill in the coverage holes flagged during exploration.

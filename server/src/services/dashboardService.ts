@@ -260,6 +260,14 @@ function buildLiveTradeDecisionHeartbeat(
   const decisionErrorCount = decisions.filter(
     (decision) => decision.status === "error" || Boolean(decision.error)
   ).length;
+  const runtimeVisibility = getLiveTradeRuntimeVisibility(runtimeState);
+  const runtimeMetadata = {
+    runtimeMode: runtimeVisibility.mode ?? null,
+    exchangeEnv: runtimeVisibility.exchange ?? null,
+    runtimeSource: runtimeVisibility.source ?? null,
+    worker: runtimeVisibility.worker ?? null,
+    workerStatus: runtimeVisibility.workerStatus ?? null
+  };
 
   if (runtimeState) {
     const lastSeenAt =
@@ -274,6 +282,7 @@ function buildLiveTradeDecisionHeartbeat(
       staleAfterSeconds,
       lastSeenAt,
       ageSeconds,
+      ...runtimeMetadata,
       latestRunId: runtimeState.runId,
       latestStep: runtimeState.lastStep,
       latestStatus: runtimeState.lastStepStatus ?? runtimeState.loopStatus,
@@ -294,6 +303,7 @@ function buildLiveTradeDecisionHeartbeat(
       staleAfterSeconds,
       lastSeenAt: null,
       ageSeconds: null,
+      ...runtimeMetadata,
       latestRunId: null,
       latestStep: null,
       latestStatus: null,
@@ -321,6 +331,7 @@ function buildLiveTradeDecisionHeartbeat(
     staleAfterSeconds,
     lastSeenAt: latestDecision?.recordedAt ?? null,
     ageSeconds,
+    ...runtimeMetadata,
     latestRunId: latestDecision?.runId ?? null,
     latestStep: latestDecision?.step ?? null,
     latestStatus: latestDecision?.status ?? null,

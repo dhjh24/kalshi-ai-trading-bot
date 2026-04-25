@@ -296,25 +296,35 @@ function resolveRuntimeSnapshot(source: unknown): RuntimeSnapshot {
       "kalshi_env",
       "environment",
     ]) ?? readEnvValue(["KALSHI_ENV", "NEXT_PUBLIC_KALSHI_ENV"]);
+  const sourceLabel =
+    readString(runtimeRecord, ["source", "source_label"]) ||
+    (runtimeRecord ? "runtime payload" : "dashboard env");
+  const isVerifiedWorkerMode = sourceLabel !== "dashboard env";
 
   let primaryModeLabel = "Unknown";
   let primaryModeTone: BadgeTone = "warning";
   let primaryModeHelpText = "No runtime mode telemetry is available yet.";
 
   if (configuredMode === "live" || live === true) {
-    primaryModeLabel = "Live";
-    primaryModeTone = "negative";
+    primaryModeLabel = isVerifiedWorkerMode ? "Live" : "Live default";
+    primaryModeTone = isVerifiedWorkerMode ? "negative" : "warning";
     primaryModeHelpText =
-      "Real orders are permitted when the Python runtime is launched in live mode.";
+      isVerifiedWorkerMode
+        ? "Real orders are permitted when the Python runtime is launched in live mode."
+        : "Dashboard defaults currently point to live mode, but the active Python worker has not verified that state yet.";
   } else if (configuredMode === "shadow" || shadow === true) {
-    primaryModeLabel = "Shadow";
+    primaryModeLabel = isVerifiedWorkerMode ? "Shadow" : "Shadow default";
     primaryModeTone = "warning";
     primaryModeHelpText =
-      "Shadow mode compares live-like execution paths without sending real orders.";
+      isVerifiedWorkerMode
+        ? "Shadow mode compares live-like execution paths without sending real orders."
+        : "Dashboard defaults currently point to shadow mode, but the active Python worker has not verified that state yet.";
   } else if (configuredMode === "paper" || paper === true) {
-    primaryModeLabel = "Paper";
+    primaryModeLabel = isVerifiedWorkerMode ? "Paper" : "Paper default";
     primaryModeTone = "positive";
-    primaryModeHelpText = "Paper mode keeps execution local and simulated.";
+    primaryModeHelpText = isVerifiedWorkerMode
+      ? "Paper mode keeps execution local and simulated."
+      : "Dashboard defaults currently point to paper mode, but the active Python worker has not verified that state yet.";
   }
 
   const exchange = normalizeExchangeLabel(exchangeRaw);
@@ -323,9 +333,7 @@ function resolveRuntimeSnapshot(source: unknown): RuntimeSnapshot {
     primaryModeLabel,
     primaryModeTone,
     primaryModeHelpText,
-    sourceLabel:
-      readString(runtimeRecord, ["source", "source_label"]) ||
-      (runtimeRecord ? "runtime payload" : "dashboard env"),
+    sourceLabel,
     paper: buildFlagState(
       paper,
       "Paper trades stay local and do not hit the exchange.",

@@ -513,6 +513,7 @@ export interface LiveTradeDecisionRecord {
   recordedAt: string | null;
   runId: string | null;
   step: string | null;
+  runtimeMode: string | null;
   marketId: string | null;
   eventTicker: string | null;
   title: string | null;
@@ -541,6 +542,11 @@ export interface LiveTradeDecisionHeartbeat {
   staleAfterSeconds: number;
   lastSeenAt: string | null;
   ageSeconds: number | null;
+  runtimeMode: string | null;
+  exchangeEnv: string | null;
+  runtimeSource: string | null;
+  worker: string | null;
+  workerStatus: string | null;
   latestRunId: string | null;
   latestStep: string | null;
   latestStatus: string | null;

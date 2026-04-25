@@ -15,7 +15,11 @@ afterEach(() => {
   }
 });
 
-function runAcceptanceScript(scriptName: string, source: string) {
+function runAcceptanceScript(
+  scriptName: string,
+  source: string,
+  envOverrides: Record<string, string> = {}
+) {
   const tempDir = mkdtempSync(path.join(tmpdir(), "live-trade-feedback-"));
   const databasePath = path.join(tempDir, "dashboard.sqlite");
   const scriptPath = path.join(tempDir, scriptName);
@@ -27,7 +31,8 @@ function runAcceptanceScript(scriptName: string, source: string) {
     cwd: serverRoot,
     env: {
       ...process.env,
-      DB_PATH: databasePath
+      DB_PATH: databasePath,
+      ...envOverrides
     },
     encoding: "utf8"
   }).trim();
@@ -162,6 +167,8 @@ describe("live-trade feedback acceptance", () => {
               strategy TEXT NOT NULL,
               worker TEXT NOT NULL,
               heartbeat_at TEXT NOT NULL,
+              runtime_mode TEXT,
+              exchange_env TEXT,
               run_id TEXT,
               loop_status TEXT NOT NULL,
               last_started_at TEXT,
@@ -235,6 +242,8 @@ describe("live-trade feedback acceptance", () => {
               strategy,
               worker,
               heartbeat_at,
+              runtime_mode,
+              exchange_env,
               run_id,
               loop_status,
               last_started_at,
@@ -508,6 +517,8 @@ describe("live-trade feedback acceptance", () => {
               strategy TEXT NOT NULL,
               worker TEXT NOT NULL,
               heartbeat_at TEXT NOT NULL,
+              runtime_mode TEXT,
+              exchange_env TEXT,
               run_id TEXT,
               loop_status TEXT NOT NULL,
               last_started_at TEXT,
@@ -580,6 +591,8 @@ describe("live-trade feedback acceptance", () => {
               strategy,
               worker,
               heartbeat_at,
+              runtime_mode,
+              exchange_env,
               run_id,
               loop_status,
               last_started_at,
@@ -594,11 +607,13 @@ describe("live-trade feedback acceptance", () => {
               latest_execution_status,
               error
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           \`).run(
             'live_trade',
             'decision_loop',
             freshHeartbeatAt,
+            'paper',
+            'demo',
             'run-runtime',
             'running',
             new Date(Date.now() - 45_000).toISOString(),
@@ -703,6 +718,11 @@ describe("live-trade feedback acceptance", () => {
         latestRecordedAt: result.body.decisionFeed.decisions[0].recordedAt,
         heartbeat: {
           status: "fresh",
+          runtimeMode: "paper",
+          exchangeEnv: "demo",
+          runtimeSource: "live_trade_runtime_state",
+          worker: "decision_loop",
+          workerStatus: "running",
           latestRunId: "run-runtime",
           latestStep: "execution",
           latestStatus: "executed",
@@ -1185,6 +1205,243 @@ describe("live-trade feedback acceptance", () => {
               notes: "Too reactive",
               source: "ops-review"
             }
+          }
+        ]
+      }
+    });
+  });
+
+  it("pushes an updated live-trade-decisions SSE event after an external decision write is detected", () => {
+    const dbUrl = pathToFileURL(path.join(serverRoot, "src/db.ts")).href;
+    const appUrl = pathToFileURL(path.join(serverRoot, "src/app.ts")).href;
+    const hubUrl = pathToFileURL(path.join(serverRoot, "src/services/liveStreamHub.ts")).href;
+    const result = runAcceptanceScript(
+      "external-write-pushes-sse.mjs",
+      `
+        import { DatabaseSync } from 'node:sqlite';
+        import { getDb } from ${JSON.stringify(dbUrl)};
+        import { buildServer } from ${JSON.stringify(appUrl)};
+        import { liveStreamHub } from ${JSON.stringify(hubUrl)};
+
+        const db = getDb();
+        const writer = new DatabaseSync(process.env.DB_PATH);
+        const originalFetch = globalThis.fetch;
+
+        async function readNextDataEvent(reader, state, timeoutMs = 5000) {
+          return Promise.race([
+            (async () => {
+              while (true) {
+                const boundaryIndex = state.buffer.indexOf('\\n\\n');
+                if (boundaryIndex >= 0) {
+                  const rawEvent = state.buffer.slice(0, boundaryIndex);
+                  state.buffer = state.buffer.slice(boundaryIndex + 2);
+
+                  if (rawEvent.startsWith(':')) {
+                    continue;
+                  }
+
+                  const dataLine = rawEvent
+                    .split('\\n')
+                    .find((line) => line.startsWith('data: '));
+                  if (dataLine) {
+                    return JSON.parse(dataLine.slice(6));
+                  }
+                }
+
+                const chunk = await reader.read();
+                if (chunk.done) {
+                  throw new Error('SSE stream ended before receiving data');
+                }
+
+                state.buffer += state.decoder.decode(chunk.value, { stream: true });
+              }
+            })(),
+            new Promise((_, reject) => {
+              setTimeout(() => reject(new Error('Timed out waiting for SSE data')), timeoutMs);
+            })
+          ]);
+        }
+
+        try {
+          db.exec(${JSON.stringify(buildSeedSql())});
+
+          globalThis.fetch = async (input, init) => {
+            const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+
+            if (url.startsWith('http://127.0.0.1:')) {
+              return originalFetch(input, init);
+            }
+
+            if (url.includes('coingecko.com') && url.includes('/ohlc')) {
+              return new Response(JSON.stringify([]), {
+                status: 200,
+                headers: {
+                  'content-type': 'application/json'
+                }
+              });
+            }
+
+            if (url.includes('coingecko.com')) {
+              return new Response(JSON.stringify({}), {
+                status: 200,
+                headers: {
+                  'content-type': 'application/json'
+                }
+              });
+            }
+
+            if (url.includes('site.api.espn.com')) {
+              return new Response(
+                JSON.stringify({
+                  sports: [
+                    {
+                      leagues: [
+                        {
+                          teams: [],
+                          events: []
+                        }
+                      ]
+                    }
+                  ],
+                  events: []
+                }),
+                {
+                  status: 200,
+                  headers: {
+                    'content-type': 'application/json'
+                  }
+                }
+              );
+            }
+
+            throw new Error('Unexpected fetch: ' + url);
+          };
+
+          const app = await buildServer();
+          liveStreamHub.start();
+
+          try {
+            const baseUrl = await app.listen({ host: '127.0.0.1', port: 0 });
+            const controller = new AbortController();
+            const streamResponse = await fetch(baseUrl + '/api/stream/live-trade-decisions', {
+              headers: {
+                accept: 'text/event-stream'
+              },
+              signal: controller.signal
+            });
+
+            if (!streamResponse.body) {
+              throw new Error('Missing SSE response body');
+            }
+
+            const reader = streamResponse.body.getReader();
+            const state = {
+              decoder: new TextDecoder(),
+              buffer: ''
+            };
+
+            const initialEvent = await readNextDataEvent(reader, state);
+
+            writer.prepare(\`
+              INSERT INTO live_trade_decisions (
+                created_at,
+                run_id,
+                step,
+                strategy,
+                status,
+                event_ticker,
+                market_ticker,
+                title,
+                focus_type,
+                provider,
+                model,
+                action,
+                side,
+                confidence,
+                hold_minutes,
+                paper_trade,
+                live_trade,
+                summary,
+                rationale,
+                payload_json
+              )
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            \`).run(
+              '2026-04-24T00:00:30Z',
+              'run-002',
+              'execution',
+              'quick_flip_scalping',
+              'executed',
+              'BTC-APR',
+              'BTC-ABOVE-94K',
+              'BTC closes above 94k',
+              'bitcoin',
+              'openai',
+              'gpt-5.1-mini',
+              'BUY',
+              'YES',
+              0.91,
+              20,
+              1,
+              0,
+              'External writer inserted a fresher execution row.',
+              'This simulates the Python loop writing directly to SQLite.',
+              '{"market":{"yesPrice":0.55}}'
+            );
+
+            const pushedEvent = await readNextDataEvent(reader, state);
+
+            controller.abort();
+            await reader.cancel().catch(() => {});
+
+            console.log(
+              ${JSON.stringify(outputMarker)} +
+                JSON.stringify({
+                  initialEvent,
+                  pushedEvent
+                }) +
+                ${JSON.stringify(outputMarker)}
+            );
+          } finally {
+            await app.close();
+          }
+        } finally {
+          globalThis.fetch = originalFetch;
+          writer.close();
+          db.close();
+        }
+      `,
+      {
+        DASHBOARD_REFRESH_MS: "60000"
+      }
+    );
+
+    expect(result.initialEvent).toMatchObject({
+      topic: "live-trade-decisions",
+      payload: {
+        available: true,
+        decisions: [
+          {
+            id: "1",
+            runId: "run-001"
+          }
+        ]
+      }
+    });
+    expect(result.pushedEvent).toMatchObject({
+      topic: "live-trade-decisions",
+      payload: {
+        available: true,
+        decisions: [
+          {
+            id: "2",
+            runId: "run-002",
+            step: "execution",
+            status: "executed"
+          },
+          {
+            id: "1",
+            runId: "run-001"
           }
         ]
       }

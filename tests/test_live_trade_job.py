@@ -1,10 +1,12 @@
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
 
+import src.jobs.live_trade as live_trade_module
 from src.config.settings import settings
 from src.jobs.live_trade import LiveTradeDecisionLoop
 from src.utils.database import DatabaseManager
@@ -232,6 +234,9 @@ async def test_live_trade_loop_persists_steps_and_opens_paper_position(monkeypat
     decision_rows = await db_manager.list_live_trade_decisions(limit=10)
     steps = {row["step"] for row in decision_rows}
     assert {"scout", "specialist", "final", "execution"} <= steps
+    assert all(row["paper_trade"] == 1 for row in decision_rows)
+    assert all(row["live_trade"] == 0 for row in decision_rows)
+    assert all(row["runtime_mode"] == "paper" for row in decision_rows)
     final_rows = await db_manager.list_live_trade_decisions(limit=5, step="final")
     assert final_rows
     assert final_rows[0]["status"] == "completed"
@@ -239,11 +244,16 @@ async def test_live_trade_loop_persists_steps_and_opens_paper_position(monkeypat
     assert final_payload["selected_candidate"]["market_ticker"] == "KXSPORTS-EVT-M1"
     assert final_payload["debate_transcript"]
     assert "trader" in final_payload["step_results"]
+    execution_rows = await db_manager.list_live_trade_decisions(limit=5, step="execution")
+    assert execution_rows
+    assert execution_rows[0]["paper_trade"] == 1
+    assert execution_rows[0]["live_trade"] == 0
 
     positions = await db_manager.get_open_positions()
     assert len(positions) == 1
     assert positions[0].market_id == "KXSPORTS-EVT-M1"
     assert positions[0].strategy == "live_trade"
+    assert positions[0].live is False
 
 
 @pytest.mark.asyncio
@@ -369,39 +379,715 @@ async def test_live_trade_loop_routes_short_hold_quick_flip_intent(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_live_trade_loop_skips_immediately_when_live_mode_enabled(monkeypatch):
+async def test_live_trade_loop_blocks_live_quick_flip_without_opt_in(monkeypatch):
     monkeypatch.setattr(settings.trading, "live_trading_enabled", True, raising=False)
+    monkeypatch.setattr(settings.trading, "enable_live_quick_flip", False, raising=False)
     monkeypatch.setattr(settings.trading, "daily_ai_budget", 10.0, raising=False)
+    monkeypatch.setattr(settings.trading, "max_position_size_pct", 3.0, raising=False)
 
-    db_manager = await _build_test_db_manager("live_trade_loop_live_skip")
-    model_router = FakeModelRouter([])
-    research_service = FakeResearchService([])
+    db_manager = await _build_test_db_manager("live_trade_loop_live_qf_blocked")
+
+    event = {
+        "event_ticker": "KXLIVE-QF-BLOCKED",
+        "title": "Will Team J score next?",
+        "category": "Sports",
+        "focus_type": "sports",
+        "hours_to_expiry": 1.0,
+        "live_score": 86.0,
+        "is_live_candidate": True,
+        "volume_24h": 7400.0,
+        "avg_yes_spread": 0.02,
+        "markets": [
+            {
+                "ticker": "KXLIVE-QF-BLOCKED-M1",
+                "title": "Team J next score",
+                "yes_midpoint": 0.28,
+                "yes_bid": 0.27,
+                "yes_ask": 0.29,
+                "no_bid": 0.71,
+                "no_ask": 0.73,
+                "yes_spread": 0.02,
+                "volume": 4300,
+                "volume_24h": 4300.0,
+                "expiration_ts": 4102444800,
+                "hours_to_expiry": 1.0,
+            }
+        ],
+    }
+
+    scout_response = """
+    {
+      "summary": "One short-hold live sports event is worth a scalp check.",
+      "selected_events": [
+        {"event_ticker": "KXLIVE-QF-BLOCKED", "priority": 1, "reason": "Immediate catalyst and tight spread."}
+      ]
+    }
+    """
+    specialist_response = """
+    {
+      "summary": "Sports specialist wants a fast live scalp.",
+      "action": "TRADE",
+      "market_ticker": "KXLIVE-QF-BLOCKED-M1",
+      "side": "YES",
+      "confidence": 0.79,
+      "edge_pct": 0.05,
+      "position_size_pct": 2.0,
+      "hold_minutes": 20,
+      "limit_price": 0.29,
+      "execution_style": "QUICK_FLIP",
+      "risk_flags": [],
+      "reasoning": "Immediate momentum setup for a short live quick flip."
+    }
+    """
+    quick_flip_calls = {"count": 0}
+
+    async def fake_execute_position(**_kwargs):
+        raise AssertionError("generic execute_position path should not run for QUICK_FLIP intents")
+
+    async def fake_guardrail(**_kwargs):
+        return True, None
+
+    async def fake_quick_flip_executor(**_kwargs):
+        quick_flip_calls["count"] += 1
+        return {
+            "executed": True,
+            "status": "executed",
+            "summary": "unexpected",
+        }
 
     loop = LiveTradeDecisionLoop(
         db_manager=db_manager,
         kalshi_client=FakeKalshiClient(),
-        model_router=model_router,
-        research_service=research_service,
+        model_router=FakeModelRouter(
+            [
+                scout_response,
+                specialist_response,
+                *_debate_response_bundle(
+                    trader_limit_price=29,
+                    trader_confidence=0.8,
+                    trader_reasoning="Debate confirms the fast live scalp.",
+                ),
+            ]
+        ),
+        research_service=FakeResearchService([event]),
+        execute_position_fn=fake_execute_position,
+        guardrail_fn=fake_guardrail,
+        quick_flip_executor_fn=fake_quick_flip_executor,
     )
 
     summary = await loop.run_once()
     await loop.close()
 
     assert summary.executed_positions == 0
-    assert summary.skipped_reason == "live mode is not wired for the W5 loop yet"
-    assert model_router.calls == 0
-    assert research_service.get_live_trade_events_calls == 0
+    assert summary.skipped_reason == "live execution did not fill"
+    assert quick_flip_calls["count"] == 0
 
-    decision_rows = await db_manager.list_live_trade_decisions(limit=5)
-    assert decision_rows == []
+    execution_rows = await db_manager.list_live_trade_decisions(limit=5, step="execution")
+    assert execution_rows
+    assert execution_rows[0]["status"] == "blocked"
+    assert execution_rows[0]["error"] == "quick_flip_live_opt_in_required"
+    assert execution_rows[0]["summary"] == (
+        "Quick-flip live execution requires ENABLE_LIVE_QUICK_FLIP opt-in."
+    )
+    assert execution_rows[0]["paper_trade"] == 0
+    assert execution_rows[0]["live_trade"] == 1
+    assert execution_rows[0]["runtime_mode"] == "live"
+
+
+@pytest.mark.asyncio
+async def test_live_trade_loop_routes_live_quick_flip_when_opted_in(monkeypatch):
+    monkeypatch.setattr(settings.trading, "live_trading_enabled", True, raising=False)
+    monkeypatch.setattr(settings.trading, "enable_live_quick_flip", True, raising=False)
+    monkeypatch.setattr(settings.trading, "daily_ai_budget", 10.0, raising=False)
+    monkeypatch.setattr(settings.trading, "max_position_size_pct", 3.0, raising=False)
+
+    db_manager = await _build_test_db_manager("live_trade_loop_live_qf_enabled")
+
+    event = {
+        "event_ticker": "KXLIVE-QF",
+        "title": "Will Team K score next?",
+        "category": "Sports",
+        "focus_type": "sports",
+        "hours_to_expiry": 1.0,
+        "live_score": 88.0,
+        "is_live_candidate": True,
+        "volume_24h": 7800.0,
+        "avg_yes_spread": 0.02,
+        "markets": [
+            {
+                "ticker": "KXLIVE-QF-M1",
+                "title": "Team K next score",
+                "yes_midpoint": 0.28,
+                "yes_bid": 0.27,
+                "yes_ask": 0.29,
+                "no_bid": 0.71,
+                "no_ask": 0.73,
+                "yes_spread": 0.02,
+                "volume": 4500,
+                "volume_24h": 4500.0,
+                "expiration_ts": 4102444800,
+                "hours_to_expiry": 1.0,
+            }
+        ],
+    }
+
+    scout_response = """
+    {
+      "summary": "One short-hold live sports event is worth a scalp check.",
+      "selected_events": [
+        {"event_ticker": "KXLIVE-QF", "priority": 1, "reason": "Immediate catalyst and tight spread."}
+      ]
+    }
+    """
+    specialist_response = """
+    {
+      "summary": "Sports specialist wants a fast live scalp.",
+      "action": "TRADE",
+      "market_ticker": "KXLIVE-QF-M1",
+      "side": "YES",
+      "confidence": 0.8,
+      "edge_pct": 0.05,
+      "position_size_pct": 2.0,
+      "hold_minutes": 20,
+      "limit_price": 0.29,
+      "execution_style": "QUICK_FLIP",
+      "risk_flags": [],
+      "reasoning": "Immediate momentum setup for a short live quick flip."
+    }
+    """
+    routed = {}
+    manager_mock = AsyncMock(
+        return_value={
+            "positions_closed": 0,
+            "positions_voided": 0,
+            "positions_synced": 0,
+            "orders_cancelled": 0,
+            "orders_adjusted": 0,
+            "losses_cut": 0,
+            "total_pnl": 0.0,
+        }
+    )
+    monkeypatch.setattr(live_trade_module, "manage_live_quick_flip_positions", manager_mock)
+
+    async def fake_execute_position(**_kwargs):
+        raise AssertionError("generic execute_position path should not run for QUICK_FLIP intents")
+
+    async def fake_guardrail(**_kwargs):
+        return True, None
+
+    async def fake_quick_flip_executor(**kwargs):
+        routed["market_ticker"] = kwargs["selected_market"]["ticker"]
+        routed["event_ticker"] = kwargs["selected_event"]["event_ticker"]
+        routed["quantity"] = kwargs["quantity"]
+        routed["execution_style"] = kwargs["final_intent"]["execution_style"]
+        return {
+            "executed": True,
+            "status": "executed",
+            "summary": "Quick-flip live position opened with a resting exit order.",
+            "quantity": kwargs["quantity"],
+            "payload": {"route": "quick_flip", "execution_mode": "live"},
+        }
+
+    loop = LiveTradeDecisionLoop(
+        db_manager=db_manager,
+        kalshi_client=FakeKalshiClient(),
+        model_router=FakeModelRouter(
+            [
+                scout_response,
+                specialist_response,
+                *_debate_response_bundle(
+                    trader_limit_price=29,
+                    trader_confidence=0.81,
+                    trader_reasoning="Debate confirms the fast live scalp.",
+                ),
+            ]
+        ),
+        research_service=FakeResearchService([event]),
+        execute_position_fn=fake_execute_position,
+        guardrail_fn=fake_guardrail,
+        quick_flip_executor_fn=fake_quick_flip_executor,
+        manage_quick_flip_positions_each_cycle=True,
+    )
+
+    summary = await loop.run_once()
+    await loop.close()
+
+    assert summary.executed_positions == 1
+    assert summary.skipped_reason is None
+    assert routed == {
+        "market_ticker": "KXLIVE-QF-M1",
+        "event_ticker": "KXLIVE-QF",
+        "quantity": 68,
+        "execution_style": "QUICK_FLIP",
+    }
+    manager_mock.assert_awaited_once()
+
+    execution_rows = await db_manager.list_live_trade_decisions(limit=5, step="execution")
+    assert execution_rows
+    assert execution_rows[0]["status"] == "executed"
+    assert execution_rows[0]["summary"] == "Quick-flip live position opened with a resting exit order."
+    assert execution_rows[0]["paper_trade"] == 0
+    assert execution_rows[0]["live_trade"] == 1
+    assert execution_rows[0]["runtime_mode"] == "live"
+    execution_payload = json.loads(execution_rows[0]["payload_json"])
+    assert execution_payload["execution_mode"] == "live"
+
+
+@pytest.mark.asyncio
+async def test_live_trade_loop_runs_quick_flip_manager_before_budget_skip(monkeypatch):
+    monkeypatch.setattr(settings.trading, "live_trading_enabled", False, raising=False)
+    monkeypatch.setattr(settings.trading, "daily_ai_budget", 5.0, raising=False)
+
+    db_manager = await _build_test_db_manager("live_trade_loop_qf_manager_budget_skip")
+    await db_manager.upsert_daily_cost(5.0)
+    manager_mock = AsyncMock(
+        return_value={
+            "positions_closed": 0,
+            "positions_voided": 0,
+            "positions_synced": 0,
+            "orders_cancelled": 0,
+            "orders_adjusted": 0,
+            "losses_cut": 0,
+            "total_pnl": 0.0,
+        }
+    )
+    monkeypatch.setattr(live_trade_module, "manage_live_quick_flip_positions", manager_mock)
+
+    loop = LiveTradeDecisionLoop(
+        db_manager=db_manager,
+        kalshi_client=FakeKalshiClient(),
+        model_router=FakeModelRouter([]),
+        research_service=FakeResearchService([]),
+        manage_quick_flip_positions_each_cycle=True,
+    )
+
+    summary = await loop.run_once()
+    await loop.close()
+
+    assert summary.executed_positions == 0
+    assert summary.skipped_reason == "daily AI budget exhausted"
+    manager_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_live_trade_loop_executes_safe_generic_path_when_live_mode_enabled(monkeypatch):
+    monkeypatch.setattr(settings.trading, "live_trading_enabled", True, raising=False)
+    monkeypatch.setattr(settings.trading, "daily_ai_budget", 10.0, raising=False)
+    monkeypatch.setattr(settings.trading, "max_position_size_pct", 3.0, raising=False)
+
+    db_manager = await _build_test_db_manager("live_trade_loop_live_execute")
+
+    event = {
+        "event_ticker": "KXLIVE-EVT",
+        "title": "Will Team H win live?",
+        "category": "Sports",
+        "focus_type": "sports",
+        "hours_to_expiry": 2.0,
+        "live_score": 74.0,
+        "is_live_candidate": True,
+        "volume_24h": 6200.0,
+        "avg_yes_spread": 0.02,
+        "markets": [
+            {
+                "ticker": "KXLIVE-EVT-M1",
+                "title": "Team H moneyline",
+                "yes_midpoint": 0.44,
+                "yes_bid": 0.43,
+                "yes_ask": 0.45,
+                "no_bid": 0.55,
+                "no_ask": 0.57,
+                "yes_spread": 0.02,
+                "volume": 3600,
+                "volume_24h": 3600.0,
+                "expiration_ts": 4102444800,
+                "hours_to_expiry": 2.0,
+            }
+        ],
+    }
+    scout_response = """
+    {
+      "summary": "One live sports event is worth deeper work.",
+      "selected_events": [
+        {"event_ticker": "KXLIVE-EVT", "priority": 1, "reason": "Tight spread and active catalyst."}
+      ]
+    }
+    """
+    specialist_response = """
+    {
+      "summary": "Sports specialist likes the live YES side.",
+      "action": "TRADE",
+      "market_ticker": "KXLIVE-EVT-M1",
+      "side": "YES",
+      "confidence": 0.77,
+      "edge_pct": 0.10,
+      "position_size_pct": 2.0,
+      "hold_minutes": 45,
+      "limit_price": 0.44,
+      "execution_style": "LIVE_TRADE",
+      "risk_flags": [],
+      "reasoning": "The live setup is liquid enough to route through the standard executor."
+    }
+    """
+    execute_calls = {}
+
+    async def fake_execute_position(**kwargs):
+        execute_calls["live_mode"] = kwargs["live_mode"]
+        execute_calls["position_live"] = kwargs["position"].live
+        return True
+
+    async def fake_guardrail(**_kwargs):
+        return True, None
+
+    model_router = FakeModelRouter(
+        [
+            scout_response,
+            specialist_response,
+            *_debate_response_bundle(
+                trader_limit_price=44,
+                trader_confidence=0.78,
+                trader_reasoning="Debate confirms the live execution path is justified.",
+            ),
+        ]
+    )
+    research_service = FakeResearchService([event])
+
+    loop = LiveTradeDecisionLoop(
+        db_manager=db_manager,
+        kalshi_client=FakeKalshiClient(),
+        model_router=model_router,
+        research_service=research_service,
+        execute_position_fn=fake_execute_position,
+        guardrail_fn=fake_guardrail,
+    )
+
+    summary = await loop.run_once()
+    await loop.close()
+
+    assert summary.executed_positions == 1
+    assert summary.skipped_reason is None
+    assert model_router.calls == 6
+    assert research_service.get_live_trade_events_calls == 1
+    assert execute_calls == {"live_mode": True, "position_live": True}
+
+    final_rows = await db_manager.list_live_trade_decisions(limit=5, step="final")
+    assert final_rows
+    assert final_rows[0]["paper_trade"] == 0
+    assert final_rows[0]["live_trade"] == 1
+    assert final_rows[0]["runtime_mode"] == "live"
+    execution_rows = await db_manager.list_live_trade_decisions(limit=5, step="execution")
+    assert execution_rows
+    assert execution_rows[0]["status"] == "executed"
+    assert execution_rows[0]["summary"] == "Live-trade position opened in live mode."
+    assert execution_rows[0]["paper_trade"] == 0
+    assert execution_rows[0]["live_trade"] == 1
+    assert execution_rows[0]["runtime_mode"] == "live"
+    execution_payload = json.loads(execution_rows[0]["payload_json"])
+    assert execution_payload["execution_mode"] == "live"
 
     runtime_state = await db_manager.get_live_trade_runtime_state()
     assert runtime_state is not None
     assert runtime_state["runtime_mode"] == "live"
     assert runtime_state["loop_status"] == "completed"
-    assert runtime_state["last_step"] == "startup"
+    assert runtime_state["last_step"] == "execution"
+    assert runtime_state["last_step_status"] == "executed"
+    assert runtime_state["last_summary"] == "Live-trade position opened in live mode."
+
+    positions = await db_manager.get_open_positions()
+    assert len(positions) == 1
+    assert positions[0].market_id == "KXLIVE-EVT-M1"
+    assert positions[0].live is True
+
+
+@pytest.mark.asyncio
+async def test_live_trade_loop_shadow_mode_records_real_shadow_telemetry(monkeypatch):
+    monkeypatch.setattr(settings.trading, "live_trading_enabled", False, raising=False)
+    monkeypatch.setattr(settings.trading, "shadow_mode_enabled", True, raising=False)
+    monkeypatch.setattr(settings.trading, "daily_ai_budget", 10.0, raising=False)
+    monkeypatch.setattr(settings.trading, "max_position_size_pct", 3.0, raising=False)
+
+    db_manager = await _build_test_db_manager("live_trade_loop_shadow_execute")
+
+    event = {
+        "event_ticker": "KXSHADOW-EVT",
+        "title": "Will Team S keep the lead?",
+        "category": "Sports",
+        "focus_type": "sports",
+        "hours_to_expiry": 2.0,
+        "live_score": 76.0,
+        "is_live_candidate": True,
+        "volume_24h": 5800.0,
+        "avg_yes_spread": 0.02,
+        "markets": [
+            {
+                "ticker": "KXSHADOW-EVT-M1",
+                "title": "Team S moneyline",
+                "yes_midpoint": 0.42,
+                "yes_bid": 0.41,
+                "yes_ask": 0.42,
+                "yes_ask_size": 12,
+                "no_bid": 0.58,
+                "no_ask": 0.60,
+                "yes_spread": 0.02,
+                "volume": 3400,
+                "volume_24h": 3400.0,
+                "expiration_ts": 4102444800,
+                "hours_to_expiry": 2.0,
+            }
+        ],
+    }
+    scout_response = """
+    {
+      "summary": "One shadow-eligible sports event is worth deeper work.",
+      "selected_events": [
+        {"event_ticker": "KXSHADOW-EVT", "priority": 1, "reason": "Tight spread and active catalyst."}
+      ]
+    }
+    """
+    specialist_response = """
+    {
+      "summary": "Sports specialist likes the shadow-mode YES side.",
+      "action": "TRADE",
+      "market_ticker": "KXSHADOW-EVT-M1",
+      "side": "YES",
+      "confidence": 0.75,
+      "edge_pct": 0.10,
+      "position_size_pct": 2.0,
+      "hold_minutes": 45,
+      "limit_price": 0.42,
+      "execution_style": "LIVE_TRADE",
+      "risk_flags": [],
+      "reasoning": "This should execute in paper mode while recording shadow telemetry."
+    }
+    """
+
+    kalshi_client = AsyncMock()
+    kalshi_client.get_balance.return_value = {
+        "balance": 20000,
+        "available_balance": 20000,
+        "portfolio_value": 0,
+    }
+    kalshi_client.get_market.return_value = {
+        "market": {
+            "ticker": "KXSHADOW-EVT-M1",
+            "yes_bid_dollars": 0.41,
+            "yes_ask_dollars": 0.42,
+            "yes_ask_size_fp": "12.00",
+            "no_bid_dollars": 0.58,
+            "no_ask_dollars": 0.60,
+        }
+    }
+    kalshi_client.get_orderbook.return_value = {
+        "orderbook": {
+            "yes": [[0.42, 4], [0.43, 6], [0.44, 20]],
+            "no": [[0.58, 30]],
+        }
+    }
+
+    async def fake_guardrail(**_kwargs):
+        return True, None
+
+    loop = LiveTradeDecisionLoop(
+        db_manager=db_manager,
+        kalshi_client=kalshi_client,
+        model_router=FakeModelRouter(
+            [
+                scout_response,
+                specialist_response,
+                *_debate_response_bundle(
+                    trader_limit_price=42,
+                    trader_confidence=0.77,
+                    trader_reasoning="Debate confirms the shadow-mode paper entry.",
+                ),
+            ]
+        ),
+        research_service=FakeResearchService([event]),
+        guardrail_fn=fake_guardrail,
+    )
+
+    summary = await loop.run_once()
+    await loop.close()
+
+    assert summary.executed_positions == 1
+    assert summary.skipped_reason is None
+
+    runtime_state = await db_manager.get_live_trade_runtime_state()
+    assert runtime_state is not None
+    assert runtime_state["runtime_mode"] == "shadow"
+    assert runtime_state["loop_status"] == "completed"
+    assert runtime_state["last_step"] == "execution"
+    assert runtime_state["last_step_status"] == "executed"
+
+    decision_rows = await db_manager.list_live_trade_decisions(limit=10)
+    assert decision_rows
+    assert all(row["paper_trade"] == 1 for row in decision_rows)
+    assert all(row["live_trade"] == 0 for row in decision_rows)
+    assert all(row["runtime_mode"] == "shadow" for row in decision_rows)
+
+    positions = await db_manager.get_open_positions()
+    assert len(positions) == 1
+    assert positions[0].market_id == "KXSHADOW-EVT-M1"
+    assert positions[0].live is False
+    assert positions[0].entry_price == pytest.approx((4 * 0.42 + 5 * 0.43) / 9)
+
+    shadow_orders = await db_manager.get_shadow_orders(
+        market_id="KXSHADOW-EVT-M1",
+        action="buy",
+    )
+    assert len(shadow_orders) == 1
+    shadow_order = shadow_orders[0]
+    assert shadow_order.status == "filled"
+    assert shadow_order.live is True
+    assert shadow_order.position_id == positions[0].id
+    assert shadow_order.quantity == pytest.approx(9.0)
+    assert shadow_order.filled_price == pytest.approx(positions[0].entry_price)
+
+    divergence_summary = await db_manager.summarize_shadow_order_divergence(
+        market_id="KXSHADOW-EVT-M1"
+    )
+    assert divergence_summary["total_orders"] == 1
+    assert divergence_summary["entry_orders"] == 1
+    assert divergence_summary["matched_position_entries"] == 1
+    assert divergence_summary["matched_live_entries"] == 1
+    assert divergence_summary["avg_entry_price_delta"] == pytest.approx(0.0)
+    assert divergence_summary["total_entry_cost_delta"] == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_live_trade_loop_skips_repeated_cycle_when_market_position_already_exists(monkeypatch):
+    monkeypatch.setattr(settings.trading, "live_trading_enabled", False, raising=False)
+    monkeypatch.setattr(settings.trading, "shadow_mode_enabled", False, raising=False)
+    monkeypatch.setattr(settings.trading, "daily_ai_budget", 10.0, raising=False)
+    monkeypatch.setattr(settings.trading, "max_position_size_pct", 3.0, raising=False)
+
+    db_manager = await _build_test_db_manager("live_trade_loop_existing_position")
+
+    event = {
+        "event_ticker": "KXSPORTS-REPEAT",
+        "title": "Will Team R hold on?",
+        "category": "Sports",
+        "focus_type": "sports",
+        "hours_to_expiry": 2.0,
+        "live_score": 71.0,
+        "is_live_candidate": True,
+        "volume_24h": 5600.0,
+        "avg_yes_spread": 0.02,
+        "markets": [
+            {
+                "ticker": "KXSPORTS-REPEAT-M1",
+                "title": "Team R moneyline",
+                "yes_midpoint": 0.42,
+                "yes_bid": 0.41,
+                "yes_ask": 0.43,
+                "no_bid": 0.57,
+                "no_ask": 0.59,
+                "yes_spread": 0.02,
+                "volume": 3200,
+                "volume_24h": 3200.0,
+                "expiration_ts": 4102444800,
+                "hours_to_expiry": 2.0,
+            }
+        ],
+    }
+    scout_response = """
+    {
+      "summary": "One sports event is worth repeated review.",
+      "selected_events": [
+        {"event_ticker": "KXSPORTS-REPEAT", "priority": 1, "reason": "Live catalyst with stable liquidity."}
+      ]
+    }
+    """
+    specialist_response = """
+    {
+      "summary": "Sports specialist still likes the YES side.",
+      "action": "TRADE",
+      "market_ticker": "KXSPORTS-REPEAT-M1",
+      "side": "YES",
+      "confidence": 0.74,
+      "edge_pct": 0.11,
+      "position_size_pct": 2.0,
+      "hold_minutes": 45,
+      "limit_price": 0.42,
+      "execution_style": "LIVE_TRADE",
+      "risk_flags": [],
+      "reasoning": "Same event should not reopen once a position is already open."
+    }
+    """
+    execute_position = AsyncMock(return_value=True)
+
+    async def fake_guardrail(**_kwargs):
+        return True, None
+
+    first_loop = LiveTradeDecisionLoop(
+        db_manager=db_manager,
+        kalshi_client=FakeKalshiClient(),
+        model_router=FakeModelRouter(
+            [
+                scout_response,
+                specialist_response,
+                *_debate_response_bundle(
+                    trader_limit_price=42,
+                    trader_confidence=0.77,
+                    trader_reasoning="First cycle should open the position.",
+                ),
+            ]
+        ),
+        research_service=FakeResearchService([event]),
+        execute_position_fn=execute_position,
+        guardrail_fn=fake_guardrail,
+    )
+
+    first_summary = await first_loop.run_once()
+    await first_loop.close()
+
+    second_loop = LiveTradeDecisionLoop(
+        db_manager=db_manager,
+        kalshi_client=FakeKalshiClient(),
+        model_router=FakeModelRouter(
+            [
+                scout_response,
+                specialist_response,
+                *_debate_response_bundle(
+                    trader_limit_price=42,
+                    trader_confidence=0.77,
+                    trader_reasoning="Second cycle sees the same market again.",
+                ),
+            ]
+        ),
+        research_service=FakeResearchService([event]),
+        execute_position_fn=execute_position,
+        guardrail_fn=fake_guardrail,
+    )
+
+    second_summary = await second_loop.run_once()
+    await second_loop.close()
+
+    assert first_summary.executed_positions == 1
+    assert second_summary.executed_positions == 0
+    assert second_summary.skipped_reason == "paper execution did not fill"
+    execute_position.assert_awaited_once()
+
+    positions = await db_manager.get_open_positions()
+    assert len(positions) == 1
+    assert positions[0].market_id == "KXSPORTS-REPEAT-M1"
+
+    execution_rows = await db_manager.list_live_trade_decisions(limit=10, step="execution")
+    assert len(execution_rows) >= 2
+    latest_execution = execution_rows[0]
+    assert latest_execution["status"] == "skipped"
+    assert latest_execution["error"] == "existing_position"
+    assert latest_execution["summary"] == "Skipped because an open position already exists for this market."
+    assert latest_execution["runtime_mode"] == "paper"
+    previous_execution = execution_rows[1]
+    assert previous_execution["status"] == "executed"
+    assert previous_execution["error"] is None
+
+    runtime_state = await db_manager.get_live_trade_runtime_state()
+    assert runtime_state is not None
+    assert runtime_state["runtime_mode"] == "paper"
+    assert runtime_state["latest_execution_status"] == "skipped"
+    assert runtime_state["last_step"] == "execution"
     assert runtime_state["last_step_status"] == "skipped"
-    assert runtime_state["last_summary"] == "live mode is not wired for the W5 loop yet"
+    assert runtime_state["last_summary"] == "Skipped because an open position already exists for this market."
 
 
 @pytest.mark.asyncio

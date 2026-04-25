@@ -402,6 +402,158 @@ describe("live_trade_decisions repository helpers", () => {
     });
   });
 
+  it("changes the live-trade refresh cursor when decisions, runtime state, or feedback change", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "dashboard-repository-"));
+    const databasePath = path.join(tempDir, "dashboard.sqlite");
+    const scriptPath = path.join(tempDir, "live-trade-refresh-cursor.mjs");
+    const repositoryUrl = pathToFileURL(
+      path.join(serverRoot, "src/repositories/dashboardRepository.ts")
+    ).href;
+    const dbUrl = pathToFileURL(path.join(serverRoot, "src/db.ts")).href;
+    tempDirs.push(tempDir);
+
+    writeFileSync(
+      scriptPath,
+      `
+        import { getDb } from ${JSON.stringify(dbUrl)};
+        import {
+          getLiveTradeDecisionRefreshCursor,
+          upsertLiveTradeDecisionFeedback
+        } from ${JSON.stringify(repositoryUrl)};
+
+        const db = getDb();
+
+        try {
+          db.exec(\`
+            CREATE TABLE live_trade_decisions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              created_at TEXT,
+              run_id TEXT,
+              step TEXT,
+              status TEXT,
+              event_ticker TEXT,
+              market_ticker TEXT,
+              payload_json TEXT
+            );
+
+            CREATE TABLE live_trade_runtime_state (
+              strategy TEXT NOT NULL,
+              worker TEXT NOT NULL,
+              heartbeat_at TEXT NOT NULL,
+              run_id TEXT,
+              loop_status TEXT NOT NULL,
+              last_step TEXT,
+              last_step_at TEXT,
+              last_step_status TEXT,
+              latest_execution_at TEXT,
+              latest_execution_status TEXT,
+              error TEXT,
+              PRIMARY KEY (strategy, worker)
+            );
+          \`);
+
+          const initial = getLiveTradeDecisionRefreshCursor();
+
+          db.prepare(
+            \`
+              INSERT INTO live_trade_decisions (
+                created_at,
+                run_id,
+                step,
+                status,
+                event_ticker,
+                market_ticker,
+                payload_json
+              )
+              VALUES (?, ?, ?, ?, ?, ?, ?)
+            \`
+          ).run(
+            '2026-04-24T00:00:00Z',
+            'run-001',
+            'ranked',
+            'completed',
+            'BTC-APR',
+            'BTC-ABOVE-94K',
+            '{"market":{"yesPrice":0.52}}'
+          );
+          const afterDecision = getLiveTradeDecisionRefreshCursor();
+
+          db.prepare(
+            \`
+              INSERT INTO live_trade_runtime_state (
+                strategy,
+                worker,
+                heartbeat_at,
+                run_id,
+                loop_status,
+                last_step,
+                last_step_at,
+                last_step_status,
+                latest_execution_at,
+                latest_execution_status,
+                error
+              )
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            \`
+          ).run(
+            'live_trade',
+            'decision_loop',
+            '2026-04-24T00:00:05Z',
+            'run-001',
+            'running',
+            'ranked',
+            '2026-04-24T00:00:05Z',
+            'completed',
+            '2026-04-24T00:00:05Z',
+            'completed',
+            null
+          );
+          const afterRuntime = getLiveTradeDecisionRefreshCursor();
+
+          upsertLiveTradeDecisionFeedback({
+            decisionId: '1',
+            runId: 'run-001',
+            eventTicker: 'BTC-APR',
+            marketId: 'BTC-ABOVE-94K',
+            feedback: 'up',
+            notes: 'Looks good',
+            source: 'dashboard'
+          });
+          const afterFeedback = getLiveTradeDecisionRefreshCursor();
+
+          console.log(
+            JSON.stringify({
+              initial,
+              afterDecision,
+              afterRuntime,
+              afterFeedback
+            })
+          );
+        } finally {
+          db.close();
+        }
+      `
+    );
+
+    const result = JSON.parse(
+      execFileSync(process.execPath, ["--import", "tsx/esm", scriptPath], {
+        cwd: serverRoot,
+        env: {
+          ...process.env,
+          DB_PATH: databasePath
+        },
+        encoding: "utf8"
+      }).trim()
+    );
+
+    expect(result.initial.signature).not.toBe(result.afterDecision.signature);
+    expect(result.afterDecision.signature).not.toBe(result.afterRuntime.signature);
+    expect(result.afterRuntime.signature).not.toBe(result.afterFeedback.signature);
+    expect(result.afterDecision.decisionFingerprint).not.toBe(result.initial.decisionFingerprint);
+    expect(result.afterRuntime.runtimeFingerprint).not.toBe(result.afterDecision.runtimeFingerprint);
+    expect(result.afterFeedback.feedbackFingerprint).not.toBe(result.afterRuntime.feedbackFingerprint);
+  });
+
   it("normalizes sparse decision rows with payload JSON fallbacks", () => {
     const tempDir = mkdtempSync(path.join(tmpdir(), "dashboard-repository-"));
     const databasePath = path.join(tempDir, "dashboard.sqlite");

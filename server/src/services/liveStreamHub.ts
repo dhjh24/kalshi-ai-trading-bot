@@ -1,5 +1,9 @@
 import { EventEmitter } from "node:events";
-import { listAnalysisRequests, listMarkets } from "../repositories/dashboardRepository.js";
+import {
+  getLiveTradeDecisionRefreshCursor,
+  listAnalysisRequests,
+  listMarkets
+} from "../repositories/dashboardRepository.js";
 import {
   getLiveTradeDecisionFeedPayload,
   getOverviewPayload,
@@ -10,14 +14,59 @@ import { resolveSportsContext } from "./external/sportsDataService.js";
 import { serverConfig } from "../config.js";
 
 type Topic = "markets" | "btc" | "scores" | "analysis" | "live-trade-decisions";
+const LIVE_TRADE_DECISION_CURSOR_POLL_MS = Math.max(
+  250,
+  Math.min(serverConfig.dataRefreshMs, 1000)
+);
+
+function isClosedDatabaseError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const message = error instanceof Error ? error.message : String(error);
+  const code = "code" in error ? String((error as { code?: unknown }).code ?? "") : "";
+  return code === "ERR_INVALID_STATE" || message.toLowerCase().includes("database is not open");
+}
 
 class LiveStreamHub {
   private readonly emitter = new EventEmitter();
   private readonly snapshots = new Map<string, unknown>();
+  private liveTradeDecisionCursor: string | null = null;
   private started = false;
 
-  refreshLiveTradeDecisions(limit = LIVE_TRADE_DECISION_FEED_LIMIT): void {
-    this.publish("live-trade-decisions", getLiveTradeDecisionFeedPayload(limit));
+  private refreshLiveTradeDecisionsOnCursorChange(limit = LIVE_TRADE_DECISION_FEED_LIMIT): void {
+    let cursor;
+    try {
+      cursor = getLiveTradeDecisionRefreshCursor();
+    } catch (error) {
+      if (isClosedDatabaseError(error)) {
+        return;
+      }
+      throw error;
+    }
+    if (cursor.signature === this.liveTradeDecisionCursor) {
+      return;
+    }
+
+    this.refreshLiveTradeDecisions(limit, cursor.signature);
+  }
+
+  refreshLiveTradeDecisions(
+    limit = LIVE_TRADE_DECISION_FEED_LIMIT,
+    cursorSignature?: string
+  ): void {
+    try {
+      const resolvedCursorSignature =
+        cursorSignature ?? getLiveTradeDecisionRefreshCursor().signature;
+      this.liveTradeDecisionCursor = resolvedCursorSignature;
+      this.publish("live-trade-decisions", getLiveTradeDecisionFeedPayload(limit));
+    } catch (error) {
+      if (isClosedDatabaseError(error)) {
+        return;
+      }
+      throw error;
+    }
   }
 
   subscribe(topic: Topic, listener: (payload: unknown) => void) {
@@ -73,19 +122,27 @@ class LiveStreamHub {
     refreshAnalysis();
     this.refreshLiveTradeDecisions();
 
-    setInterval(() => {
+    const startInterval = (callback: () => void, intervalMs: number) => {
+      const handle = setInterval(callback, intervalMs);
+      handle.unref?.();
+    };
+
+    startInterval(() => {
       void refreshMarkets();
     }, serverConfig.dataRefreshMs);
-    setInterval(() => {
+    startInterval(() => {
       void refreshBtc();
     }, serverConfig.cryptoRefreshMs);
-    setInterval(() => {
+    startInterval(() => {
       void refreshScores();
     }, serverConfig.sportsRefreshMs);
-    setInterval(() => {
+    startInterval(() => {
       refreshAnalysis();
     }, serverConfig.dataRefreshMs);
-    setInterval(() => {
+    startInterval(() => {
+      this.refreshLiveTradeDecisionsOnCursorChange();
+    }, LIVE_TRADE_DECISION_CURSOR_POLL_MS);
+    startInterval(() => {
       this.refreshLiveTradeDecisions();
     }, serverConfig.dataRefreshMs);
   }

@@ -49,7 +49,7 @@ cp env.template .env   # then open .env and fill in:
                        # - or set OPENAI_API_KEY / OPENROUTER_API_KEY
 
 # 3. Run the AI ensemble (default — 5-model debate on every trade)
-python cli.py run --paper
+python cli.py run --paper        # includes the embedded live-trade loop during the main job cycle
 
 # Or run the safe compounder (conservative, math-only, NO-side edge-based)
 python cli.py run --safe-compounder
@@ -244,15 +244,18 @@ python -m src.utils.database
 
 ```bash
 # AI Ensemble — paper trading (no real orders — safe to test)
-python cli.py run --paper
+python cli.py run --paper        # includes the embedded live-trade loop during the main job cycle
 
 # AI Ensemble — live trading (real money)
-python cli.py run --live
+python cli.py run --shadow       # includes the embedded live-trade loop plus shadow-side telemetry
+python cli.py run --live         # main AI ensemble live path plus the embedded live-trade loop
 
-# Paper-only live-trade decision loop
+# Dedicated live-trade loop only
 python cli.py run --live-trade
+python cli.py run --live-trade --shadow
+python cli.py run --live-trade --live   # generic live intents only; live quick flips require ENABLE_LIVE_QUICK_FLIP
 
-# Run one bounded cycle and exit
+# Run one bounded AI Ensemble cycle and exit
 python cli.py run --once
 
 # Startup + ingestion smoke test (no LLM calls)
@@ -280,6 +283,11 @@ python cli.py scores
 python cli.py history --limit 100
 ```
 
+Command matrix:
+
+- `python cli.py run --paper`, `python cli.py run --shadow`, and `python cli.py run --live` all execute the embedded `run_live_trade_loop_cycle()` during the main job.
+- `python cli.py run --live-trade` is the dedicated loop-only runtime, and it now supports `paper`, `shadow`, or `live` execution semantics.
+
 Direct bot entrypoints still work:
 
 ```bash
@@ -294,9 +302,10 @@ Fastify API, and FastAPI analysis bridge.
 
 When running `python cli.py run --live-trade`, open `http://127.0.0.1:3000/live-trade` in the dashboard stack.
 
-- The runtime banner is the first safety check: confirm `paper`, `shadow`, or `live` mode plus the Kalshi exchange target before acting on any row.
+- The runtime banner is one safety check: confirm `paper`, `shadow`, or `live` mode, the Kalshi exchange target, and the telemetry source label before acting on any row. If the page falls back to `dashboard env`, verify the actual Python launch flags too.
 - The decision monitoring strip/rollup summarizes worker heartbeat, latest execution status, recent errors, and which visible events already have persisted decision rows.
-- The page auto-refreshes every 20 seconds by default, and operators can pause auto-refresh or force an immediate refresh from the controls bar.
+- The decision feed uses SSE/EventSource as its primary transport and now falls back to explicit reconnect / HTTP sync behavior if the browser stream goes stale or drops.
+- The broader page snapshot still auto-refreshes every 20 seconds by default, and operators can pause auto-refresh or force an immediate refresh from the controls bar.
 - Heartbeat freshness prefers `live_trade_runtime_state` telemetry when available and falls back to recent persisted decision rows if that table has not been created yet.
 
 ---
@@ -428,9 +437,11 @@ Provider request behavior:
 Five frontier LLMs debate every trade. Positions only open when models agree.
 
 ```bash
-python cli.py run --paper        # Paper trading (safe, no real money)
-python cli.py run --live         # Live trading
-python cli.py run --live-trade   # Paper-only live-trade loop
+python cli.py run --paper        # Paper trading (safe, no real money; embeds the live-trade loop)
+python cli.py run --shadow       # Shadow mode with live-vs-paper telemetry
+python cli.py run --live         # Live trading (main AI ensemble path + embedded live-trade loop)
+python cli.py run --live-trade   # Dedicated live-trade loop (paper by default)
+python cli.py run --live-trade --live   # Dedicated live-trade loop with live execution
 ```
 
 Guardrails active:

@@ -29,8 +29,12 @@ type AttentionItem = {
   latestAnalysisAt: string | null;
   decisionCount: number;
   liveTagged: boolean;
+  shadowTagged: boolean;
   paperTagged: boolean;
+  heartbeatMismatch: boolean;
 };
+
+type RuntimeMode = "paper" | "shadow" | "live";
 
 function getTimestampValue(value: string | null | undefined): number {
   if (!value) {
@@ -104,11 +108,42 @@ function getHoursUrgencyBonus(hoursToExpiry: number | null): number {
   return 0;
 }
 
+function normalizeRuntimeMode(value: string | null | undefined): RuntimeMode | null {
+  const normalized = value?.trim().toLowerCase();
+  if (
+    normalized === "paper" ||
+    normalized === "shadow" ||
+    normalized === "live"
+  ) {
+    return normalized;
+  }
+
+  return null;
+}
+
+function getRecordRuntimeMode(record: LiveTradeDecisionRecord): RuntimeMode | null {
+  const explicitMode = normalizeRuntimeMode(record.runtimeMode);
+  if (explicitMode) {
+    return explicitMode;
+  }
+
+  if (record.liveTrade === true) {
+    return "live";
+  }
+
+  if (record.paperTrade === true) {
+    return "paper";
+  }
+
+  return null;
+}
+
 function buildAttentionItems(
   events: LiveTradeEventSnapshot[],
   decisionFeed: LiveTradeDecisionFeedPayload,
 ): AttentionItem[] {
   const decisionsByEvent = new Map<string, LiveTradeDecisionRecord[]>();
+  const heartbeatMode = normalizeRuntimeMode(decisionFeed.heartbeat.runtimeMode);
 
   for (const record of decisionFeed.decisions) {
     if (!record.eventTicker) {
@@ -129,8 +164,18 @@ function buildAttentionItems(
       const latestDecision = records[0] ?? null;
       const latestError = records.find(isErrorDecision) ?? null;
       const actionableCount = records.filter(isActionableDecision).length;
-      const liveTagged = records.some((record) => record.liveTrade === true);
-      const paperTagged = records.some((record) => record.paperTrade === true);
+      const observedModes = new Set(
+        records
+          .map((record) => getRecordRuntimeMode(record))
+          .filter((mode): mode is RuntimeMode => mode !== null),
+      );
+      const liveTagged = observedModes.has("live");
+      const shadowTagged = observedModes.has("shadow");
+      const paperTagged = observedModes.has("paper");
+      const heartbeatMismatch =
+        heartbeatMode !== null &&
+        observedModes.size > 0 &&
+        Array.from(observedModes).some((mode) => mode !== heartbeatMode);
       const latestAnalysisAt = event.latestAnalysis?.completedAt ?? null;
       const analysisAgeMinutes =
         latestAnalysisAt === null
@@ -170,12 +215,14 @@ function buildAttentionItems(
         summary =
           "This live candidate has no linked decision rows in the current feed.";
         score = 105;
-      } else if (liveTagged && paperTagged) {
+      } else if (observedModes.size > 1 || heartbeatMismatch) {
         reason = "mixed_routing";
-        reasonLabel = "Mixed routing";
+        reasonLabel = heartbeatMismatch ? "Heartbeat mismatch" : "Mixed routing";
         reasonTone = "warning";
         summary =
-          "Both live-tagged and paper-tagged decision rows are visible for this event.";
+          heartbeatMismatch && heartbeatMode
+            ? `Recent decision rows expose ${Array.from(observedModes).join(", ")} runtime tags while the worker heartbeat reports ${heartbeatMode}.`
+            : `Recent decision rows mix ${Array.from(observedModes).join(", ")} runtime tags for this event.`;
         score = 90;
       } else if (analysisIsStale) {
         reason = "analysis_stale";
@@ -217,7 +264,9 @@ function buildAttentionItems(
         latestAnalysisAt,
         decisionCount: records.length,
         liveTagged,
+        shadowTagged,
         paperTagged,
+        heartbeatMismatch,
       } satisfies AttentionItem;
     });
 
@@ -292,7 +341,11 @@ export function LiveTradeAttentionBoard({
                   <div className="flex flex-wrap items-center gap-2">
                     <Badge tone={item.reasonTone}>{item.reasonLabel}</Badge>
                     {item.liveTagged ? <Badge tone="warning">Live tag</Badge> : null}
+                    {item.shadowTagged ? <Badge tone="warning">Shadow tag</Badge> : null}
                     {item.paperTagged ? <Badge tone="positive">Paper tag</Badge> : null}
+                    {item.heartbeatMismatch ? (
+                      <Badge tone="negative">Heartbeat mismatch</Badge>
+                    ) : null}
                   </div>
                   <Link
                     href={`/events/${item.eventTicker}`}

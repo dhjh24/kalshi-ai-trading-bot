@@ -393,6 +393,15 @@ class TradingConfig:
     quick_flip_capital_per_trade: float = field(
         default_factory=lambda: float(os.getenv("QUICK_FLIP_CAPITAL_PER_TRADE", "50.0"))
     )
+    quick_flip_daily_loss_budget_pct: float = field(
+        default_factory=lambda: float(os.getenv("QUICK_FLIP_DAILY_LOSS_BUDGET_PCT", "0.05"))
+    )
+    quick_flip_max_open_positions: int = field(
+        default_factory=lambda: int(os.getenv("QUICK_FLIP_MAX_OPEN_POSITIONS", "10"))
+    )
+    quick_flip_max_trades_per_hour: int = field(
+        default_factory=lambda: int(os.getenv("QUICK_FLIP_MAX_TRADES_PER_HOUR", "60"))
+    )
     quick_flip_confidence_threshold: float = field(
         default_factory=lambda: float(os.getenv("QUICK_FLIP_CONFIDENCE_THRESHOLD", "0.6"))
     )
@@ -440,6 +449,15 @@ class TradingConfig:
     )
     quick_flip_stop_loss_pct: float = field(
         default_factory=lambda: float(os.getenv("QUICK_FLIP_STOP_LOSS_PCT", "0.08"))
+    )
+    live_trade_daily_loss_budget_pct: float = field(
+        default_factory=lambda: float(os.getenv("LIVE_TRADE_DAILY_LOSS_BUDGET_PCT", "0.05"))
+    )
+    live_trade_max_open_positions: int = field(
+        default_factory=lambda: int(os.getenv("LIVE_TRADE_MAX_OPEN_POSITIONS", "5"))
+    )
+    live_trade_max_trades_per_hour: int = field(
+        default_factory=lambda: int(os.getenv("LIVE_TRADE_MAX_TRADES_PER_HOUR", "20"))
     )
 
     # Cost control and market analysis frequency - MORE PERMISSIVE

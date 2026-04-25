@@ -125,19 +125,25 @@ async def run_trading_job(*, shadow_mode: Optional[bool] = None) -> Optional[Tra
             db_manager, kalshi_client, xai_client, config
         )
         live_trade_summary = None
-        if not bool(getattr(settings.trading, "live_trading_enabled", False)):
-            try:
-                live_trade_summary = await run_live_trade_loop_cycle(
-                    db_manager=db_manager,
-                    kalshi_client=kalshi_client,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Live-trade decision loop failed open for this cycle",
-                    error=str(exc),
-                )
+        try:
+            live_trade_summary = await run_live_trade_loop_cycle(
+                db_manager=db_manager,
+                kalshi_client=kalshi_client,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Live-trade decision loop failed open for this cycle",
+                error=str(exc),
+            )
 
         # Log comprehensive results
+        live_trade_runtime_label = (
+            "live"
+            if bool(getattr(settings.trading, "live_trading_enabled", False))
+            else "shadow"
+            if shadow_mode
+            else "paper"
+        )
         if results.total_positions > 0:
             logger.info(
                 f"âœ… TRADING JOB COMPLETE - BEAST MODE RESULTS:\n"
@@ -156,7 +162,7 @@ async def run_trading_job(*, shadow_mode: Optional[bool] = None) -> Optional[Tra
                 f"  â€¢ Directional: {results.directional_positions} positions, ${results.directional_expected_return:.2f} return\n"
                 f"  â€¢ Quick Flip: {results.quick_flip_positions} positions, ${results.quick_flip_expected_profit:.2f} expected profit\n"
                 f"  â€¢ Live Trade Loop: "
-                f"{0 if live_trade_summary is None else live_trade_summary.executed_positions} paper positions, "
+                f"{0 if live_trade_summary is None else live_trade_summary.executed_positions} {live_trade_runtime_label} positions, "
                 f"{0 if live_trade_summary is None else live_trade_summary.specialist_candidates} specialist candidates\n"
                 f"\n"
                 f"âš¡ SYSTEM STATUS: MAXIMUM CAPITAL EFFICIENCY ACHIEVED!"

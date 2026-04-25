@@ -131,9 +131,17 @@ def test_cmd_run_dispatches_live_trade_loop(
 
     dispatched = {}
 
-    def fake_run_live_trade_loop_command(*, once: bool, max_runtime_seconds: int | None):
+    def fake_run_live_trade_loop_command(
+        *,
+        once: bool,
+        max_runtime_seconds: int | None,
+        live_mode: bool = False,
+        shadow_mode: bool = False,
+    ):
         dispatched["once"] = once
         dispatched["max_runtime_seconds"] = max_runtime_seconds
+        dispatched["live_mode"] = live_mode
+        dispatched["shadow_mode"] = shadow_mode
 
     monkeypatch.setattr(
         cli,
@@ -157,34 +165,147 @@ def test_cmd_run_dispatches_live_trade_loop(
         )
     )
 
-    assert dispatched == {"once": True, "max_runtime_seconds": 45}
+    assert dispatched == {
+        "once": True,
+        "max_runtime_seconds": 45,
+        "live_mode": False,
+        "shadow_mode": False,
+    }
 
 
-def test_cmd_run_rejects_live_trade_with_live_mode(
+def test_cmd_run_dispatches_live_trade_loop_in_live_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     logging_module = ModuleType("src.utils.logging_setup")
     logging_module.setup_logging = MagicMock()
     monkeypatch.setitem(sys.modules, "src.utils.logging_setup", logging_module)
 
-    with pytest.raises(SystemExit) as excinfo:
-        cli.cmd_run(
-            SimpleNamespace(
-                log_level="INFO",
-                live=True,
-                paper=False,
-                shadow=False,
-                beast=False,
-                disciplined=True,
-                safe_compounder=False,
-                live_trade=True,
-                once=False,
-                smoke=False,
-                max_runtime_seconds=None,
-            )
-        )
+    dispatched = {}
 
-    assert excinfo.value.code == 1
+    def fake_run_live_trade_loop_command(
+        *,
+        once: bool,
+        max_runtime_seconds: int | None,
+        live_mode: bool = False,
+        shadow_mode: bool = False,
+    ):
+        dispatched["once"] = once
+        dispatched["max_runtime_seconds"] = max_runtime_seconds
+        dispatched["live_mode"] = live_mode
+        dispatched["shadow_mode"] = shadow_mode
+
+    monkeypatch.setattr(
+        cli,
+        "_run_live_trade_loop_command",
+        fake_run_live_trade_loop_command,
+    )
+
+    cli.cmd_run(
+        SimpleNamespace(
+            log_level="INFO",
+            live=True,
+            paper=False,
+            shadow=False,
+            beast=False,
+            disciplined=True,
+            safe_compounder=False,
+            live_trade=True,
+            once=False,
+            smoke=False,
+            max_runtime_seconds=None,
+        )
+    )
+
+    assert dispatched == {
+        "once": False,
+        "max_runtime_seconds": None,
+        "live_mode": True,
+        "shadow_mode": False,
+    }
+
+
+def test_cmd_run_live_mode_keeps_embedded_live_trade_loop_inside_main_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logging_module = ModuleType("src.utils.logging_setup")
+    logging_module.setup_logging = MagicMock()
+    monkeypatch.setitem(sys.modules, "src.utils.logging_setup", logging_module)
+
+    beast_module = ModuleType("beast_mode_bot")
+
+    class FakeBeastModeBot:
+        def __init__(self, live_mode: bool = False, shadow_mode: bool = False):
+            self.live_mode = live_mode
+            self.shadow_mode = shadow_mode
+
+    beast_module.BeastModeBot = FakeBeastModeBot
+    monkeypatch.setitem(sys.modules, "beast_mode_bot", beast_module)
+
+    category_scorer_module = ModuleType("src.strategies.category_scorer")
+    category_scorer_module.CategoryScorer = object
+    monkeypatch.setitem(sys.modules, "src.strategies.category_scorer", category_scorer_module)
+
+    portfolio_enforcer_module = ModuleType("src.strategies.portfolio_enforcer")
+    portfolio_enforcer_module.PortfolioEnforcer = object
+    monkeypatch.setitem(sys.modules, "src.strategies.portfolio_enforcer", portfolio_enforcer_module)
+
+    config_module = ModuleType("src.config")
+    config_module.settings = SimpleNamespace(
+        settings=SimpleNamespace(
+            trading=SimpleNamespace(
+                min_confidence_to_trade=0.0,
+                max_position_size_pct=0.0,
+                kelly_fraction=0.0,
+            ),
+            max_drawdown=0.0,
+            max_sector_exposure=0.0,
+        )
+    )
+    monkeypatch.setitem(sys.modules, "src.config", config_module)
+
+    dispatched = {"standalone_loop": False}
+    constructed = {}
+
+    def fake_run_live_trade_loop_command(**kwargs):
+        dispatched["standalone_loop"] = True
+
+    async def fake_run_bot_entrypoint(bot, **kwargs):
+        constructed["bot"] = bot
+        constructed["kwargs"] = kwargs
+        return None
+
+    def fake_construct_runtime(cls, **kwargs):
+        constructed["class"] = cls
+        constructed["construct_kwargs"] = kwargs
+        return cls(**kwargs)
+
+    real_asyncio_run = asyncio.run
+
+    monkeypatch.setattr(cli, "_run_live_trade_loop_command", fake_run_live_trade_loop_command)
+    monkeypatch.setattr(cli, "_construct_runtime", fake_construct_runtime)
+    monkeypatch.setattr(cli, "_run_bot_entrypoint", fake_run_bot_entrypoint)
+    monkeypatch.setattr(cli.asyncio, "run", real_asyncio_run)
+
+    cli.cmd_run(
+        SimpleNamespace(
+            log_level="INFO",
+            live=True,
+            paper=False,
+            shadow=False,
+            beast=False,
+            disciplined=True,
+            safe_compounder=False,
+            live_trade=False,
+            once=False,
+            smoke=False,
+            max_runtime_seconds=None,
+        )
+    )
+
+    assert dispatched["standalone_loop"] is False
+    assert constructed["class"] is FakeBeastModeBot
+    assert constructed["construct_kwargs"]["live_mode"] is True
+    assert constructed["construct_kwargs"]["shadow_mode"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +572,52 @@ async def test_live_trade_hourly_rate_cap_default_20(ephemeral_db):
     )
     assert not allowed
     assert "trade-rate cap" in reason.lower()
+
+
+def test_portfolio_enforcer_uses_trading_config_strategy_limits():
+    from src.config.settings import settings
+    from src.strategies.portfolio_enforcer import (
+        PortfolioEnforcer,
+        STRATEGY_LIVE_TRADE,
+        STRATEGY_QUICK_FLIP,
+    )
+
+    original_values = (
+        settings.trading.quick_flip_daily_loss_budget_pct,
+        settings.trading.quick_flip_max_open_positions,
+        settings.trading.quick_flip_max_trades_per_hour,
+        settings.trading.live_trade_daily_loss_budget_pct,
+        settings.trading.live_trade_max_open_positions,
+        settings.trading.live_trade_max_trades_per_hour,
+    )
+    try:
+        settings.trading.quick_flip_daily_loss_budget_pct = 0.07
+        settings.trading.quick_flip_max_open_positions = 12
+        settings.trading.quick_flip_max_trades_per_hour = 77
+        settings.trading.live_trade_daily_loss_budget_pct = 0.09
+        settings.trading.live_trade_max_open_positions = 6
+        settings.trading.live_trade_max_trades_per_hour = 23
+
+        enforcer = PortfolioEnforcer(db_path=":memory:", portfolio_value=10_000.0)
+
+        quick_flip_limits = enforcer.limits_for(STRATEGY_QUICK_FLIP)
+        live_trade_limits = enforcer.limits_for(STRATEGY_LIVE_TRADE)
+
+        assert quick_flip_limits.daily_loss_budget_pct == pytest.approx(0.07)
+        assert quick_flip_limits.max_open_positions == 12
+        assert quick_flip_limits.max_trades_per_hour == 77
+        assert live_trade_limits.daily_loss_budget_pct == pytest.approx(0.09)
+        assert live_trade_limits.max_open_positions == 6
+        assert live_trade_limits.max_trades_per_hour == 23
+    finally:
+        (
+            settings.trading.quick_flip_daily_loss_budget_pct,
+            settings.trading.quick_flip_max_open_positions,
+            settings.trading.quick_flip_max_trades_per_hour,
+            settings.trading.live_trade_daily_loss_budget_pct,
+            settings.trading.live_trade_max_open_positions,
+            settings.trading.live_trade_max_trades_per_hour,
+        ) = original_values
 
 
 @pytest.mark.asyncio
