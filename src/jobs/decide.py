@@ -107,6 +107,7 @@ async def _passes_live_trade_guardrails(
     portfolio_value: float,
     db_manager: DatabaseManager,
     enforcement_mode: Optional[str] = None,
+    strategy: Optional[str] = None,
 ) -> tuple[bool, str | None]:
     """Apply the W7 live-trade portfolio enforcer before returning a position."""
     db_path = getattr(db_manager, "db_path", None)
@@ -141,17 +142,17 @@ async def _passes_live_trade_guardrails(
             title=market.title,
                 category=market.category,
                 current_positions=current_positions or None,
-                strategy=STRATEGY_LIVE_TRADE,
+                strategy=strategy or STRATEGY_LIVE_TRADE,
                 mode=resolved_mode,
             )
         return allowed, (reason or None)
     except Exception as exc:
         get_trading_logger("decision_engine").warning(
-            "Portfolio enforcer check failed open for %s",
+            "Portfolio enforcer check failed closed for %s",
             market.market_id,
             error=str(exc),
         )
-        return True, None
+        return False, f"Portfolio enforcer unavailable: {exc}"
 
 
 async def _run_ensemble_decision(

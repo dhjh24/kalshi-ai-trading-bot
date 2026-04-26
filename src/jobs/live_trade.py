@@ -1320,6 +1320,7 @@ class LiveTradeDecisionLoop:
         side: str,
         trade_value: float,
         portfolio_value: float,
+        strategy: str = "live_trade",
     ) -> tuple[bool, Optional[str]]:
         if self.guardrail_fn is not None:
             return await self.guardrail_fn(
@@ -1328,6 +1329,7 @@ class LiveTradeDecisionLoop:
                 trade_value=trade_value,
                 portfolio_value=portfolio_value,
                 db_manager=self.db_manager,
+                strategy=strategy,
             )
 
         from src.jobs.decide import _passes_live_trade_guardrails
@@ -1348,6 +1350,7 @@ class LiveTradeDecisionLoop:
             portfolio_value=portfolio_value,
             db_manager=self.db_manager,
             enforcement_mode=guardrail_mode,
+            strategy=strategy,
         )
 
     async def _execute_final_intent(
@@ -1381,6 +1384,17 @@ class LiveTradeDecisionLoop:
                 status="error",
                 summary="Final intent references a market that is no longer present.",
                 error="missing_market",
+            )
+            return False
+
+        execution_style = str(final_intent.get("execution_style") or "NONE").upper()
+        if execution_style == "NONE":
+            await self._record_execution_status(
+                run_id=run_id,
+                final_intent=final_intent,
+                status="skipped",
+                summary="Skipped because the final intent requested no execution.",
+                error="execution_style_none",
             )
             return False
 
@@ -1427,11 +1441,18 @@ class LiveTradeDecisionLoop:
             last_updated=datetime.now(timezone.utc),
             has_position=False,
         )
+        execution_style = str(final_intent.get("execution_style") or "NONE").upper()
+        is_short_quick_flip = (
+            execution_style == "QUICK_FLIP"
+            and _safe_int(final_intent.get("hold_minutes"), 0) <= 30
+        )
+        guardrail_strategy = "quick_flip" if is_short_quick_flip else "live_trade"
         allowed, reason = await self._passes_guardrails(
             market=market_record,
             side=str(final_intent.get("side") or "YES"),
             trade_value=quantity * limit_price,
             portfolio_value=portfolio_value,
+            strategy=guardrail_strategy,
         )
         if not allowed:
             await self._record_execution_status(
@@ -1444,11 +1465,10 @@ class LiveTradeDecisionLoop:
             )
             return False
 
-        execution_style = str(final_intent.get("execution_style") or "NONE").upper()
         live_mode = self._is_live_execution_mode()
         runtime_mode = self._resolve_runtime_mode()
         execution_mode_label = "live" if live_mode else runtime_mode
-        if execution_style == "QUICK_FLIP" and _safe_int(final_intent.get("hold_minutes"), 0) <= 30:
+        if is_short_quick_flip:
             if live_mode and not bool(getattr(settings.trading, "enable_live_quick_flip", False)):
                 await self._record_execution_status(
                     run_id=run_id,

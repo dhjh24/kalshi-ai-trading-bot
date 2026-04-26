@@ -399,6 +399,7 @@ class PortfolioEnforcer:
                     FROM positions
                     WHERE ({strategy_clause})
                       AND timestamp >= ?
+                      AND status = 'open'
                     """,
                     (*strategy_params, cutoff),
                 )

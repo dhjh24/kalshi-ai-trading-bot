@@ -387,12 +387,19 @@ export interface PortfolioQuotaWindowSummary {
   queryCount: number;
   tokensUsed: number;
   latestAt: string | null;
+  limit: number | null;
+  remaining: number | null;
+  resetAt: string | null;
 }
 
 export interface PortfolioCodexQuotaSummary {
   available: boolean;
   sourceTable: string | null;
   provider: "codex";
+  planTier: string | null;
+  quotaUnit: string;
+  windowLabel: string | null;
+  source: string | null;
   last24h: PortfolioQuotaWindowSummary;
   last7d: PortfolioQuotaWindowSummary;
   lifetime: PortfolioQuotaWindowSummary;

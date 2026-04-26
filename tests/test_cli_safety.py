@@ -173,6 +173,40 @@ def test_cmd_run_dispatches_live_trade_loop(
     }
 
 
+@pytest.mark.parametrize(
+    "flag",
+    ["smoke", "beast", "safe_compounder"],
+)
+def test_cmd_run_rejects_live_trade_with_incompatible_modes(
+    monkeypatch: pytest.MonkeyPatch,
+    flag: str,
+) -> None:
+    logging_module = ModuleType("src.utils.logging_setup")
+    logging_module.setup_logging = MagicMock()
+    monkeypatch.setitem(sys.modules, "src.utils.logging_setup", logging_module)
+    monkeypatch.setattr(cli, "_run_live_trade_loop_command", MagicMock())
+
+    args = {
+        "log_level": "INFO",
+        "live": False,
+        "paper": False,
+        "shadow": False,
+        "beast": False,
+        "disciplined": True,
+        "safe_compounder": False,
+        "live_trade": True,
+        "once": True,
+        "smoke": False,
+        "max_runtime_seconds": 45,
+    }
+    args[flag] = True
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.cmd_run(SimpleNamespace(**args))
+
+    assert exc_info.value.code == 1
+
+
 def test_cmd_run_dispatches_live_trade_loop_in_live_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -641,6 +675,46 @@ async def test_hourly_rate_cap_ignores_old_trades(ephemeral_db):
     assert count == 0
 
 
+@pytest.mark.asyncio
+async def test_hourly_rate_cap_does_not_double_count_closed_recent_positions(ephemeral_db):
+    from src.strategies.portfolio_enforcer import STRATEGY_LIVE_TRADE
+
+    enforcer = await _enforcer(ephemeral_db, portfolio_value=10_000.0)
+    recent_ts = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
+    await _insert_trade_log(
+        ephemeral_db,
+        strategy=STRATEGY_LIVE_TRADE,
+        pnl=0.01,
+        exit_timestamp=recent_ts,
+        entry_timestamp=recent_ts,
+    )
+
+    async with aiosqlite.connect(ephemeral_db) as db:
+        await db.execute(
+            """
+            INSERT INTO positions
+            (market_id, side, entry_price, quantity, timestamp, rationale,
+             confidence, entry_fee, contracts_cost, entry_order_id, live,
+             status, strategy)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, NULL, 0, 'closed', ?)
+            """,
+            (
+                "KXNCAAB-CLOSED-RECENT",
+                "yes",
+                0.50,
+                1.0,
+                recent_ts,
+                "closed position mirror",
+                0.7,
+                STRATEGY_LIVE_TRADE,
+            ),
+        )
+        await db.commit()
+
+    count = await enforcer.get_trades_in_last_hour(STRATEGY_LIVE_TRADE)
+    assert count == 1
+
+
 # --- Circuit breaker 3: open-position cap ---
 
 
@@ -898,7 +972,7 @@ def test_cmd_status_prefers_db_helper_summaries_when_available(
 async def test_ai_spend_provider_breakdown_makes_codex_quota_explicit(
     tmp_path: Path,
 ):
-    from src.utils.database import DatabaseManager, LLMQuery
+    from src.utils.database import CodexQuotaSnapshot, DatabaseManager, LLMQuery
 
     db_path = tmp_path / "codex_quota_summary.db"
     manager = DatabaseManager(db_path=str(db_path))
@@ -916,6 +990,17 @@ async def test_ai_spend_provider_breakdown_makes_codex_quota_explicit(
             provider="codex",
             tokens_used=321,
             cost_usd=0.0,
+        )
+    )
+    await manager.record_codex_quota_snapshot(
+        CodexQuotaSnapshot(
+            recorded_at=now,
+            plan_tier="plus",
+            used=13,
+            limit_value=50,
+            remaining=37,
+            reset_at="2026-04-27T00:00:00Z",
+            source="codex-cli",
         )
     )
     await manager.log_llm_query(
@@ -980,7 +1065,7 @@ async def test_ai_spend_provider_breakdown_makes_codex_quota_explicit(
 
     summary = (await manager.get_ai_spend_provider_breakdown())["summary"]
 
-    assert "codex $0.00 (1 req, 321 tok)" in summary
+    assert "codex $0.00 (13 req, 321 tok, limit 50, remaining 37, resets 2026-04-27T00:00:00Z)" in summary
     assert "openai $0.12" in summary
 
 

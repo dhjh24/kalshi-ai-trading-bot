@@ -571,7 +571,10 @@ function emptyQuotaWindowSummary() {
   return {
     queryCount: 0,
     tokensUsed: 0,
-    latestAt: null
+    latestAt: null,
+    limit: null,
+    remaining: null,
+    resetAt: null
   };
 }
 
@@ -580,6 +583,10 @@ function emptyCodexQuotaSummary(sourceTable: string | null = null): PortfolioCod
     available: false,
     sourceTable,
     provider: "codex",
+    planTier: null,
+    quotaUnit: "request",
+    windowLabel: null,
+    source: null,
     last24h: emptyQuotaWindowSummary(),
     last7d: emptyQuotaWindowSummary(),
     lifetime: emptyQuotaWindowSummary()
@@ -1475,6 +1482,185 @@ export function getPortfolioFeeDriftMetrics(trailingHours = 168): PortfolioFeeDr
 }
 
 export function getPortfolioCodexQuotaSummary(): PortfolioCodexQuotaSummary {
+  const fallbackFromLlmQueries = (): PortfolioCodexQuotaSummary => {
+    if (!tableExists("llm_queries")) {
+      return emptyCodexQuotaSummary();
+    }
+
+    if (
+      !columnExists("llm_queries", "provider") ||
+      !columnExists("llm_queries", "timestamp")
+    ) {
+      return emptyCodexQuotaSummary("llm_queries");
+    }
+
+    const tokensField = columnExists("llm_queries", "tokens_used") ? "tokens_used" : null;
+    const tokensValue = (timePredicate = "1 = 1") =>
+      tokensField
+        ? `COALESCE(SUM(CASE WHEN ${timePredicate} THEN COALESCE(${tokensField}, 0) ELSE 0 END), 0)`
+        : "0";
+    const providerExpression = "LOWER(TRIM(CAST(provider AS TEXT)))";
+    const row = db
+      .prepare(
+        `
+          SELECT
+            COUNT(*) AS lifetime_count,
+            ${tokensValue()} AS lifetime_tokens,
+            MAX(timestamp) AS lifetime_latest_at,
+            COALESCE(
+              SUM(CASE WHEN julianday(timestamp) >= julianday('now', '-1 day') THEN 1 ELSE 0 END),
+              0
+            ) AS count_24h,
+            ${tokensValue("julianday(timestamp) >= julianday('now', '-1 day')")} AS tokens_24h,
+            MAX(
+              CASE
+                WHEN julianday(timestamp) >= julianday('now', '-1 day')
+                THEN timestamp
+                ELSE NULL
+              END
+            ) AS latest_24h_at,
+            COALESCE(
+              SUM(CASE WHEN julianday(timestamp) >= julianday('now', '-7 day') THEN 1 ELSE 0 END),
+              0
+            ) AS count_7d,
+            ${tokensValue("julianday(timestamp) >= julianday('now', '-7 day')")} AS tokens_7d,
+            MAX(
+              CASE
+                WHEN julianday(timestamp) >= julianday('now', '-7 day')
+                THEN timestamp
+                ELSE NULL
+              END
+            ) AS latest_7d_at
+          FROM llm_queries
+          WHERE ${providerExpression} = 'codex'
+        `
+      )
+      .get() as
+      | {
+          lifetime_count?: number;
+          lifetime_tokens?: number;
+          lifetime_latest_at?: string | null;
+          count_24h?: number;
+          tokens_24h?: number;
+          latest_24h_at?: string | null;
+          count_7d?: number;
+          tokens_7d?: number;
+          latest_7d_at?: string | null;
+        }
+      | undefined;
+
+    return {
+      available: true,
+      sourceTable: "llm_queries",
+      provider: "codex",
+      planTier: null,
+      quotaUnit: "request",
+      windowLabel: null,
+      source: "llm_queries",
+      last24h: {
+        queryCount: toCount(row?.count_24h),
+        tokensUsed: toCount(row?.tokens_24h),
+        latestAt: row?.latest_24h_at ?? null,
+        limit: null,
+        remaining: null,
+        resetAt: null
+      },
+      last7d: {
+        queryCount: toCount(row?.count_7d),
+        tokensUsed: toCount(row?.tokens_7d),
+        latestAt: row?.latest_7d_at ?? null,
+        limit: null,
+        remaining: null,
+        resetAt: null
+      },
+      lifetime: {
+        queryCount: toCount(row?.lifetime_count),
+        tokensUsed: toCount(row?.lifetime_tokens),
+        latestAt: row?.lifetime_latest_at ?? null,
+        limit: null,
+        remaining: null,
+        resetAt: null
+      }
+    };
+  };
+
+  if (
+    tableExists("codex_quota_tracking") &&
+    columnExists("codex_quota_tracking", "recorded_at") &&
+    columnExists("codex_quota_tracking", "used")
+  ) {
+    const quotaRow = db
+      .prepare(
+        `
+          SELECT
+            recorded_at,
+            provider,
+            plan_tier,
+            quota_unit,
+            window_label,
+            used,
+            limit_value,
+            remaining,
+            reset_at,
+            source
+          FROM codex_quota_tracking
+          WHERE LOWER(TRIM(COALESCE(provider, 'codex'))) = 'codex'
+          ORDER BY julianday(recorded_at) DESC, id DESC
+          LIMIT 1
+        `
+      )
+      .get() as
+      | {
+          recorded_at?: string | null;
+          plan_tier?: string | null;
+          quota_unit?: string | null;
+          window_label?: string | null;
+          used?: number | null;
+          limit_value?: number | null;
+          remaining?: number | null;
+          reset_at?: string | null;
+          source?: string | null;
+        }
+      | undefined;
+
+    if (quotaRow) {
+      const fallback = fallbackFromLlmQueries();
+      const queryCount = toCount(quotaRow.used);
+      const limit = quotaRow.limit_value == null ? null : toCount(quotaRow.limit_value);
+      const remaining = quotaRow.remaining == null ? null : toCount(quotaRow.remaining);
+      return {
+        available: true,
+        sourceTable: "codex_quota_tracking",
+        provider: "codex",
+        planTier: quotaRow.plan_tier ?? null,
+        quotaUnit: quotaRow.quota_unit ?? "request",
+        windowLabel: quotaRow.window_label ?? "daily",
+        source: quotaRow.source ?? "codex_quota_tracking",
+        last24h: {
+          queryCount,
+          tokensUsed: fallback.last24h.tokensUsed,
+          latestAt: quotaRow.recorded_at ?? fallback.last24h.latestAt,
+          limit,
+          remaining,
+          resetAt: quotaRow.reset_at ?? null
+        },
+        last7d: fallback.last7d,
+        lifetime: {
+          ...fallback.lifetime,
+          queryCount: Math.max(fallback.lifetime.queryCount, queryCount),
+          latestAt: quotaRow.recorded_at ?? fallback.lifetime.latestAt,
+          limit,
+          remaining,
+          resetAt: quotaRow.reset_at ?? null
+        }
+      };
+    }
+  }
+
+  return fallbackFromLlmQueries();
+}
+
+export function getPortfolioCodexQuotaSummaryLegacy(): PortfolioCodexQuotaSummary {
   if (!tableExists("llm_queries")) {
     return emptyCodexQuotaSummary();
   }
@@ -1545,20 +1731,33 @@ export function getPortfolioCodexQuotaSummary(): PortfolioCodexQuotaSummary {
     available: true,
     sourceTable: "llm_queries",
     provider: "codex",
+    planTier: null,
+    quotaUnit: "request",
+    windowLabel: null,
+    source: "llm_queries",
     last24h: {
       queryCount: toCount(row?.count_24h),
       tokensUsed: toCount(row?.tokens_24h),
-      latestAt: row?.latest_24h_at ?? null
+      latestAt: row?.latest_24h_at ?? null,
+      limit: null,
+      remaining: null,
+      resetAt: null
     },
     last7d: {
       queryCount: toCount(row?.count_7d),
       tokensUsed: toCount(row?.tokens_7d),
-      latestAt: row?.latest_7d_at ?? null
+      latestAt: row?.latest_7d_at ?? null,
+      limit: null,
+      remaining: null,
+      resetAt: null
     },
     lifetime: {
       queryCount: toCount(row?.lifetime_count),
       tokensUsed: toCount(row?.lifetime_tokens),
-      latestAt: row?.lifetime_latest_at ?? null
+      latestAt: row?.lifetime_latest_at ?? null,
+      limit: null,
+      remaining: null,
+      resetAt: null
     }
   };
 }

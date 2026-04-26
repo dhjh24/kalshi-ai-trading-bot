@@ -58,6 +58,11 @@ def _validate_executable_price(*, ticker: str, side: str, price: float) -> float
     return price
 
 
+def _entry_price_exceeds_limit(*, executable_price: float, limit_price: float) -> bool:
+    """Return True when the executable price is above the caller-approved cap."""
+    return dollars_to_cents(executable_price) > dollars_to_cents(limit_price)
+
+
 def _floor_to_valid_tick(price: float, tick_size: float) -> float:
     """Round a sell limit down to the nearest valid tick inside Kalshi bounds."""
     effective_tick = tick_size if tick_size > 0 else 0.01
@@ -1236,6 +1241,17 @@ async def execute_position(
                 error=str(exc),
             )
 
+        if _entry_price_exceeds_limit(
+            executable_price=top_of_book_price,
+            limit_price=position.entry_price,
+        ):
+            logger.warning(
+                f"Skipping paper entry for {position.market_id}: executable ask "
+                f"${top_of_book_price:.4f} exceeds approved limit "
+                f"${position.entry_price:.4f}"
+            )
+            return False
+
         # Depth-aware FOK simulation: walk the visible book so paper fills match
         # what a real FOK limit would actually achieve. If the order can't be fully
         # filled within one tick of the submitted limit, reject the entry just like
@@ -1264,6 +1280,16 @@ async def execute_position(
                         f"visible book can only fill {depth_summary['filled_quantity']:.2f} of "
                         f"{position.quantity:.2f} contracts within one tick of "
                         f"${top_of_book_price:.4f}"
+                    )
+                    return False
+                if _entry_price_exceeds_limit(
+                    executable_price=float(depth_summary["average_price"]),
+                    limit_price=position.entry_price,
+                ):
+                    logger.warning(
+                        f"Skipping paper entry for {position.market_id}: depth-walk "
+                        f"average ${depth_summary['average_price']:.4f} exceeds "
+                        f"approved limit ${position.entry_price:.4f}"
                     )
                     return False
                 paper_entry_price = depth_summary["average_price"]
@@ -1368,6 +1394,16 @@ async def execute_position(
             ticker=position.market_id,
             side=position.side,
         )
+        if _entry_price_exceeds_limit(
+            executable_price=ask_dollars,
+            limit_price=position.entry_price,
+        ):
+            logger.warning(
+                f"Skipping live entry for {position.market_id}: executable ask "
+                f"${ask_dollars:.4f} exceeds approved limit "
+                f"${position.entry_price:.4f}"
+            )
+            return False
         _validate_entry_liquidity(
             ticker=position.market_id,
             side=position.side,

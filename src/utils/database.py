@@ -153,6 +153,23 @@ class LLMQuery:
 
 
 @dataclass
+class CodexQuotaSnapshot:
+    """Represents a persisted Codex plan quota snapshot."""
+    recorded_at: datetime
+    provider: str = "codex"
+    plan_tier: Optional[str] = None
+    quota_unit: str = "request"
+    window_label: str = "daily"
+    used: int = 0
+    limit_value: Optional[int] = None
+    remaining: Optional[int] = None
+    reset_at: Optional[str] = None
+    source: Optional[str] = None
+    payload_json: Optional[str] = None
+    id: Optional[int] = None
+
+
+@dataclass
 class LiveTradeDecision:
     """Represents one persisted live-trade loop step or execution outcome."""
     created_at: datetime
@@ -351,6 +368,23 @@ class DatabaseManager(TradingLoggerMixin):
                     cost_usd REAL,
                     confidence_extracted REAL,
                     decision_extracted TEXT
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS codex_quota_tracking (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recorded_at TEXT NOT NULL,
+                    provider TEXT NOT NULL DEFAULT 'codex',
+                    plan_tier TEXT,
+                    quota_unit TEXT NOT NULL DEFAULT 'request',
+                    window_label TEXT NOT NULL DEFAULT 'daily',
+                    used INTEGER NOT NULL DEFAULT 0,
+                    limit_value INTEGER,
+                    remaining INTEGER,
+                    reset_at TEXT,
+                    source TEXT,
+                    payload_json TEXT
                 )
             """)
 
@@ -1099,6 +1133,23 @@ class DatabaseManager(TradingLoggerMixin):
                 cost_usd REAL,
                 confidence_extracted REAL,
                 decision_extracted TEXT
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS codex_quota_tracking (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recorded_at TEXT NOT NULL,
+                provider TEXT NOT NULL DEFAULT 'codex',
+                plan_tier TEXT,
+                quota_unit TEXT NOT NULL DEFAULT 'request',
+                window_label TEXT NOT NULL DEFAULT 'daily',
+                used INTEGER NOT NULL DEFAULT 0,
+                limit_value INTEGER,
+                remaining INTEGER,
+                reset_at TEXT,
+                source TEXT,
+                payload_json TEXT
             )
         """)
 
@@ -2676,6 +2727,96 @@ class DatabaseManager(TradingLoggerMixin):
             }
         return usage
 
+    async def record_codex_quota_snapshot(
+        self,
+        snapshot: CodexQuotaSnapshot,
+    ) -> int:
+        """Persist a first-class Codex quota snapshot for status/dashboard use."""
+        snapshot_dict = asdict(snapshot)
+        snapshot_dict["recorded_at"] = snapshot.recorded_at.isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO codex_quota_tracking (
+                    recorded_at, provider, plan_tier, quota_unit, window_label,
+                    used, limit_value, remaining, reset_at, source, payload_json
+                ) VALUES (
+                    :recorded_at, :provider, :plan_tier, :quota_unit, :window_label,
+                    :used, :limit_value, :remaining, :reset_at, :source, :payload_json
+                )
+                """,
+                snapshot_dict,
+            )
+            await db.commit()
+            return int(cursor.lastrowid or 0)
+
+    async def get_codex_quota_summary(
+        self,
+        recent_days: int = LLM_USAGE_RECENT_WINDOW_DAYS,
+    ) -> Dict[str, Any]:
+        """Return the latest Codex quota snapshot with llm_queries fallback usage."""
+        usage = await self._get_recent_llm_query_provider_usage(recent_days=recent_days)
+        codex_usage = usage.get("codex", {})
+        fallback_used = int(codex_usage.get("request_count") or 0)
+        fallback_tokens = int(codex_usage.get("total_tokens") or 0)
+
+        summary: Dict[str, Any] = {
+            "available": fallback_used > 0 or fallback_tokens > 0,
+            "source_table": "llm_queries" if fallback_used > 0 or fallback_tokens > 0 else None,
+            "provider": "codex",
+            "plan_tier": None,
+            "quota_unit": "request",
+            "window_label": f"{max(int(recent_days or LLM_USAGE_RECENT_WINDOW_DAYS), 1)}d",
+            "used": fallback_used,
+            "tokens_used": fallback_tokens,
+            "limit_value": None,
+            "remaining": None,
+            "reset_at": None,
+            "recorded_at": None,
+            "source": "llm_queries" if fallback_used > 0 or fallback_tokens > 0 else None,
+        }
+
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='codex_quota_tracking'"
+                )
+                if not await cursor.fetchone():
+                    return summary
+
+                cursor = await db.execute(
+                    """
+                    SELECT *
+                    FROM codex_quota_tracking
+                    WHERE LOWER(TRIM(COALESCE(provider, 'codex'))) = 'codex'
+                    ORDER BY datetime(recorded_at) DESC, id DESC
+                    LIMIT 1
+                    """
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    return summary
+        except Exception as exc:
+            self.logger.debug("Could not load Codex quota snapshot", error=str(exc))
+            return summary
+
+        return {
+            "available": True,
+            "source_table": "codex_quota_tracking",
+            "provider": "codex",
+            "plan_tier": row["plan_tier"],
+            "quota_unit": row["quota_unit"] or "request",
+            "window_label": row["window_label"] or "daily",
+            "used": int(row["used"] or 0),
+            "tokens_used": fallback_tokens,
+            "limit_value": row["limit_value"],
+            "remaining": row["remaining"],
+            "reset_at": row["reset_at"],
+            "recorded_at": row["recorded_at"],
+            "source": row["source"],
+        }
+
     async def get_ai_spend_provider_breakdown(
         self,
         recent_days: int = LLM_USAGE_RECENT_WINDOW_DAYS,
@@ -2699,6 +2840,19 @@ class DatabaseManager(TradingLoggerMixin):
         llm_query_usage = await self._get_recent_llm_query_provider_usage(
             recent_days=window_days
         )
+        codex_quota = await self.get_codex_quota_summary(recent_days=window_days)
+        if codex_quota.get("available") and not any(
+            str(row.get("provider") or "").casefold() == "codex"
+            for row in provider_rows
+        ):
+            provider_rows.append(
+                {
+                    "provider": "codex",
+                    "request_count": int(codex_quota.get("used") or 0),
+                    "total_cost": 0.0,
+                    "total_tokens": int(codex_quota.get("tokens_used") or 0),
+                }
+            )
 
         provider_bits = []
         for row in provider_rows:
@@ -2713,12 +2867,21 @@ class DatabaseManager(TradingLoggerMixin):
             if provider.casefold() == "codex":
                 quota_usage = llm_query_usage.get(provider.casefold(), {})
                 quota_bits = []
-                quota_request_count = int(quota_usage.get("request_count") or 0)
+                quota_request_count = int(codex_quota.get("used") or quota_usage.get("request_count") or 0)
                 quota_total_tokens = int(quota_usage.get("total_tokens") or 0)
                 if quota_request_count > 0:
                     quota_bits.append(f"{quota_request_count} req")
                 if quota_total_tokens > 0:
                     quota_bits.append(f"{quota_total_tokens:,} tok")
+                limit_value = codex_quota.get("limit_value")
+                remaining = codex_quota.get("remaining")
+                reset_at = codex_quota.get("reset_at")
+                if limit_value is not None:
+                    quota_bits.append(f"limit {int(limit_value):,}")
+                if remaining is not None:
+                    quota_bits.append(f"remaining {int(remaining):,}")
+                if reset_at:
+                    quota_bits.append(f"resets {reset_at}")
                 if quota_bits:
                     provider_bit = f"{provider_bit} ({', '.join(quota_bits)})"
             provider_bits.append(provider_bit)

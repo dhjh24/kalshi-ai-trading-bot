@@ -10,7 +10,7 @@ import src.jobs.live_trade as live_trade_module
 import src.jobs.decide as decide_module
 from src.config.settings import settings
 from src.jobs.live_trade import LiveTradeDecisionLoop
-from src.utils.database import DatabaseManager
+from src.utils.database import DatabaseManager, Market
 
 
 class FakeModelRouter:
@@ -209,6 +209,7 @@ async def _run_live_trade_loop_once_for_mode(
         return True
 
     async def fake_guardrail(**_kwargs):
+        route_capture["guardrail_strategy"] = _kwargs.get("strategy")
         return True, None
 
     loop = LiveTradeDecisionLoop(
@@ -416,6 +417,8 @@ async def test_live_trade_loop_makes_equivalent_execution_decision_in_paper_and_
     assert paper_final_rows[0]["side"] == live_final_rows[0]["side"] == "YES"
     assert paper_final_rows[0]["action"] == live_final_rows[0]["action"] == "BUY"
     assert paper_final_rows[0]["market_ticker"] == live_final_rows[0]["market_ticker"]
+    for field in ("market_ticker", "side", "limit_price", "quantity", "hold_minutes"):
+        assert paper_execution_rows[0][field] == live_execution_rows[0][field]
     assert paper["runtime_state"]["runtime_mode"] == "paper"
     assert live["runtime_state"]["runtime_mode"] == "live"
     assert json.loads(paper_execution_rows[0]["payload_json"])["execution_mode"] == "paper"
@@ -452,6 +455,8 @@ async def test_live_trade_loop_keeps_final_intent_route_parity_for_quick_flip(mo
     assert live["summary"].executed_positions == 1
     assert paper["route_capture"]["route"] == "quick_flip_executor"
     assert live["route_capture"]["route"] == "quick_flip_executor"
+    assert paper["route_capture"]["guardrail_strategy"] == "quick_flip"
+    assert live["route_capture"]["guardrail_strategy"] == "quick_flip"
     assert paper["route_capture"]["selected_market"] == "KXSPORTS-ROUTE-PARITY-M1"
     assert live["route_capture"]["selected_market"] == "KXSPORTS-ROUTE-PARITY-M1"
     assert paper["runtime_state"]["runtime_mode"] == "paper"
@@ -461,6 +466,91 @@ async def test_live_trade_loop_keeps_final_intent_route_parity_for_quick_flip(mo
     assert _final_payload_signature(paper_final_rows[0]["payload_json"]) == _final_payload_signature(
         live_final_rows[0]["payload_json"]
     )
+
+
+@pytest.mark.asyncio
+async def test_live_trade_loop_uses_live_trade_guardrail_bucket_for_standard_intents(monkeypatch):
+    db_manager = await _build_test_db_manager("live_trade_loop_route_parity_standard")
+    result = await _run_live_trade_loop_once_for_mode_with_route_probe(
+        db_manager=db_manager,
+        live_enabled=False,
+        execution_style="LIVE_TRADE",
+        hold_minutes=45,
+        monkeypatch=monkeypatch,
+    )
+    await db_manager.close()
+
+    assert result["summary"].executed_positions == 1
+    assert result["route_capture"]["route"] == "standard_executor"
+    assert result["route_capture"]["guardrail_strategy"] == "live_trade"
+
+
+@pytest.mark.asyncio
+async def test_live_trade_loop_skips_buy_intent_with_no_execution_style(monkeypatch):
+    monkeypatch.setattr(settings.trading, "live_trading_enabled", False, raising=False)
+    monkeypatch.setattr(settings.trading, "shadow_mode_enabled", False, raising=False)
+
+    db_manager = await _build_test_db_manager("live_trade_loop_execution_style_none")
+
+    async def fake_execute_position(**_kwargs):
+        raise AssertionError("execute_position should not run for execution_style NONE")
+
+    async def fake_guardrail(**_kwargs):
+        raise AssertionError("guardrails should not run for execution_style NONE")
+
+    loop = LiveTradeDecisionLoop(
+        db_manager=db_manager,
+        kalshi_client=FakeKalshiClient(),
+        model_router=FakeModelRouter([]),
+        research_service=FakeResearchService([]),
+        execute_position_fn=fake_execute_position,
+        guardrail_fn=fake_guardrail,
+    )
+    event = {
+        "event_ticker": "KXNONE-EVT",
+        "title": "Will no execution style stay passive?",
+        "category": "Sports",
+        "markets": [
+            {
+                "ticker": "KXNONE-EVT-M1",
+                "title": "No execution style market",
+                "yes_midpoint": 0.42,
+                "no_bid": 0.58,
+                "no_ask": 0.60,
+                "volume": 1000,
+                "expiration_ts": 4102444800,
+            }
+        ],
+    }
+
+    executed = await loop._execute_final_intent(
+        run_id="execution-style-none-regression",
+        final_intent={
+            "summary": "The debate says buy, but the schema says no execution.",
+            "action": "BUY",
+            "event_ticker": "KXNONE-EVT",
+            "market_ticker": "KXNONE-EVT-M1",
+            "side": "YES",
+            "confidence": 0.8,
+            "edge_pct": 0.1,
+            "position_size_pct": 2.0,
+            "hold_minutes": 45,
+            "limit_price": 0.42,
+            "execution_style": "NONE",
+            "reasoning": "Regression coverage for passive final intents.",
+        },
+        event_map={"KXNONE-EVT": event},
+    )
+    await loop.close()
+
+    assert executed is False
+    execution_rows = await db_manager.list_live_trade_decisions(limit=5, step="execution")
+    assert execution_rows
+    assert execution_rows[0]["status"] == "skipped"
+    assert execution_rows[0]["error"] == "execution_style_none"
+    assert execution_rows[0]["summary"] == "Skipped because the final intent requested no execution."
+    assert await db_manager.get_open_positions() == []
+    await db_manager.close()
 
 
 @pytest.mark.asyncio
@@ -1124,6 +1214,74 @@ async def test_live_trade_loop_executes_safe_generic_path_when_live_mode_enabled
 
 
 @pytest.mark.asyncio
+async def test_live_trade_loop_voids_position_when_generic_execution_fails(monkeypatch):
+    monkeypatch.setattr(settings.trading, "live_trading_enabled", False, raising=False)
+    monkeypatch.setattr(settings.trading, "shadow_mode_enabled", False, raising=False)
+    monkeypatch.setattr(settings.trading, "max_position_size_pct", 3.0, raising=False)
+
+    db_manager = await _build_test_db_manager("live_trade_loop_execution_failure_void")
+
+    async def fake_execute_position(**_kwargs):
+        return False
+
+    async def fake_guardrail(**_kwargs):
+        return True, None
+
+    loop = LiveTradeDecisionLoop(
+        db_manager=db_manager,
+        kalshi_client=FakeKalshiClient(),
+        model_router=FakeModelRouter([]),
+        research_service=FakeResearchService([]),
+        execute_position_fn=fake_execute_position,
+        guardrail_fn=fake_guardrail,
+    )
+
+    executed = await loop._execute_final_intent(
+        run_id="execution-failure-regression",
+        final_intent={
+            "summary": "Execution should fail after position creation.",
+            "action": "BUY",
+            "event_ticker": "KXFAIL-EVT",
+            "market_ticker": "KXFAIL-EVT-M1",
+            "side": "YES",
+            "confidence": 0.75,
+            "edge_pct": 0.08,
+            "position_size_pct": 2.0,
+            "hold_minutes": 45,
+            "limit_price": 0.41,
+            "execution_style": "LIVE_TRADE",
+            "risk_flags": [],
+            "reasoning": "Regression for failed executor cleanup.",
+        },
+        selected_event={
+            "event_ticker": "KXFAIL-EVT",
+            "title": "Will execution fail cleanly?",
+            "category": "Sports",
+        },
+        selected_market={
+            "ticker": "KXFAIL-EVT-M1",
+            "title": "Execution failure market",
+            "yes_midpoint": 0.40,
+            "yes_ask": 0.41,
+            "no_ask": 0.61,
+            "volume": 1000,
+            "expiration_ts": 4102444800,
+        },
+    )
+    await loop.close()
+
+    assert executed is False
+    position = await db_manager.get_position_by_market_id("KXFAIL-EVT-M1")
+    assert position is not None
+    assert position.status == "voided"
+    execution_rows = await db_manager.list_live_trade_decisions(limit=5, step="execution")
+    assert execution_rows
+    assert execution_rows[0]["status"] == "error"
+    assert execution_rows[0]["error"] == "execution_failed"
+    await db_manager.close()
+
+
+@pytest.mark.asyncio
 async def test_live_trade_loop_shadow_mode_records_real_shadow_telemetry(monkeypatch):
     monkeypatch.setattr(settings.trading, "live_trading_enabled", False, raising=False)
     monkeypatch.setattr(settings.trading, "shadow_mode_enabled", True, raising=False)
@@ -1562,6 +1720,48 @@ async def test_live_trade_loop_records_blocked_execution_when_guardrail_rejects(
 
     positions = await db_manager.get_open_positions()
     assert positions == []
+
+
+@pytest.mark.asyncio
+async def test_live_trade_guardrail_errors_fail_closed(monkeypatch):
+    from src.strategies import portfolio_enforcer as enforcer_module
+
+    db_manager = await _build_test_db_manager("live_trade_guardrail_fail_closed")
+
+    async def raising_check_trade(self, **_kwargs):
+        raise RuntimeError("guardrail database unavailable")
+
+    monkeypatch.setattr(
+        enforcer_module.PortfolioEnforcer,
+        "check_trade",
+        raising_check_trade,
+        raising=False,
+    )
+
+    market = Market(
+        market_id="KXGUARDRAIL-FAIL-CLOSED",
+        title="Will the guardrail fail closed?",
+        yes_price=0.40,
+        no_price=0.60,
+        volume=1000,
+        expiration_ts=9999999999,
+        category="Sports",
+        status="active",
+        last_updated=datetime.now(timezone.utc),
+        has_position=False,
+    )
+
+    allowed, reason = await decide_module._passes_live_trade_guardrails(
+        market=market,
+        side="YES",
+        trade_value=10.0,
+        portfolio_value=1000.0,
+        db_manager=db_manager,
+    )
+
+    assert allowed is False
+    assert "Portfolio enforcer unavailable" in reason
+    await db_manager.close()
 
 
 @pytest.mark.asyncio

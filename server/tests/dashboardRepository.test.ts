@@ -378,20 +378,33 @@ describe("getPortfolioAiSpendSummary", () => {
         available: true,
         sourceTable: "llm_queries",
         provider: "codex",
+        planTier: null,
+        quotaUnit: "request",
+        windowLabel: null,
+        source: "llm_queries",
         last24h: {
           queryCount: 1,
           tokensUsed: 120,
-          latestAt: sixHoursAgo
+          latestAt: sixHoursAgo,
+          limit: null,
+          remaining: null,
+          resetAt: null
         },
         last7d: {
           queryCount: 2,
           tokensUsed: 200,
-          latestAt: sixHoursAgo
+          latestAt: sixHoursAgo,
+          limit: null,
+          remaining: null,
+          resetAt: null
         },
         lifetime: {
           queryCount: 3,
           tokensUsed: 400,
-          latestAt: sixHoursAgo
+          latestAt: sixHoursAgo,
+          limit: null,
+          remaining: null,
+          resetAt: null
         }
       }
     });

@@ -131,7 +131,7 @@ async def test_execute_position_paper_mode_keeps_position_non_live():
     test_position = Position(
         market_id="PAPER-TEST-1",
         side="YES",
-        entry_price=0.25,
+        entry_price=0.27,
         quantity=4,
         timestamp=datetime.now(),
         rationale="Paper trade",
@@ -166,6 +166,111 @@ async def test_execute_position_paper_mode_keeps_position_non_live():
         assert updated_position.live is False
         assert updated_position.quantity == pytest.approx(4)
         assert updated_position.entry_price == pytest.approx(0.27)
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+async def test_execute_position_paper_mode_rejects_ask_above_approved_limit():
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+
+    test_position = Position(
+        market_id="PAPER-LIMIT-DRIFT",
+        side="YES",
+        entry_price=0.27,
+        quantity=4,
+        timestamp=datetime.now(),
+        rationale="Paper limit drift block",
+        confidence=0.70,
+        live=False,
+    )
+    test_position.id = await db_manager.add_position(test_position)
+
+    mock_kalshi_client = AsyncMock()
+    mock_kalshi_client.get_market.return_value = {
+        "market": {
+            "ticker": "PAPER-LIMIT-DRIFT",
+            "yes_bid_dollars": 0.28,
+            "yes_ask_dollars": 0.29,
+            "yes_ask_size_fp": "10.00",
+            "no_bid_dollars": 0.71,
+            "no_ask_dollars": 0.72,
+        }
+    }
+
+    try:
+        result = await execute_position(
+            position=test_position,
+            live_mode=False,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+        )
+
+        assert result is False
+        simulated_buys = await db_manager.get_simulated_orders(
+            strategy="directional_trading",
+            market_id="PAPER-LIMIT-DRIFT",
+            side="YES",
+            action="buy",
+            status="filled",
+        )
+        assert simulated_buys == []
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+async def test_execute_position_live_mode_rejects_ask_above_approved_limit():
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+
+    test_position = Position(
+        market_id="LIVE-LIMIT-DRIFT",
+        side="YES",
+        entry_price=0.60,
+        quantity=10,
+        timestamp=datetime.now(),
+        rationale="Live limit drift block",
+        confidence=0.80,
+        live=False,
+    )
+    test_position.id = await db_manager.add_position(test_position)
+
+    from unittest.mock import Mock
+    mock_kalshi_client = Mock()
+    mock_kalshi_client.get_market = AsyncMock(
+        return_value={
+            "market": {
+                "ticker": "LIVE-LIMIT-DRIFT",
+                "yes_bid_dollars": 0.61,
+                "yes_ask_dollars": 0.62,
+                "yes_ask_size_fp": "20.00",
+                "no_bid_dollars": 0.38,
+                "no_ask_dollars": 0.39,
+            }
+        }
+    )
+    mock_kalshi_client.place_order = AsyncMock()
+
+    try:
+        result = await execute_position(
+            position=test_position,
+            live_mode=True,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+        )
+
+        assert result is False
+        mock_kalshi_client.place_order.assert_not_called()
     finally:
         if os.path.exists(db_path):
             os.remove(db_path)
@@ -293,7 +398,7 @@ async def test_execute_position_paper_mode_records_shadow_entry_order_when_reque
     test_position = Position(
         market_id="PAPER-SHADOW-ENTRY-1",
         side="YES",
-        entry_price=0.60,
+        entry_price=0.61,
         quantity=10,
         timestamp=datetime.now(),
         rationale="Paper trade with shadow entry logging",
@@ -374,7 +479,7 @@ async def test_execute_position_paper_mode_preserves_exit_plan_metadata():
     test_position = Position(
         market_id="PAPER-PLAN-1",
         side="YES",
-        entry_price=0.25,
+        entry_price=0.27,
         quantity=4,
         timestamp=datetime.now(),
         rationale="Paper trade with exit plan",
@@ -428,7 +533,7 @@ async def test_execute_position_paper_mode_records_filled_buy_order_and_fee_snap
     test_position = Position(
         market_id="PAPER-FILL-1",
         side="YES",
-        entry_price=0.25,
+        entry_price=0.27,
         quantity=4,
         timestamp=datetime.now(),
         rationale="Paper trade with execution trail",
@@ -1151,7 +1256,7 @@ async def test_execute_position_paper_mode_walks_visible_book_for_avg_fill_price
     test_position = Position(
         market_id="PAPER-DEPTH-WALK",
         side="YES",
-        entry_price=0.27,
+        entry_price=0.28,
         quantity=10,
         timestamp=datetime.now(),
         rationale="Depth-aware paper entry",

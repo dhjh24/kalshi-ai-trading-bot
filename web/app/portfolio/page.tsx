@@ -596,11 +596,17 @@ function CodexQuotaWindow({
   queryCount,
   tokensUsed,
   latestAt,
+  limit,
+  remaining,
+  resetAt,
 }: {
   label: string;
   queryCount: number;
   tokensUsed: number;
   latestAt: string | null;
+  limit?: number | null;
+  remaining?: number | null;
+  resetAt?: string | null;
 }) {
   return (
     <div className="rounded-2xl border border-slate-100 bg-white/80 px-4 py-4">
@@ -613,6 +619,17 @@ function CodexQuotaWindow({
       <p className="mt-1 text-sm text-slate-500">
         {formatCount(tokensUsed)} tokens
       </p>
+      {limit !== null && limit !== undefined ? (
+        <p className="mt-1 text-xs text-slate-500">
+          Limit {formatCount(limit)}
+          {remaining !== null && remaining !== undefined
+            ? `, ${formatCount(remaining)} remaining`
+            : ""}
+        </p>
+      ) : null}
+      {resetAt ? (
+        <p className="mt-1 text-xs text-slate-500">Resets {formatTimestamp(resetAt)}</p>
+      ) : null}
       <p className="mt-3 text-xs uppercase tracking-[0.18em] text-slate-400">
         Latest {formatTimestamp(latestAt)}
       </p>
@@ -631,8 +648,8 @@ function CodexQuotaCard({
         <div>
           <h3 className="font-medium text-steel">Codex usage</h3>
           <p className="mt-1 text-sm text-slate-500">
-            Runtime usage pulled from <code>llm_queries</code> where provider is{" "}
-            <code>codex</code>.
+            Usage pulled from{" "}
+            {quota.sourceTable ? <code>{quota.sourceTable}</code> : "runtime telemetry"}.
           </p>
         </div>
         <div className="text-right">
@@ -661,18 +678,27 @@ function CodexQuotaCard({
             queryCount={quota.last24h.queryCount}
             tokensUsed={quota.last24h.tokensUsed}
             latestAt={quota.last24h.latestAt}
+            limit={quota.last24h.limit}
+            remaining={quota.last24h.remaining}
+            resetAt={quota.last24h.resetAt}
           />
           <CodexQuotaWindow
             label="Last 7d"
             queryCount={quota.last7d.queryCount}
             tokensUsed={quota.last7d.tokensUsed}
             latestAt={quota.last7d.latestAt}
+            limit={quota.last7d.limit}
+            remaining={quota.last7d.remaining}
+            resetAt={quota.last7d.resetAt}
           />
           <CodexQuotaWindow
             label="Lifetime"
             queryCount={quota.lifetime.queryCount}
             tokensUsed={quota.lifetime.tokensUsed}
             latestAt={quota.lifetime.latestAt}
+            limit={quota.lifetime.limit}
+            remaining={quota.lifetime.remaining}
+            resetAt={quota.lifetime.resetAt}
           />
         </div>
       )}
@@ -714,7 +740,7 @@ export default async function PortfolioPage() {
 
       <Panel title="Monitoring cadence">
         <PortfolioRefreshControls
-          generatedAt={payload.generatedAt ?? payload.generated_at ?? new Date().toISOString()}
+          generatedAt={payload.generatedAt ?? payload.generated_at ?? null}
           heartbeatAt={payload.runtime?.heartbeatAt ?? null}
         />
       </Panel>
@@ -737,7 +763,7 @@ export default async function PortfolioPage() {
           tone={payload.metrics.realizedPnl >= 0 ? "positive" : "negative"}
         />
         <StatCard
-          label="AI Spend Today"
+          label="Metered AI Spend Today"
           value={formatMoney(payload.metrics.todayAiCost)}
           tone="warning"
         />

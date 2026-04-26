@@ -35,6 +35,29 @@ class LiveStreamHub {
   private liveTradeDecisionCursor: string | null = null;
   private started = false;
 
+  constructor() {
+    this.emitter.setMaxListeners(0);
+  }
+
+  private handleRefreshError(error: unknown): void {
+    if (isClosedDatabaseError(error)) {
+      return;
+    }
+
+    console.warn("Live stream refresh failed", error);
+  }
+
+  private runRefresh(callback: () => void | Promise<void>): void {
+    try {
+      const result = callback();
+      if (result && typeof result === "object" && "catch" in result) {
+        void (result as Promise<void>).catch((error) => this.handleRefreshError(error));
+      }
+    } catch (error) {
+      this.handleRefreshError(error);
+    }
+  }
+
   private refreshLiveTradeDecisionsOnCursorChange(limit = LIVE_TRADE_DECISION_FEED_LIMIT): void {
     let cursor;
     try {
@@ -116,35 +139,26 @@ class LiveStreamHub {
       this.publish("analysis", listAnalysisRequests(20));
     };
 
-    void refreshMarkets();
-    void refreshBtc();
-    void refreshScores();
-    refreshAnalysis();
-    this.refreshLiveTradeDecisions();
+    this.runRefresh(refreshMarkets);
+    this.runRefresh(refreshBtc);
+    this.runRefresh(refreshScores);
+    this.runRefresh(refreshAnalysis);
+    this.runRefresh(() => this.refreshLiveTradeDecisions());
 
-    const startInterval = (callback: () => void, intervalMs: number) => {
-      const handle = setInterval(callback, intervalMs);
+    const startInterval = (callback: () => void | Promise<void>, intervalMs: number) => {
+      const handle = setInterval(() => this.runRefresh(callback), intervalMs);
       handle.unref?.();
     };
 
-    startInterval(() => {
-      void refreshMarkets();
-    }, serverConfig.dataRefreshMs);
-    startInterval(() => {
-      void refreshBtc();
-    }, serverConfig.cryptoRefreshMs);
-    startInterval(() => {
-      void refreshScores();
-    }, serverConfig.sportsRefreshMs);
-    startInterval(() => {
-      refreshAnalysis();
-    }, serverConfig.dataRefreshMs);
-    startInterval(() => {
-      this.refreshLiveTradeDecisionsOnCursorChange();
-    }, LIVE_TRADE_DECISION_CURSOR_POLL_MS);
-    startInterval(() => {
-      this.refreshLiveTradeDecisions();
-    }, serverConfig.dataRefreshMs);
+    startInterval(refreshMarkets, serverConfig.dataRefreshMs);
+    startInterval(refreshBtc, serverConfig.cryptoRefreshMs);
+    startInterval(refreshScores, serverConfig.sportsRefreshMs);
+    startInterval(refreshAnalysis, serverConfig.dataRefreshMs);
+    startInterval(
+      () => this.refreshLiveTradeDecisionsOnCursorChange(),
+      LIVE_TRADE_DECISION_CURSOR_POLL_MS
+    );
+    startInterval(() => this.refreshLiveTradeDecisions(), serverConfig.dataRefreshMs);
   }
 }
 

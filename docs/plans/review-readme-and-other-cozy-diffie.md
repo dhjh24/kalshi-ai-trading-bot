@@ -18,6 +18,10 @@
 > 2026-04-25 automation follow-up: W11 compatibility cleanup was hardened so the shared LLM dataclasses now export explicitly from both `src/clients/shared_types.py` and the legacy `src/clients/xai_client.py` shim, while the `scripts/beast_mode_dashboard.py` wrapper and legacy-pickle compatibility stay covered by focused Python tests.
 >
 > 2026-04-26 local follow-up: W5/W10 shadow-mode visibility tightened for generic live-trade intents. `src/jobs/live_trade.py` now records execution payloads with `execution_mode="shadow"` when `shadow_mode_enabled=True` while still using paper execution semantics, and `tests/test_live_trade_job.py` locks the label to the persisted `live_trade_runtime_state.runtime_mode`.
+>
+> 2026-04-26 safety follow-up: live-trade guardrails now fail closed when `PortfolioEnforcer` errors, W5 short-hold `QUICK_FLIP` intents pre-check the quick-flip budget bucket instead of the live-trade bucket, generic execution rejects paper/live entries when the current ask or depth-walk average exceeds the approved entry limit, failed generic W5 executions void the pre-created position row, and the hourly trade-rate cap no longer double-counts closed recent positions mirrored in `positions`.
+>
+> 2026-04-26 implementation follow-up: W5 final intents with `execution_style="NONE"` now skip before guardrails or order creation, parity tests pin execution-row quantity/side/limit/hold fields and guardrail bucket routing, W8 has a first-class `codex_quota_tracking` snapshot path with `llm_queries` fallback, and W9 SSE refresh intervals catch sync/async refresh errors while allowing high fanout listeners.
 
 ---
 
@@ -132,6 +136,7 @@ Each workstream is sized for **one subagent** working in parallel with the other
   - Dedicated `python cli.py run --live-trade` now supports paper, shadow, and live runtimes; the standalone loop also runs the quick-flip manager each cycle so quick-flip exits / repricing stay active when the loop is run on its own.
   - Live `QUICK_FLIP` intents now require `ENABLE_LIVE_QUICK_FLIP=1` and route through the existing quick-flip machinery. `src/jobs/trade.py` now runs `run_live_trade_loop_cycle()` inside the main AI-ensemble runtime for paper, shadow, and live modes, so the embedded and dedicated paths share the same W5 loop. The remaining product gap is broader parity proof.
   - 2026-04-26 local follow-up: generic `LIVE_TRADE` intents now persist `execution_mode="shadow"` in execution payloads when the worker runtime is shadow, so dashboard/debug payloads no longer collapse shadow runs into paper labels.
+  - 2026-04-26 safety follow-up: guardrail failures fail closed, short-hold quick-flip intents use the quick-flip enforcer bucket before routing, failed generic executions void their pending position row, and generic execution refuses ask drift above the approved limit in both paper and live mode.
 - **Owner:** AI Engineer (lead) + Sales Engineer–style subagent for prompt design
 - **Depends on:** **W1** preferred (so Codex powers the loop) but can prototype on OpenAI/OpenRouter first
 - **Goal:** Replace the single-shot LLM call inside [src/data/live_trade_research.py](src/data/live_trade_research.py) with a real multi-agent loop tuned for short-dated, in-play markets.
@@ -186,9 +191,10 @@ Each workstream is sized for **one subagent** working in parallel with the other
 ### W8 — Cost & Budget Instrumentation  *(Status: in progress — `llm_queries.role` migration + rollup fallback is live as of 2026-04-26, with schema/quota cleanup still open)*
 - **Follow-ups flagged by Codex after merge:**
   - Provider/role/strategy spend telemetry now renders in the portfolio route using `analysis_requests.provider` plus the current `llm_queries.provider` / `llm_queries.role` / `llm_queries.strategy` fields. The earlier explicit `llm_queries.provider` schema cleanup is now in-tree; remaining cleanup is first-class quota accounting rather than provider attribution.
-  - Codex quota-vs-dollar accounting is still only partially represented (`cost_usd=0`, runtime query counts, and provider rollups). If we want first-class quota reporting, add a dedicated persisted quota/usage field and thread it through the dashboard/API.
+  - Codex quota-vs-dollar accounting is still only partially represented (`cost_usd=0`, runtime query counts, and provider rollups). The UI now labels this as Codex usage rather than quota until a dedicated persisted quota/limit/reset field exists.
   - 2026-04-23 local follow-up: the CLI/database provider summary now uses a shared recent 7-day window for both provider totals and logged-query totals, and the Node dashboard repository no longer assumes `analysis_requests` has a `tokens_used` column when aggregating provider spend. Regressions landed in `tests/test_llm_query_provider.py` and `server/tests/dashboardRepository.test.ts`.
   - 2026-04-24 automation follow-up: the CLI Codex quota suffix now counts only `llm_queries` request/token rows, matching `server/src/repositories/dashboardRepository.ts` instead of inflating quota telemetry with `analysis_requests`.
+  - 2026-04-26 implementation follow-up: `codex_quota_tracking` now exists as a durable quota snapshot table, `DatabaseManager` can record/read snapshots with `llm_queries` fallback, CLI/provider summaries include limit/remaining/reset details when present, and the dashboard repository prefers quota snapshots over legacy inferred usage.
 - **Owner:** Analytics Reporter subagent
 - **Depends on:** W1 (Codex calls need to land in `daily_cost_tracking` with `cost_usd=0`)
 - **Goal:** A single panel that shows AI spend split by provider (Codex / OpenAI / OpenRouter), by agent role, and by strategy, plus quota-vs-dollar accounting for the Codex plan.
@@ -203,6 +209,8 @@ Each workstream is sized for **one subagent** working in parallel with the other
   - `/live-trade` already mounts `LiveTradeDecisionsPanel`, subscribes to the `live-trade-decisions` SSE topic, and exposes thumbs-up / down feedback writes. The old "live SSE/feedback work remains" note is stale.
   - `server/src/services/liveStreamHub.ts` now polls a lightweight decision/runtime/feedback cursor every <=1s and refreshes the SSE snapshot when SQLite state changes, with the existing slower full-refresh interval still acting as fallback.
   - The current remaining polish is mostly about optional migration onto the shared stream hook and any future push-based Python -> Node refresh hook if cursor polling proves insufficient.
+  - 2026-04-26 local polish: `/live-trade` now defaults back to the strategy-aligned 12h expiry window and its page copy describes the W5 persisted decision feed instead of the retired Streamlit carry-over.
+  - 2026-04-26 implementation follow-up: `liveStreamHub` now suppresses closed-DB refresh errors, catches interval refresh failures, and removes the default EventEmitter listener cap for valid SSE fanout. `/portfolio` labels dollar spend as metered spend and no longer fabricates a fresh generated timestamp when the payload omits one.
 - **Owner:** Frontend Developer
 - **Depends on:** W5 (data shape) and W8 (cost panel)
 - **Goal:** Make `/live-trade` and `/portfolio` actually useful for monitoring the new flow.
@@ -221,6 +229,7 @@ Each workstream is sized for **one subagent** working in parallel with the other
   - 2026-04-26 local follow-up: the shadow-mode success case now also asserts generic live-trade execution payloads carry `execution_mode="shadow"` instead of the older paper fallback label.
   - Added a repeated-cycle regression in `tests/test_live_trade_job.py` so the same market cannot be reopened on the next loop pass while an earlier position is still open; the newest execution row now stays auditable as `status="skipped"` / `error="existing_position"`.
   - Hardened the Node acceptance harness so `server/tests/liveTradeFeedbackSse.test.ts` parses the intended JSON payload even when child-process logs/warnings are present, added SSE coverage for external SQLite writes that change the decision feed, repaired the new quota/strategy-P&L fixtures plus the refresh-cursor repository coverage in `server/tests/dashboardRepository.test.ts`, and added focused web-side feed precedence / fallback coverage in `web/lib/live-trade-decision-feed.test.ts`.
+  - 2026-04-26 safety coverage: tests now cover fail-closed live-trade guardrails, paper/live ask drift blocking above the approved entry limit, failed generic execution voiding its position row, closed recent positions not double-counting against hourly caps, and invalid `--live-trade` CLI mode combinations.
 - **Owner:** API Tester or Test Results Analyzer
 - **Depends on:** W1, W2, W4, W5 (tests live alongside the code they cover)
 - **Goal:** Fill in the coverage holes flagged during exploration.

@@ -7,7 +7,11 @@ import { formatTimestamp } from "../../lib/format";
 
 const AUTO_REFRESH_INTERVAL_MS = 20000;
 
-function formatAgeLabel(timestamp: string, now: number): string {
+function formatAgeLabel(timestamp: string | null, now: number): string {
+  if (!timestamp) {
+    return "age unknown";
+  }
+
   const parsed = Date.parse(timestamp);
   if (!Number.isFinite(parsed)) {
     return "n/a";
@@ -36,7 +40,7 @@ export function PortfolioRefreshControls({
   generatedAt,
   heartbeatAt
 }: {
-  generatedAt: string;
+  generatedAt: string | null;
   heartbeatAt: string | null;
 }) {
   const router = useRouter();
@@ -119,7 +123,7 @@ export function PortfolioRefreshControls({
 
   return (
     <div className="flex flex-wrap items-center gap-3 text-sm text-slate-500">
-      <span>Snapshot {formatTimestamp(generatedAt)}.</span>
+      <span>Snapshot {generatedAt ? formatTimestamp(generatedAt) : "unknown"}.</span>
       <span>{formatAgeLabel(generatedAt, now)}.</span>
       {heartbeatAt ? <span>Worker heartbeat {formatTimestamp(heartbeatAt)}.</span> : null}
       <Badge tone={isPending ? "warning" : autoRefresh ? "positive" : "neutral"}>
