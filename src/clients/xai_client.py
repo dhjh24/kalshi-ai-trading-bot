@@ -1,55 +1,28 @@
 """
-xai_client.py — Legacy compatibility shim.
+Legacy compatibility shim for legacy call sites that still import ``XAIClient``.
 
-The direct xAI API dependency has been removed.  All LLM calls now go through
-OpenRouter (see model_router.py / openrouter_client.py).
+The direct xAI API dependency has been removed. All LLM calls now go through
+the active configured provider (Codex, OpenAI, or OpenRouter).
 
-This file is kept for:
- 1. The ``TradingDecision`` and ``DailyUsageTracker`` dataclasses which are
-    imported by openrouter_client.py and other modules.
- 2. The ``XAIClient`` class, which beast_mode_bot uses as a thin daily-cost-
-    tracking wrapper.  It delegates all actual completions to OpenRouter.
+This file is intentionally limited in scope:
+1. Keep ``XAIClient`` for older execution paths.
+2. Keep backwards-compatible re-exports of shared LLM dataclasses.
 """
 
-import asyncio
 import os
 import pickle
-import time
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime
+from typing import Any, Dict, Optional
 
 from src.config.settings import settings
+from src.clients.shared_types import DailyUsageTracker, TradingDecision
 from src.utils.logging_setup import TradingLoggerMixin
 
-
-# ---------------------------------------------------------------------------
-# Shared dataclasses (imported by openrouter_client, model_router, agents …)
-# ---------------------------------------------------------------------------
-
-@dataclass
-class TradingDecision:
-    """Represents an AI trading decision."""
-    action: str           # "buy", "sell", "hold"
-    side: str             # "yes", "no"
-    confidence: float     # 0.0 to 1.0
-    limit_price: Optional[int] = None   # limit price in cents
-    reasoning: Optional[str] = None
-
-
-@dataclass
-class DailyUsageTracker:
-    """Track daily AI usage and costs."""
-    date: str
-    total_cost: float = 0.0
-    request_count: int = 0
-    daily_limit: float = 10.0  # Default $10/day (override via DAILY_AI_COST_LIMIT env var)
-    is_exhausted: bool = False
-    last_exhausted_time: Optional[datetime] = None
+__all__ = ["DailyUsageTracker", "TradingDecision", "XAIClient"]
 
 
 # ---------------------------------------------------------------------------
-# XAIClient — cost-tracking wrapper (delegates completions to OpenRouter)
+# XAIClient — cost-tracking wrapper (delegates completions to the active provider)
 # ---------------------------------------------------------------------------
 
 class XAIClient(TradingLoggerMixin):
@@ -145,6 +118,16 @@ class XAIClient(TradingLoggerMixin):
                 requests_today=self.daily_tracker.request_count,
             )
 
+    def _update_daily_usage(self, cost: float) -> None:
+        """
+        Compatibility shim path for request-only accounting.
+
+        Legacy runtime paths may call this wrapper explicitly; it preserves parity
+        with provider clients that still treat each compatibility call as a tracked
+        request.
+        """
+        self._update_daily_cost(float(cost or 0.0))
+
     async def _check_daily_limits(self) -> bool:
         """
         Returns True if we can proceed, False if daily limit reached.
@@ -180,7 +163,11 @@ class XAIClient(TradingLoggerMixin):
         """Lazy-init the configured provider client."""
         if self._provider_client is None:
             try:
-                if self._provider_name == "openai":
+                if self._provider_name == "codex":
+                    from src.clients.codex_client import CodexClient
+
+                    self._provider_client = CodexClient(db_manager=self.db_manager)
+                elif self._provider_name == "openai":
                     from src.clients.openai_client import OpenAIClient
 
                     self._provider_client = OpenAIClient(db_manager=self.db_manager)
@@ -200,11 +187,24 @@ class XAIClient(TradingLoggerMixin):
         """Mirror provider-side usage into the compatibility shim totals."""
         if result is None:
             return
+
+        prior_tracker = self._load_daily_tracker()
         metadata = getattr(client, "last_request_metadata", None)
-        cost = getattr(metadata, "cost", 0.0) if metadata is not None else 0.0
+        raw_cost = getattr(metadata, "cost", 0.0) if metadata is not None else 0.0
+        try:
+            cost = float(raw_cost)
+        except (TypeError, ValueError):
+            cost = 0.0
+
         self.total_cost += cost
         self.request_count += 1
         self.daily_tracker = self._load_daily_tracker()
+        if (
+            self.daily_tracker.date == prior_tracker.date
+            and self.daily_tracker.request_count == prior_tracker.request_count
+            and abs(self.daily_tracker.total_cost - prior_tracker.total_cost) < 1e-12
+        ):
+            self._update_daily_usage(cost)
 
     async def get_completion(
         self,

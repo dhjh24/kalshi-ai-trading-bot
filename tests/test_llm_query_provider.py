@@ -105,17 +105,20 @@ async def test_legacy_llm_queries_migrate_provider_column_and_preserve_rows(
         cursor = await db.execute("PRAGMA table_info(llm_queries)")
         columns = {row[1] for row in await cursor.fetchall()}
         assert "provider" in columns
+        assert "role" in columns
 
     queries = await manager.get_llm_queries(hours_back=48, limit=10)
     assert len(queries) == 1
     assert queries[0].strategy == "legacy_strategy"
     assert queries[0].provider is None
+    assert queries[0].role is None
 
     await manager.log_llm_query(
         LLMQuery(
             timestamp=datetime.now(),
             strategy="unit_test",
             query_type="completion",
+            role="unit_role",
             market_id="NEW-1",
             prompt="fresh prompt",
             response="fresh response",
@@ -127,6 +130,7 @@ async def test_legacy_llm_queries_migrate_provider_column_and_preserve_rows(
 
     queries = await manager.get_llm_queries(hours_back=48, limit=10)
     assert any(query.provider == "openai" for query in queries)
+    assert any(query.role == "unit_role" for query in queries)
 
 
 async def test_ai_spend_provider_breakdown_uses_recent_window(tmp_path: Path):
@@ -246,6 +250,168 @@ async def test_ai_spend_provider_breakdown_uses_recent_window(tmp_path: Path):
     assert "7d logged $0.20 across 1 queries" in summary
 
 
+async def test_legacy_analysis_requests_migrates_provider_column_and_still_breaks_down(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "legacy-analysis-requests.db"
+    legacy_timestamp = (datetime.now() - timedelta(hours=1)).isoformat()
+
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """
+            CREATE TABLE analysis_requests (
+                request_id TEXT PRIMARY KEY,
+                target_type TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                requested_at TEXT NOT NULL,
+                completed_at TEXT,
+                model TEXT,
+                cost_usd REAL,
+                sources_json TEXT,
+                response_json TEXT,
+                context_json TEXT,
+                error TEXT
+            )
+            """
+        )
+        await db.execute(
+            """
+            INSERT INTO analysis_requests (
+                request_id, target_type, target_id, status, requested_at,
+                completed_at, model, cost_usd, sources_json, response_json,
+                context_json, error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-analysis-1",
+                "market",
+                "MKT-1",
+                "completed",
+                legacy_timestamp,
+                legacy_timestamp,
+                "gpt-5-codex",
+                0.05,
+                "{}",
+                "{}",
+                "{}",
+                None,
+            ),
+        )
+        await db.commit()
+
+    manager = DatabaseManager(db_path=str(db_path))
+    await manager.initialize()
+
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute("PRAGMA table_info(analysis_requests)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        assert "provider" in columns
+
+        await db.execute(
+            """
+            INSERT INTO analysis_requests (
+                request_id, target_type, target_id, status, requested_at,
+                completed_at, provider, model, cost_usd, sources_json,
+                response_json, context_json, error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "migrated-analysis-1",
+                "market",
+                "MKT-2",
+                "completed",
+                legacy_timestamp,
+                legacy_timestamp,
+                "openai",
+                "gpt-5-mini",
+                0.10,
+                "{}",
+                "{}",
+                "{}",
+                None,
+            ),
+        )
+        await db.commit()
+
+    summary = (await manager.get_ai_spend_provider_breakdown())["summary"]
+    assert "openai $0.10" in summary
+    assert "7d providers" in summary
+
+
+async def test_ai_spend_provider_breakdown_counts_codex_quota_from_llm_queries_only(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "codex-quota-window.db"
+    manager = DatabaseManager(db_path=str(db_path))
+    await manager.initialize()
+    now = datetime.now()
+
+    await manager.log_llm_query(
+        LLMQuery(
+            timestamp=now,
+            strategy="quick_flip",
+            query_type="completion",
+            market_id="COD-1",
+            prompt="prompt",
+            response="response",
+            provider="codex",
+            tokens_used=321,
+            cost_usd=0.0,
+        )
+    )
+
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """
+            CREATE TABLE analysis_requests (
+                request_id TEXT PRIMARY KEY,
+                target_type TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                requested_at TEXT NOT NULL,
+                completed_at TEXT,
+                provider TEXT,
+                model TEXT,
+                cost_usd REAL,
+                sources_json TEXT,
+                response_json TEXT,
+                context_json TEXT,
+                error TEXT
+            )
+            """
+        )
+        await db.execute(
+            """
+            INSERT INTO analysis_requests (
+                request_id, target_type, target_id, status, requested_at,
+                completed_at, provider, model, cost_usd, sources_json,
+                response_json, context_json, error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "codex-analysis",
+                "market",
+                "COD-ANALYSIS",
+                "completed",
+                now.isoformat(),
+                now.isoformat(),
+                "codex",
+                "codex/gpt-5-codex",
+                0.0,
+                "{}",
+                "{}",
+                "{}",
+                None,
+            ),
+        )
+        await db.commit()
+
+    summary = (await manager.get_ai_spend_provider_breakdown())["summary"]
+
+    assert "codex $0.00 (1 req, 321 tok)" in summary
+
+
 @pytest.mark.parametrize(
     ("factory", "expected_provider"),
     [
@@ -274,3 +440,48 @@ async def test_client_loggers_tag_llm_queries_with_provider(factory, expected_pr
     assert logged.provider == expected_provider
     assert logged.market_id == "TEST-1"
     assert logged.strategy == "unit_test"
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [_make_openai_client, _make_openrouter_client, _make_codex_client],
+)
+async def test_client_loggers_tag_llm_queries_with_role_fallback(factory):
+    db_manager = MagicMock()
+    db_manager.log_llm_query = AsyncMock()
+    client = factory(db_manager)
+
+    await client._log_query(
+        strategy="unit_test",
+        query_type="completion",
+        prompt="hello",
+        response="world",
+        market_id="TEST-1",
+        tokens_used=11,
+        cost_usd=0.22,
+    )
+    await asyncio.sleep(0)
+
+    logged = db_manager.log_llm_query.await_args.args[0]
+    assert logged.role == "completion"
+
+
+async def test_client_loggers_respect_explicit_role_override():
+    db_manager = MagicMock()
+    db_manager.log_llm_query = AsyncMock()
+    client = _make_openai_client(db_manager)
+
+    await client._log_query(
+        strategy="unit_test",
+        query_type="completion",
+        role="trade_agent",
+        prompt="hello",
+        response="world",
+        market_id="TEST-1",
+        tokens_used=11,
+        cost_usd=0.22,
+    )
+    await asyncio.sleep(0)
+
+    logged = db_manager.log_llm_query.await_args.args[0]
+    assert logged.role == "trade_agent"

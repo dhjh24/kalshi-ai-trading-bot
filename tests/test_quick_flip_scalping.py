@@ -1408,12 +1408,12 @@ async def test_analyze_market_movement_uses_heuristic_when_disable_ai_flag_set()
 
 
 @pytest.mark.asyncio
-async def test_analyze_market_movement_uses_heuristic_when_env_var_truthy(monkeypatch):
+async def test_analyze_market_movement_uses_heuristic_when_settings_flag_truthy(monkeypatch):
     """
-    Setting ``QUICK_FLIP_DISABLE_AI=1`` should be enough to switch the strategy
-    into heuristic-only mode — no explicit constructor kwarg required.
+    Setting the centralized quick-flip flag should be enough to switch the
+    strategy into heuristic-only mode — no explicit constructor kwarg required.
     """
-    monkeypatch.setenv("QUICK_FLIP_DISABLE_AI", "1")
+    monkeypatch.setattr(settings.trading, "quick_flip_disable_ai", True)
     failing_client = SimpleNamespace(
         get_completion=AsyncMock(side_effect=AssertionError("AI must not be called"))
     )

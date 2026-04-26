@@ -372,6 +372,9 @@ class TradingConfig:
     enable_live_quick_flip: bool = field(
         default_factory=lambda: _get_bool_env("ENABLE_LIVE_QUICK_FLIP")
     )
+    quick_flip_disable_ai: bool = field(
+        default_factory=lambda: _get_bool_env("QUICK_FLIP_DISABLE_AI")
+    )
     quick_flip_allocation: float = field(
         default_factory=lambda: float(os.getenv("QUICK_FLIP_ALLOCATION", "0.0"))
     )

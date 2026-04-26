@@ -9,12 +9,16 @@ installed (required by the W1 plan).
 from __future__ import annotations
 
 import json
+import io
+import pickle
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from src.clients import codex_client as codex_module
+from src.clients.shared_types import DailyUsageTracker
 from src.clients.codex_client import (
     CODEX_FALLBACK_ORDER,
     CodexClient,
@@ -245,6 +249,37 @@ class TestTokenExtraction:
 
 
 class TestCodexClientCompletion:
+    def test_load_daily_tracker_accepts_legacy_xai_pickle(self, monkeypatch):
+        tracker = DailyUsageTracker(
+            date=datetime.now().strftime("%Y-%m-%d"),
+            request_count=7,
+            total_cost=0.0,
+        )
+        original_module = DailyUsageTracker.__module__
+        DailyUsageTracker.__module__ = "src.clients.xai_client"
+        try:
+            payload = pickle.dumps(tracker)
+        finally:
+            DailyUsageTracker.__module__ = original_module
+
+        usage_file = "memory://daily_ai_usage.pkl"
+        monkeypatch.setattr(codex_module, "SHARED_USAGE_FILE", usage_file)
+        monkeypatch.setattr(
+            codex_module.os.path,
+            "exists",
+            lambda path: path == usage_file,
+        )
+
+        def _fake_open(path, mode="rb", *args, **kwargs):
+            assert path == usage_file
+            assert "rb" in mode
+            return io.BytesIO(payload)
+
+        with patch("builtins.open", _fake_open):
+            client = _make_client()
+
+        assert client.daily_tracker.request_count == 7
+
     @pytest.mark.asyncio
     async def test_get_completion_parses_json_payload(self):
         client = _make_client()

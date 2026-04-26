@@ -128,6 +128,179 @@ describe("getPortfolioAiSpendByProvider", () => {
   });
 });
 
+describe("getPortfolioAiSpendByRole", () => {
+  it("uses role when present and falls back to query_type for null role rows", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "dashboard-repository-"));
+    const databasePath = path.join(tempDir, "dashboard.sqlite");
+    const scriptPath = path.join(tempDir, "role-breakdown-check.mjs");
+    const repositoryUrl = pathToFileURL(
+      path.join(serverRoot, "src/repositories/dashboardRepository.ts")
+    ).href;
+    const dbUrl = pathToFileURL(path.join(serverRoot, "src/db.ts")).href;
+    tempDirs.push(tempDir);
+
+    writeFileSync(
+      scriptPath,
+      `
+        import { getDb } from ${JSON.stringify(dbUrl)};
+        import { getPortfolioAiSpendByRole } from ${JSON.stringify(repositoryUrl)};
+
+        const db = getDb();
+
+        try {
+          db.exec(\`
+            CREATE TABLE llm_queries (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              role TEXT,
+              query_type TEXT NOT NULL,
+              cost_usd REAL,
+              tokens_used INTEGER,
+              timestamp TEXT NOT NULL
+            );
+
+            INSERT INTO llm_queries (role, query_type, cost_usd, tokens_used, timestamp)
+            VALUES
+              ('researcher', 'completion', 1.0, 100, '2026-04-20T01:00:00Z'),
+              (NULL, 'analysis', 0.4, 200, '2026-04-20T02:00:00Z'),
+              ('', 'analysis', 0.6, 300, '2026-04-20T03:00:00Z'),
+              (NULL, '', 0.25, 25, '2026-04-20T04:00:00Z');
+          \`);
+
+          console.log(JSON.stringify(getPortfolioAiSpendByRole()));
+        } finally {
+          db.close();
+        }
+      `
+    );
+
+    const result = JSON.parse(
+      execFileSync(process.execPath, ["--import", "tsx/esm", scriptPath], {
+        cwd: serverRoot,
+        env: {
+          ...process.env,
+          DB_PATH: databasePath
+        },
+        encoding: "utf8"
+      }).trim()
+    );
+
+    expect(result).toEqual({
+      available: true,
+      sourceTable: "llm_queries",
+      sourceField: "role",
+      totalCostUsd: 2.25,
+      attributedCostUsd: 2,
+      unattributedCostUsd: 0.25,
+      items: [
+        {
+          key: "analysis",
+          label: "analysis",
+          costUsd: 1,
+          count: 2,
+          tokensUsed: 500,
+          shareOfKnownCostPct: 50
+        },
+        {
+          key: "researcher",
+          label: "researcher",
+          costUsd: 1,
+          count: 1,
+          tokensUsed: 100,
+          shareOfKnownCostPct: 50
+        },
+        {
+          key: "unattributed",
+          label: "Unattributed",
+          costUsd: 0.25,
+          count: 1,
+          tokensUsed: 25,
+          shareOfKnownCostPct: 0
+        }
+      ]
+    });
+  });
+
+  it("falls back to query_type when role column is absent", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "dashboard-repository-"));
+    const databasePath = path.join(tempDir, "dashboard.sqlite");
+    const scriptPath = path.join(tempDir, "role-fallback-check.mjs");
+    const repositoryUrl = pathToFileURL(
+      path.join(serverRoot, "src/repositories/dashboardRepository.ts")
+    ).href;
+    const dbUrl = pathToFileURL(path.join(serverRoot, "src/db.ts")).href;
+    tempDirs.push(tempDir);
+
+    writeFileSync(
+      scriptPath,
+      `
+        import { getDb } from ${JSON.stringify(dbUrl)};
+        import { getPortfolioAiSpendByRole } from ${JSON.stringify(repositoryUrl)};
+
+        const db = getDb();
+
+        try {
+          db.exec(\`
+            CREATE TABLE llm_queries (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              query_type TEXT NOT NULL,
+              cost_usd REAL,
+              tokens_used INTEGER,
+              timestamp TEXT NOT NULL
+            );
+
+            INSERT INTO llm_queries (query_type, cost_usd, tokens_used, timestamp)
+            VALUES
+              ('analysis', 0.75, 40, '2026-04-20T01:00:00Z'),
+              ('trading_decision', 0.25, 60, '2026-04-20T02:00:00Z');
+          \`);
+
+          console.log(JSON.stringify(getPortfolioAiSpendByRole()));
+        } finally {
+          db.close();
+        }
+      `
+    );
+
+    const result = JSON.parse(
+      execFileSync(process.execPath, ["--import", "tsx/esm", scriptPath], {
+        cwd: serverRoot,
+        env: {
+          ...process.env,
+          DB_PATH: databasePath
+        },
+        encoding: "utf8"
+      }).trim()
+    );
+
+    expect(result).toEqual({
+      available: true,
+      sourceTable: "llm_queries",
+      sourceField: "role",
+      totalCostUsd: 1,
+      attributedCostUsd: 1,
+      unattributedCostUsd: 0,
+      items: [
+        {
+          key: "analysis",
+          label: "analysis",
+          costUsd: 0.75,
+          count: 1,
+          tokensUsed: 40,
+          shareOfKnownCostPct: 75
+        },
+        {
+          key: "trading_decision",
+          label: "trading_decision",
+          costUsd: 0.25,
+          count: 1,
+          tokensUsed: 60,
+          shareOfKnownCostPct: 25
+        }
+      ]
+    });
+  });
+});
+
 describe("getPortfolioAiSpendSummary", () => {
   it("includes Codex quota windows derived from llm query telemetry", () => {
     const tempDir = mkdtempSync(path.join(tmpdir(), "dashboard-repository-"));

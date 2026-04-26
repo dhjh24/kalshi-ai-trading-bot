@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 import math
-import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
@@ -62,14 +61,6 @@ from src.utils.trade_pricing import (
     extract_fee_metadata,
     sum_fill_fees,
 )
-
-
-def _env_flag_is_truthy(value: Optional[str]) -> bool:
-    """Accept a loose ``--no-ai`` / env-var convention for disabling AI calls."""
-    if value is None:
-        return False
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
 
 @dataclass
 class QuickFlipOpportunity:
@@ -159,15 +150,14 @@ class QuickFlipScalpingStrategy:
         self.active_positions: Dict[str, Position] = {}
         self.pending_sells: Dict[str, dict] = {}
         # W2 Gap 4: AI-less fallback. When either the constructor flag or the
-        # QUICK_FLIP_DISABLE_AI env var is set, quick flip skips the movement
+        # centralized settings flag is set, quick flip skips the movement
         # prediction LLM call and derives a target price from recent-trade
         # momentum and book depth. Keeps the bot running when the daily AI
         # budget is exhausted or Codex is unreachable.
-        # TODO: move to settings.py once W1 merges.
         self.disable_ai = (
             bool(disable_ai)
             if disable_ai is not None
-            else _env_flag_is_truthy(os.environ.get("QUICK_FLIP_DISABLE_AI"))
+            else bool(getattr(settings.trading, "quick_flip_disable_ai", False))
         )
         self._portfolio_enforcer: Optional[Any] = None
 

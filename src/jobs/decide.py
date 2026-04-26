@@ -106,6 +106,7 @@ async def _passes_live_trade_guardrails(
     trade_value: float,
     portfolio_value: float,
     db_manager: DatabaseManager,
+    enforcement_mode: Optional[str] = None,
 ) -> tuple[bool, str | None]:
     """Apply the W7 live-trade portfolio enforcer before returning a position."""
     db_path = getattr(db_manager, "db_path", None)
@@ -120,6 +121,13 @@ async def _passes_live_trade_guardrails(
             STRATEGY_LIVE_TRADE,
         )
 
+        resolved_mode = (
+            enforcement_mode
+            if enforcement_mode
+            else MODE_LIVE
+            if getattr(settings.trading, "live_trading_enabled", False)
+            else MODE_PAPER
+        )
         enforcer = PortfolioEnforcer(
             db_path=str(db_path),
             portfolio_value=max(float(portfolio_value or 0.0), 0.0),
@@ -131,11 +139,11 @@ async def _passes_live_trade_guardrails(
             side=str(side or "").lower(),
             amount=float(trade_value),
             title=market.title,
-            category=market.category,
-            current_positions=current_positions or None,
-            strategy=STRATEGY_LIVE_TRADE,
-            mode=MODE_LIVE if getattr(settings.trading, "live_trading_enabled", False) else MODE_PAPER,
-        )
+                category=market.category,
+                current_positions=current_positions or None,
+                strategy=STRATEGY_LIVE_TRADE,
+                mode=resolved_mode,
+            )
         return allowed, (reason or None)
     except Exception as exc:
         get_trading_logger("decision_engine").warning(
@@ -163,12 +171,13 @@ async def _run_ensemble_decision(
         runner = DebateRunner()
 
         # Build get_completion callables for each agent role using the model router
-        async def _make_completion(model_name):
+        async def _make_completion(role: str, model_name: str):
             async def _fn(prompt, **request_options):
                 return await model_router.get_completion(
                     prompt=prompt,
                     model=model_name,
                     strategy="ensemble",
+                    role=role,
                     query_type="agent_analysis",
                     market_id=market_data.get("ticker"),
                     **request_options,
@@ -179,7 +188,7 @@ async def _run_ensemble_decision(
         model_map = settings.ensemble.get_role_model_map()
         completions = {}
         for role, model_id in model_map.items():
-            completions[role] = await _make_completion(model_id)
+            completions[role] = await _make_completion(role, model_id)
 
         # Inject news into market_data for agents
         enriched_data = {**market_data, "news_summary": news_summary}
@@ -440,7 +449,7 @@ async def make_decision_for_market(
                 model_router=model_router,
             )
             if ensemble_result:
-                from src.clients.xai_client import TradingDecision
+                from src.clients.shared_types import TradingDecision
                 decision = TradingDecision(
                     action=ensemble_result.get("action", "SKIP"),
                     side=ensemble_result.get("side", "YES"),

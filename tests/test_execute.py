@@ -1,5 +1,6 @@
 import os
 import pytest
+from typing import Any, Dict
 from unittest.mock import AsyncMock
 from datetime import datetime
 
@@ -679,6 +680,123 @@ async def test_place_sell_limit_order_live_mode_records_shadow_exit_order_when_r
             os.remove(db_path)
 
 
+async def _run_execute_position_for_parity_probe(*, live_mode: bool) -> Dict[str, Any]:
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+
+    test_position = Position(
+        market_id="PARITY-PROBE-1",
+        side="YES",
+        entry_price=0.27,
+        quantity=5,
+        timestamp=datetime.now(),
+        rationale="Parity probe for execution mode consistency",
+        confidence=0.73,
+        live=live_mode,
+        strategy="directional_trading",
+        stop_loss_price=0.18,
+        take_profit_price=0.42,
+        max_hold_hours=2,
+    )
+    position_id = await db_manager.add_position(test_position)
+    test_position.id = position_id
+
+    mock_kalshi_client = AsyncMock()
+    mock_kalshi_client.get_market.return_value = {
+        "market": {
+            "ticker": "PARITY-PROBE-1",
+            "yes_bid_dollars": 0.26,
+            "yes_ask_dollars": 0.27,
+            "yes_ask_size_fp": "10.00",
+            "no_bid_dollars": 0.73,
+            "no_ask_dollars": 0.74,
+        }
+    }
+    mock_kalshi_client.get_orderbook.return_value = {
+        "orderbook": {
+            "yes": [[0.27, 10]],
+            "no": [[0.73, 40]],
+        }
+    }
+
+    if live_mode:
+        mock_kalshi_client.place_order = AsyncMock(
+            return_value={
+                "order": {
+                    "order_id": "live-parity-order",
+                    "status": "filled",
+                    "fill_count_fp": "5",
+                    "yes_price_dollars": "0.2700",
+                }
+            }
+        )
+        mock_kalshi_client.get_fills = AsyncMock(
+            return_value={
+                "fills": [
+                    {
+                        "ticker": "PARITY-PROBE-1",
+                        "client_order_id": "ignored",
+                        "order_id": "live-parity-order",
+                        "count_fp": "5",
+                        "yes_price_dollars": "0.2700",
+                        "purchased_side": "yes",
+                    }
+                ]
+            }
+        )
+
+    try:
+        result = await execute_position(
+            position=test_position,
+            live_mode=live_mode,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+        )
+
+        assert result is True
+        updated_position = await db_manager.get_position_by_market_id("PARITY-PROBE-1")
+        assert updated_position is not None
+        return {
+            "entry_price": updated_position.entry_price,
+            "quantity": updated_position.quantity,
+            "contracts_cost": updated_position.contracts_cost,
+            "entry_fee": updated_position.entry_fee,
+            "stop_loss_price": updated_position.stop_loss_price,
+            "take_profit_price": updated_position.take_profit_price,
+            "max_hold_hours": updated_position.max_hold_hours,
+            "entry_order_id": updated_position.entry_order_id,
+            "live": updated_position.live,
+            "position_id": position_id,
+            "result": result,
+        }
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+@pytest.mark.asyncio
+async def test_execute_position_entry_logic_parity_between_paper_and_live_inputs():
+    paper = await _run_execute_position_for_parity_probe(live_mode=False)
+    live = await _run_execute_position_for_parity_probe(live_mode=True)
+
+    assert paper["result"] is True
+    assert live["result"] is True
+    assert paper["entry_price"] == pytest.approx(live["entry_price"])
+    assert paper["quantity"] == pytest.approx(live["quantity"])
+    assert paper["contracts_cost"] == pytest.approx(live["contracts_cost"])
+    assert paper["entry_fee"] == pytest.approx(live["entry_fee"])
+    assert paper["stop_loss_price"] == pytest.approx(live["stop_loss_price"])
+    assert paper["take_profit_price"] == pytest.approx(live["take_profit_price"])
+    assert paper["max_hold_hours"] == live["max_hold_hours"]
+    assert paper["live"] is False
+    assert live["live"] is True
+    assert paper["entry_order_id"] != live["entry_order_id"]
+
+
 async def test_place_sell_limit_order_live_mode_records_exit_fee_divergence_for_immediate_fill():
     db_path = TEST_DB
     if os.path.exists(db_path):
@@ -1143,6 +1261,84 @@ async def test_execute_position_paper_mode_rejects_when_book_too_thin_for_fok():
             status="filled",
         )
         assert simulated_buys == []
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+async def test_execute_position_shadow_mode_rejects_fok_fill_beyond_one_tick_slippage():
+    """
+    A shadow-mode paper execution should not silently create shadow telemetry
+    when the live book can only fill inside a deeper slippage band than the
+    allowed FOK threshold.
+    """
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+
+    test_position = Position(
+        market_id="PAPER-SHADOW-THRESHOLD",
+        side="YES",
+        entry_price=0.30,
+        quantity=10,
+        timestamp=datetime.now(),
+        rationale="Shadow FOK threshold rejection",
+        confidence=0.75,
+        live=False,
+    )
+    position_id = await db_manager.add_position(test_position)
+    test_position.id = position_id
+
+    mock_kalshi_client = AsyncMock()
+    mock_kalshi_client.get_market.return_value = {
+        "market": {
+            "ticker": "PAPER-SHADOW-THRESHOLD",
+            "yes_bid_dollars": 0.29,
+            "yes_ask_dollars": 0.30,
+            "yes_ask_size_fp": "100.00",
+            "no_bid_dollars": 0.70,
+            "no_ask_dollars": 0.71,
+        }
+    }
+    mock_kalshi_client.get_orderbook.return_value = {
+        "orderbook": {
+            "yes": [[0.30, 5], [0.32, 50]],
+            "no": [[0.70, 50]],
+        }
+    }
+
+    try:
+        result = await execute_position(
+            position=test_position,
+            live_mode=False,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+            shadow_mode=True,
+        )
+
+        assert result is False
+        updated_position = await db_manager.get_position_by_market_id("PAPER-SHADOW-THRESHOLD")
+        assert updated_position is not None
+        assert updated_position.entry_price == pytest.approx(0.30)
+        assert updated_position.live is False
+
+        simulated_fills = await db_manager.get_simulated_orders(
+            strategy="directional_trading",
+            market_id="PAPER-SHADOW-THRESHOLD",
+            side="YES",
+            action="buy",
+            status="filled",
+        )
+        assert simulated_fills == []
+
+        shadow_orders = await db_manager.get_shadow_orders(
+            market_id="PAPER-SHADOW-THRESHOLD",
+            action="buy",
+        )
+        assert shadow_orders == []
     finally:
         if os.path.exists(db_path):
             os.remove(db_path)

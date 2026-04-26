@@ -12,6 +12,10 @@
 > 2026-04-24 local follow-up: W5 is no longer "not started" in practice. The repo already contains `src/jobs/live_trade.py`, the `python cli.py run --live-trade` entrypoint, persisted `live_trade_decisions` / `live_trade_runtime_state` / `live_trade_decision_feedback` tables, and the `/live-trade` dashboard decision feed with SSE + feedback actions. This pass added focused regression coverage for the no-events skip path and specialist-payload fallback (`tests/test_live_trade_loop_regressions.py`) and hardened the Node acceptance fixtures in `server/tests/liveTradeFeedbackSse.test.ts` and `server/tests/dashboardRepository.test.ts`. Remaining W5/W10 gaps are live-mode execution wiring, optional write-triggered decision-feed refresh, and broader parity/shadow coverage.
 >
 > 2026-04-24 local follow-up: the W5 live-mode startup skip is gone for non-`QUICK_FLIP` intents. `src/jobs/live_trade.py` now drives the existing generic execution path with `live_mode=True`, persists truthful `paper_trade` / `live_trade` flags on decision rows, and records live-specific execution summaries. Dedicated `python cli.py run --live-trade` now supports `paper`, `shadow`, and `live` runtimes, and live `QUICK_FLIP` intents now route through the existing quick-flip machinery when `ENABLE_LIVE_QUICK_FLIP=1`, with the standalone loop also running the quick-flip manager each cycle so exits, repricing, and reconciliation stay active. On the dashboard side, `server/src/repositories/dashboardRepository.ts` now exposes a lightweight live-trade decision refresh cursor, `server/src/services/liveStreamHub.ts` polls that cursor every <=1s, and the web client now falls back to explicit reconnect / HTTP sync when the SSE feed goes stale. A follow-up visibility pass now persists explicit per-decision `runtime_mode`, threads verified worker-mode / exchange-source metadata through the decision-feed heartbeat, and softens the live-trade banners when the UI is only seeing `dashboard env` defaults instead of `live_trade_runtime_state`. Focused regression coverage landed in `tests/test_live_trade_job.py`, `tests/test_cli_safety.py`, `server/tests/dashboardRepository.test.ts`, `server/tests/liveTradeFeedbackSse.test.ts`, and `web/lib/live-trade-decision-feed.test.ts`. Remaining W9/W10 gaps are broader parity coverage and any future fully push-based Python -> Node refresh hook if we decide to remove cursor polling entirely.
+>
+> 2026-04-24 automation follow-up: the legacy `XAIClient` shim now respects `LLM_PROVIDER=codex` instead of silently falling through to OpenRouter, shared `TradingDecision` / `DailyUsageTracker` dataclasses were extracted to a neutral `src/clients/shared_types.py` module with compatibility re-exports left in place, quick-flip's heuristic fallback flag moved onto `settings.trading.quick_flip_disable_ai`, and the CLI Codex quota suffix now counts only `llm_queries` rows so it matches the dashboard's quota semantics instead of double-counting `analysis_requests`.
+>
+> 2026-04-25 automation follow-up: W11 compatibility cleanup was hardened so the shared LLM dataclasses now export explicitly from both `src/clients/shared_types.py` and the legacy `src/clients/xai_client.py` shim, while the `scripts/beast_mode_dashboard.py` wrapper and legacy-pickle compatibility stay covered by focused Python tests.
 
 ---
 
@@ -57,6 +61,7 @@ Each workstream is sized for **one subagent** working in parallel with the other
 > - W5 can call `router.get_completion(..., capability=...)` and route through Codex transparently; `create_structured_completion(prompt, schema=...)` is the right call for structured per-agent outputs.
 > - W8 can pivot on `router.get_cost_summary()["providers"]["codex"]` + existing `llm_queries.strategy='codex'` + `tokens_used` without any schema change. Optional provider column on `LLMQuery` would be cleaner.
 > - Pre-existing test-isolation bug in `tests/test_openrouter_client.py::test_router_sends_one_request_with_fallback_models` (does not patch settings — fails when `OPENAI_API_KEY` is set). W10 should sweep similar tests.
+> - 2026-04-24 automation follow-up: `src/clients/xai_client.py` now initializes `CodexClient` when the effective provider resolves to `codex`, so older runtime paths (`trade.py`, `decide.py`, performance jobs) no longer bypass the Codex-first routing default.
 - **Owner:** Backend Architect or Senior Developer subagent
 - **Depends on:** none
 - **Goal:** Add a third value to `LLM_PROVIDER` (`codex`) that shells out to the official `codex` CLI (signed in via ChatGPT plan), and make it the new default when the CLI is detected on PATH.
@@ -80,6 +85,7 @@ Each workstream is sized for **one subagent** working in parallel with the other
 > - **Exit-leg fee reconciliation not yet wired.** Entry leg writes to `fee_divergence_log`; exit leg lives in `quick_flip_scalping._close_position_from_recent_fills` and `place_sell_limit_order` live branch — neither calls `record_fee_divergence(leg='exit')` today. Trivial follow-up.
 > - `QUICK_FLIP_DISABLE_AI` is read via `os.environ.get` inline. Move to `settings.trading` once the surface area calms down (W1 already merged).
 > - If `get_orderbook` fails on the paper entry path, Gap 1 silently falls back to the old best-ask snapshot. Good enough for tests; call out if W3/W4 rely on depth protection being on.
+- **2026-04-24 automation follow-up:** both of the stale notes above are now resolved locally: exit-leg fee divergence is already wired and covered in `tests/test_quick_flip_scalping.py` / `tests/test_execute.py`, and the quick-flip AI fallback flag now lives on `settings.trading.quick_flip_disable_ai` with docs/env-template coverage.
 - **Owner:** Senior Developer
 - **Depends on:** none (parallel-safe)
 - **Goal:** Close the three known gaps in [src/strategies/quick_flip_scalping.py](src/strategies/quick_flip_scalping.py) and [src/jobs/execute.py](src/jobs/execute.py).
@@ -163,6 +169,7 @@ Each workstream is sized for **one subagent** working in parallel with the other
 > - `python cli.py status` currently requires Kalshi API access (it hits `/get_balance`) and the new strategy-budget block is appended inside that same code path. In envs without Kalshi creds, budgets remain invisible. Restructure `cmd_status` to surface budgets independent of API reachability — noted as out of scope here.
 > - Per-strategy env vars (`QUICK_FLIP_DAILY_LOSS_BUDGET_PCT`, `LIVE_TRADE_MAX_TRADES_PER_HOUR`, etc.) are read via `os.environ.get` with `TODO: promote to TradingConfig after W1 merges` markers. W1 is now merged — a cleanup pass can migrate these into `settings.trading`.
 > - 2026-04-23 local follow-up: `portfolio_enforcer` now treats `directional_trading`, `portfolio_optimization`, and `immediate_portfolio_optimization` as `live_trade` aliases for daily-loss, trade-rate, and open-position checks, and the directional decision/allocation paths now consult the enforcer before returning or placing positions. Remaining integration work is the future W5 live-trade loop.
+> - 2026-04-26 follow-up: W5 live-trade loop now calls `PortfolioEnforcer` with `MODE_LIVE` when `shadow_mode_enabled=True`, so shadow and live share parity guards for hourly rate cap, open-position caps, and daily-loss halts.
 - **Owner:** Backend Architect
 - **Depends on:** W2 fee-divergence metric is helpful but not required
 - **Goal:** Make sure the existing portfolio enforcer and category scorer kick in on the new live-trade flow as well as the legacy decide path.
@@ -173,11 +180,12 @@ Each workstream is sized for **one subagent** working in parallel with the other
   - Make sure `--shadow` mode reads the same config so paper and live share guardrails.
 - **Done when:** [tests/test_cli_safety.py](tests/test_cli_safety.py) covers the new circuit breakers, and `python cli.py status` shows budget remaining per strategy.
 
-### W8 — Cost & Budget Instrumentation  *(Status: in progress — `/portfolio` spend panels + `cli.py status` provider summary merged to main 2026-04-23 via `21ecaef`)*
+### W8 — Cost & Budget Instrumentation  *(Status: in progress — `llm_queries.role` migration + rollup fallback is live as of 2026-04-26, with schema/quota cleanup still open)*
 - **Follow-ups flagged by Codex after merge:**
   - Provider/role/strategy spend telemetry now renders in the portfolio route using the current `analysis_requests.provider` and `llm_queries.query_type/strategy` fields. The explicit `llm_queries.provider` schema cleanup from the original plan is still open.
   - Codex quota-vs-dollar accounting is still only partially represented (`cost_usd=0`, runtime query counts, and provider rollups). If we want first-class quota reporting, add a dedicated persisted quota/usage field and thread it through the dashboard/API.
   - 2026-04-23 local follow-up: the CLI/database provider summary now uses a shared recent 7-day window for both provider totals and logged-query totals, and the Node dashboard repository no longer assumes `analysis_requests` has a `tokens_used` column when aggregating provider spend. Regressions landed in `tests/test_llm_query_provider.py` and `server/tests/dashboardRepository.test.ts`.
+  - 2026-04-24 automation follow-up: the CLI Codex quota suffix now counts only `llm_queries` request/token rows, matching `server/src/repositories/dashboardRepository.ts` instead of inflating quota telemetry with `analysis_requests`.
 - **Owner:** Analytics Reporter subagent
 - **Depends on:** W1 (Codex calls need to land in `daily_cost_tracking` with `cost_usd=0`)
 - **Goal:** A single panel that shows AI spend split by provider (Codex / OpenAI / OpenRouter), by agent role, and by strategy, plus quota-vs-dollar accounting for the Codex plan.
@@ -187,7 +195,7 @@ Each workstream is sized for **one subagent** working in parallel with the other
   - New panel on `/portfolio` (or a new `/spend` page) consuming the data.
 - **Done when:** dashboard panel renders with at least 24h of real data and `cli.py status` prints today's spend per provider.
 
-### W9 — Dashboard Live-Trade Polish  *(Status: in progress — configured-mode banner, analysis freshness, decision-feed SSE, feedback actions, low-latency SQLite-backed refresh, and client reconnect / fallback behavior are in-tree; broader UX polish remains)*
+### W9 — Dashboard Live-Trade Polish  *(Status: in progress — dashboard polish is stable in-tree with optional shared-stream migration and optional push-based refresh hook remaining)*
 - **Follow-ups flagged by 2026-04-24 review:**
   - `/live-trade` already mounts `LiveTradeDecisionsPanel`, subscribes to the `live-trade-decisions` SSE topic, and exposes thumbs-up / down feedback writes. The old "live SSE/feedback work remains" note is stale.
   - `server/src/services/liveStreamHub.ts` now polls a lightweight decision/runtime/feedback cursor every <=1s and refreshes the SSE snapshot when SQLite state changes, with the existing slower full-refresh interval still acting as fallback.
@@ -201,7 +209,7 @@ Each workstream is sized for **one subagent** working in parallel with the other
   - Keep decision-feed heartbeat metadata and page banners aligned so operators can tell whether the visible mode comes from verified worker telemetry (`live_trade_runtime_state`) or dashboard defaults.
 - **Done when:** A user can sit on `/live-trade` and `/portfolio` for 10 minutes and confidently say what the bot is doing and how it's doing.
 
-### W10 — Test Coverage Gaps  *(Status: in progress — live-trade regression hardening, live-mode execution coverage, shadow-mode loop coverage, and dashboard refresh-cursor acceptance coverage landed locally on 2026-04-24; broader parity coverage remains)*
+### W10 — Test Coverage Gaps  *(Status: in progress — live-trade execution/parity regressions are mostly landed as of 2026-04-26, but full route-level paper/live parity and broader stress parity remain open)*
 - **Follow-ups flagged by 2026-04-24 review:**
   - Added `tests/test_live_trade_loop_regressions.py` to cover the no-events skip branch and the specialist-payload fallback branch without modifying the existing dirty `tests/test_live_trade_job.py`.
   - Added live-mode execution assertions in `tests/test_live_trade_job.py` so the loop now proves it reaches the safe generic live executor, marks persisted decision rows with truthful paper/live flags, and stores live positions when `live_trading_enabled` is on.
@@ -219,15 +227,17 @@ Each workstream is sized for **one subagent** working in parallel with the other
   - Shadow-mode drift-threshold test (W4).
 - **Done when:** `pytest --cov=src` shows ≥80% coverage on the strategies, jobs, and clients packages.
 
-### W11 — Legacy Cleanup  *(Status: not started, low priority)*
+### W11 — Legacy Cleanup  *(Status: in progress — compatibility hardening landed as of 2026-04-26; final removals still blocked by remaining downstream callsites)*
 - **Owner:** Code Reviewer subagent
 - **Depends on:** W1 (Codex stable), W4 (shadow mode operational), W9 (dashboard polished)
 - **Goal:** Remove the old paths now that the new ones work.
 - **Candidates:**
-  - `beast_mode_dashboard.py` (Streamlit, superseded).
-  - `beast_mode_bot.py` (entry point, redundant with `cli.py run --beast`).
-  - `src/clients/xai_client.py` (only `TradingDecision` and `DailyUsageTracker` are still imported by [src/clients/model_router.py:15](src/clients/model_router.py#L15) — extract them to a small standalone module first, then delete).
-  - Legacy paper signal tracker in [src/paper/tracker.py](src/paper/tracker.py) (signals-only path) — keep only the unified runtime path.
+- `beast_mode_dashboard.py` / `scripts/beast_mode_dashboard.py` legacy dashboard entrypoints — keep the repo-root module canonical and retain the script path as a thin compatibility wrapper until downstream callers are gone.
+- `beast_mode_bot.py` (entry point, redundant with `cli.py run --beast`).
+- `src/clients/xai_client.py` (only `TradingDecision` and `DailyUsageTracker` are still imported by [src/clients/model_router.py:15](src/clients/model_router.py#L15) — extract them to a small standalone module first, then delete).
+- Legacy paper signal tracker in [src/paper/tracker.py](src/paper/tracker.py) (signals-only path) — keep only the unified runtime path.
+- 2026-04-26 hardening note: `scripts/beast_mode_dashboard.py` is retained as a compatibility wrapper, and `src/clients/xai_client.py` now carries explicit legacy-shim documentation for downstream callers.
+- 2026-04-26 automation follow-up: `src/clients/xai_client.py` now mirrors provider usage into persisted daily counters (request_count + total_cost) so legacy daily-limit checks remain accurate across tracker reloads.
 - **Done when:** files removed, README updated, `pytest` still green.
 
 ---

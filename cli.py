@@ -708,13 +708,15 @@ def cmd_dashboard(args: argparse.Namespace) -> None:
 
     # Legacy fallback only when the Node dashboard workspace is unavailable.
     dashboard_script = repo_root / "scripts" / "launch_dashboard.py"
-    beast_dashboard = repo_root / "scripts" / "beast_mode_dashboard.py"
+    beast_dashboard = repo_root / "beast_mode_dashboard.py"
+    beast_bot = repo_root / "beast_mode_bot.py"
 
     if dashboard_script.exists():
         print("Node dashboard workspace not available; falling back to legacy Streamlit launcher.")
         subprocess.run([sys.executable, str(dashboard_script)], check=False)
-    elif beast_dashboard.exists():
-        # Fall back to running the dashboard module directly.
+    elif beast_dashboard.exists() and beast_bot.exists():
+        # Fall back to the legacy beast-mode dashboard runtime when the
+        # canonical repo-root entrypoints are still present.
         from src.utils.logging_setup import setup_logging
         from beast_mode_bot import BeastModeBot
 

@@ -1121,6 +1121,7 @@ class LiveTradeDecisionLoop:
             prompt=prompt,
             capability="fast",
             strategy="live_trade",
+            role=focus_type,
             query_type=f"live_trade_{focus_type}_specialist",
             market_id=event.get("event_ticker"),
             response_format=_response_format("live_trade_specialist", SPECIALIST_SCHEMA),
@@ -1235,6 +1236,7 @@ class LiveTradeDecisionLoop:
                     model=model_name,
                     capability="reasoning" if role in {"risk_manager", "trader"} else "fast",
                     strategy="live_trade",
+                    role=role,
                     query_type=f"live_trade_final_{role}",
                     market_id=selected_candidate.get("market_ticker") or selected_candidate.get("event_ticker"),
                     **request_options,
@@ -1329,13 +1331,23 @@ class LiveTradeDecisionLoop:
             )
 
         from src.jobs.decide import _passes_live_trade_guardrails
+        from src.strategies.portfolio_enforcer import MODE_LIVE, MODE_PAPER
 
+        guardrail_mode = (
+            MODE_LIVE
+            if (
+                self._is_live_execution_mode()
+                or bool(getattr(settings.trading, "shadow_mode_enabled", False))
+            )
+            else MODE_PAPER
+        )
         return await _passes_live_trade_guardrails(
             market=market,
             side=side,
             trade_value=trade_value,
             portfolio_value=portfolio_value,
             db_manager=self.db_manager,
+            enforcement_mode=guardrail_mode,
         )
 
     async def _execute_final_intent(

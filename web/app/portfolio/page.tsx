@@ -882,7 +882,7 @@ export default async function PortfolioPage() {
             />
             <BreakdownList
               title="By role"
-              description="Currently sourced from llm query type until per-agent role telemetry is stored."
+              description="Role values are stored where available, with query_type fallback for legacy rows."
               breakdown={payload.aiSpend.byRole}
             />
           </div>

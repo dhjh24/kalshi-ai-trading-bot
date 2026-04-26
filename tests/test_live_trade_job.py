@@ -7,6 +7,7 @@ from uuid import uuid4
 import pytest
 
 import src.jobs.live_trade as live_trade_module
+import src.jobs.decide as decide_module
 from src.config.settings import settings
 from src.jobs.live_trade import LiveTradeDecisionLoop
 from src.utils.database import DatabaseManager
@@ -136,6 +137,330 @@ def _debate_response_bundle(
     }}
     """
     return [bull_response, bear_response, risk_response, trader_response]
+
+
+async def _run_live_trade_loop_once_for_mode(
+    *,
+    db_manager: DatabaseManager,
+    live_enabled: bool,
+    monkeypatch,
+) -> dict:
+    monkeypatch.setattr(settings.trading, "live_trading_enabled", live_enabled, raising=False)
+    monkeypatch.setattr(settings.trading, "shadow_mode_enabled", False, raising=False)
+    monkeypatch.setattr(settings.trading, "daily_ai_budget", 10.0, raising=False)
+    monkeypatch.setattr(settings.trading, "max_position_size_pct", 3.0, raising=False)
+
+    event = {
+        "event_ticker": "KXSPORTS-DECISION-COMPARE",
+        "title": "Will Team L score late?",
+        "category": "Sports",
+        "focus_type": "sports",
+        "hours_to_expiry": 1.75,
+        "live_score": 76.0,
+        "is_live_candidate": True,
+        "volume_24h": 5600.0,
+        "avg_yes_spread": 0.02,
+        "markets": [
+            {
+                "ticker": "KXSPORTS-DECISION-COMPARE-M1",
+                "title": "Team L moneyline",
+                "yes_midpoint": 0.41,
+                "yes_bid": 0.40,
+                "yes_ask": 0.42,
+                "no_bid": 0.59,
+                "no_ask": 0.61,
+                "yes_spread": 0.02,
+                "volume": 4100,
+                "volume_24h": 4100.0,
+                "expiration_ts": 4102444800,
+                "hours_to_expiry": 1.75,
+            }
+        ],
+    }
+    scout_response = """
+    {
+      "summary": "One sports event is a clean A/B parity check.",
+      "selected_events": [
+        {"event_ticker": "KXSPORTS-DECISION-COMPARE", "priority": 1, "reason": "Tight book and clear intent."}
+      ]
+    }
+    """
+    specialist_response = """
+    {
+      "summary": "Sports specialist likes a short-lived parity check.",
+      "action": "TRADE",
+      "market_ticker": "KXSPORTS-DECISION-COMPARE-M1",
+      "side": "YES",
+      "confidence": 0.79,
+      "edge_pct": 0.08,
+      "position_size_pct": 2.0,
+      "hold_minutes": 30,
+      "limit_price": 0.41,
+      "execution_style": "LIVE_TRADE",
+      "risk_flags": [],
+      "reasoning": "Parity test should stay on the same execution path in both paper and live."
+    }
+    """
+    calls = {}
+
+    async def fake_execute_position(**kwargs):
+        calls["live_mode"] = kwargs["live_mode"]
+        calls["position_live"] = kwargs["position"].live
+        return True
+
+    async def fake_guardrail(**_kwargs):
+        return True, None
+
+    loop = LiveTradeDecisionLoop(
+        db_manager=db_manager,
+        kalshi_client=FakeKalshiClient(),
+        model_router=FakeModelRouter(
+            [
+                scout_response,
+                specialist_response,
+                *_debate_response_bundle(
+                    trader_limit_price=41,
+                    trader_confidence=0.8,
+                    trader_reasoning="Parities align on both execution modes.",
+                ),
+            ]
+        ),
+        research_service=FakeResearchService([event]),
+        execute_position_fn=fake_execute_position,
+        guardrail_fn=fake_guardrail,
+    )
+
+    summary = await loop.run_once()
+    await loop.close()
+
+    final_rows = await db_manager.list_live_trade_decisions(limit=1, step="final")
+    execution_rows = await db_manager.list_live_trade_decisions(limit=1, step="execution")
+    runtime_state = await db_manager.get_live_trade_runtime_state()
+    return {
+        "summary": summary,
+        "calls": calls,
+        "final_rows": final_rows,
+        "execution_rows": execution_rows,
+        "runtime_state": runtime_state,
+    }
+
+
+def _final_payload_signature(row_payload_json: str | None) -> dict:
+    payload = json.loads(row_payload_json) if row_payload_json else {}
+    if not isinstance(payload, dict):
+        return {}
+    stable = dict(payload)
+    stable.pop("elapsed_seconds", None)
+    return stable
+
+
+async def _run_live_trade_loop_once_for_mode_with_route_probe(
+    *,
+    db_manager: DatabaseManager,
+    live_enabled: bool,
+    execution_style: str,
+    hold_minutes: int,
+    monkeypatch,
+) -> dict:
+    monkeypatch.setattr(settings.trading, "live_trading_enabled", live_enabled, raising=False)
+    monkeypatch.setattr(settings.trading, "shadow_mode_enabled", False, raising=False)
+    monkeypatch.setattr(settings.trading, "daily_ai_budget", 10.0, raising=False)
+    monkeypatch.setattr(settings.trading, "max_position_size_pct", 3.0, raising=False)
+    if live_enabled:
+        monkeypatch.setattr(settings.trading, "enable_live_quick_flip", True, raising=False)
+
+    event = {
+        "event_ticker": "KXSPORTS-ROUTE-PARITY",
+        "title": "Will Team M confirm the route parity assumption?",
+        "category": "Sports",
+        "focus_type": "sports",
+        "hours_to_expiry": 1.5,
+        "live_score": 75.0,
+        "is_live_candidate": True,
+        "volume_24h": 5200.0,
+        "avg_yes_spread": 0.02,
+        "markets": [
+            {
+                "ticker": "KXSPORTS-ROUTE-PARITY-M1",
+                "title": "Team M moneyline parity",
+                "yes_midpoint": 0.37,
+                "yes_bid": 0.36,
+                "yes_ask": 0.38,
+                "no_bid": 0.62,
+                "no_ask": 0.64,
+                "yes_spread": 0.02,
+                "volume": 4200,
+                "volume_24h": 4200.0,
+                "expiration_ts": 4102444800,
+                "hours_to_expiry": 1.5,
+            }
+        ],
+    }
+    scout_response = """
+    {
+      "summary": "One sports event deserves parity validation.",
+      "selected_events": [
+        {"event_ticker": "KXSPORTS-ROUTE-PARITY", "priority": 1, "reason": "Consistent edge and tight spread."}
+      ]
+    }
+    """
+    specialist_response = f"""
+    {
+      "summary": "Parity specialist proposes the same route in both runtime modes.",
+      "action": "TRADE",
+      "market_ticker": "KXSPORTS-ROUTE-PARITY-M1",
+      "side": "YES",
+      "confidence": 0.77,
+      "edge_pct": 0.07,
+      "position_size_pct": 2.0,
+      "hold_minutes": {hold_minutes},
+      "limit_price": 0.37,
+      "execution_style": "{execution_style}",
+      "risk_flags": [],
+      "reasoning": "Route-level parity test intent."
+    }
+    """
+    route_capture = {}
+
+    async def fake_execute_position(**kwargs):
+        route_capture["route"] = "standard_executor"
+        route_capture["executed_live_mode"] = kwargs["live_mode"]
+        route_capture["position"] = kwargs["position"]
+        return True
+
+    async def fake_quick_flip_executor(**kwargs):
+        route_capture["route"] = "quick_flip_executor"
+        route_capture["intent"] = kwargs["final_intent"]
+        route_capture["selected_market"] = kwargs["selected_market"]["ticker"]
+        route_capture["quantity"] = kwargs["quantity"]
+        return {
+            "executed": True,
+            "status": "executed",
+            "summary": "Quick flip route parity test execution path.",
+            "quantity": kwargs["quantity"],
+            "payload": {"route": "quick_flip"},
+        }
+
+    async def fake_guardrail(**_kwargs):
+        return True, None
+
+    loop = LiveTradeDecisionLoop(
+        db_manager=db_manager,
+        kalshi_client=FakeKalshiClient(),
+        model_router=FakeModelRouter(
+            [
+                scout_response,
+                specialist_response,
+                *_debate_response_bundle(
+                    trader_limit_price=37,
+                    trader_confidence=0.77,
+                    trader_reasoning="Route parity requires consistent final intent.",
+                ),
+            ]
+        ),
+        research_service=FakeResearchService([event]),
+        execute_position_fn=fake_execute_position,
+        guardrail_fn=fake_guardrail,
+        quick_flip_executor_fn=fake_quick_flip_executor,
+    )
+
+    summary = await loop.run_once()
+    await loop.close()
+
+    final_rows = await db_manager.list_live_trade_decisions(limit=1, step="final")
+    execution_rows = await db_manager.list_live_trade_decisions(limit=1, step="execution")
+    runtime_state = await db_manager.get_live_trade_runtime_state()
+    return {
+        "summary": summary,
+        "route_capture": route_capture,
+        "final_rows": final_rows,
+        "execution_rows": execution_rows,
+        "runtime_state": runtime_state,
+    }
+
+
+@pytest.mark.asyncio
+async def test_live_trade_loop_makes_equivalent_execution_decision_in_paper_and_live_modes(monkeypatch):
+    db_manager_paper = await _build_test_db_manager("live_trade_loop_decision_parity_paper")
+    paper = await _run_live_trade_loop_once_for_mode(
+        db_manager=db_manager_paper,
+        live_enabled=False,
+        monkeypatch=monkeypatch,
+    )
+    await db_manager_paper.close()
+
+    db_manager_live = await _build_test_db_manager("live_trade_loop_decision_parity_live")
+    live = await _run_live_trade_loop_once_for_mode(
+        db_manager=db_manager_live,
+        live_enabled=True,
+        monkeypatch=monkeypatch,
+    )
+    await db_manager_live.close()
+
+    paper_final_rows = paper["final_rows"]
+    live_final_rows = live["final_rows"]
+    paper_execution_rows = paper["execution_rows"]
+    live_execution_rows = live["execution_rows"]
+
+    assert paper["summary"].executed_positions == 1
+    assert live["summary"].executed_positions == 1
+    assert paper["calls"]["live_mode"] is False
+    assert live["calls"]["live_mode"] is True
+    assert paper["calls"]["position_live"] is False
+    assert live["calls"]["position_live"] is True
+    assert paper_final_rows and live_final_rows
+    assert paper_execution_rows and live_execution_rows
+    assert _final_payload_signature(paper_final_rows[0]["payload_json"]) == _final_payload_signature(
+        live_final_rows[0]["payload_json"]
+    )
+    assert paper_final_rows[0]["side"] == live_final_rows[0]["side"] == "YES"
+    assert paper_final_rows[0]["action"] == live_final_rows[0]["action"] == "BUY"
+    assert paper_final_rows[0]["market_ticker"] == live_final_rows[0]["market_ticker"]
+    assert paper["runtime_state"]["runtime_mode"] == "paper"
+    assert live["runtime_state"]["runtime_mode"] == "live"
+    assert json.loads(paper_execution_rows[0]["payload_json"])["execution_mode"] == "paper"
+    assert json.loads(live_execution_rows[0]["payload_json"])["execution_mode"] == "live"
+    assert paper_execution_rows[0]["paper_trade"] == 1
+    assert live_execution_rows[0]["live_trade"] == 1
+
+
+@pytest.mark.asyncio
+async def test_live_trade_loop_keeps_final_intent_route_parity_for_quick_flip(monkeypatch):
+    db_manager_paper = await _build_test_db_manager("live_trade_loop_route_parity_quickflip_paper")
+    paper = await _run_live_trade_loop_once_for_mode_with_route_probe(
+        db_manager=db_manager_paper,
+        live_enabled=False,
+        execution_style="QUICK_FLIP",
+        hold_minutes=20,
+        monkeypatch=monkeypatch,
+    )
+    await db_manager_paper.close()
+
+    db_manager_live = await _build_test_db_manager("live_trade_loop_route_parity_quickflip_live")
+    live = await _run_live_trade_loop_once_for_mode_with_route_probe(
+        db_manager=db_manager_live,
+        live_enabled=True,
+        execution_style="QUICK_FLIP",
+        hold_minutes=20,
+        monkeypatch=monkeypatch,
+    )
+    await db_manager_live.close()
+
+    paper_final_rows = paper["final_rows"]
+    live_final_rows = live["final_rows"]
+    assert paper["summary"].executed_positions == 1
+    assert live["summary"].executed_positions == 1
+    assert paper["route_capture"]["route"] == "quick_flip_executor"
+    assert live["route_capture"]["route"] == "quick_flip_executor"
+    assert paper["route_capture"]["selected_market"] == "KXSPORTS-ROUTE-PARITY-M1"
+    assert live["route_capture"]["selected_market"] == "KXSPORTS-ROUTE-PARITY-M1"
+    assert paper["runtime_state"]["runtime_mode"] == "paper"
+    assert live["runtime_state"]["runtime_mode"] == "live"
+    assert paper_final_rows and live_final_rows
+    assert paper["route_capture"]["intent"] == live["route_capture"]["intent"]
+    assert _final_payload_signature(paper_final_rows[0]["payload_json"]) == _final_payload_signature(
+        live_final_rows[0]["payload_json"]
+    )
 
 
 @pytest.mark.asyncio
@@ -1233,6 +1558,114 @@ async def test_live_trade_loop_records_blocked_execution_when_guardrail_rejects(
 
     positions = await db_manager.get_open_positions()
     assert positions == []
+
+
+@pytest.mark.asyncio
+async def test_live_trade_loop_passes_live_guardrail_mode_in_shadow(monkeypatch):
+    monkeypatch.setattr(settings.trading, "live_trading_enabled", False, raising=False)
+    monkeypatch.setattr(settings.trading, "shadow_mode_enabled", True, raising=False)
+    monkeypatch.setattr(settings.trading, "daily_ai_budget", 10.0, raising=False)
+    monkeypatch.setattr(settings.trading, "max_position_size_pct", 3.0, raising=False)
+
+    db_manager = await _build_test_db_manager("live_trade_loop_shadow_guardrail_mode")
+
+    event = {
+        "event_ticker": "KXSPORTS-SHADOW-GUARDRAIL",
+        "title": "Will Team M convert late?",
+        "category": "Sports",
+        "focus_type": "sports",
+        "hours_to_expiry": 1.5,
+        "live_score": 71.0,
+        "is_live_candidate": True,
+        "volume_24h": 6200.0,
+        "avg_yes_spread": 0.02,
+        "markets": [
+            {
+                "ticker": "KXSPORTS-SHADOW-GUARDRAIL-M1",
+                "title": "Team M total points",
+                "yes_midpoint": 0.39,
+                "yes_bid": 0.38,
+                "yes_ask": 0.40,
+                "no_bid": 0.60,
+                "no_ask": 0.62,
+                "yes_spread": 0.02,
+                "volume": 3000,
+                "volume_24h": 3000.0,
+                "expiration_ts": 4102444800,
+                "hours_to_expiry": 1.5,
+            }
+        ],
+    }
+
+    scout_response = """
+    {
+      "summary": "One sports event should get shadow-mode coverage with live-like guardrails.",
+      "selected_events": [
+        {"event_ticker": "KXSPORTS-SHADOW-GUARDRAIL", "priority": 1, "reason": "Liquidity and urgency are strong."}
+      ]
+    }
+    """
+    specialist_response = """
+    {
+      "summary": "Sports specialist wants a live-like shadow entry.",
+      "action": "TRADE",
+      "market_ticker": "KXSPORTS-SHADOW-GUARDRAIL-M1",
+      "side": "YES",
+      "confidence": 0.75,
+      "edge_pct": 0.08,
+      "position_size_pct": 2.0,
+      "hold_minutes": 45,
+      "limit_price": 0.39,
+      "execution_style": "LIVE_TRADE",
+      "risk_flags": [],
+      "reasoning": "Shadow mode should still enforce live parity limits."
+    }
+    """
+
+    captured = {}
+
+    async def fake_live_guardrail(
+        *,
+        market,
+        side,
+        trade_value,
+        portfolio_value,
+        db_manager,
+        enforcement_mode=None,
+        **_kwargs,
+    ):
+        captured["mode"] = enforcement_mode
+        return True, None
+
+    monkeypatch.setattr(
+        decide_module,
+        "_passes_live_trade_guardrails",
+        fake_live_guardrail,
+        raising=False,
+    )
+
+    loop = LiveTradeDecisionLoop(
+        db_manager=db_manager,
+        kalshi_client=FakeKalshiClient(),
+        model_router=FakeModelRouter(
+            [
+                scout_response,
+                specialist_response,
+                *_debate_response_bundle(
+                    trader_limit_price=39,
+                    trader_confidence=0.76,
+                    trader_reasoning="Debate confirms a shadow paper execution.",
+                ),
+            ]
+        ),
+        research_service=FakeResearchService([event]),
+    )
+
+    summary = await loop.run_once()
+    await loop.close()
+
+    assert summary.executed_positions == 1
+    assert captured.get("mode") == "live"
 
 
 @pytest.mark.asyncio

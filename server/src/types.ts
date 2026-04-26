@@ -376,7 +376,7 @@ export interface PortfolioAiSpendBucket {
 export interface PortfolioAiSpendBreakdown {
   available: boolean;
   sourceTable: string | null;
-  sourceField: "provider" | "strategy" | "query_type" | null;
+  sourceField: "provider" | "strategy" | "query_type" | "role" | null;
   totalCostUsd: number;
   attributedCostUsd: number;
   unattributedCostUsd: number;

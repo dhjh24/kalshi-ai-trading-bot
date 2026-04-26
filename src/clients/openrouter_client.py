@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from json_repair import repair_json
 from openai import AsyncOpenAI
 
-from src.clients.xai_client import DailyUsageTracker, TradingDecision
+from src.clients.shared_types import DailyUsageTracker, TradingDecision
 from src.config.settings import settings
 from src.utils.kalshi_normalization import get_market_prices, get_market_volume
 from src.utils.logging_setup import TradingLoggerMixin, log_error_with_context
@@ -653,6 +653,7 @@ class OpenRouterClient(TradingLoggerMixin):
         temperature: Optional[float] = None,
         strategy: str = "unknown",
         query_type: str = "completion",
+        role: Optional[str] = None,
         market_id: Optional[str] = None,
         fallback_models: Optional[List[str]] = None,
         provider: Optional[Dict[str, Any]] = None,
@@ -704,6 +705,7 @@ class OpenRouterClient(TradingLoggerMixin):
             await self._log_query(
                 strategy=strategy,
                 query_type=query_type,
+                role=role or query_type,
                 prompt=prompt_preview,
                 response=content,
                 market_id=market_id,
@@ -738,6 +740,7 @@ class OpenRouterClient(TradingLoggerMixin):
         model: Optional[str] = None,
         *,
         fallback_models: Optional[List[str]] = None,
+        role: Optional[str] = None,
         provider: Optional[Dict[str, Any]] = None,
         response_format: Optional[Dict[str, Any]] = None,
         plugins: Optional[List[Dict[str, Any]]] = None,
@@ -789,6 +792,7 @@ class OpenRouterClient(TradingLoggerMixin):
                 await self._log_query(
                     strategy="openrouter",
                     query_type="trading_decision",
+                    role=role or "trading_decision",
                     prompt=prompt,
                     response=content,
                     market_id=market_data.get("ticker") or market_data.get("market_id"),
@@ -944,6 +948,7 @@ Example skip:
         prompt: str,
         response: str,
         market_id: Optional[str] = None,
+        role: Optional[str] = None,
         tokens_used: Optional[int] = None,
         cost_usd: Optional[float] = None,
         confidence_extracted: Optional[float] = None,
@@ -959,6 +964,7 @@ Example skip:
                 timestamp=datetime.now(),
                 strategy=strategy,
                 query_type=query_type,
+                role=role or query_type,
                 market_id=market_id,
                 prompt=prompt[:2000],
                 response=response[:5000],

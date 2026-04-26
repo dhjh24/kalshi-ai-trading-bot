@@ -225,6 +225,7 @@ Common trading and dashboard env vars:
 
 - `PREFERRED_CATEGORIES=Sports` — default market focus for screening
 - `PREFER_LIVE_WAGERING=true` and `LIVE_WAGERING_MAX_HOURS_TO_EXPIRY=12` — bias toward short-dated live opportunities
+- `QUICK_FLIP_DISABLE_AI=true` — force quick flip into the heuristic-only fallback when Codex/API quota is unavailable or you want math-only behavior
 - `DAILY_AI_COST_LIMIT=10.0` — hard cap for daily model spend
 - `DB_PATH`, `DASHBOARD_BRIDGE_PORT`, `DASHBOARD_WEB_PORT`, `DASHBOARD_SERVER_PORT`, `ANALYSIS_BRIDGE_URL`, `DASHBOARD_REFRESH_MS` — optional overrides for the dashboard stack
 
@@ -288,9 +289,10 @@ Command matrix:
 - `python cli.py run --paper`, `python cli.py run --shadow`, and `python cli.py run --live` all execute the embedded `run_live_trade_loop_cycle()` during the main job.
 - `python cli.py run --live-trade` is the dedicated loop-only runtime, and it now supports `paper`, `shadow`, or `live` execution semantics.
 
-Direct bot entrypoints still work:
+Primary CLI is recommended for Beast Mode and dashboard workflows:
 
 ```bash
+python scripts/beast_mode_dashboard.py   # Legacy dashboard shim; use `python cli.py dashboard` for production path
 python beast_mode_bot.py              # Paper trading
 python beast_mode_bot.py --live       # Live trading
 ```

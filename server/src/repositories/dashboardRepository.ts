@@ -697,7 +697,18 @@ function getAiSpendBreakdown(options: {
     return emptyAiSpendBreakdown(null);
   }
 
-  if (!tableExists(options.tableName) || !columnExists(options.tableName, options.sourceField)) {
+  const usesRole = options.sourceField === "role";
+  const hasRole = tableExists(options.tableName)
+    && columnExists(options.tableName, "role");
+  const hasQueryType = tableExists(options.tableName)
+    && columnExists(options.tableName, "query_type");
+
+  if (
+    !tableExists(options.tableName) ||
+    (usesRole
+      ? !(hasRole || hasQueryType)
+      : !columnExists(options.tableName, options.sourceField))
+  ) {
     return emptyAiSpendBreakdown(options.sourceField, tableExists(options.tableName) ? options.tableName : null);
   }
 
@@ -709,7 +720,14 @@ function getAiSpendBreakdown(options: {
     options.tokensField && columnExists(options.tableName, options.tokensField)
       ? options.tokensField
       : null;
-  const bucketExpression = `COALESCE(NULLIF(TRIM(CAST(${options.sourceField} AS TEXT)), ''), 'unattributed')`;
+  const roleSourceExpression = hasRole
+    ? hasQueryType
+      ? "CASE WHEN role IS NULL OR TRIM(CAST(role AS TEXT)) = '' THEN query_type ELSE role END"
+      : "role"
+    : "query_type";
+  const sourceExpression = usesRole
+    ? `COALESCE(NULLIF(TRIM(CAST(${roleSourceExpression} AS TEXT)), ''), 'unattributed')`
+    : `COALESCE(NULLIF(TRIM(CAST(${options.sourceField} AS TEXT)), ''), 'unattributed')`;
   const totals = db
     .prepare(
       `
@@ -718,7 +736,7 @@ function getAiSpendBreakdown(options: {
           COALESCE(
             SUM(
               CASE
-                WHEN ${bucketExpression} <> 'unattributed'
+                WHEN ${sourceExpression} <> 'unattributed'
                 THEN COALESCE(cost_usd, 0)
                 ELSE 0
               END
@@ -745,7 +763,7 @@ function getAiSpendBreakdown(options: {
     db.prepare(
       `
         SELECT
-          ${bucketExpression} AS bucket_key,
+          ${sourceExpression} AS bucket_key,
           COUNT(*) AS bucket_count,
           COALESCE(SUM(COALESCE(cost_usd, 0)), 0) AS cost_usd,
           ${tokensSql}
@@ -1709,7 +1727,7 @@ export function getPortfolioAiSpendByStrategy(): PortfolioAiSpendBreakdown {
 export function getPortfolioAiSpendByRole(): PortfolioAiSpendBreakdown {
   return getAiSpendBreakdown({
     tableName: "llm_queries",
-    sourceField: "query_type",
+    sourceField: "role",
     tokensField: "tokens_used"
   });
 }

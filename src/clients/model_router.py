@@ -1,9 +1,9 @@
 """
 Unified model routing layer for the Kalshi AI Trading Bot.
 
-Routes ALL requests through OpenRouter — single API key, full model fleet.
-Provides aggregate cost tracking, daily budget enforcement, and transparent
-fallback across the full model fleet.
+Routes requests across Codex, direct OpenAI, and OpenRouter providers while
+keeping aggregate cost tracking, daily budget enforcement, and transparent
+fallback behavior in one place.
 """
 
 import asyncio
@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from src.clients.xai_client import TradingDecision, DailyUsageTracker
+from src.clients.shared_types import TradingDecision, DailyUsageTracker
 from src.clients.openai_client import OpenAIClient
 from src.clients.openrouter_client import OpenRouterClient, MODEL_PRICING
 from src.clients.codex_client import CodexClient
@@ -371,14 +371,42 @@ class ModelRouter(TradingLoggerMixin):
         """
         Infer the provider to use for a requested model.
 
-        Codex mode keeps requests on the Codex CLI fleet; OpenAI mode stays
-        on OpenAI; everything else flows through OpenRouter.
+        Explicit Codex models always go through the Codex CLI. When the active
+        default is OpenRouter, non-Codex models stay on OpenRouter so callers
+        can request `openai/...` models via OpenRouter-native routing. Direct
+        OpenAI is used only for models in the OpenAI fleet when OpenRouter is
+        not the active default. Everything else falls back to OpenRouter.
         """
-        if self.default_provider == "codex":
+        normalized = str(model or "").strip()
+        bare_name = normalized.split("/", 1)[-1] if normalized else ""
+        codex_models = {name for name, _ in CODEX_FULL_FLEET}
+        openai_models = {name for name, _ in OPENAI_FULL_FLEET}
+        codex_bare_models = {name.split("/", 1)[-1] for name in codex_models}
+        openai_bare_models = {name.split("/", 1)[-1] for name in openai_models}
+
+        if (
+            normalized in codex_models
+            or normalized.startswith("codex/")
+            or bare_name in codex_bare_models
+        ):
             return "codex"
-        if self.default_provider == "openai":
+        if self.default_provider == "openrouter":
+            return "openrouter"
+        if (
+            normalized in openai_models
+            or normalized.startswith("openai/")
+            or bare_name in openai_bare_models
+        ):
             return "openai"
         return "openrouter"
+
+    def _fleet_for_provider(self, provider: str) -> List[Tuple[str, str]]:
+        """Return the canonical fallback fleet for a provider."""
+        if provider == "codex":
+            return CODEX_FULL_FLEET
+        if provider == "openai":
+            return OPENAI_FULL_FLEET
+        return FULL_FLEET
 
     def _resolve_targets(
         self,
@@ -394,19 +422,21 @@ class ModelRouter(TradingLoggerMixin):
         3. Full fleet sorted by health / success rate.
         """
         targets: List[Tuple[str, str]] = []
+        fleet = self._active_fleet()
 
         if model is not None:
             provider = self._infer_provider(model)
             targets.append((model, provider))
+            fleet = self._fleet_for_provider(provider)
         elif capability is not None:
             cap_targets = self._active_capability_map().get(capability, [])
             targets.extend(cap_targets)
         else:
-            targets = list(self._active_fleet())
+            targets = list(fleet)
 
         # Append remaining fleet members not yet in the list
         seen = set(targets)
-        for entry in self._active_fleet():
+        for entry in fleet:
             if entry not in seen:
                 targets.append(entry)
                 seen.add(entry)
@@ -455,6 +485,7 @@ class ModelRouter(TradingLoggerMixin):
         max_tokens: Optional[int] = None,
         strategy: str = "unknown",
         query_type: str = "completion",
+        role: Optional[str] = None,
         market_id: Optional[str] = None,
         response_format: Optional[Dict[str, Any]] = None,
         provider_preferences: Optional[Dict[str, Any]] = None,
@@ -473,6 +504,7 @@ class ModelRouter(TradingLoggerMixin):
             temperature=temperature,
             strategy=strategy,
             query_type=query_type,
+            role=role,
             market_id=market_id,
             response_format=response_format,
             provider=provider_preferences,
@@ -489,6 +521,7 @@ class ModelRouter(TradingLoggerMixin):
         news_summary: str,
         model: str,
         provider: str,
+        role: Optional[str] = None,
         fallback_models: Optional[List[str]] = None,
         provider_preferences: Optional[Dict[str, Any]] = None,
         response_format: Optional[Dict[str, Any]] = None,
@@ -504,6 +537,7 @@ class ModelRouter(TradingLoggerMixin):
             portfolio_data=portfolio_data,
             news_summary=news_summary,
             model=model,
+            role=role,
             fallback_models=fallback_models,
             provider=provider_preferences,
             response_format=response_format,
@@ -526,6 +560,7 @@ class ModelRouter(TradingLoggerMixin):
         max_tokens: Optional[int] = None,
         strategy: str = "unknown",
         query_type: str = "completion",
+        role: Optional[str] = None,
         market_id: Optional[str] = None,
         response_format: Optional[Dict[str, Any]] = None,
         provider_preferences: Optional[Dict[str, Any]] = None,
@@ -566,6 +601,7 @@ class ModelRouter(TradingLoggerMixin):
                 max_tokens=max_tokens,
                 strategy=strategy,
                 query_type=query_type,
+                role=role,
                 market_id=market_id,
                 response_format=response_format,
                 provider_preferences=provider_preferences,
@@ -692,6 +728,7 @@ class ModelRouter(TradingLoggerMixin):
         model: Optional[str] = None,
         capability: Optional[str] = None,
         provider_preferences: Optional[Dict[str, Any]] = None,
+        role: Optional[str] = None,
         response_format: Optional[Dict[str, Any]] = None,
         plugins: Optional[List[Dict[str, Any]]] = None,
         metadata: Optional[Dict[str, Any]] = None,
@@ -725,6 +762,7 @@ class ModelRouter(TradingLoggerMixin):
                 provider=primary_provider,
                 fallback_models=fallback_models,
                 provider_preferences=provider_preferences,
+                role=role,
                 response_format=response_format,
                 plugins=plugins,
                 metadata=metadata,

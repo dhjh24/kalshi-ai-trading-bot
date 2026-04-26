@@ -980,7 +980,7 @@ async def test_ai_spend_provider_breakdown_makes_codex_quota_explicit(
 
     summary = (await manager.get_ai_spend_provider_breakdown())["summary"]
 
-    assert "codex $0.00 (2 req, 321 tok)" in summary
+    assert "codex $0.00 (1 req, 321 tok)" in summary
     assert "openai $0.12" in summary
 
 

@@ -140,6 +140,7 @@ class LLMQuery:
     timestamp: datetime
     strategy: str  # Which strategy made the query
     query_type: str  # Type of query (market_analysis, movement_prediction, etc.)
+    role: Optional[str] = None  # Role/agent context for cost accounting (fallback to query_type)
     market_id: Optional[str]  # Market being analyzed (if applicable)
     prompt: str  # The prompt sent to LLM
     response: str  # LLM response
@@ -342,6 +343,7 @@ class DatabaseManager(TradingLoggerMixin):
                     strategy TEXT NOT NULL,
                     provider TEXT,
                     query_type TEXT NOT NULL,
+                    role TEXT,
                     market_id TEXT,
                     prompt TEXT NOT NULL,
                     response TEXT NOT NULL,
@@ -358,6 +360,16 @@ class DatabaseManager(TradingLoggerMixin):
             if "provider" not in llm_query_columns:
                 await db.execute("ALTER TABLE llm_queries ADD COLUMN provider TEXT")
                 self.logger.info("Added provider column to llm_queries table")
+            if "role" not in llm_query_columns:
+                await db.execute("ALTER TABLE llm_queries ADD COLUMN role TEXT")
+                self.logger.info("Added role column to llm_queries table")
+
+            cursor = await db.execute("PRAGMA table_info(analysis_requests)")
+            analysis_request_info = await cursor.fetchall()
+            analysis_request_columns = {col[1] for col in analysis_request_info}
+            if analysis_request_info and "provider" not in analysis_request_columns:
+                await db.execute("ALTER TABLE analysis_requests ADD COLUMN provider TEXT")
+                self.logger.info("Added provider column to analysis_requests table")
 
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS blocked_trades (
@@ -2608,6 +2620,62 @@ class DatabaseManager(TradingLoggerMixin):
             ),
         )
 
+    async def _get_recent_llm_query_provider_usage(
+        self,
+        recent_days: int = LLM_USAGE_RECENT_WINDOW_DAYS,
+    ) -> Dict[str, Dict[str, int]]:
+        """Return recent llm_queries-only request/token usage keyed by provider."""
+        window_days = max(int(recent_days or LLM_USAGE_RECENT_WINDOW_DAYS), 1)
+        cutoff_time = (datetime.now() - timedelta(days=window_days)).isoformat()
+
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='llm_queries'"
+                )
+                if not await cursor.fetchone():
+                    return {}
+
+                cursor = await db.execute("PRAGMA table_info(llm_queries)")
+                columns = {row["name"] for row in await cursor.fetchall()}
+                if "provider" not in columns or "timestamp" not in columns:
+                    return {}
+
+                token_select = (
+                    "COALESCE(SUM(COALESCE(tokens_used, 0)), 0) AS total_tokens"
+                    if "tokens_used" in columns
+                    else "0 AS total_tokens"
+                )
+                cursor = await db.execute(
+                    f"""
+                    SELECT
+                        COALESCE(NULLIF(TRIM(COALESCE(provider, '')), ''), 'unattributed') AS provider,
+                        COUNT(*) AS request_count,
+                        {token_select}
+                    FROM llm_queries
+                    WHERE datetime(timestamp) >= datetime(?)
+                    GROUP BY provider
+                    """,
+                    (cutoff_time,),
+                )
+                rows = await cursor.fetchall()
+        except Exception as exc:
+            self.logger.debug(
+                "Could not summarize llm_queries provider usage",
+                error=str(exc),
+            )
+            return {}
+
+        usage: Dict[str, Dict[str, int]] = {}
+        for row in rows:
+            provider = str((row["provider"] or "unattributed")).strip() or "unattributed"
+            usage[provider.casefold()] = {
+                "request_count": int(row["request_count"] or 0),
+                "total_tokens": int(row["total_tokens"] or 0),
+            }
+        return usage
+
     async def get_ai_spend_provider_breakdown(
         self,
         recent_days: int = LLM_USAGE_RECENT_WINDOW_DAYS,
@@ -2628,6 +2696,9 @@ class DatabaseManager(TradingLoggerMixin):
         provider_rows = await self._get_recent_provider_spend_rows(
             recent_days=window_days
         )
+        llm_query_usage = await self._get_recent_llm_query_provider_usage(
+            recent_days=window_days
+        )
 
         provider_bits = []
         for row in provider_rows:
@@ -2640,11 +2711,14 @@ class DatabaseManager(TradingLoggerMixin):
 
             provider_bit = f"{provider} ${total_cost:.2f}"
             if provider.casefold() == "codex":
+                quota_usage = llm_query_usage.get(provider.casefold(), {})
                 quota_bits = []
-                if request_count > 0:
-                    quota_bits.append(f"{request_count} req")
-                if total_tokens > 0:
-                    quota_bits.append(f"{total_tokens:,} tok")
+                quota_request_count = int(quota_usage.get("request_count") or 0)
+                quota_total_tokens = int(quota_usage.get("total_tokens") or 0)
+                if quota_request_count > 0:
+                    quota_bits.append(f"{quota_request_count} req")
+                if quota_total_tokens > 0:
+                    quota_bits.append(f"{quota_total_tokens:,} tok")
                 if quota_bits:
                     provider_bit = f"{provider_bit} ({', '.join(quota_bits)})"
             provider_bits.append(provider_bit)
@@ -2922,17 +2996,18 @@ class DatabaseManager(TradingLoggerMixin):
     async def log_llm_query(self, llm_query: LLMQuery) -> None:
         """Log an LLM query and response for analysis."""
         try:
-            query_dict = asdict(llm_query)
-            query_dict['timestamp'] = llm_query.timestamp.isoformat()
-            query_dict.setdefault('provider', None)
-            
-            async with aiosqlite.connect(self.db_path) as db:
-                await db.execute("""
-                    INSERT INTO llm_queries (
-                        timestamp, strategy, provider, query_type, market_id, prompt, response,
+                query_dict = asdict(llm_query)
+                query_dict['timestamp'] = llm_query.timestamp.isoformat()
+                query_dict.setdefault('provider', None)
+                query_dict.setdefault('role', None)
+                
+                async with aiosqlite.connect(self.db_path) as db:
+                    await db.execute("""
+                        INSERT INTO llm_queries (
+                        timestamp, strategy, provider, query_type, role, market_id, prompt, response,
                         tokens_used, cost_usd, confidence_extracted, decision_extracted
                     ) VALUES (
-                        :timestamp, :strategy, :provider, :query_type, :market_id, :prompt, :response,
+                        :timestamp, :strategy, :provider, :query_type, :role, :market_id, :prompt, :response,
                         :tokens_used, :cost_usd, :confidence_extracted, :decision_extracted
                     )
                 """, query_dict)
