@@ -1241,6 +1241,10 @@ async def test_live_trade_loop_shadow_mode_records_real_shadow_telemetry(monkeyp
     assert runtime_state["loop_status"] == "completed"
     assert runtime_state["last_step"] == "execution"
     assert runtime_state["last_step_status"] == "executed"
+    execution_rows = await db_manager.list_live_trade_decisions(limit=5, step="execution")
+    assert execution_rows
+    execution_payload = json.loads(execution_rows[0]["payload_json"])
+    assert execution_payload["execution_mode"] == "shadow"
 
     decision_rows = await db_manager.list_live_trade_decisions(limit=10)
     assert decision_rows

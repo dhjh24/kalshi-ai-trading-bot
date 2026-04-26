@@ -629,7 +629,7 @@ function CodexQuotaCard({
     <div className="rounded-3xl border border-amber-200/80 bg-gradient-to-br from-amber-50 via-white to-orange-50 p-5">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h3 className="font-medium text-steel">Codex quota</h3>
+          <h3 className="font-medium text-steel">Codex usage</h3>
           <p className="mt-1 text-sm text-slate-500">
             Runtime usage pulled from <code>llm_queries</code> where provider is{" "}
             <code>codex</code>.
@@ -647,11 +647,11 @@ function CodexQuotaCard({
 
       {!quota.available ? (
         <div className="mt-4 rounded-2xl border border-dashed border-amber-200 bg-white/70 px-4 py-4 text-sm text-slate-500">
-          Codex quota telemetry is not available yet on this deployment.
+          Codex usage telemetry is not available yet on this deployment.
         </div>
       ) : quota.lifetime.queryCount === 0 ? (
         <div className="mt-4 rounded-2xl border border-dashed border-amber-200 bg-white/70 px-4 py-4 text-sm text-slate-500">
-          Codex usage has not been logged yet, so these quota windows are still
+          Codex usage has not been logged yet, so these usage windows are still
           empty.
         </div>
       ) : (
@@ -824,7 +824,7 @@ export default async function PortfolioPage() {
         <Panel title="AI spend breakdown">
           <p className="max-w-3xl text-sm text-slate-500">
             Provider attribution combines manual analysis requests with runtime{" "}
-            <code>llm_queries</code> logs. Codex quota windows below are sourced
+            <code>llm_queries</code> logs. Codex usage windows below are sourced
             from runtime rows where the provider is <code>codex</code>.
           </p>
 

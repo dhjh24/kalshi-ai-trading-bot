@@ -334,7 +334,7 @@ export default async function LiveTradePage({
     limit: parseNumber(params.limit, 36, VISIBLE_EVENT_OPTIONS),
     maxHoursToExpiry: parseNumber(
       params.maxHoursToExpiry,
-      72,
+      12,
       MAX_HOURS_OPTIONS,
     ),
     categories: normalizeCategories(params.category),
@@ -368,13 +368,13 @@ export default async function LiveTradePage({
     <div className="space-y-6">
       <Panel
         eyebrow="Live Trade"
-        title="Ranked event feed from the Streamlit live-trade workflow"
+        title="Ranked event feed for the W5 decision loop"
       >
         <p className="max-w-3xl text-slate-600">
-          This route carries over the Streamlit live-trade view: short-dated
-          event ranking, category filters, crypto context, and manual analysis
-          controls for the highest-signal candidates, plus persisted decision
-          rows streamed from SQLite as they land.
+          This route tracks the short-dated event queue, category filters,
+          crypto context, manual analysis controls, and persisted scout,
+          specialist, final, and execution rows streamed from SQLite as they
+          land.
         </p>
       </Panel>
 

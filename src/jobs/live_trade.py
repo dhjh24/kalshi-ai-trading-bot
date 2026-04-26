@@ -1446,6 +1446,8 @@ class LiveTradeDecisionLoop:
 
         execution_style = str(final_intent.get("execution_style") or "NONE").upper()
         live_mode = self._is_live_execution_mode()
+        runtime_mode = self._resolve_runtime_mode()
+        execution_mode_label = "live" if live_mode else runtime_mode
         if execution_style == "QUICK_FLIP" and _safe_int(final_intent.get("hold_minutes"), 0) <= 30:
             if live_mode and not bool(getattr(settings.trading, "enable_live_quick_flip", False)):
                 await self._record_execution_status(
@@ -1545,12 +1547,16 @@ class LiveTradeDecisionLoop:
                 summary=(
                     "Live-trade position opened in live mode."
                     if live_mode
-                    else "Paper live-trade position opened."
+                    else (
+                        "Shadow live-trade position opened with paper execution."
+                        if runtime_mode == "shadow"
+                        else "Paper live-trade position opened."
+                    )
                 ),
                 quantity=position.quantity,
                 payload={
                     "position_id": position.id,
-                    "execution_mode": "live" if live_mode else "paper",
+                    "execution_mode": execution_mode_label,
                     "entry_fee": position.entry_fee,
                     "contracts_cost": position.contracts_cost,
                     "stop_loss_price": position.stop_loss_price,
@@ -1567,7 +1573,11 @@ class LiveTradeDecisionLoop:
             summary=(
                 "Live execution did not fill the selected live-trade intent."
                 if live_mode
-                else "Paper execution did not fill the selected live-trade intent."
+                else (
+                    "Shadow paper execution did not fill the selected live-trade intent."
+                    if runtime_mode == "shadow"
+                    else "Paper execution did not fill the selected live-trade intent."
+                )
             ),
             error="execution_failed",
             quantity=quantity,

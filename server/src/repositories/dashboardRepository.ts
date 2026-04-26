@@ -1619,6 +1619,10 @@ export function getPortfolioAiSpendByProvider(): PortfolioAiSpendBreakdown {
     const tokensSql = hasTokens
       ? "COALESCE(SUM(COALESCE(tokens_used, 0)), 0) AS tokens_used"
       : "NULL AS tokens_used";
+    const providerExpression =
+      tableName === "llm_queries" && columnExists(tableName, "strategy")
+        ? "CASE WHEN (provider IS NULL OR TRIM(CAST(provider AS TEXT)) = '') AND LOWER(TRIM(CAST(strategy AS TEXT))) = 'codex' THEN 'codex' ELSE provider END"
+        : "provider";
     const rows = rowsAs<
       Array<{
         bucket_key?: string;
@@ -1630,7 +1634,7 @@ export function getPortfolioAiSpendByProvider(): PortfolioAiSpendBreakdown {
       db.prepare(
         `
           SELECT
-            COALESCE(NULLIF(TRIM(CAST(provider AS TEXT)), ''), 'unattributed') AS bucket_key,
+            COALESCE(NULLIF(TRIM(CAST(${providerExpression} AS TEXT)), ''), 'unattributed') AS bucket_key,
             COUNT(*) AS bucket_count,
             COALESCE(SUM(COALESCE(cost_usd, 0)), 0) AS cost_usd,
             ${tokensSql}
