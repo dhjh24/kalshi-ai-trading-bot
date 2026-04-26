@@ -557,6 +557,88 @@ class CodexClient(TradingLoggerMixin):
         return input_tokens, output_tokens, total_tokens, reasoning_tokens
 
     @staticmethod
+    def _extract_quota_signals(stdout: str, stderr: str) -> Dict[str, Any]:
+        """
+        Best-effort quota field extraction from Codex CLI output.
+
+        Some CLI builds print a trailing status block like ``rate-limit: 12/50
+        remaining=38 resets=2026-04-27T00:00:00Z``; others embed
+        ``rate_limit`` / ``quota`` keys in the final JSON. We probe both,
+        returning a dict with any subset of ``used``, ``limit``,
+        ``remaining``, ``reset_at``. Missing fields stay absent so the caller
+        can decide whether to persist a "minimal" snapshot.
+        """
+        result: Dict[str, Any] = {}
+
+        for text in (stdout, stderr):
+            parsed = CodexClient._extract_last_json_object(text)
+            if not isinstance(parsed, dict):
+                continue
+            block = (
+                parsed.get("rate_limit")
+                or parsed.get("quota")
+                or parsed.get("plan_quota")
+                or {}
+            )
+            if isinstance(block, dict):
+                used = block.get("used") or block.get("requests_used")
+                limit = block.get("limit") or block.get("limit_value") or block.get("requests_limit")
+                remaining = (
+                    block.get("remaining")
+                    or block.get("requests_remaining")
+                )
+                reset_at = block.get("reset_at") or block.get("resets_at") or block.get("reset")
+                if used is not None:
+                    try:
+                        result["used"] = int(used)
+                    except (TypeError, ValueError):
+                        pass
+                if limit is not None:
+                    try:
+                        result["limit"] = int(limit)
+                    except (TypeError, ValueError):
+                        pass
+                if remaining is not None:
+                    try:
+                        result["remaining"] = int(remaining)
+                    except (TypeError, ValueError):
+                        pass
+                if reset_at:
+                    result["reset_at"] = str(reset_at)
+                if result:
+                    return result
+
+        combined = f"{stdout}\n{stderr}"
+        ratio_match = re.search(
+            r"rate[-_ ]?limit[: ]+(\d+)\s*/\s*(\d+)", combined, re.IGNORECASE
+        )
+        if ratio_match:
+            result["used"] = int(ratio_match.group(1))
+            result["limit"] = int(ratio_match.group(2))
+
+        used_match = re.search(
+            r"requests?[_ ]?used[=: ]+(\d+)", combined, re.IGNORECASE
+        )
+        limit_match = re.search(
+            r"requests?[_ ]?limit[=: ]+(\d+)", combined, re.IGNORECASE
+        )
+        remaining_match = re.search(
+            r"(?:requests?[_ ]?remaining|remaining)[=: ]+(\d+)", combined, re.IGNORECASE
+        )
+        reset_match = re.search(
+            r"(?:resets?(?:_at)?|reset)[=: ]+([\w:\-+TZ\.]+)", combined, re.IGNORECASE
+        )
+        if used_match:
+            result["used"] = int(used_match.group(1))
+        if limit_match:
+            result["limit"] = int(limit_match.group(1))
+        if remaining_match:
+            result["remaining"] = int(remaining_match.group(1))
+        if reset_match:
+            result["reset_at"] = reset_match.group(1)
+        return result
+
+    @staticmethod
     def _extract_completion_text(stdout: str) -> str:
         """Extract assistant text content from the Codex CLI stdout."""
         parsed = CodexClient._extract_last_json_object(stdout)
@@ -689,6 +771,12 @@ class CodexClient(TradingLoggerMixin):
                     market_id=market_id,
                     tokens_used=total_tok,
                     cost_usd=0.0,
+                )
+
+                quota_signals = self._extract_quota_signals(stdout, stderr)
+                await self._record_quota_snapshot(
+                    total_tokens=total_tok,
+                    quota_signals=quota_signals,
                 )
 
                 self.logger.debug(
@@ -898,6 +986,69 @@ class CodexClient(TradingLoggerMixin):
         self.total_cost += metadata.cost  # Always 0 for Codex.
         self.request_count += 1
         self._update_daily_usage()
+
+    async def _record_quota_snapshot(
+        self,
+        *,
+        total_tokens: int,
+        quota_signals: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Persist a Codex quota snapshot when a DB manager is available.
+
+        Always best-effort: if the CLI surfaced explicit limit/remaining/reset
+        fields they are recorded; otherwise we still write a "minimal" row so
+        downstream consumers (CLI status, dashboard) can show running quota
+        usage even when the CLI does not report it inline.
+        """
+        if not self.db_manager:
+            return
+        record_helper = getattr(self.db_manager, "record_codex_quota_snapshot", None)
+        if not callable(record_helper):
+            return
+        try:
+            from src.utils.database import CodexQuotaSnapshot
+        except Exception:
+            return
+
+        signals = quota_signals or {}
+        used = int(signals.get("used") or self.daily_tracker.request_count)
+        limit_value = signals.get("limit")
+        remaining = signals.get("remaining")
+        reset_at = signals.get("reset_at")
+        source = "codex-cli" if signals else "codex-cli-best-effort"
+        payload_json: Optional[str]
+        try:
+            payload_json = json.dumps(
+                {
+                    "tokens_used": int(total_tokens or 0),
+                    "request_count": self.daily_tracker.request_count,
+                    "plan_tier": self.plan_tier,
+                    "signals": signals,
+                }
+            )
+        except (TypeError, ValueError):
+            payload_json = None
+
+        snapshot = CodexQuotaSnapshot(
+            recorded_at=datetime.now(),
+            provider="codex",
+            plan_tier=self.plan_tier,
+            quota_unit="request",
+            window_label="daily",
+            used=used,
+            limit_value=int(limit_value) if limit_value is not None else None,
+            remaining=int(remaining) if remaining is not None else None,
+            reset_at=str(reset_at) if reset_at else None,
+            source=source,
+            payload_json=payload_json,
+        )
+        try:
+            await record_helper(snapshot)
+        except Exception as exc:
+            self.logger.debug(
+                "Failed to persist Codex quota snapshot",
+                error=str(exc),
+            )
 
     async def _log_query(
         self,

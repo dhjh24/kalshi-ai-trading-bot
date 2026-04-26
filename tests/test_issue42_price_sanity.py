@@ -243,7 +243,7 @@ async def test_execute_allows_normal_market():
 
     normal_market = {
         "yes_bid_dollars": 0.48,
-        "yes_ask_dollars": 0.52,
+        "yes_ask_dollars": 0.50,
         "no_bid_dollars": 0.46,
         "no_ask_dollars": 0.50,
     }

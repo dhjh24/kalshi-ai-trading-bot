@@ -114,10 +114,10 @@ async def test_xai_client_mirror_provider_usage_persists_when_provider_does_not_
         async def close(self):
             return None
 
-    import src.clients.xai_client as xai_client
+    import src.clients.openai_client as openai_client_module
 
     monkeypatch.setattr(settings.api, "resolve_llm_provider", lambda: "openai")
-    monkeypatch.setattr(xai_client, "OpenAIClient", FakeOpenAIClient)
+    monkeypatch.setattr(openai_client_module, "OpenAIClient", FakeOpenAIClient)
 
     client = XAIClient()
     client.usage_file = str(usage_file)
@@ -164,10 +164,10 @@ async def test_xai_client_mirror_provider_usage_does_not_double_count_when_provi
         async def close(self):
             return None
 
-    import src.clients.xai_client as xai_client
+    import src.clients.openai_client as openai_client_module
 
     monkeypatch.setattr(settings.api, "resolve_llm_provider", lambda: "openai")
-    monkeypatch.setattr(xai_client, "OpenAIClient", FakeOpenAIClient)
+    monkeypatch.setattr(openai_client_module, "OpenAIClient", FakeOpenAIClient)
 
     client = XAIClient()
     client.usage_file = str(usage_file)

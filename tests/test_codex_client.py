@@ -243,6 +243,37 @@ class TestTokenExtraction:
         assert CodexClient._extract_token_counts("plain text", "") == (0, 0, 0, 0)
 
 
+class TestQuotaSignalExtraction:
+    def test_extract_quota_from_json_block(self):
+        stdout = json.dumps(
+            {
+                "content": "ok",
+                "rate_limit": {
+                    "used": 12,
+                    "limit": 50,
+                    "remaining": 38,
+                    "reset_at": "2026-04-27T00:00:00Z",
+                },
+            }
+        )
+        signals = CodexClient._extract_quota_signals(stdout, "")
+        assert signals["used"] == 12
+        assert signals["limit"] == 50
+        assert signals["remaining"] == 38
+        assert signals["reset_at"] == "2026-04-27T00:00:00Z"
+
+    def test_extract_quota_from_stderr_text(self):
+        stderr = "rate-limit: 7/50 remaining=43 resets=2026-04-27T01:23:45Z"
+        signals = CodexClient._extract_quota_signals("", stderr)
+        assert signals["used"] == 7
+        assert signals["limit"] == 50
+        assert signals["remaining"] == 43
+        assert signals["reset_at"].startswith("2026-04-27")
+
+    def test_extract_quota_returns_empty_when_absent(self):
+        assert CodexClient._extract_quota_signals("hello world", "no quota") == {}
+
+
 # ---------------------------------------------------------------------------
 # End-to-end client behavior (fully mocked subprocess)
 # ---------------------------------------------------------------------------
@@ -492,6 +523,7 @@ class TestCodexClientAccounting:
     async def test_llm_query_logged_with_zero_cost(self):
         db_manager = MagicMock()
         db_manager.log_llm_query = AsyncMock()
+        db_manager.record_codex_quota_snapshot = AsyncMock()
         client = _make_client(db_manager=db_manager)
 
         proc = _FakeProcess(
@@ -518,3 +550,97 @@ class TestCodexClientAccounting:
         assert logged.tokens_used == 10
         assert logged.market_id == "KXFOO"
         assert logged.strategy == "s"
+
+    @pytest.mark.asyncio
+    async def test_quota_snapshot_recorded_on_success(self):
+        """Every successful Codex call should write a quota snapshot."""
+        db_manager = MagicMock()
+        db_manager.log_llm_query = AsyncMock()
+        db_manager.record_codex_quota_snapshot = AsyncMock(return_value=1)
+        client = _make_client(db_manager=db_manager)
+
+        proc = _FakeProcess(
+            stdout=json.dumps(
+                {
+                    "content": "ok",
+                    "usage": {"input_tokens": 12, "output_tokens": 8},
+                    "rate_limit": {
+                        "used": 4,
+                        "limit": 50,
+                        "remaining": 46,
+                        "reset_at": "2026-04-27T00:00:00Z",
+                    },
+                }
+            ).encode()
+        )
+        with patch(
+            "src.clients.codex_client.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=proc),
+        ):
+            await client.get_completion("hello with quota")
+
+        assert db_manager.record_codex_quota_snapshot.await_count == 1
+        snapshot = db_manager.record_codex_quota_snapshot.await_args.args[0]
+        assert snapshot.provider == "codex"
+        assert snapshot.used == 4
+        assert snapshot.limit_value == 50
+        assert snapshot.remaining == 46
+        assert snapshot.reset_at == "2026-04-27T00:00:00Z"
+        assert snapshot.source == "codex-cli"
+
+    @pytest.mark.asyncio
+    async def test_quota_snapshot_best_effort_when_cli_silent(self):
+        """When the CLI omits quota, still write a minimal snapshot."""
+        db_manager = MagicMock()
+        db_manager.log_llm_query = AsyncMock()
+        db_manager.record_codex_quota_snapshot = AsyncMock(return_value=1)
+        client = _make_client(db_manager=db_manager)
+
+        proc = _FakeProcess(
+            stdout=json.dumps(
+                {"content": "ok", "usage": {"prompt_tokens": 3, "completion_tokens": 4}}
+            ).encode()
+        )
+        with patch(
+            "src.clients.codex_client.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=proc),
+        ):
+            await client.get_completion("hello quiet cli")
+
+        assert db_manager.record_codex_quota_snapshot.await_count == 1
+        snapshot = db_manager.record_codex_quota_snapshot.await_args.args[0]
+        assert snapshot.limit_value is None
+        assert snapshot.remaining is None
+        assert snapshot.source == "codex-cli-best-effort"
+        assert snapshot.used == client.daily_tracker.request_count
+
+    @pytest.mark.asyncio
+    async def test_quota_snapshot_skipped_when_db_missing(self):
+        """No db_manager and no record_codex_quota_snapshot should not raise."""
+        client = _make_client()
+        proc = _FakeProcess(
+            stdout=json.dumps({"content": "ok", "usage": {"prompt_tokens": 1, "completion_tokens": 1}}).encode()
+        )
+        with patch(
+            "src.clients.codex_client.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=proc),
+        ):
+            result = await client.get_completion("no db here")
+        assert result == "ok"
+
+    @pytest.mark.asyncio
+    async def test_quota_snapshot_swallows_db_errors(self):
+        db_manager = MagicMock()
+        db_manager.log_llm_query = AsyncMock()
+        db_manager.record_codex_quota_snapshot = AsyncMock(side_effect=RuntimeError("boom"))
+        client = _make_client(db_manager=db_manager)
+        proc = _FakeProcess(
+            stdout=json.dumps({"content": "ok", "usage": {"prompt_tokens": 1, "completion_tokens": 1}}).encode()
+        )
+        with patch(
+            "src.clients.codex_client.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=proc),
+        ):
+            result = await client.get_completion("error path")
+        assert result == "ok"
+        assert db_manager.record_codex_quota_snapshot.await_count == 1

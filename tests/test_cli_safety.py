@@ -1070,6 +1070,31 @@ async def test_ai_spend_provider_breakdown_makes_codex_quota_explicit(
 
 
 @pytest.mark.asyncio
+async def test_ai_spend_provider_breakdown_safe_with_empty_quota_table(
+    tmp_path: Path,
+):
+    """A fresh DB with no quota snapshots must not crash the status summary."""
+    from src.utils.database import DatabaseManager
+
+    db_path = tmp_path / "empty_quota_summary.db"
+    manager = DatabaseManager(db_path=str(db_path))
+    await manager.initialize()
+
+    quota = await manager.get_codex_quota_summary()
+    assert quota["available"] is False
+    assert quota["limit_value"] is None
+    assert quota["remaining"] is None
+    assert quota["reset_at"] is None
+
+    summary_payload = await manager.get_ai_spend_provider_breakdown()
+    assert isinstance(summary_payload, dict)
+    summary = summary_payload["summary"]
+    assert "today" in summary
+    assert "limit" not in summary
+    assert "remaining" not in summary
+
+
+@pytest.mark.asyncio
 async def test_get_strategy_status_reports_budget_remaining(ephemeral_db):
     """`cli.py status` depends on get_strategy_status returning clean fields."""
     from src.strategies.portfolio_enforcer import STRATEGY_LIVE_TRADE

@@ -409,6 +409,94 @@ describe("getPortfolioAiSpendSummary", () => {
       }
     });
   });
+
+  it("prefers codex_quota_tracking snapshot over llm_queries inferred usage", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "dashboard-repository-"));
+    const databasePath = path.join(tempDir, "dashboard.sqlite");
+    const scriptPath = path.join(tempDir, "codex-quota-snapshot-check.mjs");
+    const repositoryUrl = pathToFileURL(
+      path.join(serverRoot, "src/repositories/dashboardRepository.ts")
+    ).href;
+    const dbUrl = pathToFileURL(path.join(serverRoot, "src/db.ts")).href;
+    const recentIso = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const recentSql = `'${recentIso}'`;
+    tempDirs.push(tempDir);
+
+    writeFileSync(
+      scriptPath,
+      `
+        import { getDb } from ${JSON.stringify(dbUrl)};
+        import { getPortfolioAiSpendSummary } from ${JSON.stringify(repositoryUrl)};
+
+        const db = getDb();
+
+        try {
+          db.exec(\`
+            CREATE TABLE llm_queries (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              provider TEXT,
+              cost_usd REAL,
+              tokens_used INTEGER,
+              timestamp TEXT NOT NULL
+            );
+            CREATE TABLE codex_quota_tracking (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              recorded_at TEXT NOT NULL,
+              provider TEXT NOT NULL DEFAULT 'codex',
+              plan_tier TEXT,
+              quota_unit TEXT NOT NULL DEFAULT 'request',
+              window_label TEXT NOT NULL DEFAULT 'daily',
+              used INTEGER NOT NULL DEFAULT 0,
+              limit_value INTEGER,
+              remaining INTEGER,
+              reset_at TEXT,
+              source TEXT,
+              payload_json TEXT
+            );
+
+            INSERT INTO llm_queries (provider, cost_usd, tokens_used, timestamp)
+            VALUES ('codex', 0.0, 200, ${recentSql});
+
+            INSERT INTO codex_quota_tracking (
+              recorded_at, provider, plan_tier, quota_unit, window_label,
+              used, limit_value, remaining, reset_at, source
+            ) VALUES (
+              ${recentSql}, 'codex', 'plus', 'request', 'daily',
+              13, 50, 37, '2026-04-27T00:00:00Z', 'codex-cli'
+            );
+          \`);
+
+          const result = getPortfolioAiSpendSummary();
+          console.log(JSON.stringify({
+            quota: result.codexQuota,
+          }));
+        } finally {
+          db.close();
+        }
+      `
+    );
+
+    const result = JSON.parse(
+      execFileSync(process.execPath, ["--import", "tsx/esm", scriptPath], {
+        cwd: serverRoot,
+        env: {
+          ...process.env,
+          DB_PATH: databasePath
+        },
+        encoding: "utf8"
+      }).trim()
+    );
+
+    expect(result.quota.available).toBe(true);
+    expect(result.quota.sourceTable).toBe("codex_quota_tracking");
+    expect(result.quota.planTier).toBe("plus");
+    expect(result.quota.last24h.queryCount).toBe(13);
+    expect(result.quota.last24h.limit).toBe(50);
+    expect(result.quota.last24h.remaining).toBe(37);
+    expect(result.quota.last24h.resetAt).toBe("2026-04-27T00:00:00Z");
+    expect(result.quota.lifetime.limit).toBe(50);
+    expect(result.quota.lifetime.remaining).toBe(37);
+  });
 });
 
 describe("getPortfolioStrategyPnlBreakdown", () => {
@@ -929,7 +1017,8 @@ describe("live_trade_decisions repository helpers", () => {
           contractsCost: null,
           costUsd: 0.02
         },
-        feedback: null
+        feedback: null,
+        runtimeMode: null
       },
       {
         id: "1",
@@ -969,7 +1058,8 @@ describe("live_trade_decisions repository helpers", () => {
           contractsCost: null,
           costUsd: null
         },
-        feedback: null
+        feedback: null,
+        runtimeMode: null
       }
     ]);
   });

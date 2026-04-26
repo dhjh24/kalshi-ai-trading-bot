@@ -140,10 +140,10 @@ class LLMQuery:
     timestamp: datetime
     strategy: str  # Which strategy made the query
     query_type: str  # Type of query (market_analysis, movement_prediction, etc.)
-    role: Optional[str] = None  # Role/agent context for cost accounting (fallback to query_type)
     market_id: Optional[str]  # Market being analyzed (if applicable)
     prompt: str  # The prompt sent to LLM
     response: str  # LLM response
+    role: Optional[str] = None  # Role/agent context for cost accounting (fallback to query_type)
     provider: Optional[str] = None  # openai, openrouter, codex, etc.
     tokens_used: Optional[int] = None  # Tokens consumed
     cost_usd: Optional[float] = None  # Cost in USD
@@ -3159,23 +3159,26 @@ class DatabaseManager(TradingLoggerMixin):
     async def log_llm_query(self, llm_query: LLMQuery) -> None:
         """Log an LLM query and response for analysis."""
         try:
-                query_dict = asdict(llm_query)
-                query_dict['timestamp'] = llm_query.timestamp.isoformat()
-                query_dict.setdefault('provider', None)
-                query_dict.setdefault('role', None)
-                
-                async with aiosqlite.connect(self.db_path) as db:
-                    await db.execute("""
-                        INSERT INTO llm_queries (
+            query_dict = asdict(llm_query)
+            query_dict['timestamp'] = llm_query.timestamp.isoformat()
+            query_dict.setdefault('provider', None)
+            query_dict.setdefault('role', None)
+
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    """
+                    INSERT INTO llm_queries (
                         timestamp, strategy, provider, query_type, role, market_id, prompt, response,
                         tokens_used, cost_usd, confidence_extracted, decision_extracted
                     ) VALUES (
                         :timestamp, :strategy, :provider, :query_type, :role, :market_id, :prompt, :response,
                         :tokens_used, :cost_usd, :confidence_extracted, :decision_extracted
                     )
-                """, query_dict)
+                    """,
+                    query_dict,
+                )
                 await db.commit()
-                
+
         except Exception as e:
             self.logger.error(f"Error logging LLM query: {e}")
 

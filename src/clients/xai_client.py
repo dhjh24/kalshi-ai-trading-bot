@@ -183,12 +183,18 @@ class XAIClient(TradingLoggerMixin):
                 self.logger.error(f"Failed to init provider client: {e}")
         return self._provider_client
 
-    def _mirror_provider_usage(self, client: Any, result: Any) -> None:
-        """Mirror provider-side usage into the compatibility shim totals."""
+    def _mirror_provider_usage(self, client: Any, result: Any, prior_tracker: Optional["DailyUsageTracker"] = None) -> None:
+        """Mirror provider-side usage into the compatibility shim totals.
+
+        prior_tracker MUST be a snapshot captured before the provider call —
+        otherwise we cannot detect whether the provider mutated the shared
+        daily-usage file and we will double-count.
+        """
         if result is None:
             return
 
-        prior_tracker = self._load_daily_tracker()
+        if prior_tracker is None:
+            prior_tracker = self._load_daily_tracker()
         metadata = getattr(client, "last_request_metadata", None)
         raw_cost = getattr(metadata, "cost", 0.0) if metadata is not None else 0.0
         try:
@@ -228,6 +234,7 @@ class XAIClient(TradingLoggerMixin):
             return None
 
         try:
+            prior_tracker = self._load_daily_tracker()
             result = await client.get_completion(
                 prompt=prompt,
                 model=self.primary_model,
@@ -238,7 +245,7 @@ class XAIClient(TradingLoggerMixin):
                 market_id=market_id,
             )
 
-            self._mirror_provider_usage(client, result)
+            self._mirror_provider_usage(client, result, prior_tracker=prior_tracker)
             return result
 
         except Exception as e:
@@ -260,6 +267,7 @@ class XAIClient(TradingLoggerMixin):
             return None
 
         try:
+            prior_tracker = self._load_daily_tracker()
             decision = await client.get_trading_decision(
                 market_data=market_data,
                 portfolio_data=portfolio_data,
@@ -267,7 +275,7 @@ class XAIClient(TradingLoggerMixin):
                 model=self.primary_model,
             )
 
-            self._mirror_provider_usage(client, decision)
+            self._mirror_provider_usage(client, decision, prior_tracker=prior_tracker)
             return decision
 
         except Exception as e:

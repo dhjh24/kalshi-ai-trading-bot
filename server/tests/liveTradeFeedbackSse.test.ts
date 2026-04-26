@@ -242,8 +242,6 @@ describe("live-trade feedback acceptance", () => {
               strategy,
               worker,
               heartbeat_at,
-              runtime_mode,
-              exchange_env,
               run_id,
               loop_status,
               last_started_at,

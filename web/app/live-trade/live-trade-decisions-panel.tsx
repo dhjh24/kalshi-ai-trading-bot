@@ -2,25 +2,26 @@
 
 import Link from "next/link";
 import {
+  useCallback,
   useDeferredValue,
   useEffect,
-  useEffectEvent,
-  useRef,
   useState
 } from "react";
 import { useMutation } from "@tanstack/react-query";
 import {
   API_BASE_URL,
-  createStreamUrl,
   getLiveTradeDecisionFeed
 } from "../../lib/api";
 import { formatMoney, formatTimestamp } from "../../lib/format";
 import {
   parseTimestampMs,
   selectLatestDecisionFeed,
-  shouldUseDecisionFeedFallback,
   type LiveTradeDecisionFeedStreamStatus
 } from "../../lib/live-trade-decision-feed";
+import {
+  defaultEnvelopeParser,
+  useLiveStream
+} from "../../lib/use-live-stream";
 import type {
   LiveTradeDecisionFeedPayload,
   LiveTradeDecisionFeedbackRecord,
@@ -40,26 +41,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function extractEnvelopePayload(value: unknown): unknown {
-  if (isRecord(value) && "payload" in value) {
-    return value.payload;
-  }
-
-  return null;
-}
-
-function extractEnvelopeTimestamp(value: unknown): string | null {
-  if (
-    isRecord(value) &&
-    typeof value.timestamp === "string" &&
-    value.timestamp.trim()
-  ) {
-    return value.timestamp;
-  }
-
-  return null;
-}
-
 function isLiveTradeDecisionFeedPayload(
   value: unknown
 ): value is LiveTradeDecisionFeedPayload {
@@ -70,6 +51,13 @@ function isLiveTradeDecisionFeedPayload(
     Array.isArray(value.decisions) &&
     isRecord(value.heartbeat)
   );
+}
+
+function decisionFeedParser(
+  envelope: unknown
+): LiveTradeDecisionFeedPayload | undefined {
+  const payload = defaultEnvelopeParser<unknown>(envelope);
+  return isLiveTradeDecisionFeedPayload(payload) ? payload : undefined;
 }
 
 function formatAgeSeconds(value: number | null): string {
@@ -533,97 +521,41 @@ export function LiveTradeDecisionsPanel({
 }: {
   initialFeed: LiveTradeDecisionFeedPayload;
 }) {
-  const [feed, setFeed] = useState(initialFeed);
-  const [streamStatus, setStreamStatus] =
-    useState<LiveTradeDecisionFeedStreamStatus>("connecting");
-  const [streamGeneration, setStreamGeneration] = useState(0);
-  const [fallbackStatus, setFallbackStatus] =
-    useState<FallbackStatus>("idle");
-  const [fallbackError, setFallbackError] = useState<string | null>(null);
-  const [lastFallbackSyncAt, setLastFallbackSyncAt] = useState<string | null>(
-    null
-  );
-  const [lastStreamEventAt, setLastStreamEventAt] = useState<string | null>(
-    () => initialFeed.generatedAt
-  );
-  const [lastStreamErrorAt, setLastStreamErrorAt] = useState<string | null>(
-    null
-  );
-  const [reconnectAttempts, setReconnectAttempts] = useState(0);
   const [activeFilter, setActiveFilter] = useState<DecisionFilter>("all");
   const [query, setQuery] = useState("");
   const [now, setNow] = useState(() => Date.now());
-  const fallbackInFlightRef = useRef(false);
   const deferredQuery = useDeferredValue(query);
 
-  useEffect(() => {
-    setFeed((previous) => selectLatestDecisionFeed(previous, initialFeed));
-  }, [initialFeed]);
+  const fetchFallback = useCallback(
+    () => getLiveTradeDecisionFeed(initialFeed.limit),
+    [initialFeed.limit]
+  );
 
-  useEffect(() => {
-    let cancelled = false;
-    let countedDisconnect = false;
-    const stream = new EventSource(createStreamUrl("live-trade-decisions"));
+  const stream = useLiveStream<LiveTradeDecisionFeedPayload>(
+    "live-trade-decisions",
+    {
+      initialData: initialFeed,
+      parser: decisionFeedParser,
+      selectLatest: selectLatestDecisionFeed,
+      staleAfterMs: STREAM_STALE_AFTER_MS,
+      pollIntervalMs: FALLBACK_POLL_INTERVAL_MS,
+      httpFallback: fetchFallback
+    }
+  );
 
-    setStreamStatus("connecting");
-
-    stream.onopen = () => {
-      if (cancelled) {
-        return;
-      }
-
-      countedDisconnect = false;
-      setStreamStatus("live");
-      setLastStreamErrorAt(null);
-    };
-
-    stream.onmessage = (event) => {
-      if (cancelled) {
-        return;
-      }
-
-      const receivedAt = new Date().toISOString();
-
-      try {
-        const envelope = JSON.parse(event.data) as unknown;
-        const nextEventAt = extractEnvelopeTimestamp(envelope) ?? receivedAt;
-        const payload = extractEnvelopePayload(envelope);
-
-        setLastStreamEventAt(nextEventAt);
-        if (isLiveTradeDecisionFeedPayload(payload)) {
-          setFeed((previous) => selectLatestDecisionFeed(previous, payload));
-        }
-
-        countedDisconnect = false;
-        setStreamStatus("live");
-        setLastStreamErrorAt(null);
-      } catch {
-        setLastStreamErrorAt(receivedAt);
-        setStreamStatus("error");
-      }
-    };
-
-    stream.onerror = () => {
-      if (cancelled) {
-        return;
-      }
-
-      if (!countedDisconnect) {
-        countedDisconnect = true;
-        setReconnectAttempts((previous) => previous + 1);
-      }
-
-      setLastStreamErrorAt(new Date().toISOString());
-      setStreamStatus(
-        stream.readyState === EventSource.CLOSED ? "error" : "reconnecting"
-      );
-    };
-
-    return () => {
-      cancelled = true;
-      stream.close();
-    };
-  }, [streamGeneration]);
+  const feed = stream.data;
+  const fallbackStatus = stream.fallbackStatus as FallbackStatus;
+  const fallbackError = stream.fallbackError;
+  const lastStreamEventAt = stream.lastEventAt ?? initialFeed.generatedAt;
+  const lastStreamErrorAt = stream.lastStreamErrorAt;
+  const lastFallbackSyncAt = stream.lastFallbackSyncAt;
+  const reconnectAttempts = stream.reconnectAttempts;
+  const reconnectStream = stream.reconnect;
+  const syncDecisionFeed = stream.syncNow;
+  const shouldUseFallback =
+    stream.status === "stale" ||
+    stream.status === "reconnecting" ||
+    stream.status === "error";
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -635,95 +567,7 @@ export function LiveTradeDecisionsPanel({
     };
   }, []);
 
-  const syncDecisionFeed = useEffectEvent(async () => {
-    if (fallbackInFlightRef.current) {
-      return;
-    }
-
-    fallbackInFlightRef.current = true;
-    setFallbackStatus("syncing");
-
-    try {
-      const payload = await getLiveTradeDecisionFeed(feed.limit);
-      setFeed((previous) => selectLatestDecisionFeed(previous, payload));
-      setLastFallbackSyncAt(new Date().toISOString());
-      setFallbackError(null);
-      setFallbackStatus("active");
-    } catch (error) {
-      setFallbackError(
-        error instanceof Error
-          ? error.message
-          : "Failed to sync the decision feed."
-      );
-      setFallbackStatus("error");
-    } finally {
-      fallbackInFlightRef.current = false;
-    }
-  });
-
-  const reconnectStream = useEffectEvent(() => {
-    setFallbackError(null);
-    setStreamStatus("connecting");
-    setStreamGeneration((previous) => previous + 1);
-    void syncDecisionFeed();
-  });
-
-  const shouldUseFallback = shouldUseDecisionFeedFallback({
-    streamStatus,
-    lastStreamEventAt,
-    now,
-    staleAfterMs: STREAM_STALE_AFTER_MS
-  });
-
-  useEffect(() => {
-    if (!shouldUseFallback) {
-      setFallbackStatus("idle");
-      setFallbackError(null);
-      return;
-    }
-
-    void syncDecisionFeed();
-
-    const interval = window.setInterval(() => {
-      if (document.visibilityState !== "visible") {
-        return;
-      }
-
-      void syncDecisionFeed();
-    }, FALLBACK_POLL_INTERVAL_MS);
-
-    return () => {
-      window.clearInterval(interval);
-    };
-  }, [shouldUseFallback, syncDecisionFeed]);
-
-  useEffect(() => {
-    if (!shouldUseFallback) {
-      return;
-    }
-
-    const syncWhenVisible = () => {
-      if (document.visibilityState !== "visible") {
-        return;
-      }
-
-      void syncDecisionFeed();
-    };
-
-    window.addEventListener("focus", syncWhenVisible);
-    document.addEventListener("visibilitychange", syncWhenVisible);
-
-    return () => {
-      window.removeEventListener("focus", syncWhenVisible);
-      document.removeEventListener("visibilitychange", syncWhenVisible);
-    };
-  }, [shouldUseFallback, syncDecisionFeed]);
-
-  const displayStreamStatus: StreamDisplayStatus =
-    shouldUseFallback &&
-    (streamStatus === "live" || streamStatus === "connecting")
-      ? "stale"
-      : streamStatus;
+  const displayStreamStatus: StreamDisplayStatus = stream.status;
   const transportSummary = buildTransportSummary({
     streamStatus: displayStreamStatus,
     fallbackStatus
