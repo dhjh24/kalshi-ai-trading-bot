@@ -599,6 +599,9 @@ function CodexQuotaWindow({
   limit,
   remaining,
   resetAt,
+  tokensLimit,
+  tokensRemaining,
+  tokensResetAt,
 }: {
   label: string;
   queryCount: number;
@@ -607,6 +610,9 @@ function CodexQuotaWindow({
   limit?: number | null;
   remaining?: number | null;
   resetAt?: string | null;
+  tokensLimit?: number | null;
+  tokensRemaining?: number | null;
+  tokensResetAt?: string | null;
 }) {
   return (
     <div className="rounded-2xl border border-slate-100 bg-white/80 px-4 py-4">
@@ -621,14 +627,27 @@ function CodexQuotaWindow({
       </p>
       {limit !== null && limit !== undefined ? (
         <p className="mt-1 text-xs text-slate-500">
-          Limit {formatCount(limit)}
+          Requests {formatCount(queryCount)} / {formatCount(limit)}
           {remaining !== null && remaining !== undefined
-            ? `, ${formatCount(remaining)} remaining`
+            ? ` · ${formatCount(remaining)} remaining`
             : ""}
         </p>
       ) : null}
       {resetAt ? (
         <p className="mt-1 text-xs text-slate-500">Resets {formatTimestamp(resetAt)}</p>
+      ) : null}
+      {tokensLimit !== null && tokensLimit !== undefined ? (
+        <p className="mt-1 text-xs text-slate-500">
+          Tokens {formatCount(tokensUsed)} / {formatCount(tokensLimit)}
+          {tokensRemaining !== null && tokensRemaining !== undefined
+            ? ` · ${formatCount(tokensRemaining)} remaining`
+            : ""}
+        </p>
+      ) : null}
+      {tokensResetAt ? (
+        <p className="mt-1 text-xs text-slate-500">
+          Token reset {formatTimestamp(tokensResetAt)}
+        </p>
       ) : null}
       <p className="mt-3 text-xs uppercase tracking-[0.18em] text-slate-400">
         Latest {formatTimestamp(latestAt)}
@@ -651,6 +670,11 @@ function CodexQuotaCard({
             Usage pulled from{" "}
             {quota.sourceTable ? <code>{quota.sourceTable}</code> : "runtime telemetry"}.
           </p>
+          {quota.planTier ? (
+            <p className="mt-1 text-xs uppercase tracking-[0.2em] text-amber-700">
+              Plan {quota.planTier}
+            </p>
+          ) : null}
         </div>
         <div className="text-right">
           <p className="text-xs uppercase tracking-[0.2em] text-slate-500">
@@ -681,6 +705,9 @@ function CodexQuotaCard({
             limit={quota.last24h.limit}
             remaining={quota.last24h.remaining}
             resetAt={quota.last24h.resetAt}
+            tokensLimit={quota.last24h.tokensLimit}
+            tokensRemaining={quota.last24h.tokensRemaining}
+            tokensResetAt={quota.last24h.tokensResetAt}
           />
           <CodexQuotaWindow
             label="Last 7d"
@@ -690,6 +717,9 @@ function CodexQuotaCard({
             limit={quota.last7d.limit}
             remaining={quota.last7d.remaining}
             resetAt={quota.last7d.resetAt}
+            tokensLimit={quota.last7d.tokensLimit}
+            tokensRemaining={quota.last7d.tokensRemaining}
+            tokensResetAt={quota.last7d.tokensResetAt}
           />
           <CodexQuotaWindow
             label="Lifetime"
@@ -699,6 +729,9 @@ function CodexQuotaCard({
             limit={quota.lifetime.limit}
             remaining={quota.lifetime.remaining}
             resetAt={quota.lifetime.resetAt}
+            tokensLimit={quota.lifetime.tokensLimit}
+            tokensRemaining={quota.lifetime.tokensRemaining}
+            tokensResetAt={quota.lifetime.tokensResetAt}
           />
         </div>
       )}

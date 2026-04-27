@@ -115,6 +115,43 @@ export async function buildServer() {
   };
   app.post("/api/live-trade/decisions/:decisionId/feedback", submitLiveTradeDecisionFeedback);
   app.put("/api/live-trade/decisions/:decisionId/feedback", submitLiveTradeDecisionFeedback);
+
+  // Internal push-refresh hook used by the Python live-trade loop to notify
+  // the SSE hub immediately after a decision / runtime-state / feedback write,
+  // instead of waiting for the cursor-poll fallback. Auth is a single shared
+  // secret (LIVE_TRADE_INTERNAL_REFRESH_TOKEN) so this endpoint is unsafe to
+  // expose externally; it must remain bound to localhost in production.
+  const internalRefreshBodySchema = z
+    .object({
+      topic: z
+        .enum(["live-trade-decisions", "runtime-state", "feedback"])
+        .optional()
+    })
+    .optional();
+  app.post("/internal/live-trade/notify-refresh", async (request, reply) => {
+    const expectedToken = (process.env.LIVE_TRADE_INTERNAL_REFRESH_TOKEN || "").trim();
+    if (!expectedToken) {
+      reply.code(503);
+      return { ok: false, error: "internal_refresh_disabled" };
+    }
+    const headerValue = request.headers["x-internal-token"];
+    const presentedToken = Array.isArray(headerValue)
+      ? headerValue[0]
+      : typeof headerValue === "string"
+        ? headerValue
+        : "";
+    if (!presentedToken || presentedToken !== expectedToken) {
+      reply.code(401);
+      return { ok: false, error: "unauthorized" };
+    }
+    const body = internalRefreshBodySchema.parse(request.body ?? undefined);
+    liveStreamHub.refreshLiveTradeDecisions();
+    return {
+      ok: true,
+      topic: body?.topic ?? "live-trade-decisions",
+      refreshedAt: new Date().toISOString()
+    };
+  });
   app.get("/api/live-trade", async (request) => {
     const query = z
       .object({

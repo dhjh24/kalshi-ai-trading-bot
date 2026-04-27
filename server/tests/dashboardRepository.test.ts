@@ -418,15 +418,17 @@ describe("getPortfolioAiSpendSummary", () => {
       path.join(serverRoot, "src/repositories/dashboardRepository.ts")
     ).href;
     const dbUrl = pathToFileURL(path.join(serverRoot, "src/db.ts")).href;
-    const recentIso = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-    const recentSql = `'${recentIso}'`;
+    const sixHoursAgo = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const sixHoursAgoSql = `'${sixHoursAgo}'`;
+    const oneHourAgoSql = `'${oneHourAgo}'`;
     tempDirs.push(tempDir);
 
     writeFileSync(
       scriptPath,
       `
         import { getDb } from ${JSON.stringify(dbUrl)};
-        import { getPortfolioAiSpendSummary } from ${JSON.stringify(repositoryUrl)};
+        import { getPortfolioCodexQuotaSummary } from ${JSON.stringify(repositoryUrl)};
 
         const db = getDb();
 
@@ -439,6 +441,7 @@ describe("getPortfolioAiSpendSummary", () => {
               tokens_used INTEGER,
               timestamp TEXT NOT NULL
             );
+
             CREATE TABLE codex_quota_tracking (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               recorded_at TEXT NOT NULL,
@@ -451,25 +454,36 @@ describe("getPortfolioAiSpendSummary", () => {
               remaining INTEGER,
               reset_at TEXT,
               source TEXT,
-              payload_json TEXT
+              payload_json TEXT,
+              requests_used INTEGER,
+              requests_limit INTEGER,
+              requests_remaining INTEGER,
+              requests_reset_at TEXT,
+              tokens_used INTEGER,
+              tokens_limit INTEGER,
+              tokens_remaining INTEGER,
+              tokens_reset_at TEXT
             );
 
             INSERT INTO llm_queries (provider, cost_usd, tokens_used, timestamp)
-            VALUES ('codex', 0.0, 200, ${recentSql});
+            VALUES
+              ('codex', 0, 120, ${sixHoursAgoSql});
 
             INSERT INTO codex_quota_tracking (
               recorded_at, provider, plan_tier, quota_unit, window_label,
-              used, limit_value, remaining, reset_at, source
-            ) VALUES (
-              ${recentSql}, 'codex', 'plus', 'request', 'daily',
-              13, 50, 37, '2026-04-27T00:00:00Z', 'codex-cli'
+              used, limit_value, remaining, reset_at, source,
+              requests_used, requests_limit, requests_remaining, requests_reset_at,
+              tokens_used, tokens_limit, tokens_remaining, tokens_reset_at
+            )
+            VALUES (
+              ${oneHourAgoSql}, 'codex', 'Plus', 'request', 'daily',
+              12, 100, 88, '2026-04-27T00:00:00Z', 'codex-cli',
+              12, 100, 88, '2026-04-27T00:00:00Z',
+              4500, 200000, 195500, '2026-04-27T00:00:00Z'
             );
           \`);
 
-          const result = getPortfolioAiSpendSummary();
-          console.log(JSON.stringify({
-            quota: result.codexQuota,
-          }));
+          console.log(JSON.stringify(getPortfolioCodexQuotaSummary()));
         } finally {
           db.close();
         }
@@ -487,15 +501,19 @@ describe("getPortfolioAiSpendSummary", () => {
       }).trim()
     );
 
-    expect(result.quota.available).toBe(true);
-    expect(result.quota.sourceTable).toBe("codex_quota_tracking");
-    expect(result.quota.planTier).toBe("plus");
-    expect(result.quota.last24h.queryCount).toBe(13);
-    expect(result.quota.last24h.limit).toBe(50);
-    expect(result.quota.last24h.remaining).toBe(37);
-    expect(result.quota.last24h.resetAt).toBe("2026-04-27T00:00:00Z");
-    expect(result.quota.lifetime.limit).toBe(50);
-    expect(result.quota.lifetime.remaining).toBe(37);
+    expect(result.available).toBe(true);
+    expect(result.sourceTable).toBe("codex_quota_tracking");
+    expect(result.planTier).toBe("Plus");
+    expect(result.source).toBe("codex-cli");
+    expect(result.last24h.queryCount).toBe(12);
+    expect(result.last24h.limit).toBe(100);
+    expect(result.last24h.remaining).toBe(88);
+    expect(result.last24h.resetAt).toBe("2026-04-27T00:00:00Z");
+    expect(result.last24h.tokensLimit).toBe(200000);
+    expect(result.last24h.tokensRemaining).toBe(195500);
+    expect(result.last24h.tokensResetAt).toBe("2026-04-27T00:00:00Z");
+    expect(result.lifetime.limit).toBe(100);
+    expect(result.lifetime.tokensLimit).toBe(200000);
   });
 });
 
@@ -1017,8 +1035,7 @@ describe("live_trade_decisions repository helpers", () => {
           contractsCost: null,
           costUsd: 0.02
         },
-        feedback: null,
-        runtimeMode: null
+        feedback: null
       },
       {
         id: "1",
@@ -1058,8 +1075,7 @@ describe("live_trade_decisions repository helpers", () => {
           contractsCost: null,
           costUsd: null
         },
-        feedback: null,
-        runtimeMode: null
+        feedback: null
       }
     ]);
   });

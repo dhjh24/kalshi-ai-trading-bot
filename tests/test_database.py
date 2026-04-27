@@ -364,3 +364,101 @@ async def test_update_position_status_clears_market_has_position_when_last_posit
         assert status_row is not None
         assert status_row[0] == "voided"
         assert "reconciliation cleanup" in status_row[1]
+
+
+async def test_codex_quota_snapshot_round_trip_preserves_plan_tier_and_attribution(
+    tmp_path: Path,
+):
+    """W8: round-trip a snapshot with the new request/token limit/reset fields."""
+    from src.utils.database import CodexQuotaSnapshot
+
+    db_path = tmp_path / "codex_quota_round_trip.db"
+    manager = DatabaseManager(db_path=str(db_path))
+    await manager.initialize()
+
+    recorded_at = datetime.now()
+    snapshot = CodexQuotaSnapshot(
+        recorded_at=recorded_at,
+        plan_tier="Plus",
+        requests_used=12,
+        requests_limit=100,
+        requests_remaining=88,
+        requests_reset_at="2026-04-27T00:00:00Z",
+        tokens_used=4500,
+        tokens_limit=200000,
+        tokens_remaining=195500,
+        tokens_reset_at="2026-04-27T00:00:00Z",
+        source="codex-cli",
+    )
+
+    snapshot_id = await manager.record_codex_quota_snapshot(snapshot)
+    assert snapshot_id > 0
+
+    fetched = await manager.get_latest_codex_quota_snapshot()
+    assert fetched is not None
+    assert fetched.plan_tier == "Plus"
+    assert fetched.requests_used == 12
+    assert fetched.requests_limit == 100
+    assert fetched.requests_remaining == 88
+    assert fetched.requests_reset_at == "2026-04-27T00:00:00Z"
+    assert fetched.tokens_used == 4500
+    assert fetched.tokens_limit == 200000
+    assert fetched.tokens_remaining == 195500
+    assert fetched.tokens_reset_at == "2026-04-27T00:00:00Z"
+    assert fetched.source == "codex-cli"
+
+    # The legacy primary triplet should mirror the request-side counters so
+    # older readers continue to see the canonical "request" view.
+    summary = await manager.get_codex_quota_summary()
+    assert summary["available"] is True
+    assert summary["source_table"] == "codex_quota_tracking"
+    assert summary["plan_tier"] == "Plus"
+    assert summary["requests_used"] == 12
+    assert summary["requests_limit"] == 100
+    assert summary["requests_remaining"] == 88
+    assert summary["requests_reset_at"] == "2026-04-27T00:00:00Z"
+    assert summary["tokens_used"] == 4500
+    assert summary["tokens_limit"] == 200000
+    assert summary["tokens_remaining"] == 195500
+    assert summary["tokens_reset_at"] == "2026-04-27T00:00:00Z"
+    # Legacy mirroring keeps `used`/`limit_value`/`remaining`/`reset_at` in sync
+    # with the request-side fields when the caller did not set them explicitly.
+    assert summary["used"] == 12
+    assert summary["limit_value"] == 100
+    assert summary["remaining"] == 88
+    assert summary["reset_at"] == "2026-04-27T00:00:00Z"
+
+
+async def test_codex_quota_summary_falls_back_to_llm_queries_when_no_snapshot(
+    tmp_path: Path,
+):
+    """When no snapshot is persisted, the summary should still surface llm_queries usage."""
+    from src.utils.database import LLMQuery
+
+    db_path = tmp_path / "codex_quota_fallback.db"
+    manager = DatabaseManager(db_path=str(db_path))
+    await manager.initialize()
+
+    await manager.log_llm_query(
+        LLMQuery(
+            timestamp=datetime.now(),
+            strategy="quick_flip",
+            query_type="completion",
+            market_id="QF-FALLBACK",
+            prompt="hi",
+            response="ok",
+            provider="codex",
+            tokens_used=100,
+            cost_usd=0.0,
+        )
+    )
+
+    fetched = await manager.get_latest_codex_quota_snapshot()
+    assert fetched is None
+
+    summary = await manager.get_codex_quota_summary()
+    assert summary["available"] is True
+    assert summary["source_table"] == "llm_queries"
+    assert summary["plan_tier"] is None
+    assert summary["requests_limit"] is None
+    assert summary["tokens_used"] == 100

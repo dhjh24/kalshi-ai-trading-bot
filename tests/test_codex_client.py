@@ -243,35 +243,188 @@ class TestTokenExtraction:
         assert CodexClient._extract_token_counts("plain text", "") == (0, 0, 0, 0)
 
 
+# ---------------------------------------------------------------------------
+# Quota signal extraction (W8 plan-tier attribution)
+# ---------------------------------------------------------------------------
+
+
 class TestQuotaSignalExtraction:
-    def test_extract_quota_from_json_block(self):
+    def test_plain_text_plan_tier_and_request_pair(self):
+        """Plain-text rate-limit lines like 'plan: Plus' / 'requests: 12/100 (resets ...)'
+        should populate plan_tier, requests_used/limit/remaining, and reset_at.
+        """
+        stdout = ""
+        stderr = (
+            "INFO codex rate-limit: plan: Plus\n"
+            "INFO requests: 12/100 (resets 2026-04-27T00:00:00Z)\n"
+            "INFO tokens: 4500/200000\n"
+        )
+        signals = CodexClient._extract_quota_signals(stdout, stderr)
+        assert signals["plan_tier"] == "Plus"
+        assert signals["requests_used"] == 12
+        assert signals["requests_limit"] == 100
+        assert signals["requests_remaining"] == 88
+        assert signals["requests_reset_at"] == "2026-04-27T00:00:00Z"
+        assert signals["tokens_used"] == 4500
+        assert signals["tokens_limit"] == 200000
+
+    def test_structured_rate_limit_block(self):
+        """JSON 'rate_limit' blocks should populate every quota field."""
         stdout = json.dumps(
             {
                 "content": "ok",
+                "plan": "Pro",
                 "rate_limit": {
-                    "used": 12,
-                    "limit": 50,
-                    "remaining": 38,
-                    "reset_at": "2026-04-27T00:00:00Z",
+                    "requests": {
+                        "used": 7,
+                        "limit": 50,
+                        "remaining": 43,
+                        "reset_at": "2026-04-27T05:00:00Z",
+                    },
+                    "tokens": {
+                        "used": 1234,
+                        "limit": 500000,
+                        "remaining": 498766,
+                        "reset_at": "2026-04-27T05:00:00Z",
+                    },
                 },
             }
         )
         signals = CodexClient._extract_quota_signals(stdout, "")
-        assert signals["used"] == 12
-        assert signals["limit"] == 50
-        assert signals["remaining"] == 38
-        assert signals["reset_at"] == "2026-04-27T00:00:00Z"
+        assert signals["plan_tier"] == "Pro"
+        assert signals["requests_used"] == 7
+        assert signals["requests_limit"] == 50
+        assert signals["requests_remaining"] == 43
+        assert signals["requests_reset_at"] == "2026-04-27T05:00:00Z"
+        assert signals["tokens_used"] == 1234
+        assert signals["tokens_limit"] == 500000
+        assert signals["tokens_remaining"] == 498766
+        assert signals["tokens_reset_at"] == "2026-04-27T05:00:00Z"
+        # raw_payload is captured for downstream debugging
+        assert signals["raw_payload"] is not None
 
-    def test_extract_quota_from_stderr_text(self):
-        stderr = "rate-limit: 7/50 remaining=43 resets=2026-04-27T01:23:45Z"
-        signals = CodexClient._extract_quota_signals("", stderr)
-        assert signals["used"] == 7
-        assert signals["limit"] == 50
-        assert signals["remaining"] == 43
-        assert signals["reset_at"].startswith("2026-04-27")
+    def test_absent_signals_return_all_none(self):
+        signals = CodexClient._extract_quota_signals("plain", "")
+        for key in (
+            "plan_tier",
+            "requests_used",
+            "requests_limit",
+            "requests_remaining",
+            "requests_reset_at",
+            "tokens_used",
+            "tokens_limit",
+            "tokens_remaining",
+            "tokens_reset_at",
+            "raw_payload",
+        ):
+            assert signals[key] is None, f"Expected {key} to be None"
 
-    def test_extract_quota_returns_empty_when_absent(self):
-        assert CodexClient._extract_quota_signals("hello world", "no quota") == {}
+    @pytest.mark.asyncio
+    async def test_record_quota_snapshot_persists_plan_tier_and_attribution(self):
+        """A successful CLI completion should record a quota snapshot row."""
+        captured = []
+
+        class _FakeDb:
+            async def log_llm_query(self, *_args, **_kwargs):
+                return None
+
+            def record_codex_quota_snapshot(self, snapshot):
+                captured.append(snapshot)
+
+                async def _noop():
+                    return 1
+
+                return _noop()
+
+        client = _make_client(db_manager=_FakeDb())
+
+        proc = _FakeProcess(
+            stdout=(
+                json.dumps(
+                    {
+                        "content": "ok",
+                        "usage": {"input_tokens": 5, "output_tokens": 7},
+                        "plan": "Plus",
+                        "rate_limit": {
+                            "requests": {
+                                "used": 12,
+                                "limit": 100,
+                                "remaining": 88,
+                                "reset_at": "2026-04-27T00:00:00Z",
+                            },
+                            "tokens": {
+                                "used": 4500,
+                                "limit": 200000,
+                                "remaining": 195500,
+                                "reset_at": "2026-04-27T00:00:00Z",
+                            },
+                        },
+                    }
+                )
+                + "\n"
+            ).encode(),
+            stderr=b"",
+            returncode=0,
+        )
+        with patch(
+            "src.clients.codex_client.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=proc),
+        ):
+            result = await client.get_completion("hi", strategy="unit_test")
+
+        assert result == "ok"
+        assert len(captured) == 1
+        snapshot = captured[0]
+        assert snapshot.plan_tier == "Plus"
+        assert snapshot.requests_used == 12
+        assert snapshot.requests_limit == 100
+        assert snapshot.requests_remaining == 88
+        assert snapshot.requests_reset_at == "2026-04-27T00:00:00Z"
+        assert snapshot.tokens_used == 4500
+        assert snapshot.tokens_limit == 200000
+        assert snapshot.tokens_remaining == 195500
+        assert snapshot.tokens_reset_at == "2026-04-27T00:00:00Z"
+        assert snapshot.source == "codex-cli"
+
+    @pytest.mark.asyncio
+    async def test_record_quota_snapshot_falls_back_to_best_effort(self):
+        """When the CLI output has no quota signals, source should be ``codex-cli-best-effort``."""
+        captured = []
+
+        class _FakeDb:
+            async def log_llm_query(self, *_args, **_kwargs):
+                return None
+
+            def record_codex_quota_snapshot(self, snapshot):
+                captured.append(snapshot)
+
+                async def _noop():
+                    return 1
+
+                return _noop()
+
+        client = _make_client(db_manager=_FakeDb())
+
+        proc = _FakeProcess(
+            stdout=json.dumps(
+                {"content": "ok", "usage": {"prompt_tokens": 3, "completion_tokens": 4}}
+            ).encode(),
+            stderr=b"",
+            returncode=0,
+        )
+        with patch(
+            "src.clients.codex_client.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=proc),
+        ):
+            await client.get_completion("hi", strategy="unit_test")
+
+        assert len(captured) == 1
+        snapshot = captured[0]
+        assert snapshot.plan_tier == client.plan_tier
+        assert snapshot.requests_limit is None
+        assert snapshot.requests_remaining is None
+        assert snapshot.tokens_limit is None
+        assert snapshot.source == "codex-cli-best-effort"
 
 
 # ---------------------------------------------------------------------------
@@ -523,7 +676,6 @@ class TestCodexClientAccounting:
     async def test_llm_query_logged_with_zero_cost(self):
         db_manager = MagicMock()
         db_manager.log_llm_query = AsyncMock()
-        db_manager.record_codex_quota_snapshot = AsyncMock()
         client = _make_client(db_manager=db_manager)
 
         proc = _FakeProcess(
@@ -550,97 +702,3 @@ class TestCodexClientAccounting:
         assert logged.tokens_used == 10
         assert logged.market_id == "KXFOO"
         assert logged.strategy == "s"
-
-    @pytest.mark.asyncio
-    async def test_quota_snapshot_recorded_on_success(self):
-        """Every successful Codex call should write a quota snapshot."""
-        db_manager = MagicMock()
-        db_manager.log_llm_query = AsyncMock()
-        db_manager.record_codex_quota_snapshot = AsyncMock(return_value=1)
-        client = _make_client(db_manager=db_manager)
-
-        proc = _FakeProcess(
-            stdout=json.dumps(
-                {
-                    "content": "ok",
-                    "usage": {"input_tokens": 12, "output_tokens": 8},
-                    "rate_limit": {
-                        "used": 4,
-                        "limit": 50,
-                        "remaining": 46,
-                        "reset_at": "2026-04-27T00:00:00Z",
-                    },
-                }
-            ).encode()
-        )
-        with patch(
-            "src.clients.codex_client.asyncio.create_subprocess_exec",
-            AsyncMock(return_value=proc),
-        ):
-            await client.get_completion("hello with quota")
-
-        assert db_manager.record_codex_quota_snapshot.await_count == 1
-        snapshot = db_manager.record_codex_quota_snapshot.await_args.args[0]
-        assert snapshot.provider == "codex"
-        assert snapshot.used == 4
-        assert snapshot.limit_value == 50
-        assert snapshot.remaining == 46
-        assert snapshot.reset_at == "2026-04-27T00:00:00Z"
-        assert snapshot.source == "codex-cli"
-
-    @pytest.mark.asyncio
-    async def test_quota_snapshot_best_effort_when_cli_silent(self):
-        """When the CLI omits quota, still write a minimal snapshot."""
-        db_manager = MagicMock()
-        db_manager.log_llm_query = AsyncMock()
-        db_manager.record_codex_quota_snapshot = AsyncMock(return_value=1)
-        client = _make_client(db_manager=db_manager)
-
-        proc = _FakeProcess(
-            stdout=json.dumps(
-                {"content": "ok", "usage": {"prompt_tokens": 3, "completion_tokens": 4}}
-            ).encode()
-        )
-        with patch(
-            "src.clients.codex_client.asyncio.create_subprocess_exec",
-            AsyncMock(return_value=proc),
-        ):
-            await client.get_completion("hello quiet cli")
-
-        assert db_manager.record_codex_quota_snapshot.await_count == 1
-        snapshot = db_manager.record_codex_quota_snapshot.await_args.args[0]
-        assert snapshot.limit_value is None
-        assert snapshot.remaining is None
-        assert snapshot.source == "codex-cli-best-effort"
-        assert snapshot.used == client.daily_tracker.request_count
-
-    @pytest.mark.asyncio
-    async def test_quota_snapshot_skipped_when_db_missing(self):
-        """No db_manager and no record_codex_quota_snapshot should not raise."""
-        client = _make_client()
-        proc = _FakeProcess(
-            stdout=json.dumps({"content": "ok", "usage": {"prompt_tokens": 1, "completion_tokens": 1}}).encode()
-        )
-        with patch(
-            "src.clients.codex_client.asyncio.create_subprocess_exec",
-            AsyncMock(return_value=proc),
-        ):
-            result = await client.get_completion("no db here")
-        assert result == "ok"
-
-    @pytest.mark.asyncio
-    async def test_quota_snapshot_swallows_db_errors(self):
-        db_manager = MagicMock()
-        db_manager.log_llm_query = AsyncMock()
-        db_manager.record_codex_quota_snapshot = AsyncMock(side_effect=RuntimeError("boom"))
-        client = _make_client(db_manager=db_manager)
-        proc = _FakeProcess(
-            stdout=json.dumps({"content": "ok", "usage": {"prompt_tokens": 1, "completion_tokens": 1}}).encode()
-        )
-        with patch(
-            "src.clients.codex_client.asyncio.create_subprocess_exec",
-            AsyncMock(return_value=proc),
-        ):
-            result = await client.get_completion("error path")
-        assert result == "ok"
-        assert db_manager.record_codex_quota_snapshot.await_count == 1

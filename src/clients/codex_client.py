@@ -558,84 +558,240 @@ class CodexClient(TradingLoggerMixin):
 
     @staticmethod
     def _extract_quota_signals(stdout: str, stderr: str) -> Dict[str, Any]:
-        """
-        Best-effort quota field extraction from Codex CLI output.
+        """Best-effort extraction of plan-tier quota signals from CLI output.
 
-        Some CLI builds print a trailing status block like ``rate-limit: 12/50
-        remaining=38 resets=2026-04-27T00:00:00Z``; others embed
-        ``rate_limit`` / ``quota`` keys in the final JSON. We probe both,
-        returning a dict with any subset of ``used``, ``limit``,
-        ``remaining``, ``reset_at``. Missing fields stay absent so the caller
-        can decide whether to persist a "minimal" snapshot.
-        """
-        result: Dict[str, Any] = {}
+        Returns a dict with the keys:
+          ``plan_tier``, ``requests_used``, ``requests_limit``,
+          ``requests_remaining``, ``requests_reset_at``, ``tokens_used``,
+          ``tokens_limit``, ``tokens_remaining``, ``tokens_reset_at``,
+          ``raw_payload``.
 
+        Every key may be ``None`` if the CLI did not surface a usable signal
+        for that field. Both structured JSON (``rate_limit`` / ``quota`` /
+        ``plan`` shapes) and the freer-form ``plan: Plus`` /
+        ``requests: 12/100 (resets 2026-04-27T00:00:00Z)`` formats are
+        handled. The intent is that any CLI emission gives us *some*
+        attribution rather than just "N used".
+        """
+        result: Dict[str, Any] = {
+            "plan_tier": None,
+            "requests_used": None,
+            "requests_limit": None,
+            "requests_remaining": None,
+            "requests_reset_at": None,
+            "tokens_used": None,
+            "tokens_limit": None,
+            "tokens_remaining": None,
+            "tokens_reset_at": None,
+            "raw_payload": None,
+        }
+
+        def _coerce_int(value: Any) -> Optional[int]:
+            if value is None:
+                return None
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        def _coerce_str(value: Any) -> Optional[str]:
+            if value is None:
+                return None
+            text = str(value).strip()
+            return text or None
+
+        # ----- Structured JSON path -----
         for text in (stdout, stderr):
             parsed = CodexClient._extract_last_json_object(text)
             if not isinstance(parsed, dict):
                 continue
-            block = (
-                parsed.get("rate_limit")
-                or parsed.get("quota")
-                or parsed.get("plan_quota")
-                or {}
+
+            plan_value = (
+                parsed.get("plan")
+                or parsed.get("plan_tier")
+                or parsed.get("plan_name")
             )
-            if isinstance(block, dict):
-                used = block.get("used") or block.get("requests_used")
-                limit = block.get("limit") or block.get("limit_value") or block.get("requests_limit")
-                remaining = (
-                    block.get("remaining")
-                    or block.get("requests_remaining")
+            if isinstance(plan_value, dict):
+                plan_value = (
+                    plan_value.get("name")
+                    or plan_value.get("tier")
+                    or plan_value.get("id")
                 )
-                reset_at = block.get("reset_at") or block.get("resets_at") or block.get("reset")
-                if used is not None:
-                    try:
-                        result["used"] = int(used)
-                    except (TypeError, ValueError):
-                        pass
-                if limit is not None:
-                    try:
-                        result["limit"] = int(limit)
-                    except (TypeError, ValueError):
-                        pass
-                if remaining is not None:
-                    try:
-                        result["remaining"] = int(remaining)
-                    except (TypeError, ValueError):
-                        pass
-                if reset_at:
-                    result["reset_at"] = str(reset_at)
-                if result:
-                    return result
+            if plan_value and not result["plan_tier"]:
+                result["plan_tier"] = _coerce_str(plan_value)
 
+            for key in ("rate_limit", "rate_limits", "quota", "quotas", "limits"):
+                block = parsed.get(key)
+                if isinstance(block, dict):
+                    requests_block = (
+                        block.get("requests")
+                        or block.get("request")
+                        or block
+                    )
+                    tokens_block = (
+                        block.get("tokens") or block.get("token") or {}
+                    )
+                    plan_inline = block.get("plan") or block.get("plan_tier")
+                    if plan_inline and not result["plan_tier"]:
+                        if isinstance(plan_inline, dict):
+                            plan_inline = (
+                                plan_inline.get("name")
+                                or plan_inline.get("tier")
+                                or plan_inline.get("id")
+                            )
+                        result["plan_tier"] = _coerce_str(plan_inline)
+                    if isinstance(requests_block, dict):
+                        if result["requests_used"] is None:
+                            result["requests_used"] = _coerce_int(
+                                requests_block.get("used")
+                                or requests_block.get("count")
+                            )
+                        if result["requests_limit"] is None:
+                            result["requests_limit"] = _coerce_int(
+                                requests_block.get("limit")
+                                or requests_block.get("max")
+                            )
+                        if result["requests_remaining"] is None:
+                            result["requests_remaining"] = _coerce_int(
+                                requests_block.get("remaining")
+                            )
+                        if result["requests_reset_at"] is None:
+                            result["requests_reset_at"] = _coerce_str(
+                                requests_block.get("reset_at")
+                                or requests_block.get("resets_at")
+                                or requests_block.get("reset")
+                            )
+                    if isinstance(tokens_block, dict):
+                        if result["tokens_used"] is None:
+                            result["tokens_used"] = _coerce_int(
+                                tokens_block.get("used")
+                                or tokens_block.get("count")
+                            )
+                        if result["tokens_limit"] is None:
+                            result["tokens_limit"] = _coerce_int(
+                                tokens_block.get("limit")
+                                or tokens_block.get("max")
+                            )
+                        if result["tokens_remaining"] is None:
+                            result["tokens_remaining"] = _coerce_int(
+                                tokens_block.get("remaining")
+                            )
+                        if result["tokens_reset_at"] is None:
+                            result["tokens_reset_at"] = _coerce_str(
+                                tokens_block.get("reset_at")
+                                or tokens_block.get("resets_at")
+                                or tokens_block.get("reset")
+                            )
+
+            if result["raw_payload"] is None:
+                # Capture only the smallest relevant sub-payload so we
+                # don't bloat the persisted snapshot row.
+                payload_keys = (
+                    "rate_limit",
+                    "rate_limits",
+                    "quota",
+                    "quotas",
+                    "limits",
+                    "plan",
+                    "plan_tier",
+                )
+                small_payload = {
+                    k: parsed[k] for k in payload_keys if k in parsed
+                }
+                if small_payload:
+                    try:
+                        result["raw_payload"] = json.dumps(
+                            small_payload, default=str
+                        )
+                    except Exception:
+                        result["raw_payload"] = None
+
+        # ----- Plain text fallback -----
         combined = f"{stdout}\n{stderr}"
-        ratio_match = re.search(
-            r"rate[-_ ]?limit[: ]+(\d+)\s*/\s*(\d+)", combined, re.IGNORECASE
-        )
-        if ratio_match:
-            result["used"] = int(ratio_match.group(1))
-            result["limit"] = int(ratio_match.group(2))
 
-        used_match = re.search(
-            r"requests?[_ ]?used[=: ]+(\d+)", combined, re.IGNORECASE
-        )
-        limit_match = re.search(
-            r"requests?[_ ]?limit[=: ]+(\d+)", combined, re.IGNORECASE
-        )
-        remaining_match = re.search(
-            r"(?:requests?[_ ]?remaining|remaining)[=: ]+(\d+)", combined, re.IGNORECASE
-        )
-        reset_match = re.search(
-            r"(?:resets?(?:_at)?|reset)[=: ]+([\w:\-+TZ\.]+)", combined, re.IGNORECASE
-        )
-        if used_match:
-            result["used"] = int(used_match.group(1))
-        if limit_match:
-            result["limit"] = int(limit_match.group(1))
-        if remaining_match:
-            result["remaining"] = int(remaining_match.group(1))
-        if reset_match:
-            result["reset_at"] = reset_match.group(1)
+        if not result["plan_tier"]:
+            plan_match = re.search(
+                r"plan(?:[_ ]tier)?\s*[:=]\s*([A-Za-z][\w\-+]*)",
+                combined,
+            )
+            if plan_match:
+                result["plan_tier"] = plan_match.group(1).strip()
+
+        # "requests: 12/100" or "requests_used: 12 / 100"
+        if result["requests_used"] is None or result["requests_limit"] is None:
+            req_pair = re.search(
+                r"requests?(?:[_ ]used)?\s*[:=]\s*(\d+)\s*/\s*(\d+)",
+                combined,
+                re.IGNORECASE,
+            )
+            if req_pair:
+                if result["requests_used"] is None:
+                    result["requests_used"] = int(req_pair.group(1))
+                if result["requests_limit"] is None:
+                    result["requests_limit"] = int(req_pair.group(2))
+                if result["requests_remaining"] is None:
+                    result["requests_remaining"] = max(
+                        0,
+                        int(req_pair.group(2)) - int(req_pair.group(1)),
+                    )
+
+        if result["requests_remaining"] is None:
+            rem_match = re.search(
+                r"requests?[_ ]remaining\s*[:=]\s*(\d+)",
+                combined,
+                re.IGNORECASE,
+            )
+            if rem_match:
+                result["requests_remaining"] = int(rem_match.group(1))
+
+        if result["requests_reset_at"] is None:
+            # "(resets 2026-04-27T00:00:00Z)" or "requests_reset_at=..."
+            reset_match = re.search(
+                r"(?:requests?[_ ]reset(?:_at)?\s*[:=]\s*|resets?\s+)"
+                r"([0-9T:\-+Z\.]+)",
+                combined,
+                re.IGNORECASE,
+            )
+            if reset_match:
+                result["requests_reset_at"] = reset_match.group(1).strip()
+
+        # Token-side plain-text patterns
+        if result["tokens_used"] is None or result["tokens_limit"] is None:
+            tok_pair = re.search(
+                r"tokens?(?:[_ ]used)?\s*[:=]\s*([\d,]+)\s*/\s*([\d,]+)",
+                combined,
+                re.IGNORECASE,
+            )
+            if tok_pair:
+                if result["tokens_used"] is None:
+                    result["tokens_used"] = int(
+                        tok_pair.group(1).replace(",", "")
+                    )
+                if result["tokens_limit"] is None:
+                    result["tokens_limit"] = int(
+                        tok_pair.group(2).replace(",", "")
+                    )
+
+        if result["tokens_remaining"] is None:
+            tok_rem = re.search(
+                r"tokens?[_ ]remaining\s*[:=]\s*([\d,]+)",
+                combined,
+                re.IGNORECASE,
+            )
+            if tok_rem:
+                result["tokens_remaining"] = int(
+                    tok_rem.group(1).replace(",", "")
+                )
+
+        if result["tokens_reset_at"] is None:
+            tok_reset = re.search(
+                r"tokens?[_ ]reset(?:_at)?\s*[:=]\s*([0-9T:\-+Z\.]+)",
+                combined,
+                re.IGNORECASE,
+            )
+            if tok_reset:
+                result["tokens_reset_at"] = tok_reset.group(1).strip()
+
         return result
 
     @staticmethod
@@ -745,6 +901,7 @@ class CodexClient(TradingLoggerMixin):
                 in_tok, out_tok, total_tok, reasoning_tok = self._extract_token_counts(
                     stdout, stderr
                 )
+                quota_signals = self._extract_quota_signals(stdout, stderr)
 
                 self._last_request_metadata = CodexResponseMetadata(
                     request_id=None,
@@ -772,11 +929,9 @@ class CodexClient(TradingLoggerMixin):
                     tokens_used=total_tok,
                     cost_usd=0.0,
                 )
-
-                quota_signals = self._extract_quota_signals(stdout, stderr)
                 await self._record_quota_snapshot(
-                    total_tokens=total_tok,
                     quota_signals=quota_signals,
+                    tokens_used_observed=total_tok,
                 )
 
                 self.logger.debug(
@@ -987,69 +1142,6 @@ class CodexClient(TradingLoggerMixin):
         self.request_count += 1
         self._update_daily_usage()
 
-    async def _record_quota_snapshot(
-        self,
-        *,
-        total_tokens: int,
-        quota_signals: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """Persist a Codex quota snapshot when a DB manager is available.
-
-        Always best-effort: if the CLI surfaced explicit limit/remaining/reset
-        fields they are recorded; otherwise we still write a "minimal" row so
-        downstream consumers (CLI status, dashboard) can show running quota
-        usage even when the CLI does not report it inline.
-        """
-        if not self.db_manager:
-            return
-        record_helper = getattr(self.db_manager, "record_codex_quota_snapshot", None)
-        if not callable(record_helper):
-            return
-        try:
-            from src.utils.database import CodexQuotaSnapshot
-        except Exception:
-            return
-
-        signals = quota_signals or {}
-        used = int(signals.get("used") or self.daily_tracker.request_count)
-        limit_value = signals.get("limit")
-        remaining = signals.get("remaining")
-        reset_at = signals.get("reset_at")
-        source = "codex-cli" if signals else "codex-cli-best-effort"
-        payload_json: Optional[str]
-        try:
-            payload_json = json.dumps(
-                {
-                    "tokens_used": int(total_tokens or 0),
-                    "request_count": self.daily_tracker.request_count,
-                    "plan_tier": self.plan_tier,
-                    "signals": signals,
-                }
-            )
-        except (TypeError, ValueError):
-            payload_json = None
-
-        snapshot = CodexQuotaSnapshot(
-            recorded_at=datetime.now(),
-            provider="codex",
-            plan_tier=self.plan_tier,
-            quota_unit="request",
-            window_label="daily",
-            used=used,
-            limit_value=int(limit_value) if limit_value is not None else None,
-            remaining=int(remaining) if remaining is not None else None,
-            reset_at=str(reset_at) if reset_at else None,
-            source=source,
-            payload_json=payload_json,
-        )
-        try:
-            await record_helper(snapshot)
-        except Exception as exc:
-            self.logger.debug(
-                "Failed to persist Codex quota snapshot",
-                error=str(exc),
-            )
-
     async def _log_query(
         self,
         strategy: str,
@@ -1086,6 +1178,101 @@ class CodexClient(TradingLoggerMixin):
             asyncio.create_task(self.db_manager.log_llm_query(llm_query))
         except Exception as exc:
             self.logger.error(f"Failed to log Codex LLM query: {exc}")
+
+    async def _record_quota_snapshot(
+        self,
+        *,
+        quota_signals: Dict[str, Any],
+        tokens_used_observed: Optional[int] = None,
+    ) -> None:
+        """Persist a Codex quota snapshot row when a database manager is wired.
+
+        We always record a row after a successful CLI call, even when the
+        CLI did not surface a plan/limit (in which case the row carries
+        observed `requests_used` / `tokens_used` and a `best-effort` source
+        flag so dashboards can still show running counts). The legacy
+        `used` / `limit_value` / `remaining` / `reset_at` triplet is kept
+        in sync with the request-side fields by ``record_codex_quota_snapshot``.
+        """
+        if not self.db_manager:
+            return
+
+        record = getattr(self.db_manager, "record_codex_quota_snapshot", None)
+        if not callable(record):
+            return
+
+        try:
+            from src.utils.database import CodexQuotaSnapshot
+        except Exception as exc:  # pragma: no cover - defensive
+            self.logger.debug(
+                "Could not import CodexQuotaSnapshot, skipping quota persistence",
+                error=str(exc),
+            )
+            return
+
+        plan_tier = quota_signals.get("plan_tier") or self.plan_tier or None
+
+        # Use the observed requests-used counter when the CLI didn't expose
+        # one explicitly. Each successful invocation = one request.
+        requests_used = quota_signals.get("requests_used")
+        if requests_used is None:
+            requests_used = self.daily_tracker.request_count or 1
+
+        tokens_used = quota_signals.get("tokens_used")
+        if tokens_used is None and tokens_used_observed:
+            tokens_used = int(tokens_used_observed)
+
+        # Source flag: ``codex-cli`` when the CLI gave us a plan-tier signal,
+        # ``codex-cli-best-effort`` when we are inferring from observed counts.
+        has_first_class_signal = any(
+            quota_signals.get(key) is not None
+            for key in (
+                "plan_tier",
+                "requests_limit",
+                "requests_remaining",
+                "requests_reset_at",
+                "tokens_limit",
+                "tokens_remaining",
+                "tokens_reset_at",
+            )
+        )
+        source_flag = (
+            "codex-cli" if has_first_class_signal else "codex-cli-best-effort"
+        )
+
+        snapshot = CodexQuotaSnapshot(
+            recorded_at=datetime.now(),
+            provider="codex",
+            plan_tier=plan_tier,
+            quota_unit="request",
+            window_label="daily",
+            used=int(requests_used or 0),
+            limit_value=quota_signals.get("requests_limit"),
+            remaining=quota_signals.get("requests_remaining"),
+            reset_at=quota_signals.get("requests_reset_at"),
+            source=source_flag,
+            payload_json=quota_signals.get("raw_payload"),
+            requests_used=int(requests_used) if requests_used is not None else None,
+            requests_limit=quota_signals.get("requests_limit"),
+            requests_remaining=quota_signals.get("requests_remaining"),
+            requests_reset_at=quota_signals.get("requests_reset_at"),
+            tokens_used=int(tokens_used) if tokens_used is not None else None,
+            tokens_limit=quota_signals.get("tokens_limit"),
+            tokens_remaining=quota_signals.get("tokens_remaining"),
+            tokens_reset_at=quota_signals.get("tokens_reset_at"),
+        )
+
+        try:
+            result = record(snapshot)
+            if asyncio.iscoroutine(result):
+                # Record without blocking the hot path for too long; if
+                # somebody awaits us, we still want to surface failures.
+                await result
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to record Codex quota snapshot",
+                error=str(exc),
+            )
 
     def get_cost_summary(self) -> Dict[str, Any]:
         """Return a summary of Codex usage (cost always 0)."""

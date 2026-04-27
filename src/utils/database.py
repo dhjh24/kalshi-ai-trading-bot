@@ -154,7 +154,17 @@ class LLMQuery:
 
 @dataclass
 class CodexQuotaSnapshot:
-    """Represents a persisted Codex plan quota snapshot."""
+    """Represents a persisted Codex plan quota snapshot.
+
+    The legacy ``used`` / ``limit_value`` / ``remaining`` / ``reset_at`` columns
+    were originally keyed by ``quota_unit`` (request|token); to give the CLI
+    and dashboard first-class access to "X requests left until Y reset on plan
+    Z" rendering, we persist explicit request- and token-side counters in
+    addition to the legacy primary view. New writers should populate the
+    explicit ``requests_*`` and ``tokens_*`` fields; the primary triplet is
+    kept in sync with the request-side values so legacy readers keep working.
+    """
+
     recorded_at: datetime
     provider: str = "codex"
     plan_tier: Optional[str] = None
@@ -166,6 +176,14 @@ class CodexQuotaSnapshot:
     reset_at: Optional[str] = None
     source: Optional[str] = None
     payload_json: Optional[str] = None
+    requests_used: Optional[int] = None
+    requests_limit: Optional[int] = None
+    requests_remaining: Optional[int] = None
+    requests_reset_at: Optional[str] = None
+    tokens_used: Optional[int] = None
+    tokens_limit: Optional[int] = None
+    tokens_remaining: Optional[int] = None
+    tokens_reset_at: Optional[str] = None
     id: Optional[int] = None
 
 
@@ -384,9 +402,41 @@ class DatabaseManager(TradingLoggerMixin):
                     remaining INTEGER,
                     reset_at TEXT,
                     source TEXT,
-                    payload_json TEXT
+                    payload_json TEXT,
+                    requests_used INTEGER,
+                    requests_limit INTEGER,
+                    requests_remaining INTEGER,
+                    requests_reset_at TEXT,
+                    tokens_used INTEGER,
+                    tokens_limit INTEGER,
+                    tokens_remaining INTEGER,
+                    tokens_reset_at TEXT
                 )
             """)
+
+            cursor = await db.execute("PRAGMA table_info(codex_quota_tracking)")
+            quota_info = await cursor.fetchall()
+            quota_columns = {col[1] for col in quota_info}
+            for column_name in (
+                "requests_used",
+                "requests_limit",
+                "requests_remaining",
+                "requests_reset_at",
+                "tokens_used",
+                "tokens_limit",
+                "tokens_remaining",
+                "tokens_reset_at",
+            ):
+                if column_name not in quota_columns:
+                    column_type = "TEXT" if column_name.endswith("_at") else "INTEGER"
+                    await db.execute(
+                        f"ALTER TABLE codex_quota_tracking "
+                        f"ADD COLUMN {column_name} {column_type} DEFAULT NULL"
+                    )
+                    self.logger.info(
+                        "Added column to codex_quota_tracking table",
+                        column=column_name,
+                    )
 
             cursor = await db.execute("PRAGMA table_info(llm_queries)")
             llm_query_info = await cursor.fetchall()
@@ -1149,7 +1199,15 @@ class DatabaseManager(TradingLoggerMixin):
                 remaining INTEGER,
                 reset_at TEXT,
                 source TEXT,
-                payload_json TEXT
+                payload_json TEXT,
+                requests_used INTEGER,
+                requests_limit INTEGER,
+                requests_remaining INTEGER,
+                requests_reset_at TEXT,
+                tokens_used INTEGER,
+                tokens_limit INTEGER,
+                tokens_remaining INTEGER,
+                tokens_reset_at TEXT
             )
         """)
 
@@ -2731,18 +2789,42 @@ class DatabaseManager(TradingLoggerMixin):
         self,
         snapshot: CodexQuotaSnapshot,
     ) -> int:
-        """Persist a first-class Codex quota snapshot for status/dashboard use."""
+        """Persist a first-class Codex quota snapshot for status/dashboard use.
+
+        When the caller populates the new ``requests_*`` / ``tokens_*`` fields
+        we mirror the request-side values onto the legacy ``used`` /
+        ``limit_value`` / ``remaining`` / ``reset_at`` triplet so older
+        readers continue to see the canonical "request" view without any
+        special-case logic.
+        """
         snapshot_dict = asdict(snapshot)
         snapshot_dict["recorded_at"] = snapshot.recorded_at.isoformat()
+
+        # Mirror requests_* into the legacy primary triplet so callers that
+        # only set requests_* still surface the same data via the older
+        # ``used`` / ``limit_value`` / ``remaining`` / ``reset_at`` columns.
+        if snapshot.requests_used is not None and not snapshot.used:
+            snapshot_dict["used"] = int(snapshot.requests_used)
+        if snapshot.requests_limit is not None and snapshot.limit_value is None:
+            snapshot_dict["limit_value"] = int(snapshot.requests_limit)
+        if snapshot.requests_remaining is not None and snapshot.remaining is None:
+            snapshot_dict["remaining"] = int(snapshot.requests_remaining)
+        if snapshot.requests_reset_at and not snapshot.reset_at:
+            snapshot_dict["reset_at"] = snapshot.requests_reset_at
+
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 """
                 INSERT INTO codex_quota_tracking (
                     recorded_at, provider, plan_tier, quota_unit, window_label,
-                    used, limit_value, remaining, reset_at, source, payload_json
+                    used, limit_value, remaining, reset_at, source, payload_json,
+                    requests_used, requests_limit, requests_remaining, requests_reset_at,
+                    tokens_used, tokens_limit, tokens_remaining, tokens_reset_at
                 ) VALUES (
                     :recorded_at, :provider, :plan_tier, :quota_unit, :window_label,
-                    :used, :limit_value, :remaining, :reset_at, :source, :payload_json
+                    :used, :limit_value, :remaining, :reset_at, :source, :payload_json,
+                    :requests_used, :requests_limit, :requests_remaining, :requests_reset_at,
+                    :tokens_used, :tokens_limit, :tokens_remaining, :tokens_reset_at
                 )
                 """,
                 snapshot_dict,
@@ -2750,11 +2832,91 @@ class DatabaseManager(TradingLoggerMixin):
             await db.commit()
             return int(cursor.lastrowid or 0)
 
+    async def get_latest_codex_quota_snapshot(self) -> Optional[CodexQuotaSnapshot]:
+        """Return the most recent persisted snapshot, or ``None`` if absent."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='codex_quota_tracking'"
+                )
+                if not await cursor.fetchone():
+                    return None
+                cursor = await db.execute(
+                    """
+                    SELECT *
+                    FROM codex_quota_tracking
+                    WHERE LOWER(TRIM(COALESCE(provider, 'codex'))) = 'codex'
+                    ORDER BY datetime(recorded_at) DESC, id DESC
+                    LIMIT 1
+                    """
+                )
+                row = await cursor.fetchone()
+        except Exception as exc:
+            self.logger.debug(
+                "Could not load latest Codex quota snapshot",
+                error=str(exc),
+            )
+            return None
+
+        if row is None:
+            return None
+
+        keys = row.keys()
+
+        def _maybe(key: str, *, integer: bool = False) -> Any:
+            if key not in keys:
+                return None
+            value = row[key]
+            if value is None:
+                return None
+            if integer:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return None
+            return value
+
+        recorded_value = row["recorded_at"]
+        try:
+            recorded_at = datetime.fromisoformat(recorded_value)
+        except (TypeError, ValueError):
+            recorded_at = datetime.now()
+
+        return CodexQuotaSnapshot(
+            recorded_at=recorded_at,
+            provider=row["provider"] or "codex",
+            plan_tier=row["plan_tier"],
+            quota_unit=row["quota_unit"] or "request",
+            window_label=row["window_label"] or "daily",
+            used=int(row["used"] or 0),
+            limit_value=_maybe("limit_value", integer=True),
+            remaining=_maybe("remaining", integer=True),
+            reset_at=row["reset_at"],
+            source=row["source"],
+            payload_json=row["payload_json"],
+            requests_used=_maybe("requests_used", integer=True),
+            requests_limit=_maybe("requests_limit", integer=True),
+            requests_remaining=_maybe("requests_remaining", integer=True),
+            requests_reset_at=_maybe("requests_reset_at"),
+            tokens_used=_maybe("tokens_used", integer=True),
+            tokens_limit=_maybe("tokens_limit", integer=True),
+            tokens_remaining=_maybe("tokens_remaining", integer=True),
+            tokens_reset_at=_maybe("tokens_reset_at"),
+            id=int(row["id"]) if "id" in keys and row["id"] is not None else None,
+        )
+
     async def get_codex_quota_summary(
         self,
         recent_days: int = LLM_USAGE_RECENT_WINDOW_DAYS,
     ) -> Dict[str, Any]:
-        """Return the latest Codex quota snapshot with llm_queries fallback usage."""
+        """Return the latest Codex quota snapshot with llm_queries fallback usage.
+
+        The returned dict always carries explicit ``requests_*`` and
+        ``tokens_*`` fields when the snapshot exposes them so the CLI and
+        dashboard can render plan-tier limits, remaining, and reset
+        attribution without re-querying the table.
+        """
         usage = await self._get_recent_llm_query_provider_usage(recent_days=recent_days)
         codex_usage = usage.get("codex", {})
         fallback_used = int(codex_usage.get("request_count") or 0)
@@ -2774,6 +2936,13 @@ class DatabaseManager(TradingLoggerMixin):
             "reset_at": None,
             "recorded_at": None,
             "source": "llm_queries" if fallback_used > 0 or fallback_tokens > 0 else None,
+            "requests_used": fallback_used or None,
+            "requests_limit": None,
+            "requests_remaining": None,
+            "requests_reset_at": None,
+            "tokens_limit": None,
+            "tokens_remaining": None,
+            "tokens_reset_at": None,
         }
 
         try:
@@ -2797,24 +2966,66 @@ class DatabaseManager(TradingLoggerMixin):
                 row = await cursor.fetchone()
                 if row is None:
                     return summary
+                column_names = set(row.keys())
         except Exception as exc:
             self.logger.debug("Could not load Codex quota snapshot", error=str(exc))
             return summary
+
+        def _row_int(name: str) -> Optional[int]:
+            if name not in column_names:
+                return None
+            value = row[name]
+            if value is None:
+                return None
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        def _row_str(name: str) -> Optional[str]:
+            if name not in column_names:
+                return None
+            value = row[name]
+            return value if value not in (None, "") else None
+
+        requests_used = _row_int("requests_used")
+        if requests_used is None:
+            requests_used = int(row["used"] or 0) if (row["used"] or 0) else None
+        requests_limit = _row_int("requests_limit")
+        if requests_limit is None:
+            requests_limit = _row_int("limit_value")
+        requests_remaining = _row_int("requests_remaining")
+        if requests_remaining is None:
+            requests_remaining = _row_int("remaining")
+        requests_reset_at = _row_str("requests_reset_at")
+        if requests_reset_at is None:
+            requests_reset_at = _row_str("reset_at")
+
+        tokens_used = _row_int("tokens_used")
+        if tokens_used is None and fallback_tokens:
+            tokens_used = fallback_tokens
 
         return {
             "available": True,
             "source_table": "codex_quota_tracking",
             "provider": "codex",
-            "plan_tier": row["plan_tier"],
-            "quota_unit": row["quota_unit"] or "request",
-            "window_label": row["window_label"] or "daily",
+            "plan_tier": _row_str("plan_tier"),
+            "quota_unit": _row_str("quota_unit") or "request",
+            "window_label": _row_str("window_label") or "daily",
             "used": int(row["used"] or 0),
-            "tokens_used": fallback_tokens,
-            "limit_value": row["limit_value"],
-            "remaining": row["remaining"],
-            "reset_at": row["reset_at"],
-            "recorded_at": row["recorded_at"],
-            "source": row["source"],
+            "tokens_used": int(tokens_used or 0) if tokens_used is not None else fallback_tokens,
+            "limit_value": _row_int("limit_value"),
+            "remaining": _row_int("remaining"),
+            "reset_at": _row_str("reset_at"),
+            "recorded_at": _row_str("recorded_at"),
+            "source": _row_str("source"),
+            "requests_used": requests_used,
+            "requests_limit": requests_limit,
+            "requests_remaining": requests_remaining,
+            "requests_reset_at": requests_reset_at,
+            "tokens_limit": _row_int("tokens_limit"),
+            "tokens_remaining": _row_int("tokens_remaining"),
+            "tokens_reset_at": _row_str("tokens_reset_at"),
         }
 
     async def get_ai_spend_provider_breakdown(
@@ -2867,21 +3078,50 @@ class DatabaseManager(TradingLoggerMixin):
             if provider.casefold() == "codex":
                 quota_usage = llm_query_usage.get(provider.casefold(), {})
                 quota_bits = []
-                quota_request_count = int(codex_quota.get("used") or quota_usage.get("request_count") or 0)
-                quota_total_tokens = int(quota_usage.get("total_tokens") or 0)
+                quota_request_count = int(
+                    codex_quota.get("requests_used")
+                    or codex_quota.get("used")
+                    or quota_usage.get("request_count")
+                    or 0
+                )
+                quota_total_tokens = int(
+                    codex_quota.get("tokens_used")
+                    or quota_usage.get("total_tokens")
+                    or 0
+                )
                 if quota_request_count > 0:
                     quota_bits.append(f"{quota_request_count} req")
                 if quota_total_tokens > 0:
                     quota_bits.append(f"{quota_total_tokens:,} tok")
-                limit_value = codex_quota.get("limit_value")
-                remaining = codex_quota.get("remaining")
-                reset_at = codex_quota.get("reset_at")
-                if limit_value is not None:
-                    quota_bits.append(f"limit {int(limit_value):,}")
-                if remaining is not None:
-                    quota_bits.append(f"remaining {int(remaining):,}")
-                if reset_at:
-                    quota_bits.append(f"resets {reset_at}")
+                requests_limit = (
+                    codex_quota.get("requests_limit")
+                    if codex_quota.get("requests_limit") is not None
+                    else codex_quota.get("limit_value")
+                )
+                requests_remaining = (
+                    codex_quota.get("requests_remaining")
+                    if codex_quota.get("requests_remaining") is not None
+                    else codex_quota.get("remaining")
+                )
+                requests_reset_at = (
+                    codex_quota.get("requests_reset_at")
+                    or codex_quota.get("reset_at")
+                )
+                if requests_limit is not None:
+                    quota_bits.append(f"limit {int(requests_limit):,}")
+                if requests_remaining is not None:
+                    quota_bits.append(f"remaining {int(requests_remaining):,}")
+                if requests_reset_at:
+                    quota_bits.append(f"resets {requests_reset_at}")
+                tokens_limit = codex_quota.get("tokens_limit")
+                tokens_remaining = codex_quota.get("tokens_remaining")
+                if tokens_limit is not None:
+                    quota_bits.append(f"token limit {int(tokens_limit):,}")
+                if tokens_remaining is not None:
+                    quota_bits.append(f"token remaining {int(tokens_remaining):,}")
+                plan_tier = codex_quota.get("plan_tier")
+                if plan_tier:
+                    quota_bits.append(f"plan {plan_tier}")
                 if quota_bits:
                     provider_bit = f"{provider_bit} ({', '.join(quota_bits)})"
             provider_bits.append(provider_bit)
@@ -3165,8 +3405,7 @@ class DatabaseManager(TradingLoggerMixin):
             query_dict.setdefault('role', None)
 
             async with aiosqlite.connect(self.db_path) as db:
-                await db.execute(
-                    """
+                await db.execute("""
                     INSERT INTO llm_queries (
                         timestamp, strategy, provider, query_type, role, market_id, prompt, response,
                         tokens_used, cost_usd, confidence_extracted, decision_extracted
@@ -3174,9 +3413,7 @@ class DatabaseManager(TradingLoggerMixin):
                         :timestamp, :strategy, :provider, :query_type, :role, :market_id, :prompt, :response,
                         :tokens_used, :cost_usd, :confidence_extracted, :decision_extracted
                     )
-                    """,
-                    query_dict,
-                )
+                """, query_dict)
                 await db.commit()
 
         except Exception as e:

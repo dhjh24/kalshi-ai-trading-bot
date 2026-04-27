@@ -326,17 +326,16 @@ The static dashboard reads from `trading_system.db` when unified paper-runtime d
 # Main paper-trading runtime (mirrors the live bot without sending real orders)
 python cli.py run --paper
 
-# Print unified paper stats from trading_system.db
+# Static HTML dashboard helpers (read from the unified trading_system.db)
 python paper_trader.py --stats
-
-# Regenerate the static HTML dashboard from unified paper data
 python paper_trader.py --dashboard
-
-# Legacy signal-tracker mode (fallback / historical path)
-python paper_trader.py
-python paper_trader.py --loop --interval 900
-python paper_trader.py --settle
 ```
+
+> **Deprecated:** `python paper_trader.py` (no flags), `--loop`, and `--settle`
+> exercise the legacy signal-only tracker. Importing the module now emits a
+> `DeprecationWarning` and the loop will be removed in a future cleanup pass.
+> Use `python cli.py run --paper` for the unified runtime; the migration plan
+> lives under W11 in [`docs/plans/review-readme-and-other-cozy-diffie.md`](docs/plans/review-readme-and-other-cozy-diffie.md).
 
 The dashboard writes to `docs/paper_dashboard.html` — open locally or host via GitHub Pages.
 
@@ -348,7 +347,7 @@ The dashboard writes to `docs/paper_dashboard.html` — open locally or host via
 kalshi-ai-trading-bot/
 ├── beast_mode_bot.py          # Main bot entry point (AI ensemble orchestrator)
 ├── cli.py                     # Unified CLI: run, dashboard, status, health, scores
-├── paper_trader.py            # Paper dashboard/stats helper + legacy signal tracker
+├── paper_trader.py            # DEPRECATED: dashboard/stats helper + legacy signal tracker (see W11)
 ├── pyproject.toml             # PEP 621 project metadata
 ├── requirements.txt           # Pinned dependencies
 ├── env.template               # Environment variable template

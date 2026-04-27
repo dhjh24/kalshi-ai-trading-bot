@@ -1,9 +1,25 @@
 #!/usr/bin/env python3
 """
-Paper Trader - signal-only mode for the Kalshi AI Trading Bot.
+DEPRECATED -- Paper Trader (signal-tracker entrypoint).
 
-Uses the same ingest and decision pipeline as the live bot, but stores
-hypothetical trades locally instead of placing real orders.
+This module is retained as a thin compatibility wrapper for the legacy
+signal-only paper-trading workflow. New work should use the unified
+runtime path instead:
+
+    python cli.py run --paper             # paper-trading runtime (loop/scan)
+    python cli.py dashboard               # primary dashboard stack
+    python paper_trader.py --stats        # still works; reads unified DB
+    python paper_trader.py --dashboard    # still works; reads unified DB
+
+The default loop (``python paper_trader.py`` / ``--loop`` / ``--settle``)
+exercises the legacy ``src/paper/tracker.py`` signal-only path
+(``log_signal`` / ``settle_signal`` / ``get_pending_signals``) which is
+slated for removal once all downstream callers migrate. See W11 in
+``docs/plans/review-readme-and-other-cozy-diffie.md`` for the migration
+plan.
+
+Importing this module emits a ``DeprecationWarning`` so callers can
+inventory remaining usage before the eventual cleanup pass.
 """
 
 from __future__ import annotations
@@ -11,6 +27,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import warnings
 from datetime import datetime
 
 from src.config.settings import settings
@@ -22,6 +39,16 @@ from src.paper.tracker import (
     settle_signal,
 )
 from src.utils.logging_setup import get_trading_logger, setup_logging
+
+warnings.warn(
+    "paper_trader.py is deprecated; use 'python cli.py run --paper' for the "
+    "paper-trading runtime and 'python cli.py dashboard' for dashboards. The "
+    "legacy signal-tracker loop in this module will be removed in a future "
+    "cleanup pass once downstream callers migrate. See W11 in "
+    "docs/plans/review-readme-and-other-cozy-diffie.md.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 logger = get_trading_logger("paper_trader")
 

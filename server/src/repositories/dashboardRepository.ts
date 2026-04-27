@@ -574,7 +574,10 @@ function emptyQuotaWindowSummary() {
     latestAt: null,
     limit: null,
     remaining: null,
-    resetAt: null
+    resetAt: null,
+    tokensLimit: null,
+    tokensRemaining: null,
+    tokensResetAt: null
   };
 }
 
@@ -1589,6 +1592,24 @@ export function getPortfolioCodexQuotaSummary(): PortfolioCodexQuotaSummary {
     columnExists("codex_quota_tracking", "recorded_at") &&
     columnExists("codex_quota_tracking", "used")
   ) {
+    const hasRequestsUsed = columnExists("codex_quota_tracking", "requests_used");
+    const hasRequestsLimit = columnExists("codex_quota_tracking", "requests_limit");
+    const hasRequestsRemaining = columnExists("codex_quota_tracking", "requests_remaining");
+    const hasRequestsResetAt = columnExists("codex_quota_tracking", "requests_reset_at");
+    const hasTokensUsed = columnExists("codex_quota_tracking", "tokens_used");
+    const hasTokensLimit = columnExists("codex_quota_tracking", "tokens_limit");
+    const hasTokensRemaining = columnExists("codex_quota_tracking", "tokens_remaining");
+    const hasTokensResetAt = columnExists("codex_quota_tracking", "tokens_reset_at");
+
+    const requestsUsedExpr = hasRequestsUsed ? "requests_used" : "NULL";
+    const requestsLimitExpr = hasRequestsLimit ? "requests_limit" : "NULL";
+    const requestsRemainingExpr = hasRequestsRemaining ? "requests_remaining" : "NULL";
+    const requestsResetAtExpr = hasRequestsResetAt ? "requests_reset_at" : "NULL";
+    const tokensUsedExpr = hasTokensUsed ? "tokens_used" : "NULL";
+    const tokensLimitExpr = hasTokensLimit ? "tokens_limit" : "NULL";
+    const tokensRemainingExpr = hasTokensRemaining ? "tokens_remaining" : "NULL";
+    const tokensResetAtExpr = hasTokensResetAt ? "tokens_reset_at" : "NULL";
+
     const quotaRow = db
       .prepare(
         `
@@ -1602,7 +1623,15 @@ export function getPortfolioCodexQuotaSummary(): PortfolioCodexQuotaSummary {
             limit_value,
             remaining,
             reset_at,
-            source
+            source,
+            ${requestsUsedExpr} AS requests_used,
+            ${requestsLimitExpr} AS requests_limit,
+            ${requestsRemainingExpr} AS requests_remaining,
+            ${requestsResetAtExpr} AS requests_reset_at,
+            ${tokensUsedExpr} AS tokens_used,
+            ${tokensLimitExpr} AS tokens_limit,
+            ${tokensRemainingExpr} AS tokens_remaining,
+            ${tokensResetAtExpr} AS tokens_reset_at
           FROM codex_quota_tracking
           WHERE LOWER(TRIM(COALESCE(provider, 'codex'))) = 'codex'
           ORDER BY julianday(recorded_at) DESC, id DESC
@@ -1620,14 +1649,43 @@ export function getPortfolioCodexQuotaSummary(): PortfolioCodexQuotaSummary {
           remaining?: number | null;
           reset_at?: string | null;
           source?: string | null;
+          requests_used?: number | null;
+          requests_limit?: number | null;
+          requests_remaining?: number | null;
+          requests_reset_at?: string | null;
+          tokens_used?: number | null;
+          tokens_limit?: number | null;
+          tokens_remaining?: number | null;
+          tokens_reset_at?: string | null;
         }
       | undefined;
 
     if (quotaRow) {
       const fallback = fallbackFromLlmQueries();
-      const queryCount = toCount(quotaRow.used);
-      const limit = quotaRow.limit_value == null ? null : toCount(quotaRow.limit_value);
-      const remaining = quotaRow.remaining == null ? null : toCount(quotaRow.remaining);
+      const requestsUsed =
+        quotaRow.requests_used != null ? quotaRow.requests_used : quotaRow.used;
+      const queryCount = toCount(requestsUsed);
+      const requestsLimitRaw =
+        quotaRow.requests_limit != null ? quotaRow.requests_limit : quotaRow.limit_value;
+      const requestsRemainingRaw =
+        quotaRow.requests_remaining != null
+          ? quotaRow.requests_remaining
+          : quotaRow.remaining;
+      const limit = requestsLimitRaw == null ? null : toCount(requestsLimitRaw);
+      const remaining = requestsRemainingRaw == null ? null : toCount(requestsRemainingRaw);
+      const resetAt =
+        quotaRow.requests_reset_at != null
+          ? quotaRow.requests_reset_at
+          : quotaRow.reset_at ?? null;
+      const tokensUsed = quotaRow.tokens_used != null ? toCount(quotaRow.tokens_used) : 0;
+      const tokensLimit =
+        quotaRow.tokens_limit == null ? null : toCount(quotaRow.tokens_limit);
+      const tokensRemaining =
+        quotaRow.tokens_remaining == null ? null : toCount(quotaRow.tokens_remaining);
+      const tokensResetAt = quotaRow.tokens_reset_at ?? null;
+      const last24hTokensUsed = tokensUsed > 0 ? tokensUsed : fallback.last24h.tokensUsed;
+      const lifetimeTokensUsed =
+        tokensUsed > fallback.lifetime.tokensUsed ? tokensUsed : fallback.lifetime.tokensUsed;
       return {
         available: true,
         sourceTable: "codex_quota_tracking",
@@ -1638,20 +1696,32 @@ export function getPortfolioCodexQuotaSummary(): PortfolioCodexQuotaSummary {
         source: quotaRow.source ?? "codex_quota_tracking",
         last24h: {
           queryCount,
-          tokensUsed: fallback.last24h.tokensUsed,
+          tokensUsed: last24hTokensUsed,
           latestAt: quotaRow.recorded_at ?? fallback.last24h.latestAt,
           limit,
           remaining,
-          resetAt: quotaRow.reset_at ?? null
+          resetAt,
+          tokensLimit,
+          tokensRemaining,
+          tokensResetAt
         },
-        last7d: fallback.last7d,
+        last7d: {
+          ...fallback.last7d,
+          tokensLimit,
+          tokensRemaining,
+          tokensResetAt
+        },
         lifetime: {
           ...fallback.lifetime,
           queryCount: Math.max(fallback.lifetime.queryCount, queryCount),
+          tokensUsed: lifetimeTokensUsed,
           latestAt: quotaRow.recorded_at ?? fallback.lifetime.latestAt,
           limit,
           remaining,
-          resetAt: quotaRow.reset_at ?? null
+          resetAt,
+          tokensLimit,
+          tokensRemaining,
+          tokensResetAt
         }
       };
     }

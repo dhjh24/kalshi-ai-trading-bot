@@ -10,13 +10,16 @@ This module adds a small W5 foundation inside the existing trading cycle:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
+import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
+import httpx
 from json_repair import repair_json
 
 from src.clients.kalshi_client import KalshiClient
@@ -692,6 +695,110 @@ class LiveTradeLoopSummary:
     skipped_reason: Optional[str] = None
 
 
+# Topic strings that the dashboard SSE hub understands. Keep in sync with the
+# Node-side `internalRefreshBodySchema` in `server/src/app.ts`.
+_NOTIFY_TOPICS = ("live-trade-decisions", "runtime-state", "feedback")
+
+
+def _resolve_notify_url() -> Optional[str]:
+    """Return the configured Node refresh hook URL, if any.
+
+    We intentionally keep this an env-driven setting (rather than baking it into
+    `settings.trading`) because the Python loop and the Node dashboard often
+    live in different process trees -- in dev / CI the Node server may be off
+    entirely, in which case we want the loop to skip notifications silently.
+    """
+    raw = (os.getenv("LIVE_TRADE_NOTIFY_URL") or "").strip()
+    if not raw:
+        return None
+    return raw
+
+
+def _resolve_notify_token() -> Optional[str]:
+    raw = (os.getenv("LIVE_TRADE_INTERNAL_REFRESH_TOKEN") or "").strip()
+    if not raw:
+        return None
+    return raw
+
+
+class LiveTradeRefreshNotifier:
+    """Best-effort fire-and-forget POST to the Node SSE hub.
+
+    The Node side already serves a lightweight cursor poll as a fallback, so
+    every method here is safe to fail silently: the dashboard will simply
+    refresh on the next poll tick instead of immediately. We log a single
+    warning per failure (de-duped on consecutive identical warnings) so an
+    unreachable Node server does not flood logs while the Python loop runs.
+    """
+
+    def __init__(
+        self,
+        *,
+        url: Optional[str] = None,
+        token: Optional[str] = None,
+        timeout_seconds: float = 0.5,
+        client_factory: Optional[Callable[..., httpx.AsyncClient]] = None,
+        logger=None,
+    ) -> None:
+        self._url = url if url is not None else _resolve_notify_url()
+        self._token = token if token is not None else _resolve_notify_token()
+        self._timeout_seconds = max(0.05, float(timeout_seconds))
+        self._client_factory = client_factory
+        self._logger = logger or get_trading_logger("live_trade_notify")
+        self._last_warning: Optional[str] = None
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self._url) and bool(self._token)
+
+    async def notify(self, topic: str = "live-trade-decisions") -> bool:
+        """POST a refresh notification to the Node hub.
+
+        Returns True when the request was sent and accepted, False otherwise.
+        Network / HTTP failures are swallowed so the trading loop never crashes
+        on a missing dashboard.
+        """
+        if not self.enabled:
+            return False
+        normalized_topic = topic if topic in _NOTIFY_TOPICS else "live-trade-decisions"
+        try:
+            if self._client_factory is not None:
+                client = self._client_factory(timeout=self._timeout_seconds)
+            else:
+                client = httpx.AsyncClient(timeout=self._timeout_seconds)
+            try:
+                response = await client.post(
+                    self._url,  # type: ignore[arg-type]
+                    json={"topic": normalized_topic},
+                    headers={"x-internal-token": self._token or ""},
+                )
+            finally:
+                await client.aclose()
+        except Exception as exc:  # pragma: no cover - defensive: must never raise
+            self._warn_once(f"live-trade refresh notify failed: {exc}")
+            return False
+
+        status_code = getattr(response, "status_code", None)
+        if status_code is None or int(status_code) >= 400:
+            self._warn_once(
+                f"live-trade refresh notify rejected with status {status_code}"
+            )
+            return False
+        # Reset the de-dupe key on success so the next failure surfaces.
+        self._last_warning = None
+        return True
+
+    def _warn_once(self, message: str) -> None:
+        if message == self._last_warning:
+            return
+        self._last_warning = message
+        try:
+            self._logger.warning(message)
+        except Exception:
+            # The logger should never break the trading loop either.
+            pass
+
+
 class LiveTradeDecisionLoop:
     """Runtime-aware W5 decision loop for the existing trading cycle."""
 
@@ -707,6 +814,7 @@ class LiveTradeDecisionLoop:
         quick_flip_executor_fn: Optional[Callable[..., Awaitable[Dict[str, Any]]]] = None,
         manage_quick_flip_positions_each_cycle: bool = False,
         shortlist_size: int = 3,
+        refresh_notifier: Optional[LiveTradeRefreshNotifier] = None,
     ) -> None:
         self.db_manager = db_manager
         self.kalshi_client = kalshi_client
@@ -724,6 +832,9 @@ class LiveTradeDecisionLoop:
         self._owns_model_router = model_router is None
         self._owns_research_service = research_service is None
         self._runtime_state: Optional[LiveTradeRuntimeState] = None
+        self.refresh_notifier = refresh_notifier or LiveTradeRefreshNotifier(
+            logger=self.logger
+        )
 
     def _resolve_runtime_mode(self) -> str:
         if bool(getattr(settings.trading, "live_trading_enabled", False)):
@@ -745,6 +856,23 @@ class LiveTradeDecisionLoop:
             live_trade=is_live_trade,
             **kwargs,
         )
+
+    async def _notify_refresh(self, topic: str = "live-trade-decisions") -> None:
+        """Best-effort push notification to the Node SSE hub.
+
+        Wraps `LiveTradeRefreshNotifier.notify` so failures cannot bubble out
+        of the trading loop. The cursor-poll fallback in `liveStreamHub.ts`
+        keeps the dashboard correct even if every push notification is
+        dropped.
+        """
+        try:
+            if not self.refresh_notifier.enabled:
+                return
+            await self.refresh_notifier.notify(topic)
+        except Exception:
+            # Notifier already swallows network errors, but defend against any
+            # surprises (logger misconfig, asyncio cancellation, etc.).
+            pass
 
     def _resolve_exchange_env(self) -> Optional[str]:
         exchange_env = getattr(getattr(settings, "api", None), "kalshi_env", None)
@@ -860,6 +988,11 @@ class LiveTradeDecisionLoop:
         if completed:
             state.last_completed_at = now
         await self.db_manager.upsert_live_trade_runtime_state(state)
+        # W9: push the dashboard hub a refresh nudge after every persisted
+        # runtime-state change. The Node side decides whether anything
+        # actually changed via its cursor, so over-notifying is cheap; the
+        # cursor poll fallback covers any dropped pushes.
+        await self._notify_refresh("runtime-state")
 
     async def run_once(self) -> LiveTradeLoopSummary:
         run_id = uuid.uuid4().hex[:12]

@@ -390,6 +390,9 @@ export interface PortfolioQuotaWindowSummary {
   limit: number | null;
   remaining: number | null;
   resetAt: string | null;
+  tokensLimit?: number | null;
+  tokensRemaining?: number | null;
+  tokensResetAt?: string | null;
 }
 
 export interface PortfolioCodexQuotaSummary {
