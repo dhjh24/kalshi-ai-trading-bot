@@ -204,6 +204,9 @@ dashboard_*.json
 *.temp
 *~
 
+# Claude Code worktrees (transient agent isolation directories)
+.claude/worktrees/
+
 # Node.js
 node_modules/
 web/.next/
