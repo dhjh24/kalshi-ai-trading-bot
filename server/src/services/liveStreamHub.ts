@@ -14,13 +14,14 @@ import { resolveSportsContext } from "./external/sportsDataService.js";
 import { serverConfig } from "../config.js";
 
 type Topic = "markets" | "btc" | "scores" | "analysis" | "live-trade-decisions";
-// Cursor polling now serves as a fallback for the push-based refresh hook
-// (POST /internal/live-trade/notify-refresh). When the Python loop pushes
-// notifications, this poll just confirms missed events; the longer interval
-// keeps wakeups cheap while still catching anything we missed.
+// Cursor polling is the safety-net for the push-based refresh hook
+// (POST /internal/live-trade/notify-refresh): when the Python loop fires
+// the push, the SSE event lands within milliseconds; when the push is
+// missed (external SQLite writers, workers without the URL configured),
+// this poll catches it within ~1s.
 const LIVE_TRADE_DECISION_CURSOR_POLL_MS = Math.max(
-  2_000,
-  serverConfig.dataRefreshMs
+  250,
+  Math.min(serverConfig.dataRefreshMs, 1000)
 );
 
 function isClosedDatabaseError(error: unknown): boolean {

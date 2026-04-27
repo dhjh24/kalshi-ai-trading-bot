@@ -1035,7 +1035,8 @@ describe("live_trade_decisions repository helpers", () => {
           contractsCost: null,
           costUsd: 0.02
         },
-        feedback: null
+        feedback: null,
+        runtimeMode: null
       },
       {
         id: "1",
@@ -1075,7 +1076,8 @@ describe("live_trade_decisions repository helpers", () => {
           contractsCost: null,
           costUsd: null
         },
-        feedback: null
+        feedback: null,
+        runtimeMode: null
       }
     ]);
   });
