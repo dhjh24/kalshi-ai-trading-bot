@@ -499,6 +499,54 @@ async def test_execute_live_maker_entry_cancels_partial_remainder():
 
 
 @pytest.mark.asyncio
+async def test_execute_live_maker_entry_rejects_reprice_above_approved_limit():
+    fake_client = SimpleNamespace(
+        get_market=AsyncMock(
+            return_value={
+                "market": {
+                    "yes_bid_dollars": "0.058",
+                    "yes_ask_dollars": "0.065",
+                    "no_bid_dollars": "0.935",
+                    "no_ask_dollars": "0.942",
+                    "price_ranges": [{"from_price_dollars": "0.0000", "to_price_dollars": "0.1000", "tick_size_dollars": "0.0010"}],
+                }
+            }
+        ),
+        place_order=AsyncMock(return_value={"order": {"order_id": "entry-1"}}),
+        cancel_order=AsyncMock(return_value={}),
+    )
+    fake_db = SimpleNamespace(update_position_execution_details=AsyncMock())
+    strategy = QuickFlipScalpingStrategy(
+        db_manager=fake_db,
+        kalshi_client=fake_client,
+        xai_client=object(),
+        config=QuickFlipConfig(
+            maker_entry_timeout_seconds=30,
+            maker_entry_reprice_seconds=30,
+        ),
+    )
+    strategy._wait_for_entry_fill = AsyncMock(
+        return_value={"filled_quantity": 10.0, "fill_price": 0.064, "status": "filled"}
+    )
+    position = Position(
+        market_id="TEST-MKT",
+        side="YES",
+        entry_price=0.057,
+        quantity=10,
+        timestamp=datetime.now(),
+        id=99,
+        strategy="quick_flip_scalping",
+    )
+
+    success = await strategy._execute_live_maker_entry(position)
+
+    assert success is False
+    fake_client.place_order.assert_not_awaited()
+    strategy._wait_for_entry_fill.assert_not_awaited()
+    fake_db.update_position_execution_details.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_cut_losses_uses_ioc_with_reduce_only_in_live_mode():
     fake_client = SimpleNamespace(
         get_market=AsyncMock(

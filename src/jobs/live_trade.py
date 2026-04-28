@@ -835,6 +835,7 @@ class LiveTradeDecisionLoop:
         self.refresh_notifier = refresh_notifier or LiveTradeRefreshNotifier(
             logger=self.logger
         )
+        self._refresh_notify_tasks: set[asyncio.Task] = set()
 
     def _resolve_runtime_mode(self) -> str:
         if bool(getattr(settings.trading, "live_trading_enabled", False)):
@@ -860,19 +861,26 @@ class LiveTradeDecisionLoop:
     async def _notify_refresh(self, topic: str = "live-trade-decisions") -> None:
         """Best-effort push notification to the Node SSE hub.
 
-        Wraps `LiveTradeRefreshNotifier.notify` so failures cannot bubble out
-        of the trading loop. The cursor-poll fallback in `liveStreamHub.ts`
-        keeps the dashboard correct even if every push notification is
-        dropped.
+        Schedule `LiveTradeRefreshNotifier.notify` without waiting on network
+        I/O. The cursor-poll fallback in `liveStreamHub.ts` keeps the dashboard
+        correct even if every push notification is dropped.
         """
-        try:
-            if not self.refresh_notifier.enabled:
-                return
-            await self.refresh_notifier.notify(topic)
-        except Exception:
-            # Notifier already swallows network errors, but defend against any
-            # surprises (logger misconfig, asyncio cancellation, etc.).
-            pass
+        if not self.refresh_notifier.enabled:
+            return
+
+        task = asyncio.create_task(self.refresh_notifier.notify(topic))
+        self._refresh_notify_tasks.add(task)
+
+        def _discard_notify_task(done: asyncio.Task) -> None:
+            self._refresh_notify_tasks.discard(done)
+            try:
+                done.result()
+            except Exception:
+                # Notifier already swallows network errors, but defend against
+                # surprises (logger misconfig, asyncio cancellation, etc.).
+                pass
+
+        task.add_done_callback(_discard_notify_task)
 
     def _resolve_exchange_env(self) -> Optional[str]:
         exchange_env = getattr(getattr(settings, "api", None), "kalshi_env", None)
@@ -881,6 +889,12 @@ class LiveTradeDecisionLoop:
         return None
 
     async def close(self) -> None:
+        if self._refresh_notify_tasks:
+            pending = list(self._refresh_notify_tasks)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            self._refresh_notify_tasks.clear()
         if self._owns_research_service:
             await self.research_service.close()
         if self._owns_model_router:
@@ -1575,10 +1589,32 @@ class LiveTradeDecisionLoop:
             has_position=False,
         )
         execution_style = str(final_intent.get("execution_style") or "NONE").upper()
-        is_short_quick_flip = (
-            execution_style == "QUICK_FLIP"
-            and _safe_int(final_intent.get("hold_minutes"), 0) <= 30
-        )
+        hold_minutes = _safe_int(final_intent.get("hold_minutes"), 0)
+        is_quick_flip_intent = execution_style == "QUICK_FLIP"
+        is_short_quick_flip = is_quick_flip_intent and hold_minutes <= 30
+        live_mode = self._is_live_execution_mode()
+        runtime_mode = self._resolve_runtime_mode()
+        execution_mode_label = "live" if live_mode else runtime_mode
+        if is_quick_flip_intent and not is_short_quick_flip:
+            await self._record_execution_status(
+                run_id=run_id,
+                final_intent=final_intent,
+                status="blocked",
+                summary="Quick-flip intents must use a hold window of 30 minutes or less.",
+                error="quick_flip_hold_exceeds_scalp_window",
+                quantity=quantity,
+            )
+            return False
+        if is_short_quick_flip and live_mode and not bool(getattr(settings.trading, "enable_live_quick_flip", False)):
+            await self._record_execution_status(
+                run_id=run_id,
+                final_intent=final_intent,
+                status="blocked",
+                summary="Quick-flip live execution requires ENABLE_LIVE_QUICK_FLIP opt-in.",
+                error="quick_flip_live_opt_in_required",
+                quantity=quantity,
+            )
+            return False
         guardrail_strategy = "quick_flip" if is_short_quick_flip else "live_trade"
         allowed, reason = await self._passes_guardrails(
             market=market_record,
@@ -1598,20 +1634,7 @@ class LiveTradeDecisionLoop:
             )
             return False
 
-        live_mode = self._is_live_execution_mode()
-        runtime_mode = self._resolve_runtime_mode()
-        execution_mode_label = "live" if live_mode else runtime_mode
         if is_short_quick_flip:
-            if live_mode and not bool(getattr(settings.trading, "enable_live_quick_flip", False)):
-                await self._record_execution_status(
-                    run_id=run_id,
-                    final_intent=final_intent,
-                    status="blocked",
-                    summary="Quick-flip live execution requires ENABLE_LIVE_QUICK_FLIP opt-in.",
-                    error="quick_flip_live_opt_in_required",
-                    quantity=quantity,
-                )
-                return False
             quick_flip_result = await self.quick_flip_executor_fn(
                 db_manager=self.db_manager,
                 kalshi_client=self.kalshi_client,

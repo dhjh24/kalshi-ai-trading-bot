@@ -52,6 +52,12 @@ share/python-wheels/
 MANIFEST
 .pytest-tmp/
 .pytest_cache/
+/pytest-cache-files-*/
+/tmp_pytest*/
+/tmp_pytest_run_*/
+/tempcheck-codex/
+/tmpdns*/
+/tmpj*/
 
 # PyInstaller
 *.manifest

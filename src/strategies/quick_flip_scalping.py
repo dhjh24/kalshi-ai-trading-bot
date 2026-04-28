@@ -689,6 +689,12 @@ class QuickFlipScalpingStrategy:
                     f"(bid={best_bid:.4f}, ask={best_ask:.4f})"
                 )
                 return False
+            if maker_price > float(position.entry_price) + 1e-9:
+                self.logger.info(
+                    f"Skipping {position.market_id}: maker entry {maker_price:.4f} "
+                    f"exceeds approved limit {position.entry_price:.4f}"
+                )
+                return False
 
             attempt_timeout = min(
                 remaining_timeout,

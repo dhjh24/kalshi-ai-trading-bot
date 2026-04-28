@@ -860,11 +860,13 @@ async def test_live_trade_loop_blocks_live_quick_flip_without_opt_in(monkeypatch
     }
     """
     quick_flip_calls = {"count": 0}
+    guardrail_calls = {"count": 0}
 
     async def fake_execute_position(**_kwargs):
         raise AssertionError("generic execute_position path should not run for QUICK_FLIP intents")
 
     async def fake_guardrail(**_kwargs):
+        guardrail_calls["count"] += 1
         return True, None
 
     async def fake_quick_flip_executor(**_kwargs):
@@ -901,6 +903,7 @@ async def test_live_trade_loop_blocks_live_quick_flip_without_opt_in(monkeypatch
     assert summary.executed_positions == 0
     assert summary.skipped_reason == "live execution did not fill"
     assert quick_flip_calls["count"] == 0
+    assert guardrail_calls["count"] == 0
 
     execution_rows = await db_manager.list_live_trade_decisions(limit=5, step="execution")
     assert execution_rows
@@ -912,6 +915,89 @@ async def test_live_trade_loop_blocks_live_quick_flip_without_opt_in(monkeypatch
     assert execution_rows[0]["paper_trade"] == 0
     assert execution_rows[0]["live_trade"] == 1
     assert execution_rows[0]["runtime_mode"] == "live"
+
+
+@pytest.mark.asyncio
+async def test_live_trade_loop_blocks_overlong_quick_flip_without_rerouting(monkeypatch):
+    monkeypatch.setattr(settings.trading, "live_trading_enabled", False, raising=False)
+    monkeypatch.setattr(settings.trading, "daily_ai_budget", 10.0, raising=False)
+    monkeypatch.setattr(settings.trading, "max_position_size_pct", 3.0, raising=False)
+
+    db_manager = await _build_test_db_manager("live_trade_loop_qf_hold_blocked")
+    guardrail_calls = {"count": 0}
+
+    event = {
+        "event_ticker": "KXQF-HOLD-BLOCKED",
+        "title": "Will Team L score next?",
+        "category": "Sports",
+        "markets": [
+            {
+                "ticker": "KXQF-HOLD-BLOCKED-M1",
+                "title": "Team L next score",
+                "yes_midpoint": 0.30,
+                "yes_bid": 0.29,
+                "yes_ask": 0.31,
+                "no_bid": 0.69,
+                "no_ask": 0.71,
+                "volume": 4300,
+                "expiration_ts": 4102444800,
+            }
+        ],
+    }
+    final_intent = {
+        "event_ticker": "KXQF-HOLD-BLOCKED",
+        "market_ticker": "KXQF-HOLD-BLOCKED-M1",
+        "action": "BUY",
+        "side": "YES",
+        "confidence": 0.80,
+        "edge_pct": 0.05,
+        "position_size_pct": 2.0,
+        "hold_minutes": 45,
+        "limit_price": 0.30,
+        "execution_style": "QUICK_FLIP",
+        "reasoning": "This asks for a scalp label but a non-scalp hold window.",
+    }
+
+    async def fake_execute_position(**_kwargs):
+        raise AssertionError("generic execute_position path should not run for overlong QUICK_FLIP intents")
+
+    async def fake_guardrail(**_kwargs):
+        guardrail_calls["count"] += 1
+        return True, None
+
+    async def fake_quick_flip_executor(**_kwargs):
+        raise AssertionError("quick-flip executor should not run for overlong QUICK_FLIP intents")
+
+    loop = LiveTradeDecisionLoop(
+        db_manager=db_manager,
+        kalshi_client=FakeKalshiClient(),
+        model_router=FakeModelRouter([]),
+        research_service=FakeResearchService([]),
+        execute_position_fn=fake_execute_position,
+        guardrail_fn=fake_guardrail,
+        quick_flip_executor_fn=fake_quick_flip_executor,
+    )
+
+    executed = await loop._execute_final_intent(
+        run_id="run-overlong-qf",
+        final_intent=final_intent,
+        event_map={event["event_ticker"]: event},
+    )
+    await loop.close()
+
+    assert executed is False
+    assert guardrail_calls["count"] == 0
+
+    execution_rows = await db_manager.list_live_trade_decisions(limit=5, step="execution")
+    assert execution_rows
+    assert execution_rows[0]["status"] == "blocked"
+    assert execution_rows[0]["error"] == "quick_flip_hold_exceeds_scalp_window"
+    assert execution_rows[0]["summary"] == (
+        "Quick-flip intents must use a hold window of 30 minutes or less."
+    )
+
+    positions = await db_manager.get_open_positions()
+    assert positions == []
 
 
 @pytest.mark.asyncio

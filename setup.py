@@ -226,5 +226,20 @@ def main():
 
 
 if __name__ == "__main__":
-    success = main()
-    sys.exit(0 if success else 1)
+    setuptools_commands = {
+        "bdist_wheel",
+        "build",
+        "build_editable",
+        "develop",
+        "dist_info",
+        "editable_wheel",
+        "egg_info",
+        "sdist",
+    }
+    if any(command in sys.argv[1:] for command in setuptools_commands):
+        from setuptools import setup
+
+        setup()
+    else:
+        success = main()
+        sys.exit(0 if success else 1)

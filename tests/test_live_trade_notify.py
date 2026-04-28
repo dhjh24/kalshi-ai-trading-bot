@@ -229,6 +229,7 @@ def test_persist_runtime_state_fires_notify_once_per_call(monkeypatch):
     # to drive `_persist_runtime_state`.
     loop = LiveTradeDecisionLoop.__new__(LiveTradeDecisionLoop)
     loop.refresh_notifier = notifier
+    loop._refresh_notify_tasks = set()
     loop.db_manager = _StubDbManager()
     loop._runtime_state = LiveTradeRuntimeState(
         heartbeat_at=datetime.now(timezone.utc).isoformat(),
@@ -238,8 +239,13 @@ def test_persist_runtime_state_fires_notify_once_per_call(monkeypatch):
     loop._resolve_runtime_mode = lambda: "paper"  # type: ignore[assignment]
     loop._resolve_exchange_env = lambda: "demo"  # type: ignore[assignment]
 
+    async def _persist_and_drain(**kwargs):
+        await loop._persist_runtime_state(**kwargs)
+        if loop._refresh_notify_tasks:
+            await asyncio.gather(*list(loop._refresh_notify_tasks))
+
     asyncio.run(
-        loop._persist_runtime_state(
+        _persist_and_drain(
             run_id="run-1",
             loop_status="running",
             step="execution",
@@ -255,7 +261,7 @@ def test_persist_runtime_state_fires_notify_once_per_call(monkeypatch):
 
     # A second call should fire a second notification (one per state write).
     asyncio.run(
-        loop._persist_runtime_state(
+        _persist_and_drain(
             run_id="run-1",
             loop_status="completed",
             step="execution",
@@ -286,6 +292,7 @@ def test_persist_runtime_state_swallows_notify_failures(monkeypatch):
 
     loop = LiveTradeDecisionLoop.__new__(LiveTradeDecisionLoop)
     loop.refresh_notifier = _ExplodingNotifier()
+    loop._refresh_notify_tasks = set()
     loop.db_manager = _StubDbManager()
     loop._runtime_state = LiveTradeRuntimeState(
         heartbeat_at=datetime.now(timezone.utc).isoformat(),
@@ -296,12 +303,70 @@ def test_persist_runtime_state_swallows_notify_failures(monkeypatch):
     loop._resolve_exchange_env = lambda: "demo"  # type: ignore[assignment]
 
     # Must complete without raising.
-    asyncio.run(
-        loop._persist_runtime_state(
+    async def _persist_and_drain() -> None:
+        await loop._persist_runtime_state(
             run_id="run-1",
             loop_status="running",
             step="execution",
             step_status="completed",
         )
-    )
+        if loop._refresh_notify_tasks:
+            await asyncio.gather(*list(loop._refresh_notify_tasks), return_exceptions=True)
+
+    asyncio.run(_persist_and_drain())
     assert len(loop.db_manager.upsert_calls) == 1
+
+
+def test_persist_runtime_state_does_not_wait_for_slow_notify():
+    """A configured but slow Node endpoint must not slow state persistence."""
+    from datetime import datetime, timezone
+
+    from src.jobs.live_trade import LiveTradeDecisionLoop
+    from src.utils.database import LiveTradeRuntimeState
+
+    class _SlowNotifier(LiveTradeRefreshNotifier):
+        def __init__(self) -> None:
+            super().__init__(url="http://x", token="y")
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        @property
+        def enabled(self) -> bool:  # type: ignore[override]
+            return True
+
+        async def notify(self, topic: str = "live-trade-decisions") -> bool:  # type: ignore[override]
+            self.started.set()
+            await self.release.wait()
+            return True
+
+    async def _run() -> None:
+        notifier = _SlowNotifier()
+        loop = LiveTradeDecisionLoop.__new__(LiveTradeDecisionLoop)
+        loop.refresh_notifier = notifier
+        loop._refresh_notify_tasks = set()
+        loop.db_manager = _StubDbManager()
+        loop._runtime_state = LiveTradeRuntimeState(
+            heartbeat_at=datetime.now(timezone.utc).isoformat(),
+            runtime_mode="paper",
+            exchange_env="demo",
+        )
+        loop._resolve_runtime_mode = lambda: "paper"  # type: ignore[assignment]
+        loop._resolve_exchange_env = lambda: "demo"  # type: ignore[assignment]
+
+        await asyncio.wait_for(
+            loop._persist_runtime_state(
+                run_id="run-1",
+                loop_status="running",
+                step="execution",
+                step_status="completed",
+            ),
+            timeout=0.05,
+        )
+        assert len(loop.db_manager.upsert_calls) == 1
+        assert loop._refresh_notify_tasks
+
+        await asyncio.wait_for(notifier.started.wait(), timeout=0.05)
+        notifier.release.set()
+        await asyncio.gather(*list(loop._refresh_notify_tasks))
+
+    asyncio.run(_run())
