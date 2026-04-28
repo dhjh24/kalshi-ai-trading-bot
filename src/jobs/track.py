@@ -444,10 +444,43 @@ async def run_tracking(
             exits_executed,
         )
 
+        await _evaluate_shadow_drift_auto_pause(db_manager, logger)
+
     except Exception as exc:
         logger.error("Error in position tracking job.", error=str(exc), exc_info=True)
     finally:
         await kalshi_client.close()
+
+
+async def _evaluate_shadow_drift_auto_pause(db_manager: DatabaseManager, logger) -> None:
+    """W4 follow-up: optional auto-pause on paper-vs-live shadow drift.
+
+    No-ops unless `shadow_drift_auto_pause_enabled=True` (the default is
+    False). Runs once per tracking pass — not in the hot trading loop.
+    """
+    if not bool(getattr(settings.trading, "shadow_drift_auto_pause_enabled", False)):
+        return
+    try:
+        from src.strategies.portfolio_enforcer import (
+            PortfolioEnforcer,
+            STRATEGY_LIVE_TRADE,
+            STRATEGY_QUICK_FLIP,
+        )
+
+        enforcer = PortfolioEnforcer(db_path=db_manager.db_path)
+        await enforcer.initialize()
+        for strategy in (STRATEGY_LIVE_TRADE, STRATEGY_QUICK_FLIP):
+            halted, reason = await enforcer.evaluate_shadow_drift_halt(
+                strategy=strategy,
+                db_manager=db_manager,
+            )
+            if halted and reason and reason != "already_halted":
+                logger.warning(
+                    "Shadow-drift auto-pause halted strategy=%s reason=%s",
+                    strategy, reason,
+                )
+    except Exception as exc:
+        logger.debug("Shadow-drift evaluation skipped: %s", exc)
 
 
 if __name__ == "__main__":
