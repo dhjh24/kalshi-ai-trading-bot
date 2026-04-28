@@ -265,15 +265,15 @@ def test_cmd_run_live_mode_keeps_embedded_live_trade_loop_inside_main_runtime(
     logging_module.setup_logging = MagicMock()
     monkeypatch.setitem(sys.modules, "src.utils.logging_setup", logging_module)
 
-    beast_module = ModuleType("beast_mode_bot")
+    unified_bot_module = ModuleType("src.runtime.unified_bot")
 
-    class FakeBeastModeBot:
+    class FakeUnifiedTradingBot:
         def __init__(self, live_mode: bool = False, shadow_mode: bool = False):
             self.live_mode = live_mode
             self.shadow_mode = shadow_mode
 
-    beast_module.BeastModeBot = FakeBeastModeBot
-    monkeypatch.setitem(sys.modules, "beast_mode_bot", beast_module)
+    unified_bot_module.UnifiedTradingBot = FakeUnifiedTradingBot
+    monkeypatch.setitem(sys.modules, "src.runtime.unified_bot", unified_bot_module)
 
     category_scorer_module = ModuleType("src.strategies.category_scorer")
     category_scorer_module.CategoryScorer = object
@@ -337,7 +337,7 @@ def test_cmd_run_live_mode_keeps_embedded_live_trade_loop_inside_main_runtime(
     )
 
     assert dispatched["standalone_loop"] is False
-    assert constructed["class"] is FakeBeastModeBot
+    assert constructed["class"] is FakeUnifiedTradingBot
     assert constructed["construct_kwargs"]["live_mode"] is True
     assert constructed["construct_kwargs"]["shadow_mode"] is False
 

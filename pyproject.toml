@@ -84,7 +84,7 @@ Repository = "https://github.com/yourusername/kalshi-ai-trading-bot"
 Issues = "https://github.com/yourusername/kalshi-ai-trading-bot/issues"
 
 [tool.setuptools]
-py-modules = ["cli", "beast_mode_bot", "beast_mode_dashboard"]
+py-modules = ["cli", "beast_mode_dashboard"]
 
 [tool.setuptools.packages.find]
 include = ["src*"]
