@@ -584,11 +584,11 @@ def cmd_run(args: argparse.Namespace) -> None:
             print("   Smoke safety mode enabled: startup + ingestion only, no OpenRouter calls.")
         elif once:
             print("   Single-pass safety mode enabled: one cycle, then exit.")
-        from beast_mode_bot import BeastModeBot
-        if shadow and not _class_accepts_kwarg(BeastModeBot, "shadow_mode"):
+        from src.runtime.unified_bot import UnifiedTradingBot
+        if shadow and not _class_accepts_kwarg(UnifiedTradingBot, "shadow_mode"):
             print("   Shadow runtime hook not available yet; falling back to paper execution semantics.")
         bot = _construct_runtime(
-            BeastModeBot,
+            UnifiedTradingBot,
             live_mode=live_mode,
             shadow_mode=shadow,
         )
@@ -616,7 +616,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     elif once:
         print("   Single-pass safety mode enabled: one cycle, then exit.")
 
-    from beast_mode_bot import BeastModeBot
+    from src.runtime.unified_bot import UnifiedTradingBot
     from src.strategies.category_scorer import CategoryScorer
     from src.strategies.portfolio_enforcer import PortfolioEnforcer
 
@@ -628,10 +628,10 @@ def cmd_run(args: argparse.Namespace) -> None:
     cfg.max_drawdown = 0.15
     cfg.max_sector_exposure = 0.30
 
-    if shadow and not _class_accepts_kwarg(BeastModeBot, "shadow_mode"):
+    if shadow and not _class_accepts_kwarg(UnifiedTradingBot, "shadow_mode"):
         print("   Shadow runtime hook not available yet; falling back to paper execution semantics.")
     bot = _construct_runtime(
-        BeastModeBot,
+        UnifiedTradingBot,
         live_mode=live_mode,
         shadow_mode=shadow,
     )
@@ -709,19 +709,18 @@ def cmd_dashboard(args: argparse.Namespace) -> None:
     # Legacy fallback only when the Node dashboard workspace is unavailable.
     dashboard_script = repo_root / "scripts" / "launch_dashboard.py"
     beast_dashboard = repo_root / "beast_mode_dashboard.py"
-    beast_bot = repo_root / "beast_mode_bot.py"
 
     if dashboard_script.exists():
         print("Node dashboard workspace not available; falling back to legacy Streamlit launcher.")
         subprocess.run([sys.executable, str(dashboard_script)], check=False)
-    elif beast_dashboard.exists() and beast_bot.exists():
-        # Fall back to the legacy beast-mode dashboard runtime when the
-        # canonical repo-root entrypoints are still present.
+    elif beast_dashboard.exists():
+        # Fall back to the legacy dashboard runtime when the canonical repo-root
+        # dashboard entrypoint is still present.
         from src.utils.logging_setup import setup_logging
-        from beast_mode_bot import BeastModeBot
+        from src.runtime.unified_bot import UnifiedTradingBot
 
         setup_logging(log_level="INFO")
-        bot = BeastModeBot(live_mode=False, dashboard_mode=True)
+        bot = UnifiedTradingBot(live_mode=False, dashboard_mode=True)
         try:
             asyncio.run(bot.run())
         except KeyboardInterrupt:

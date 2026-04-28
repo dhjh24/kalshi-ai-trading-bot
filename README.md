@@ -293,8 +293,8 @@ Primary CLI is recommended for Beast Mode and dashboard workflows:
 
 ```bash
 python scripts/beast_mode_dashboard.py   # Legacy dashboard shim; use `python cli.py dashboard` for production path
-python beast_mode_bot.py              # Paper trading
-python beast_mode_bot.py --live       # Live trading
+python cli.py run                     # Paper trading
+python cli.py run --live              # Live trading
 ```
 
 Use `python cli.py dashboard` for the current dashboard flow. That command owns the Next.js web app,
@@ -345,7 +345,6 @@ The dashboard writes to `docs/paper_dashboard.html` — open locally or host via
 
 ```
 kalshi-ai-trading-bot/
-├── beast_mode_bot.py          # Main bot entry point (AI ensemble orchestrator)
 ├── cli.py                     # Unified CLI: run, dashboard, status, health, scores
 ├── paper_trader.py            # DEPRECATED: dashboard/stats helper + legacy signal tracker (see W11)
 ├── pyproject.toml             # PEP 621 project metadata
@@ -359,6 +358,7 @@ kalshi-ai-trading-bot/
 │   ├── data/                  # News aggregation and sentiment analysis
 │   ├── events/                # Async event bus for real-time streaming
 │   ├── jobs/                  # Core pipeline: ingest, decide, execute, track, evaluate
+│   ├── runtime/               # Unified trading bot orchestrator (unified_bot.py)
 │   ├── strategies/            # Safe compounder, category scorer, portfolio enforcer
 │   └── utils/                 # Database, logging, prompts, risk helpers
 │
@@ -563,8 +563,8 @@ pytest --cov=src       # with coverage
 ### Code Quality
 
 ```bash
-black src/ tests/ cli.py beast_mode_bot.py
-isort src/ tests/ cli.py beast_mode_bot.py
+black src/ tests/ cli.py
+isort src/ tests/ cli.py
 mypy src/
 ```
 
@@ -604,7 +604,7 @@ Error getting performance: no such table: positions
 ```bash
 python cli.py run --paper
 # or
-python beast_mode_bot.py
+python cli.py run
 ```
 
 If you want to initialize the database manually (e.g., to verify the schema before starting the bot):

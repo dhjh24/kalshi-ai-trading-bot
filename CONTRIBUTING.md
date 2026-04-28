@@ -53,8 +53,8 @@ Optional: launch the dashboard locally with `python cli.py dashboard`.
 ### Formatting and checks
 
 ```bash
-black src/ tests/ cli.py beast_mode_bot.py
-isort src/ tests/ cli.py beast_mode_bot.py
+black src/ tests/ cli.py
+isort src/ tests/ cli.py
 mypy src/
 ```
 
