@@ -7,6 +7,7 @@ import aiosqlite
 import pytest
 
 from src.jobs.decide import _get_current_position_exposures
+import src.strategies.portfolio_enforcer as portfolio_enforcer_module
 from src.strategies.portfolio_enforcer import STRATEGY_LIVE_TRADE, PortfolioEnforcer
 from src.utils.database import DatabaseManager
 
@@ -25,6 +26,29 @@ def guardrail_db() -> str:
     return _local_test_db_path("live_trade_guardrails")
 
 
+@pytest.fixture
+def frozen_now(monkeypatch) -> datetime:
+    """
+    Anchor `datetime.now(...)` inside the enforcer module to UTC noon today
+    so that exit-offset arithmetic in the alias tests cannot cross UTC
+    midnight when the test runs near 00:00 UTC.
+    """
+    today_utc = datetime.now(timezone.utc).date()
+    anchor = datetime(today_utc.year, today_utc.month, today_utc.day, 12, 0, 0, tzinfo=timezone.utc)
+
+    real_datetime = portfolio_enforcer_module.datetime
+
+    class _FrozenDatetime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return anchor.replace(tzinfo=None)
+            return anchor.astimezone(tz)
+
+    monkeypatch.setattr(portfolio_enforcer_module, "datetime", _FrozenDatetime)
+    return anchor
+
+
 async def _build_enforcer(db_path: str, portfolio_value: float = 1000.0) -> PortfolioEnforcer:
     db_manager = DatabaseManager(db_path=db_path)
     await db_manager.initialize()
@@ -41,10 +65,11 @@ async def _insert_trade_log(
     pnl: float,
     entry_offset_minutes: int = 0,
     exit_offset_minutes: int = 0,
+    now: datetime | None = None,
 ) -> None:
-    now = datetime.now(timezone.utc)
-    entry_ts = (now - timedelta(minutes=entry_offset_minutes)).isoformat()
-    exit_ts = (now - timedelta(minutes=exit_offset_minutes)).isoformat()
+    base = now if now is not None else datetime.now(timezone.utc)
+    entry_ts = (base - timedelta(minutes=entry_offset_minutes)).isoformat()
+    exit_ts = (base - timedelta(minutes=exit_offset_minutes)).isoformat()
 
     async with aiosqlite.connect(db_path) as db:
         await db.execute(
@@ -95,7 +120,9 @@ async def _insert_open_position(db_path: str, *, strategy: str, market_id: str) 
         await db.commit()
 
 
-async def test_live_trade_aliases_share_daily_loss_and_trade_rate_budget(guardrail_db: str):
+async def test_live_trade_aliases_share_daily_loss_and_trade_rate_budget(
+    guardrail_db: str, frozen_now: datetime
+):
     enforcer = await _build_enforcer(guardrail_db)
 
     await _insert_trade_log(
@@ -104,6 +131,7 @@ async def test_live_trade_aliases_share_daily_loss_and_trade_rate_budget(guardra
         pnl=-12.0,
         entry_offset_minutes=10,
         exit_offset_minutes=5,
+        now=frozen_now,
     )
     await _insert_trade_log(
         guardrail_db,
@@ -111,6 +139,7 @@ async def test_live_trade_aliases_share_daily_loss_and_trade_rate_budget(guardra
         pnl=-7.0,
         entry_offset_minutes=15,
         exit_offset_minutes=8,
+        now=frozen_now,
     )
     await _insert_trade_log(
         guardrail_db,
@@ -118,6 +147,7 @@ async def test_live_trade_aliases_share_daily_loss_and_trade_rate_budget(guardra
         pnl=3.5,
         entry_offset_minutes=20,
         exit_offset_minutes=12,
+        now=frozen_now,
     )
     await _insert_trade_log(
         guardrail_db,
@@ -125,6 +155,7 @@ async def test_live_trade_aliases_share_daily_loss_and_trade_rate_budget(guardra
         pnl=-99.0,
         entry_offset_minutes=180,
         exit_offset_minutes=180,
+        now=frozen_now,
     )
 
     assert await enforcer.get_trades_in_last_hour(STRATEGY_LIVE_TRADE) == 3
