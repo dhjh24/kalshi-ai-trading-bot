@@ -300,6 +300,7 @@ async def _execute_quick_flip_paper_intent(
         config=config,
         disable_ai=True,
     )
+    runtime_shadow_mode = runtime_label == "shadow"
 
     market_info: Dict[str, Any] = {}
     try:
@@ -353,7 +354,10 @@ async def _execute_quick_flip_paper_intent(
         tick_size=tick_size,
     )
 
-    executed = await strategy._execute_single_quick_flip(opportunity)
+    executed = await strategy._execute_single_quick_flip(
+        opportunity,
+        shadow_mode=runtime_shadow_mode,
+    )
     if not executed:
         return {
             "executed": False,

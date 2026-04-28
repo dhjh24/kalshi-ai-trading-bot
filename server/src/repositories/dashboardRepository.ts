@@ -2150,6 +2150,8 @@ export function getLiveTradeDecisionRefreshCursor(): LiveTradeDecisionRefreshCur
     ]);
     const stateSignatureExpression = buildConcatenatedTextExpression(columns, [
       "run_id",
+      "runtime_mode",
+      "exchange_env",
       "loop_status",
       "last_step",
       "last_step_status",

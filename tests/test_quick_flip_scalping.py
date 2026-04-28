@@ -11,6 +11,7 @@ from src.strategies.quick_flip_scalping import (
     QuickFlipOpportunity,
     QuickFlipScalpingStrategy,
 )
+from src.strategies.portfolio_enforcer import MODE_SHADOW
 from src.utils.database import DatabaseManager, Market, Position
 from src.utils.trade_pricing import estimate_kalshi_fee
 
@@ -94,7 +95,7 @@ def test_minimum_profitable_exit_uses_dynamic_tick_sizes():
 
 
 @pytest.mark.asyncio
-async def test_analyze_market_movement_rejects_unstructured_ai_response():
+async def test_analyze_market_movement_falls_back_to_heuristic_on_unstructured_ai_response():
     strategy = QuickFlipScalpingStrategy(
         db_manager=object(),
         kalshi_client=object(),
@@ -102,6 +103,15 @@ async def test_analyze_market_movement_rejects_unstructured_ai_response():
             get_completion=AsyncMock(return_value="This is not a good scalp opportunity.")
         ),
         config=QuickFlipConfig(),
+    )
+    strategy._get_recent_trade_stats = AsyncMock(
+        return_value={
+            "trade_count": 10.0,
+            "recent_max_price": 0.22,
+            "recent_min_price": 0.20,
+            "recent_last_price": 0.21,
+            "recent_range": 0.02,
+        }
     )
 
     analysis = await strategy._analyze_market_movement(
@@ -114,8 +124,44 @@ async def test_analyze_market_movement_rejects_unstructured_ai_response():
         spread=0.02,
     )
 
-    assert analysis["confidence"] == 0.0
-    assert analysis["target_price"] == pytest.approx(0.18)
+    assert analysis["confidence"] > 0.0
+    assert analysis["target_price"] >= 0.22
+    assert "Heuristic" in analysis["reason"]
+
+
+@pytest.mark.asyncio
+async def test_analyze_market_movement_falls_back_to_heuristic_on_ai_exception():
+    strategy = QuickFlipScalpingStrategy(
+        db_manager=object(),
+        kalshi_client=object(),
+        xai_client=SimpleNamespace(
+            get_completion=AsyncMock(side_effect=RuntimeError("AI API is unavailable"))
+        ),
+        config=QuickFlipConfig(),
+    )
+    strategy._get_recent_trade_stats = AsyncMock(
+        return_value={
+            "trade_count": 10.0,
+            "recent_max_price": 0.22,
+            "recent_min_price": 0.20,
+            "recent_last_price": 0.21,
+            "recent_range": 0.02,
+        }
+    )
+
+    analysis = await strategy._analyze_market_movement(
+        _build_market(),
+        "YES",
+        0.18,
+        required_exit_price=0.22,
+        hours_to_expiry=2.0,
+        market_volume=5000,
+        spread=0.02,
+    )
+
+    assert analysis["confidence"] > 0.0
+    assert analysis["target_price"] >= 0.22
+    assert "Heuristic" in analysis["reason"]
 
 
 @pytest.mark.asyncio
@@ -1233,7 +1279,7 @@ async def test_execute_single_quick_flip_blocks_when_portfolio_enforcer_rejects(
 
 
 @pytest.mark.asyncio
-async def test_execute_single_quick_flip_persists_when_portfolio_enforcer_allows():
+async def test_execute_single_quick_flip_persists_when_portfolio_enforcer_allows(monkeypatch):
     fake_db = SimpleNamespace(
         db_path="quick_flip_guardrails.db",
         add_position=AsyncMock(return_value=99),
@@ -1248,6 +1294,7 @@ async def test_execute_single_quick_flip_persists_when_portfolio_enforcer_allows
         xai_client=object(),
         config=QuickFlipConfig(max_hold_minutes=30),
     )
+    monkeypatch.setattr(settings.trading, "live_trading_enabled", False)
     opportunity = QuickFlipOpportunity(
         market_id="TEST-MKT",
         market_title="Test market",
@@ -1282,8 +1329,72 @@ async def test_execute_single_quick_flip_persists_when_portfolio_enforcer_allows
     assert result is True
     fake_enforcer.initialize.assert_awaited_once()
     fake_enforcer.check_trade.assert_awaited_once()
+    assert fake_enforcer.check_trade.await_args.kwargs["mode"] == "paper"
     fake_db.add_position.assert_awaited_once()
     fake_db.update_position_execution_details.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_execute_single_quick_flip_passes_shadow_mode_to_enforcer_and_executor():
+    fake_db = SimpleNamespace(
+        db_path="quick_flip_guardrails.db",
+        add_position=AsyncMock(return_value=99),
+        update_position_execution_details=AsyncMock(),
+    )
+    fake_client = SimpleNamespace(
+        get_balance=AsyncMock(return_value={"balance": "5000", "portfolio_value": "2500"})
+    )
+    strategy = QuickFlipScalpingStrategy(
+        db_manager=fake_db,
+        kalshi_client=fake_client,
+        xai_client=object(),
+        config=QuickFlipConfig(max_hold_minutes=30),
+    )
+    opportunity = QuickFlipOpportunity(
+        market_id="TEST-MKT",
+        market_title="Test market",
+        side="YES",
+        entry_price=0.05,
+        exit_price=0.07,
+        quantity=10,
+        expected_profit=0.10,
+        confidence_score=0.95,
+        movement_indicator="short-term momentum",
+        max_hold_time=30,
+        tick_size=0.001,
+    )
+    fake_enforcer = SimpleNamespace(
+        initialize=AsyncMock(),
+        check_trade=AsyncMock(return_value=(True, "allowed")),
+        portfolio_value=0.0,
+    )
+    execute_position = AsyncMock(return_value=True)
+
+    with (
+        patch(
+            "src.strategies.portfolio_enforcer.PortfolioEnforcer",
+            return_value=fake_enforcer,
+        ),
+        patch(
+            "src.strategies.quick_flip_scalping.execute_position",
+            execute_position,
+        ),
+    ):
+        result = await strategy._execute_single_quick_flip(
+            opportunity,
+            shadow_mode=True,
+        )
+
+    assert result is True
+    fake_enforcer.initialize.assert_awaited_once()
+    fake_enforcer.check_trade.assert_awaited_once()
+    assert fake_enforcer.check_trade.await_args.kwargs["mode"] == MODE_SHADOW
+    fake_db.add_position.assert_awaited_once()
+    fake_db.update_position_execution_details.assert_awaited_once()
+    assert execute_position.await_count == 1
+    call_kwargs = execute_position.await_args.kwargs
+    assert call_kwargs["live_mode"] is False
+    assert call_kwargs["shadow_mode"] is True
 
 
 @pytest.mark.asyncio

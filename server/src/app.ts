@@ -123,11 +123,20 @@ export async function buildServer() {
   // expose externally; it must remain bound to localhost in production.
   const internalRefreshBodySchema = z
     .object({
-      topic: z
-        .enum(["live-trade-decisions", "runtime-state", "feedback"])
-        .optional()
+      topic: z.string().optional().nullable()
     })
     .optional();
+
+  const normalizeInternalRefreshTopic = (value: unknown): "live-trade-decisions" | "runtime-state" | "feedback" => {
+    if (value === "runtime-state") {
+      return "runtime-state";
+    }
+    if (value === "feedback") {
+      return "feedback";
+    }
+    return "live-trade-decisions";
+  };
+
   app.post("/internal/live-trade/notify-refresh", async (request, reply) => {
     const expectedToken = (process.env.LIVE_TRADE_INTERNAL_REFRESH_TOKEN || "").trim();
     if (!expectedToken) {
@@ -145,10 +154,24 @@ export async function buildServer() {
       return { ok: false, error: "unauthorized" };
     }
     const body = internalRefreshBodySchema.parse(request.body ?? undefined);
-    liveStreamHub.refreshLiveTradeDecisions();
+    const topic = normalizeInternalRefreshTopic(body?.topic);
+
+    switch (topic) {
+      case "runtime-state":
+        liveStreamHub.refreshLiveTradeDecisions();
+        break;
+      case "feedback":
+        liveStreamHub.refreshLiveTradeDecisions();
+        break;
+      case "live-trade-decisions":
+      default:
+        liveStreamHub.refreshLiveTradeDecisions();
+        break;
+    }
+
     return {
       ok: true,
-      topic: body?.topic ?? "live-trade-decisions",
+      topic,
       refreshedAt: new Date().toISOString()
     };
   });

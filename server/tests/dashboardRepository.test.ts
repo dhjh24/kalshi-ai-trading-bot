@@ -729,11 +729,13 @@ describe("live_trade_decisions repository helpers", () => {
             );
 
             CREATE TABLE live_trade_runtime_state (
-              strategy TEXT NOT NULL,
-              worker TEXT NOT NULL,
-              heartbeat_at TEXT NOT NULL,
-              run_id TEXT,
-              loop_status TEXT NOT NULL,
+               strategy TEXT NOT NULL,
+               worker TEXT NOT NULL,
+               heartbeat_at TEXT NOT NULL,
+               run_id TEXT,
+               runtime_mode TEXT,
+               exchange_env TEXT,
+               loop_status TEXT NOT NULL,
               last_step TEXT,
               last_step_at TEXT,
               last_step_status TEXT,
@@ -775,23 +777,27 @@ describe("live_trade_decisions repository helpers", () => {
               INSERT INTO live_trade_runtime_state (
                 strategy,
                 worker,
-                heartbeat_at,
-                run_id,
-                loop_status,
-                last_step,
-                last_step_at,
+               heartbeat_at,
+               run_id,
+               runtime_mode,
+               exchange_env,
+               loop_status,
+               last_step,
+               last_step_at,
                 last_step_status,
                 latest_execution_at,
                 latest_execution_status,
                 error
               )
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             \`
           ).run(
             'live_trade',
             'decision_loop',
             '2026-04-24T00:00:05Z',
             'run-001',
+            'paper',
+            'paper',
             'running',
             'ranked',
             '2026-04-24T00:00:05Z',
@@ -799,8 +805,18 @@ describe("live_trade_decisions repository helpers", () => {
             '2026-04-24T00:00:05Z',
             'completed',
             null
-          );
-          const afterRuntime = getLiveTradeDecisionRefreshCursor();
+           );
+           const afterRuntime = getLiveTradeDecisionRefreshCursor();
+
+          db.prepare(
+            \`
+              UPDATE live_trade_runtime_state
+              SET runtime_mode = 'shadow',
+                  exchange_env = 'shadow'
+              WHERE strategy = 'live_trade'
+            \`
+          ).run();
+          const afterRuntimeMetadata = getLiveTradeDecisionRefreshCursor();
 
           upsertLiveTradeDecisionFeedback({
             decisionId: '1',
@@ -815,11 +831,12 @@ describe("live_trade_decisions repository helpers", () => {
 
           console.log(
             JSON.stringify({
-              initial,
-              afterDecision,
-              afterRuntime,
-              afterFeedback
-            })
+             initial,
+             afterDecision,
+             afterRuntime,
+             afterFeedback,
+             afterRuntimeMetadata
+           })
           );
         } finally {
           db.close();
@@ -841,9 +858,11 @@ describe("live_trade_decisions repository helpers", () => {
     expect(result.initial.signature).not.toBe(result.afterDecision.signature);
     expect(result.afterDecision.signature).not.toBe(result.afterRuntime.signature);
     expect(result.afterRuntime.signature).not.toBe(result.afterFeedback.signature);
+    expect(result.afterFeedback.signature).not.toBe(result.afterRuntimeMetadata.signature);
     expect(result.afterDecision.decisionFingerprint).not.toBe(result.initial.decisionFingerprint);
     expect(result.afterRuntime.runtimeFingerprint).not.toBe(result.afterDecision.runtimeFingerprint);
     expect(result.afterFeedback.feedbackFingerprint).not.toBe(result.afterRuntime.feedbackFingerprint);
+    expect(result.afterRuntime.runtimeFingerprint).not.toBe(result.afterRuntimeMetadata.runtimeFingerprint);
   });
 
   it("normalizes sparse decision rows with payload JSON fallbacks", () => {

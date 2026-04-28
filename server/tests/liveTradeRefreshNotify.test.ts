@@ -251,6 +251,176 @@ describe("live-trade internal refresh notify endpoint", () => {
     });
   });
 
+  it("treats unknown or missing topics as live-trade-decisions and still refreshes SSE", () => {
+    const dbUrl = pathToFileURL(path.join(serverRoot, "src/db.ts")).href;
+    const appUrl = pathToFileURL(path.join(serverRoot, "src/app.ts")).href;
+    const result = runAcceptanceScript(
+      "notify-default-topic-branches.mjs",
+      `
+        import { getDb } from ${JSON.stringify(dbUrl)};
+        import { buildServer } from ${JSON.stringify(appUrl)};
+
+        const db = getDb();
+
+        async function readNextDataEvent(reader, state, timeoutMs = 5000) {
+          return Promise.race([
+            (async () => {
+              while (true) {
+                const boundaryIndex = state.buffer.indexOf('\\n\\n');
+                if (boundaryIndex >= 0) {
+                  const rawEvent = state.buffer.slice(0, boundaryIndex);
+                  state.buffer = state.buffer.slice(boundaryIndex + 2);
+
+                  if (rawEvent.startsWith(':')) {
+                    continue;
+                  }
+
+                  const dataLine = rawEvent
+                    .split('\\n')
+                    .find((line) => line.startsWith('data: '));
+                  if (dataLine) {
+                    return JSON.parse(dataLine.slice(6));
+                  }
+                }
+
+                const chunk = await reader.read();
+                if (chunk.done) {
+                  throw new Error('SSE stream ended before receiving data');
+                }
+
+                state.buffer += state.decoder.decode(chunk.value, { stream: true });
+              }
+            })(),
+            new Promise((_, reject) => {
+              setTimeout(() => reject(new Error('Timed out waiting for SSE data')), timeoutMs);
+            })
+          ]);
+        }
+
+        try {
+          db.exec(${JSON.stringify(buildSeedSql())});
+
+          const app = await buildServer();
+
+          try {
+            const baseUrl = await app.listen({ host: '127.0.0.1', port: 0 });
+            const controller = new AbortController();
+            const streamResponse = await fetch(baseUrl + '/api/stream/live-trade-decisions', {
+              headers: { accept: 'text/event-stream' },
+              signal: controller.signal
+            });
+
+            if (!streamResponse.body) {
+              throw new Error('Missing SSE response body');
+            }
+
+            const reader = streamResponse.body.getReader();
+            const state = { decoder: new TextDecoder(), buffer: '' };
+
+            await readNextDataEvent(reader, state);
+
+            const runtimeTopicResponse = await fetch(baseUrl + '/internal/live-trade/notify-refresh', {
+              method: 'POST',
+              headers: {
+                'content-type': 'application/json',
+                'x-internal-token': 'super-secret-token'
+              },
+              body: JSON.stringify({ topic: 'runtime-state' })
+            });
+
+            const missingTopicResponse = await fetch(baseUrl + '/internal/live-trade/notify-refresh', {
+              method: 'POST',
+              headers: {
+                'content-type': 'application/json',
+                'x-internal-token': 'super-secret-token'
+              },
+              body: JSON.stringify({})
+            });
+
+            const unknownTopicResponse = await fetch(baseUrl + '/internal/live-trade/notify-refresh', {
+              method: 'POST',
+              headers: {
+                'content-type': 'application/json',
+                'x-internal-token': 'super-secret-token'
+              },
+              body: JSON.stringify({ topic: 'mystery-topic' })
+            });
+
+            const unknownTopicNullResponse = await fetch(baseUrl + '/internal/live-trade/notify-refresh', {
+              method: 'POST',
+              headers: {
+                'content-type': 'application/json',
+                'x-internal-token': 'super-secret-token'
+              },
+              body: JSON.stringify({ topic: null })
+            });
+
+            const pushedEventOne = await readNextDataEvent(reader, state);
+            const pushedEventTwo = await readNextDataEvent(reader, state);
+            const pushedEventThree = await readNextDataEvent(reader, state);
+            const pushedEventFour = await readNextDataEvent(reader, state);
+
+            controller.abort();
+            await reader.cancel().catch(() => {});
+
+            console.log(
+              ${JSON.stringify(outputMarker)} +
+                JSON.stringify({
+                  runtimeTopicResponse: {
+                    status: runtimeTopicResponse.status,
+                    body: await runtimeTopicResponse.json()
+                  },
+                  missingTopicResponse: {
+                    status: missingTopicResponse.status,
+                    body: await missingTopicResponse.json()
+                  },
+                  unknownTopicResponse: {
+                    status: unknownTopicResponse.status,
+                    body: await unknownTopicResponse.json()
+                  },
+                  unknownTopicNullResponse: {
+                    status: unknownTopicNullResponse.status,
+                    body: await unknownTopicNullResponse.json()
+                  },
+                  pushedTopics: [
+                    pushedEventOne.topic,
+                    pushedEventTwo.topic,
+                    pushedEventThree.topic,
+                    pushedEventFour.topic
+                  ],
+                  pushedPayloadId: pushedEventOne.payload.decisions?.[0]?.id
+                }) +
+                ${JSON.stringify(outputMarker)}
+            );
+          } finally {
+            await app.close();
+          }
+        } finally {
+          db.close();
+        }
+      `,
+      {
+        LIVE_TRADE_INTERNAL_REFRESH_TOKEN: "super-secret-token"
+      }
+    );
+
+    expect(result.runtimeTopicResponse.status).toBe(200);
+    expect(result.runtimeTopicResponse.body).toMatchObject({ ok: true, topic: "runtime-state" });
+    expect(result.missingTopicResponse.status).toBe(200);
+    expect(result.missingTopicResponse.body).toMatchObject({ ok: true, topic: "live-trade-decisions" });
+    expect(result.unknownTopicResponse.status).toBe(200);
+    expect(result.unknownTopicResponse.body).toMatchObject({ ok: true, topic: "live-trade-decisions" });
+    expect(result.unknownTopicNullResponse.status).toBe(200);
+    expect(result.unknownTopicNullResponse.body).toMatchObject({ ok: true, topic: "live-trade-decisions" });
+    expect(result.pushedTopics).toEqual([
+      "live-trade-decisions",
+      "live-trade-decisions",
+      "live-trade-decisions",
+      "live-trade-decisions"
+    ]);
+    expect(result.pushedPayloadId).toBe("1");
+  });
+
   it("returns 401 and skips the SSE refresh when the token header is missing or wrong", () => {
     const dbUrl = pathToFileURL(path.join(serverRoot, "src/db.ts")).href;
     const appUrl = pathToFileURL(path.join(serverRoot, "src/app.ts")).href;

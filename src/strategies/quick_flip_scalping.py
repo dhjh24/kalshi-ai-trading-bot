@@ -219,11 +219,19 @@ class QuickFlipScalpingStrategy:
         self._portfolio_enforcer.portfolio_value = portfolio_value
         return self._portfolio_enforcer
 
-    async def _passes_portfolio_enforcer(self, opportunity: QuickFlipOpportunity) -> bool:
+    async def _passes_portfolio_enforcer(
+        self,
+        opportunity: QuickFlipOpportunity,
+        *,
+        live_mode: Optional[bool] = None,
+        shadow_mode: Optional[bool] = None,
+        current_positions: Optional[Dict[str, float]] = None,
+    ) -> bool:
         """Check the existing PortfolioEnforcer before persisting a quick-flip entry."""
         from src.strategies.portfolio_enforcer import (
             MODE_LIVE,
             MODE_PAPER,
+            MODE_SHADOW,
             STRATEGY_QUICK_FLIP,
         )
 
@@ -235,14 +243,22 @@ class QuickFlipScalpingStrategy:
         if enforcer is None:
             return True
 
-        live_mode = getattr(settings.trading, "live_trading_enabled", False)
+        if live_mode is None:
+            live_mode = getattr(settings.trading, "live_trading_enabled", False)
+        if shadow_mode is None:
+            shadow_mode = getattr(settings.trading, "shadow_mode_enabled", False)
+        if current_positions is None:
+            current_positions = await self._get_current_position_exposures()
+
+        mode = MODE_LIVE if live_mode else MODE_SHADOW if shadow_mode else MODE_PAPER
         allowed, reason = await enforcer.check_trade(
             ticker=opportunity.market_id,
             side=opportunity.side.lower(),
             amount=trade_value,
             title=opportunity.market_title,
             strategy=STRATEGY_QUICK_FLIP,
-            mode=MODE_LIVE if live_mode else MODE_PAPER,
+            mode=mode,
+            current_positions=current_positions,
         )
         if not allowed:
             self.logger.warning(
@@ -250,6 +266,50 @@ class QuickFlipScalpingStrategy:
                 f"{reason}"
             )
         return allowed
+
+    @staticmethod
+    def _estimate_position_cost_basis(position: Any) -> float:
+        """Estimate deployed capital for an open position."""
+        def _field(name: str, default: float = 0.0):
+            if isinstance(position, dict):
+                return position.get(name, default)
+            return getattr(position, name, default)
+
+        contracts_cost = float(_field("contracts_cost", 0.0) or 0.0)
+        if contracts_cost > 0:
+            return contracts_cost
+
+        quantity = float(_field("quantity", 0.0) or 0.0)
+        entry_price = float(_field("entry_price", 0.0) or 0.0)
+        entry_fee = max(float(_field("entry_fee", 0.0) or 0.0), 0.0)
+        return max((quantity * entry_price) + entry_fee, 0.0)
+
+    async def _get_current_position_exposures(self) -> Dict[str, float]:
+        """Return a best-effort market exposure map for the portfolio enforcer."""
+        getter = getattr(self.db_manager, "get_open_positions", None)
+        if not callable(getter):
+            return {}
+
+        try:
+            positions_result = getter()
+            if asyncio.iscoroutine(positions_result):
+                positions_result = await positions_result
+
+            exposures: Dict[str, float] = {}
+            for position in positions_result or []:
+                if isinstance(position, dict):
+                    market_id = str(position.get("market_id", "") or "")
+                else:
+                    market_id = str(getattr(position, "market_id", "") or "")
+                if not market_id:
+                    continue
+                exposures[market_id] = exposures.get(market_id, 0.0) + self._estimate_position_cost_basis(position)
+            return exposures
+        except Exception as exc:
+            self.logger.warning(
+                f"Could not calculate current quick-flip position exposures: {exc}"
+            )
+            return {}
 
     @staticmethod
     def _estimate_kalshi_fee(price: float, quantity: float, *, maker: bool) -> float:
@@ -1240,6 +1300,20 @@ class QuickFlipScalpingStrategy:
         if min_profitable_exit > 0.95:
             return None
 
+        try:
+            recent_trade_stats = await self._get_recent_trade_stats(market.market_id, side)
+        except Exception as exc:
+            self.logger.warning(
+                f"Could not fetch quick flip recent trade stats for {market.market_id}: {exc}"
+            )
+            recent_trade_stats = {
+                "trade_count": 0.0,
+                "recent_max_price": 0.0,
+                "recent_min_price": 0.0,
+                "recent_last_price": 0.0,
+                "recent_range": 0.0,
+            }
+
         movement_analysis = await self._analyze_market_movement(
             market,
             side,
@@ -1248,6 +1322,7 @@ class QuickFlipScalpingStrategy:
             hours_to_expiry=hours_to_expiry,
             market_volume=market_volume,
             spread=spread,
+            recent_trade_stats=recent_trade_stats,
         )
         if movement_analysis["confidence"] < self.config.confidence_threshold:
             return None
@@ -1273,13 +1348,12 @@ class QuickFlipScalpingStrategy:
         ):
             return None
 
-        recent_trade_stats = await self._get_recent_trade_stats(market.market_id, side)
-        if recent_trade_stats["trade_count"] < self.config.min_recent_trade_count:
+        if recent_trade_stats.get("trade_count", 0.0) < self.config.min_recent_trade_count:
             return None
 
-        recent_last_price = recent_trade_stats["recent_last_price"]
-        recent_max_price = recent_trade_stats["recent_max_price"]
-        recent_min_price = recent_trade_stats["recent_min_price"]
+        recent_last_price = float(recent_trade_stats.get("recent_last_price", 0.0))
+        recent_max_price = float(recent_trade_stats.get("recent_max_price", 0.0))
+        recent_min_price = float(recent_trade_stats.get("recent_min_price", 0.0))
         recent_range = recent_trade_stats.get("recent_range", recent_max_price - recent_min_price)
         required_move = target_price - current_ask
         min_recent_range = max(required_move, tick_size * self.config.min_recent_range_ticks)
@@ -1301,7 +1375,8 @@ class QuickFlipScalpingStrategy:
         reason = (
             f"{movement_analysis['reason']} | bid=${current_bid:.4f} ask=${current_ask:.4f} "
             f"spread=${spread:.4f} qty={quantity} vol={market_volume} "
-            f"hours_to_expiry={hours_to_expiry:.1f} recent_trades={int(recent_trade_stats['trade_count'])} "
+            f"hours_to_expiry={hours_to_expiry:.1f} "
+            f"recent_trades={int(recent_trade_stats.get('trade_count', 0.0))} "
             f"recent_max=${recent_max_price:.4f} expected_net=${expected_profit:.2f}"
         )
 
@@ -1328,6 +1403,7 @@ class QuickFlipScalpingStrategy:
         required_exit_price: float,
         hours_to_expiry: float,
         spread: float,
+        recent_trade_stats: Optional[Dict[str, float]] = None,
     ) -> dict:
         """
         AI-less movement prediction fallback for quick flip.
@@ -1345,7 +1421,10 @@ class QuickFlipScalpingStrategy:
         - Hours to expiry is short enough that momentum still matters.
         """
         try:
-            recent = await self._get_recent_trade_stats(market.market_id, side)
+            if isinstance(recent_trade_stats, dict):
+                recent = recent_trade_stats
+            else:
+                recent = await self._get_recent_trade_stats(market.market_id, side)
         except Exception as exc:
             return {
                 "target_price": current_price,
@@ -1436,8 +1515,37 @@ class QuickFlipScalpingStrategy:
         hours_to_expiry: float,
         market_volume: int,
         spread: float,
+        recent_trade_stats: Optional[Dict[str, float]] = None,
     ) -> dict:
         """Use AI to estimate short-horizon upside potential."""
+
+        async def _fallback_from_ai_error(
+            reason: str,
+            exc: Optional[Exception] = None,
+        ) -> dict:
+            if exc is None:
+                self.logger.warning(
+                    "Quick flip AI analysis unavailable for %s (%s); falling back to heuristic movement analysis.",
+                    market.market_id,
+                    reason,
+                )
+            else:
+                self.logger.warning(
+                    "Quick flip AI analysis failed for %s (%s): %s; falling back to heuristic movement analysis.",
+                    market.market_id,
+                    reason,
+                    exc,
+                )
+
+            return await self._heuristic_movement_analysis(
+                market,
+                side,
+                current_price,
+                required_exit_price=required_exit_price,
+                hours_to_expiry=hours_to_expiry,
+                spread=spread,
+                recent_trade_stats=recent_trade_stats,
+            )
         try:
             if self.disable_ai:
                 return await self._heuristic_movement_analysis(
@@ -1447,6 +1555,7 @@ class QuickFlipScalpingStrategy:
                     required_exit_price=required_exit_price,
                     hours_to_expiry=hours_to_expiry,
                     spread=spread,
+                    recent_trade_stats=recent_trade_stats,
                 )
 
             if self.xai_client is None:
@@ -1460,6 +1569,7 @@ class QuickFlipScalpingStrategy:
                     required_exit_price=required_exit_price,
                     hours_to_expiry=hours_to_expiry,
                     spread=spread,
+                    recent_trade_stats=recent_trade_stats,
                 )
 
             prompt = f"""
@@ -1494,11 +1604,7 @@ Respond with JSON only:
             )
 
             if response is None:
-                return {
-                    "target_price": current_price,
-                    "confidence": 0.0,
-                    "reason": "AI analysis unavailable",
-                }
+                return await _fallback_from_ai_error("empty AI response")
 
             json_payload = response.strip()
             if "```" in json_payload:
@@ -1528,17 +1634,16 @@ Respond with JSON only:
                 "confidence": confidence,
                 "reason": reason,
             }
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            return await _fallback_from_ai_error("invalid AI payload", exc=exc)
         except Exception as exc:
-            self.logger.error(f"Error in movement analysis: {exc}")
-            return {
-                "target_price": current_price,
-                "confidence": 0.0,
-                "reason": f"Analysis failed: {exc}",
-            }
+            return await _fallback_from_ai_error("unexpected AI failure", exc=exc)
 
     async def execute_quick_flip_opportunities(
         self,
         opportunities: List[QuickFlipOpportunity],
+        *,
+        shadow_mode: Optional[bool] = None,
     ) -> Dict:
         """Execute quick-flip entries and queue corresponding exit orders."""
         results = {
@@ -1559,7 +1664,10 @@ Respond with JSON only:
 
         for opportunity in opportunities:
             try:
-                success = await self._execute_single_quick_flip(opportunity)
+                success = await self._execute_single_quick_flip(
+                    opportunity,
+                    shadow_mode=shadow_mode,
+                )
                 if not success:
                     results["failed_executions"] += 1
                     continue
@@ -1589,7 +1697,12 @@ Respond with JSON only:
         )
         return results
 
-    async def _execute_single_quick_flip(self, opportunity: QuickFlipOpportunity) -> bool:
+    async def _execute_single_quick_flip(
+        self,
+        opportunity: QuickFlipOpportunity,
+        *,
+        shadow_mode: Optional[bool] = None,
+    ) -> bool:
         """Create and execute one quick-flip entry."""
         try:
             if self._reason_blocks_trade(opportunity.movement_indicator):
@@ -1600,7 +1713,30 @@ Respond with JSON only:
                 return False
 
             live_mode = getattr(settings.trading, "live_trading_enabled", False)
-            if not await self._passes_portfolio_enforcer(opportunity):
+            if shadow_mode is None:
+                shadow_mode = getattr(settings.trading, "shadow_mode_enabled", False)
+
+            try:
+                existing_position = await self.db_manager.get_position_by_market_id(
+                    opportunity.market_id
+                )
+                if existing_position is not None:
+                    self.logger.warning(
+                        f"Skipping quick flip execution because an open position already exists for {opportunity.market_id}"
+                    )
+                    return False
+            except Exception as exc:
+                self.logger.warning(
+                    f"Could not check for existing quick flip position on {opportunity.market_id}: {exc}"
+                )
+
+            current_positions = await self._get_current_position_exposures()
+            if not await self._passes_portfolio_enforcer(
+                opportunity,
+                live_mode=live_mode,
+                shadow_mode=shadow_mode,
+                current_positions=current_positions,
+            ):
                 return False
 
             position = Position(
@@ -1631,6 +1767,7 @@ Respond with JSON only:
                     live_mode=False,
                     db_manager=self.db_manager,
                     kalshi_client=self.kalshi_client,
+                    shadow_mode=shadow_mode,
                 )
             if success:
                 if not live_mode:

@@ -320,22 +320,15 @@ The unified `--paper` runtime now uses the same main SQLite database as live mod
 - resting simulated paper orders that reconcile against live market data
 - fee-aware closed paper trades in `trade_logs`
 
-The static dashboard reads from `trading_system.db` when unified paper-runtime data exists, and falls back to the older signal tracker only if needed.
+The static dashboard reads paper-runtime data from `trading_system.db`.
 
 ```bash
 # Main paper-trading runtime (mirrors the live bot without sending real orders)
 python cli.py run --paper
 
-# Static HTML dashboard helpers (read from the unified trading_system.db)
-python paper_trader.py --stats
-python paper_trader.py --dashboard
+# Dashboard output and runtime snapshot from the unified trading_system.db
+python cli.py dashboard
 ```
-
-> **Deprecated:** `python paper_trader.py` (no flags), `--loop`, and `--settle`
-> exercise the legacy signal-only tracker. Importing the module now emits a
-> `DeprecationWarning` and the loop will be removed in a future cleanup pass.
-> Use `python cli.py run --paper` for the unified runtime; the migration plan
-> lives under W11 in [`docs/plans/review-readme-and-other-cozy-diffie.md`](docs/plans/review-readme-and-other-cozy-diffie.md).
 
 The dashboard writes to `docs/paper_dashboard.html` — open locally or host via GitHub Pages.
 
@@ -346,7 +339,6 @@ The dashboard writes to `docs/paper_dashboard.html` — open locally or host via
 ```
 kalshi-ai-trading-bot/
 ├── cli.py                     # Unified CLI: run, dashboard, status, health, scores
-├── paper_trader.py            # DEPRECATED: dashboard/stats helper + legacy signal tracker (see W11)
 ├── pyproject.toml             # PEP 621 project metadata
 ├── requirements.txt           # Pinned dependencies
 ├── env.template               # Environment variable template
@@ -778,3 +770,4 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE) for detai
 Made with ❤️ for the Kalshi trading community
 
 </div>
+
