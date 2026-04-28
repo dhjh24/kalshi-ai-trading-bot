@@ -21,7 +21,7 @@ from datetime import datetime
 from typing import Optional
 
 from src.clients.kalshi_client import KalshiClient
-from src.clients.xai_client import XAIClient
+from src.clients.model_router import ModelRouter
 from src.utils.database import DatabaseManager
 from src.config.settings import settings
 from src.utils.logging_setup import get_trading_logger
@@ -71,7 +71,7 @@ async def run_trading_job(*, shadow_mode: Optional[bool] = None) -> Optional[Tra
     """
     logger = get_trading_logger("trading_job")
     kalshi_client: Optional[KalshiClient] = None
-    xai_client: Optional[XAIClient] = None
+    xai_client: Optional[ModelRouter] = None
 
     try:
         shadow_mode = (
@@ -86,7 +86,7 @@ async def run_trading_job(*, shadow_mode: Optional[bool] = None) -> Optional[Tra
         # Initialize clients
         db_manager = DatabaseManager()
         kalshi_client = KalshiClient()
-        xai_client = XAIClient(db_manager=db_manager)  # Pass db_manager for LLM logging
+        xai_client = ModelRouter(db_manager=db_manager)  # routes to Codex/OpenAI/OpenRouter
         quick_flip_enabled, quick_flip_allocation, quick_flip_skip_reason = (
             _resolve_quick_flip_runtime_config()
         )
@@ -206,7 +206,7 @@ async def _fallback_legacy_trading(
     """
     logger = get_trading_logger("trading_job_fallback")
     kalshi_client: Optional[KalshiClient] = None
-    xai_client: Optional[XAIClient] = None
+    xai_client: Optional[ModelRouter] = None
 
     try:
         logger.info("ðŸ”„ Executing fallback legacy trading system")
@@ -214,7 +214,7 @@ async def _fallback_legacy_trading(
         # Initialize components
         db_manager = DatabaseManager()
         kalshi_client = KalshiClient()
-        xai_client = XAIClient()
+        xai_client = ModelRouter(db_manager=db_manager)
         live_mode = bool(getattr(settings.trading, "live_trading_enabled", False))
         shadow_mode = (
             bool(getattr(settings.trading, "shadow_mode_enabled", False))

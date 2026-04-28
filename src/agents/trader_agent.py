@@ -13,7 +13,7 @@ class TraderAgent(BaseAgent):
     Synthesises all agents' outputs into a final BUY/SELL/SKIP decision.
 
     The output dict is compatible with the TradingDecision dataclass in
-    ``src.clients.xai_client``.
+    ``src.clients.shared_types``.
     """
 
     AGENT_NAME = "trader"

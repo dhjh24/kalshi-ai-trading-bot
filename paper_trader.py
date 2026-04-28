@@ -70,7 +70,7 @@ def _parse_iso(value: str) -> datetime | None:
 async def scan_and_log() -> int:
     """Scan markets, run decisions, and log actionable paper signals."""
     from src.clients.kalshi_client import KalshiClient
-    from src.clients.xai_client import XAIClient
+    from src.clients.model_router import ModelRouter
     from src.jobs.decide import make_decision_for_market
     from src.jobs.ingest import run_ingestion
     from src.utils.database import DatabaseManager
@@ -80,7 +80,7 @@ async def scan_and_log() -> int:
     kalshi = KalshiClient()
     db = DatabaseManager()
     await db.initialize()
-    xai = XAIClient(db_manager=db)
+    xai = ModelRouter(db_manager=db)
 
     try:
         market_queue: asyncio.Queue = asyncio.Queue()

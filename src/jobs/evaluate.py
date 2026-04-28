@@ -16,7 +16,8 @@ from src.utils.logging_setup import get_trading_logger
 
 def _read_xai_tracker_from_pickle() -> Optional[dict]:
     """
-    Read the in-memory DailyUsageTracker that xai_client persists to disk.
+    Read the in-memory DailyUsageTracker that the configured LLM provider
+    client (ModelRouter / Codex / OpenAI / OpenRouter) persists to disk.
 
     Returns a plain dict with keys: date, total_cost, request_count,
     daily_limit, is_exhausted — or None if the file is missing/unreadable.

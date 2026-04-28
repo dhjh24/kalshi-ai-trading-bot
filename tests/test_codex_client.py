@@ -434,17 +434,26 @@ class TestQuotaSignalExtraction:
 
 class TestCodexClientCompletion:
     def test_load_daily_tracker_accepts_legacy_xai_pickle(self, monkeypatch):
+        import sys
+        import types
+
         tracker = DailyUsageTracker(
             date=datetime.now().strftime("%Y-%m-%d"),
             request_count=7,
             total_cost=0.0,
         )
+        # Synthesize a pickle stream that references the deleted module.
+        legacy_mod_name = "src.clients.xai_client"
+        fake_mod = types.ModuleType(legacy_mod_name)
+        fake_mod.DailyUsageTracker = DailyUsageTracker  # type: ignore[attr-defined]
+        sys.modules[legacy_mod_name] = fake_mod
         original_module = DailyUsageTracker.__module__
-        DailyUsageTracker.__module__ = "src.clients.xai_client"
+        DailyUsageTracker.__module__ = legacy_mod_name
         try:
             payload = pickle.dumps(tracker)
         finally:
             DailyUsageTracker.__module__ = original_module
+            sys.modules.pop(legacy_mod_name, None)
 
         usage_file = "memory://daily_ai_usage.pkl"
         monkeypatch.setattr(codex_module, "SHARED_USAGE_FILE", usage_file)

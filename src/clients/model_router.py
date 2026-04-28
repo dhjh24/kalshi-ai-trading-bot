@@ -12,7 +12,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from src.clients.shared_types import TradingDecision, DailyUsageTracker
+from src.clients.shared_types import (
+    DailyUsageTracker,
+    TradingDecision,
+    load_daily_tracker_pickle,
+)
 from src.clients.openai_client import OpenAIClient
 from src.clients.openrouter_client import OpenRouterClient, MODEL_PRICING
 from src.clients.codex_client import CodexClient
@@ -229,7 +233,6 @@ class ModelRouter(TradingLoggerMixin):
     def _load_daily_tracker(self) -> DailyUsageTracker:
         """Load or create daily usage tracker (shared with OpenRouterClient)."""
         import os
-        import pickle
 
         today = datetime.now().strftime("%Y-%m-%d")
         usage_file = "logs/daily_ai_usage.pkl"
@@ -240,7 +243,7 @@ class ModelRouter(TradingLoggerMixin):
         try:
             if os.path.exists(usage_file):
                 with open(usage_file, "rb") as f:
-                    tracker = pickle.load(f)
+                    tracker = load_daily_tracker_pickle(f)
                 if tracker.date != today:
                     tracker = DailyUsageTracker(date=today, daily_limit=daily_limit)
                 else:
