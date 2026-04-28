@@ -9,6 +9,10 @@ secrets.json
 config.json
 .codex
 /codex*
+.codex_tmp/
+.codex_pytest*
+.claude/
+/.claude
 
 # Database files
 *.db
@@ -46,6 +50,8 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+.pytest-tmp/
+.pytest_cache/
 
 # PyInstaller
 *.manifest
