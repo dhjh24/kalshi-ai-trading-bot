@@ -5,7 +5,7 @@ from datetime import datetime
 
 from src.jobs.decide import make_decision_for_market
 from src.utils.database import DatabaseManager
-from src.clients.xai_client import XAIClient
+from src.clients.model_router import ModelRouter
 from src.clients.kalshi_client import KalshiClient
 from src.config.settings import settings
 from tests.test_database import load_and_prepare_markets, TEST_DB, FIXTURE_PATH
@@ -24,7 +24,7 @@ async def test_make_decision_for_market_creates_position():
     
     # Use real clients - no mocking
     kalshi_client = KalshiClient()
-    xai_client = XAIClient()
+    xai_client = ModelRouter(db_manager=db_manager)
     
     try:
         # Get a suitable test market efficiently (only 5 API calls max)

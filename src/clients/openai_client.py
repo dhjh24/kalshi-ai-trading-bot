@@ -19,7 +19,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from openai import AsyncOpenAI
 
-from src.clients.shared_types import DailyUsageTracker, TradingDecision
+from src.clients.shared_types import (
+    DailyUsageTracker,
+    TradingDecision,
+    load_daily_tracker_pickle,
+)
 from src.config.settings import settings
 from src.utils.kalshi_normalization import get_market_prices, get_market_volume
 from src.utils.logging_setup import TradingLoggerMixin, log_error_with_context
@@ -244,7 +248,7 @@ class OpenAIClient(TradingLoggerMixin):
         try:
             if os.path.exists(self.usage_file):
                 with open(self.usage_file, "rb") as fh:
-                    tracker: DailyUsageTracker = pickle.load(fh)
+                    tracker: DailyUsageTracker = load_daily_tracker_pickle(fh)
                 if tracker.date != today:
                     tracker = DailyUsageTracker(date=today, daily_limit=daily_limit)
                 else:

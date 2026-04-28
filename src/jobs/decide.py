@@ -13,7 +13,6 @@ from src.utils.database import DatabaseManager, Market, Position
 from src.config.settings import settings
 from src.utils.kalshi_normalization import get_balance_dollars, get_portfolio_value_dollars
 from src.utils.logging_setup import get_trading_logger
-from src.clients.xai_client import XAIClient
 from src.clients.kalshi_client import KalshiClient
 from src.clients.model_router import ModelRouter
 
@@ -220,7 +219,7 @@ async def _run_ensemble_decision(
 async def make_decision_for_market(
     market: Market,
     db_manager: DatabaseManager,
-    xai_client: XAIClient,
+    xai_client: Any,
     kalshi_client: KalshiClient,
     model_router: Optional[ModelRouter] = None,
 ) -> Optional[Position]:
@@ -414,19 +413,26 @@ async def make_decision_for_market(
                     estimated_search_cost = 0.0
 
             if not sentiment_analysis or news_summary is None:
-                # Fall back to xAI search
-                try:
-                    news_summary = await asyncio.wait_for(
-                        xai_client.search(market.title, max_length=200),
-                        timeout=15.0
-                    )
-                    estimated_search_cost = 0.02
-                except asyncio.TimeoutError:
-                    logger.warning(f"Search timeout for market {market.market_id}, using fallback")
-                    news_summary = f"Search timeout. Analyzing {market.title} based on market data only."
-                    estimated_search_cost = 0.0
-                except Exception as e:
-                    logger.warning(f"Search failed for market {market.market_id}, continuing without news", error=str(e))
+                # Fall back to legacy xAI-style search if the AI client still
+                # exposes one; otherwise skip news entirely (xAI search was
+                # removed and ModelRouter does not provide a substitute).
+                search_fn = getattr(xai_client, "search", None)
+                if callable(search_fn):
+                    try:
+                        news_summary = await asyncio.wait_for(
+                            search_fn(market.title, max_length=200),
+                            timeout=15.0
+                        )
+                        estimated_search_cost = 0.02
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Search timeout for market {market.market_id}, using fallback")
+                        news_summary = f"Search timeout. Analyzing {market.title} based on market data only."
+                        estimated_search_cost = 0.0
+                    except Exception as e:
+                        logger.warning(f"Search failed for market {market.market_id}, continuing without news", error=str(e))
+                        news_summary = f"News search unavailable. Analysis based on market data only."
+                        estimated_search_cost = 0.0
+                else:
                     news_summary = f"News search unavailable. Analysis based on market data only."
                     estimated_search_cost = 0.0
 

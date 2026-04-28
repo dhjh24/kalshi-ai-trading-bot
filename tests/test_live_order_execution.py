@@ -14,7 +14,7 @@ import pytest
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.clients.kalshi_client import KalshiClient
-from src.clients.xai_client import XAIClient
+from src.clients.model_router import ModelRouter
 from src.strategies.portfolio_optimization import create_market_opportunities_from_markets
 from src.utils.database import DatabaseManager, Market
 from src.utils.kalshi_normalization import (
@@ -34,11 +34,11 @@ async def test_immediate_trading_fix():
     setup_logging()
     logger = logging.getLogger("immediate_fix_test")
     kalshi_client = KalshiClient()
-    xai_client = XAIClient()
     db_manager = DatabaseManager()
 
     try:
         await db_manager.initialize()
+        xai_client = ModelRouter(db_manager=db_manager)
 
         initial_positions = await kalshi_client.get_positions()
         initial_markets = {

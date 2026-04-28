@@ -25,7 +25,7 @@ import logging
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, NamedTuple
+from typing import Any, Dict, List, Optional, Tuple, NamedTuple
 from dataclasses import dataclass
 from scipy.optimize import minimize, minimize_scalar
 import warnings
@@ -33,7 +33,6 @@ warnings.filterwarnings('ignore')
 
 from src.utils.database import DatabaseManager, Market, Position
 from src.clients.kalshi_client import KalshiClient
-from src.clients.xai_client import XAIClient
 from src.config.settings import settings
 from src.utils.kalshi_normalization import (
     get_balance_dollars,
@@ -107,7 +106,7 @@ class AdvancedPortfolioOptimizer:
         self,
         db_manager: DatabaseManager,
         kalshi_client: KalshiClient,
-        xai_client: XAIClient
+        xai_client: Any
     ):
         self.db_manager = db_manager
         self.kalshi_client = kalshi_client
@@ -824,7 +823,7 @@ class AdvancedPortfolioOptimizer:
 
 async def create_market_opportunities_from_markets(
     markets: List[Market],
-    xai_client: XAIClient,
+    xai_client: Any,
     kalshi_client: KalshiClient,
     db_manager: DatabaseManager = None,
     total_capital: float = 10000
@@ -1213,7 +1212,7 @@ def _calculate_simple_kelly(opportunity: MarketOpportunity) -> float:
 
 async def _get_fast_ai_prediction(
     market: Market,
-    xai_client: XAIClient,
+    xai_client: Any,
     market_price: float
 ) -> Tuple[Optional[float], Optional[float]]:
     """
@@ -1287,7 +1286,7 @@ async def _get_fast_ai_prediction(
 async def run_portfolio_optimization(
     db_manager: DatabaseManager,
     kalshi_client: KalshiClient,
-    xai_client: XAIClient
+    xai_client: Any
 ) -> PortfolioAllocation:
     """
     Main entry point for portfolio optimization.

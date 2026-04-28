@@ -19,7 +19,6 @@ import uuid
 from json_repair import repair_json
 
 from src.clients.kalshi_client import KalshiClient
-from src.clients.xai_client import XAIClient
 from src.config.settings import settings
 from src.jobs.execute import (
     _record_live_exit_fee_divergence_if_filled,
@@ -137,7 +136,7 @@ class QuickFlipScalpingStrategy:
         self,
         db_manager: DatabaseManager,
         kalshi_client: KalshiClient,
-        xai_client: XAIClient,
+        xai_client: Any,
         config: Optional[QuickFlipConfig] = None,
         *,
         disable_ai: Optional[bool] = None,
@@ -2125,7 +2124,7 @@ Respond with JSON only:
 async def run_quick_flip_strategy(
     db_manager: DatabaseManager,
     kalshi_client: KalshiClient,
-    xai_client: XAIClient,
+    xai_client: Any,
     available_capital: float,
     config: Optional[QuickFlipConfig] = None,
     *,

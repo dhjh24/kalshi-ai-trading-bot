@@ -6,7 +6,7 @@ import json
 sys.path.append('.')
 
 from src.clients.kalshi_client import KalshiClient
-from src.clients.xai_client import XAIClient
+from src.clients.model_router import ModelRouter
 from src.utils.database import DatabaseManager
 import aiosqlite
 from datetime import datetime, timedelta
@@ -19,9 +19,9 @@ async def run_quick_analysis():
     
     # Initialize clients
     kalshi_client = KalshiClient()
-    xai_client = XAIClient()
     db = DatabaseManager()
     await db.initialize()
+    xai_client = ModelRouter(db_manager=db)
     
     try:
         # 1. Gather current portfolio data

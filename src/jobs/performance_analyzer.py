@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Any
 import aiosqlite
 
 from src.clients.kalshi_client import KalshiClient
-from src.clients.xai_client import XAIClient
+from src.clients.model_router import ModelRouter
 from src.utils.database import DatabaseManager, Position, TradeLog
 from src.config.settings import settings
 from src.utils.kalshi_normalization import (
@@ -34,7 +34,7 @@ class TradingPerformanceAnalyzer:
     - Edge detection accuracy
     """
     
-    def __init__(self, db_manager: DatabaseManager, kalshi_client: KalshiClient, xai_client: XAIClient):
+    def __init__(self, db_manager: DatabaseManager, kalshi_client: KalshiClient, xai_client: Any):
         self.db_manager = db_manager
         self.kalshi_client = kalshi_client
         self.xai_client = xai_client
@@ -358,7 +358,7 @@ Focus on actionable insights that can immediately improve performance.
 async def run_performance_analysis(
     db_manager: Optional[DatabaseManager] = None,
     kalshi_client: Optional[KalshiClient] = None,
-    xai_client: Optional[XAIClient] = None
+    xai_client: Optional[Any] = None
 ) -> Dict[str, Any]:
     """
     Run automated performance analysis.
@@ -378,7 +378,7 @@ async def run_performance_analysis(
         kalshi_client = KalshiClient()
     
     if xai_client is None:
-        xai_client = XAIClient()
+        xai_client = ModelRouter(db_manager=db_manager)
     
     try:
         analyzer = TradingPerformanceAnalyzer(db_manager, kalshi_client, xai_client)

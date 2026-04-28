@@ -22,7 +22,7 @@ from enum import Enum
 import aiosqlite
 
 from src.clients.kalshi_client import KalshiClient
-from src.clients.xai_client import XAIClient
+from src.clients.model_router import ModelRouter
 from src.utils.database import DatabaseManager, Position, TradeLog
 from src.config.settings import settings
 from src.utils.kalshi_normalization import (
@@ -101,9 +101,9 @@ class AutomatedPerformanceAnalyzer:
     async def initialize(self):
         """Initialize clients and database connections."""
         self.kalshi_client = KalshiClient()
-        self.xai_client = XAIClient()
         self.db = DatabaseManager()
         await self.db.initialize()
+        self.xai_client = ModelRouter(db_manager=self.db)
         self.logger.info("Automated Performance Analyzer initialized")
     
     async def close(self):
@@ -432,7 +432,8 @@ Be concise and actionable. Focus on the top 3 priorities.
                 strategy="performance_analysis",
                 query_type="analysis",
             )
-            cost = getattr(self.xai_client, 'total_cost', 0.0)
+            cost_getter = getattr(self.xai_client, 'get_total_cost', None)
+            cost = cost_getter() if callable(cost_getter) else getattr(self.xai_client, 'total_cost', 0.0)
 
             return {
                 'analysis_text': response_content,

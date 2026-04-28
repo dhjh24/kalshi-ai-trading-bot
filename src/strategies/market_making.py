@@ -10,12 +10,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from src.clients.kalshi_client import KalshiClient
-from src.clients.xai_client import XAIClient
 from src.config.settings import settings
 from src.jobs.execute import record_simulated_position_exit
 from src.utils.database import DatabaseManager, Market, Position, SimulatedOrder
@@ -86,7 +85,7 @@ class AdvancedMarketMaker:
         self,
         db_manager: DatabaseManager,
         kalshi_client: KalshiClient,
-        xai_client: XAIClient,
+        xai_client: Any,
     ):
         self.db_manager = db_manager
         self.kalshi_client = kalshi_client
@@ -923,7 +922,7 @@ class AdvancedMarketMaker:
 async def run_market_making_strategy(
     db_manager: DatabaseManager,
     kalshi_client: KalshiClient,
-    xai_client: XAIClient,
+    xai_client: Any,
 ) -> Dict:
     """Main entry point for the market-making strategy."""
     logger = get_trading_logger("market_making_main")

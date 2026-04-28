@@ -23,12 +23,11 @@ Key innovations:
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
 import numpy as np
 
 from src.clients.kalshi_client import KalshiClient
-from src.clients.xai_client import XAIClient
 from src.utils.database import DatabaseManager, Market, Position
 from src.config.settings import settings
 from src.utils.kalshi_normalization import (
@@ -143,7 +142,7 @@ class UnifiedAdvancedTradingSystem:
         self,
         db_manager: DatabaseManager,
         kalshi_client: KalshiClient,
-        xai_client: XAIClient,
+        xai_client: Any,
         config: Optional[TradingSystemConfig] = None
     ):
         self.db_manager = db_manager
@@ -945,7 +944,7 @@ class UnifiedAdvancedTradingSystem:
 async def run_unified_trading_system(
     db_manager: DatabaseManager,
     kalshi_client: KalshiClient,
-    xai_client: XAIClient,
+    xai_client: Any,
     config: Optional[TradingSystemConfig] = None
 ) -> TradingSystemResults:
     """

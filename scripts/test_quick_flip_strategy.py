@@ -19,7 +19,7 @@ from datetime import datetime
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.clients.kalshi_client import KalshiClient
-from src.clients.xai_client import XAIClient
+from src.clients.model_router import ModelRouter
 from src.utils.database import DatabaseManager
 from src.utils.logging_setup import setup_logging
 from src.strategies.quick_flip_scalping import (
@@ -41,7 +41,7 @@ async def test_quick_flip_opportunities():
     kalshi_client = KalshiClient()
     db_manager = DatabaseManager()
     await db_manager.initialize()
-    xai_client = XAIClient(db_manager=db_manager)  # Pass db_manager for LLM logging
+    xai_client = ModelRouter(db_manager=db_manager)  # Pass db_manager for LLM logging
     
     try:
         # Create strategy instance
@@ -115,7 +115,7 @@ async def test_quick_flip_full_strategy():
     kalshi_client = KalshiClient()
     db_manager = DatabaseManager()
     await db_manager.initialize()
-    xai_client = XAIClient(db_manager=db_manager)  # Pass db_manager for LLM logging
+    xai_client = ModelRouter(db_manager=db_manager)  # Pass db_manager for LLM logging
     
     try:
         # Configure for conservative testing

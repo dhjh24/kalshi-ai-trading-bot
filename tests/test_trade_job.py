@@ -101,7 +101,7 @@ async def test_run_trading_job_runs_embedded_live_trade_loop_each_cycle(
 
         monkeypatch.setattr(trade, "DatabaseManager", lambda: db_manager)
         monkeypatch.setattr(trade, "KalshiClient", lambda: kalshi_client)
-        monkeypatch.setattr(trade, "XAIClient", lambda db_manager=None: xai_client)
+        monkeypatch.setattr(trade, "ModelRouter", lambda db_manager=None: xai_client)
         monkeypatch.setattr(trade, "get_trading_logger", lambda _: logger)
         monkeypatch.setattr(trade, "_resolve_quick_flip_runtime_config", lambda: (False, 0.0, None))
         monkeypatch.setattr(trade, "run_unified_trading_system", AsyncMock(return_value=results))
@@ -141,7 +141,7 @@ async def test_run_trading_job_fails_open_when_embedded_live_trade_loop_raises(m
 
         monkeypatch.setattr(trade, "DatabaseManager", lambda: db_manager)
         monkeypatch.setattr(trade, "KalshiClient", lambda: kalshi_client)
-        monkeypatch.setattr(trade, "XAIClient", lambda db_manager=None: xai_client)
+        monkeypatch.setattr(trade, "ModelRouter", lambda db_manager=None: xai_client)
         monkeypatch.setattr(trade, "get_trading_logger", lambda _: logger)
         monkeypatch.setattr(trade, "_resolve_quick_flip_runtime_config", lambda: (False, 0.0, None))
         monkeypatch.setattr(trade, "run_unified_trading_system", AsyncMock(return_value=results))

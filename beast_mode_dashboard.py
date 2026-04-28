@@ -28,7 +28,7 @@ import pandas as pd
 
 from src.utils.database import DatabaseManager
 from src.clients.kalshi_client import KalshiClient
-from src.clients.xai_client import XAIClient
+from src.clients.model_router import ModelRouter
 from src.config.settings import settings
 
 from src.strategies.unified_trading_system import (
@@ -54,8 +54,8 @@ class BeastModeDashboard:
     def __init__(self):
         self.db_manager = DatabaseManager()
         self.kalshi_client = KalshiClient()
-        self.xai_client = XAIClient()
-        
+        self.xai_client = ModelRouter(db_manager=self.db_manager)
+
         # Initialize unified system for performance tracking
         self.unified_system = UnifiedAdvancedTradingSystem(
             self.db_manager, self.kalshi_client, self.xai_client

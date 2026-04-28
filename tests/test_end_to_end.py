@@ -7,7 +7,7 @@ from src.jobs.decide import make_decision_for_market
 from src.jobs.execute import execute_position
 from src.jobs.ingest import run_ingestion
 from src.utils.database import DatabaseManager, Market
-from src.clients.xai_client import XAIClient
+from src.clients.model_router import ModelRouter
 from src.clients.kalshi_client import KalshiClient
 from src.config.settings import settings
 from tests.test_helpers import find_suitable_test_market
@@ -27,7 +27,7 @@ async def test_full_trading_cycle():
     await db_manager.initialize()
     
     kalshi_client = KalshiClient()
-    xai_client = XAIClient()
+    xai_client = ModelRouter(db_manager=db_manager)
     
     try:
         # Step 1: Get a single test market efficiently (no ingestion of all markets)
