@@ -459,6 +459,7 @@ class PortfolioEnforcer:
             if limits.daily_loss_budget_pct is not None and self.portfolio_value > 0
             else None
         )
+        drift_halt, drift_reason, drift_metrics = await self._read_drift_halt_state(name)
         return {
             "strategy": name,
             "halted": halted,
@@ -470,7 +471,145 @@ class PortfolioEnforcer:
             "max_trades_per_hour": limits.max_trades_per_hour,
             "trades_last_hour": await self.get_trades_in_last_hour(name),
             "open_positions": await self.get_open_position_count(name),
+            "drift_halt": drift_halt,
+            "drift_halt_reason": drift_reason,
+            "drift_halt_avg_abs_entry_delta": drift_metrics.get("avg_abs_entry_price_delta"),
+            "drift_halt_total_entry_cost_delta": drift_metrics.get("total_entry_cost_delta"),
         }
+
+    async def _read_drift_halt_state(
+        self, strategy: str
+    ) -> Tuple[bool, Optional[str], Dict[str, float]]:
+        """Look up today's recorded drift halt for a strategy, if any.
+
+        Returns (drift_halt, reason, metrics). `metrics` carries the offending
+        delta values so the CLI can render them inline. Reason is the persisted
+        `strategy_halts.reason` field if it starts with `shadow_drift_`.
+        """
+        name = self._normalize_strategy(strategy)
+        if name == STRATEGY_DEFAULT:
+            return False, None, {}
+        day = self._today_utc()
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute(
+                    """
+                    SELECT reason, loss_amount, budget
+                    FROM strategy_halts
+                    WHERE strategy = ? AND halt_date = ?
+                      AND reason LIKE 'shadow_drift_%'
+                    LIMIT 1
+                    """,
+                    (name, day),
+                )
+                row = await cursor.fetchone()
+        except aiosqlite.OperationalError:
+            return False, None, {}
+        if row is None:
+            return False, None, {}
+
+        reason = str(row["reason"])
+        metrics: Dict[str, float] = {}
+        loss_amount = float(row["loss_amount"] or 0.0)
+        if "avg_abs" in reason:
+            # Reason was raised on the avg cents threshold; surface as dollars.
+            metrics["avg_abs_entry_price_delta"] = loss_amount / 100.0
+        elif "cost" in reason:
+            metrics["total_entry_cost_delta"] = loss_amount
+        return True, reason, metrics
+
+    # ------------------------------------------------------------------
+    # Shadow-drift auto-pause (W4 follow-up)
+    # ------------------------------------------------------------------
+
+    async def evaluate_shadow_drift_halt(
+        self,
+        strategy: str,
+        db_manager,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Auto-halt a strategy when shadow-vs-live entry drift exceeds thresholds.
+
+        Reads `summarize_shadow_order_divergence` for the canonical bucket name
+        and compares the configured cents / USD thresholds against:
+          - `avg_abs_entry_price_delta` (dollars; converted to cents)
+          - `total_entry_cost_delta` (signed USD; absolute value compared)
+
+        Returns (halted, reason). Idempotent: if a halt is already recorded
+        for the bucket today, returns (True, "already_halted") without
+        re-recording. Returns (False, None) when the feature is disabled,
+        when the matched-entry sample is below the noise floor, or when no
+        threshold is exceeded.
+        """
+        from src.config.settings import settings as live_settings
+
+        trading = live_settings.trading
+        if not bool(getattr(trading, "shadow_drift_auto_pause_enabled", False)):
+            return False, None
+
+        name = self._normalize_strategy(strategy)
+        if name == STRATEGY_DEFAULT:
+            return False, None
+
+        if await self.is_halted(name):
+            return True, "already_halted"
+
+        try:
+            summary = await db_manager.summarize_shadow_order_divergence(strategy=name)
+        except Exception as exc:
+            logger.debug(
+                "shadow drift evaluation skipped: divergence summary failed strategy=%s err=%s",
+                name, exc,
+            )
+            return False, None
+
+        matched = int(summary.get("matched_position_entries") or 0)
+        min_matched = int(getattr(trading, "shadow_drift_min_matched_entries", 5) or 5)
+        if matched < min_matched:
+            return False, None
+
+        avg_abs_dollars = float(summary.get("avg_abs_entry_price_delta") or 0.0)
+        avg_abs_cents = avg_abs_dollars * 100.0
+        total_cost_delta = float(summary.get("total_entry_cost_delta") or 0.0)
+        total_cost_abs = abs(total_cost_delta)
+
+        cents_threshold = float(
+            getattr(trading, "shadow_drift_max_avg_abs_entry_delta_cents", 2.0) or 2.0
+        )
+        cost_threshold = float(
+            getattr(trading, "shadow_drift_max_total_entry_cost_delta_usd", 25.0) or 25.0
+        )
+
+        breach: Optional[str] = None
+        loss_amount = 0.0
+        budget = 0.0
+        if avg_abs_cents > cents_threshold:
+            breach = "avg_abs"
+            loss_amount = avg_abs_cents
+            budget = cents_threshold
+        elif total_cost_abs > cost_threshold:
+            breach = "cost"
+            loss_amount = total_cost_abs
+            budget = cost_threshold
+
+        if breach is None:
+            return False, None
+
+        reason = f"shadow_drift_threshold_exceeded:{breach}"
+        await self._record_halt(
+            strategy=name,
+            reason=reason,
+            loss_amount=loss_amount,
+            budget=budget,
+        )
+        logger.warning(
+            "SHADOW DRIFT HALT | strategy=%s breach=%s matched_entries=%d "
+            "avg_abs_cents=%.4f cost_drift_usd=%.4f cents_threshold=%.4f cost_threshold=%.2f",
+            name, breach, matched, avg_abs_cents, total_cost_delta,
+            cents_threshold, cost_threshold,
+        )
+        return True, reason
 
     # ------------------------------------------------------------------
     # Main gate

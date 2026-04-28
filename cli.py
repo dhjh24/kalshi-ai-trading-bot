@@ -784,6 +784,15 @@ async def _print_strategy_budget_status(portfolio_value: float) -> None:
                 f"  {status['strategy']:<14} {state:>10} "
                 f"{loss:>10} {budget:>10} {remaining:>12} {rate:>10}"
             )
+            if status.get("drift_halt"):
+                avg_delta = status.get("drift_halt_avg_abs_entry_delta")
+                cost_drift = status.get("drift_halt_total_entry_cost_delta")
+                avg_delta_str = f"${avg_delta:.4f}" if avg_delta is not None else "n/a"
+                cost_drift_str = f"${cost_drift:.2f}" if cost_drift is not None else "n/a"
+                print(
+                    f"  drift halt: {status.get('drift_halt_reason')} "
+                    f"(avg delta {avg_delta_str}, cost drift {cost_drift_str})"
+                )
     except Exception as exc:
         print(f"  (strategy budgets unavailable: {exc})")
 

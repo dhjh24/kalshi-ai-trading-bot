@@ -463,6 +463,21 @@ class TradingConfig:
         default_factory=lambda: int(os.getenv("LIVE_TRADE_MAX_TRADES_PER_HOUR", "20"))
     )
 
+    # Shadow drift auto-pause (W4 follow-up). Default OFF so existing runtime
+    # behavior is preserved unless explicitly opted in via env.
+    shadow_drift_auto_pause_enabled: bool = field(
+        default_factory=lambda: os.getenv("SHADOW_DRIFT_AUTO_PAUSE_ENABLED", "false").lower() in ("1", "true", "yes")
+    )
+    shadow_drift_max_avg_abs_entry_delta_cents: float = field(
+        default_factory=lambda: float(os.getenv("SHADOW_DRIFT_MAX_AVG_ABS_ENTRY_DELTA_CENTS", "2.0"))
+    )
+    shadow_drift_max_total_entry_cost_delta_usd: float = field(
+        default_factory=lambda: float(os.getenv("SHADOW_DRIFT_MAX_TOTAL_ENTRY_COST_DELTA_USD", "25.0"))
+    )
+    shadow_drift_min_matched_entries: int = field(
+        default_factory=lambda: int(os.getenv("SHADOW_DRIFT_MIN_MATCHED_ENTRIES", "5"))
+    )
+
     # Cost control and market analysis frequency - MORE PERMISSIVE
     daily_ai_budget: float = 10.0  # INCREASED: Higher daily budget (was 5.0, now 10.0)
     max_ai_cost_per_decision: float = 0.08  # INCREASED: Higher per-decision cost (was 0.05, now 0.08)
