@@ -12,9 +12,10 @@ This subsystem handles post-trade performance review, risk checks, scheduler-dri
 
 ## Current implementation notes
 
-- The automated performance analyzer currently uses `XAIClient` for its AI-written analysis layer
-- The rest of the application may route trading-time model requests through OpenAI or OpenRouter, so do not assume the performance subsystem uses the same provider path
+- The automated performance analyzer uses `ModelRouter` for its AI-written analysis layer
+- Model calls follow the same provider selection as the rest of the app: `LLM_PROVIDER=auto|codex|openai|openrouter`
 - Performance analysis is separate from the new Node dashboard stack, but its outputs can still be surfaced by dashboard integration jobs
+- Some constructor and variable names still say `xai_client` for compatibility with older call sites; they now receive a router-like object with `get_completion(...)`
 
 ## Main entrypoints
 

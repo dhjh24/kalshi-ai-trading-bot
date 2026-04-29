@@ -34,6 +34,9 @@ You can also run `npm run dashboard` directly from the repo root.
 - Category filters for `Sports`, `Financials`, `Crypto`, and `Economics`
 - Expiry-window filtering and fallback ranking when no events match the strict window
 - Batch queueing for manual event analysis, with optional web research
+- Persisted decision feed from `live_trade_decisions`, including scout/specialist/final/execution rows
+- Runtime heartbeat from `live_trade_runtime_state`, including paper/shadow/live labels and recent execution status
+- Feedback actions persisted to `live_trade_decision_feedback`
 
 ### `/markets`
 - SQLite-backed market explorer
@@ -49,7 +52,7 @@ You can also run `npm run dashboard` directly from the repo root.
 - Event-level market list, news, sports or crypto context, and one-click event analysis
 
 ### `/portfolio`
-- Open positions, recent closed trades, exposure, realized P&L, and AI spend
+- Open positions, recent closed trades, exposure, realized P&L, AI spend, Codex quota snapshots, and paper-vs-live drift telemetry
 
 ### `/analysis`
 - Persisted analysis queue for manual market and event requests
@@ -67,8 +70,13 @@ Key API routes:
 - `GET /api/portfolio`
 - `GET /api/analysis/requests`
 - `GET /api/live-trade`
+- `GET /api/live-trade/decisions`
+- `GET /api/live-trade/decisions/:decisionId/feedback`
 - `POST /api/analysis/markets/:ticker`
 - `POST /api/analysis/events/:eventTicker`
+- `POST /api/live-trade/decisions/:decisionId/feedback`
+- `PUT /api/live-trade/decisions/:decisionId/feedback`
+- `POST /internal/live-trade/notify-refresh`
 
 SSE route:
 
@@ -80,6 +88,9 @@ Supported stream topics:
 - `btc`
 - `scores`
 - `analysis`
+- `live-trade-decisions`
+
+`live-trade-decisions` refreshes from both a cursor-poll fallback and the internal push hook. The push hook accepts an optional `{ "topic": "live-trade-decisions" | "runtime-state" | "feedback" }` body and always refreshes the public decision feed after authentication.
 
 ## Analysis workflow
 
@@ -107,6 +118,8 @@ This keeps the dashboard fast and predictable while still exposing richer AI rev
 - `ANALYSIS_BRIDGE_URL` - point the API at a different analysis bridge
 - `DASHBOARD_REFRESH_MS` - adjust server-side refresh caching
 - `DASHBOARD_NEWS_REFRESH_MS`, `DASHBOARD_SPORTS_REFRESH_MS`, `DASHBOARD_CRYPTO_REFRESH_MS` - tune adapter cache TTLs
+- `LIVE_TRADE_NOTIFY_URL` - optional Python-to-Node refresh URL, usually `http://127.0.0.1:4000/internal/live-trade/notify-refresh`
+- `LIVE_TRADE_INTERNAL_REFRESH_TOKEN` - shared secret sent in the `x-internal-token` header for the internal refresh hook
 
 ## Troubleshooting
 
@@ -135,4 +148,11 @@ Then check:
 
 - Confirm the Python bridge is running on `http://127.0.0.1:8101`
 - Check the terminal where `python cli.py dashboard` is running for bridge errors
-- Verify `OPENAI_API_KEY` and/or `OPENROUTER_API_KEY` are configured in `.env`
+- Verify `LLM_PROVIDER=auto` has a signed-in Codex CLI or that `OPENAI_API_KEY` / `OPENROUTER_API_KEY` are configured in `.env`
+
+### Live-trade decision feed looks stale
+
+- Confirm the Python live-trade loop is running with `python cli.py run --live-trade`, `--shadow`, or `--live`
+- Check whether `live_trade_runtime_state` rows exist in the configured `DB_PATH`
+- If using push refresh, make sure `LIVE_TRADE_NOTIFY_URL` and `LIVE_TRADE_INTERNAL_REFRESH_TOKEN` match between the Python runtime and Node server
+- The dashboard still polls the decision cursor as a fallback, so stale rows usually indicate a DB path mismatch or a stopped Python loop

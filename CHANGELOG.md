@@ -7,6 +7,20 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+- Documented the current `2.0.0` application state, including `UnifiedTradingBot`, ModelRouter-based provider routing, shadow mode, and the unified paper-runtime database
+- Added operator-facing documentation for live-trade SSE refresh, per-strategy budgets, quick-flip live opt-in, and shadow drift auto-pause configuration
+- Added current quick-flip allocation and filter knobs to `env.template`
+
+### Changed
+- Paper trading documentation now points to `python cli.py run --paper`, the Node dashboard, and the optional `python -m src.paper.dashboard` static report
+- Quick Flip documentation now reflects the current fee-aware, maker-entry, heuristic-fallback, paper/shadow/live strategy behavior
+- Performance-system docs now describe the current `ModelRouter` path instead of the removed legacy client shim
+
+### Removed
+- Removed documentation for the retired `paper_trader.py` loop and legacy signal-tracker dashboard fallback
+- Removed active-path references to the deleted `src/clients/xai_client.py` shim
+
 ### Docs
 - Refreshed the README, dashboard docs, changelog, and contributor setup instructions to match the current 2.x application
 - Documented the Node dashboard stack, manual analysis flow, and current provider-routing options

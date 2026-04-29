@@ -27,6 +27,16 @@ Use a signed-in Codex CLI first, or fall back to direct OpenAI / OpenRouter bill
 
 ---
 
+## Current Application
+
+- Package version: `2.0.0` in `pyproject.toml`; unreleased runtime/docs changes are tracked in `CHANGELOG.md`.
+- Canonical runtime: `python cli.py run` instantiates `src.runtime.unified_bot.UnifiedTradingBot` for paper, shadow, live, and retained `--beast` settings-overrides.
+- Canonical paper path: `python cli.py run --paper`; the retired `paper_trader.py` and legacy signal-tracker fallback are no longer part of the app.
+- Canonical model path: `src.clients.model_router.ModelRouter` over Codex CLI, direct OpenAI, or OpenRouter. The old `src/clients/xai_client.py` shim has been removed.
+- Shadow mode: `python cli.py run --shadow` executes paper orders while recording live-comparison telemetry and optional drift auto-pause state.
+
+---
+
 ## 🚀 Quick Start
 
 **Paper-trading plus the new dashboard in a few minutes:**
@@ -86,7 +96,9 @@ This launches the current dashboard stack:
 - ✅ **Deterministic outputs** — temperature=0 for reproducible AI reasoning
 
 ### Trading Strategies
-- ✅ **AI Ensemble** (default) — five-model debate with Kelly Criterion sizing and portfolio guardrails
+- ✅ **AI Ensemble** (default) — five-model debate with Kelly Criterion sizing, category scoring, and portfolio guardrails
+- ✅ **Live-Trade loop** — short-dated event scout/specialist/final-debate runtime, embedded in the main cycle and available standalone with `--live-trade`
+- ✅ **Quick Flip** — fast maker-entry scalp strategy with fee-aware profit floors, heuristic fallback, shadow-mode parity, and live execution gated by `ENABLE_LIVE_QUICK_FLIP`
 - ✅ **Safe Compounder** — pure edge-based NO-side strategy; near-certain outcomes only, no AI required
 
 ### Risk Management
@@ -95,6 +107,8 @@ This launches the current dashboard stack:
 - ✅ **Max drawdown circuit breaker** — halts at 15% portfolio drawdown
 - ✅ **Sector concentration cap** — no more than 30% in any single category
 - ✅ **Category scoring** — hard-blocks categories with proven negative edge
+- ✅ **Per-strategy guardrails** — separate daily-loss, open-position, and hourly-trade budgets for quick flip and live-trade paths
+- ✅ **Shadow drift halt** — optional auto-pause when paper/live shadow entry drift breaches configured thresholds
 - ✅ **Daily AI cost budget** — stops spending when API costs hit the configurable daily limit (default: $10/day)
 
 ### Dynamic Exit Strategies
@@ -106,9 +120,10 @@ This launches the current dashboard stack:
 
 ### Observability
 - ✅ **Node dashboard stack** — route-based Next.js UI, Fastify API, SSE live updates, and manual analysis requests
-- ✅ **Live trade route** — ranked short-dated events with category filters, BTC context, sports context, and batch analysis controls
+- ✅ **Live trade route** — ranked short-dated events, persisted decision feed, feedback actions, runtime heartbeat, BTC context, sports context, and batch analysis controls
 - ✅ **Market and event detail pages** — microstructure, sibling contracts, related news, and one-click manual analysis
-- ✅ **Paper trading mode** — simulate trades without real orders; track outcomes on settled markets
+- ✅ **Paper trading mode** — simulate trades without real orders using the same `trading_system.db` runtime tables as live mode
+- ✅ **Push + poll refresh** — Python can notify the Fastify SSE hub after live-trade writes, with cursor polling as the fallback
 - ✅ **SQLite telemetry** — every trade, AI decision, and cost metric logged locally
 - ✅ **Unified CLI** — `run`, `dashboard`, `status`, `health`, `scores`, `history` commands
 
@@ -225,7 +240,13 @@ Common trading and dashboard env vars:
 
 - `PREFERRED_CATEGORIES=Sports` — default market focus for screening
 - `PREFER_LIVE_WAGERING=true` and `LIVE_WAGERING_MAX_HOURS_TO_EXPIRY=12` — bias toward short-dated live opportunities
+- `ENABLE_QUICK_FLIP=true` and `QUICK_FLIP_ALLOCATION=0.05` — opt into the quick-flip lane inside the unified runtime
+- `ENABLE_LIVE_QUICK_FLIP=true` — allow live `QUICK_FLIP` intents; without this, live quick-flip attempts are blocked before execution
 - `QUICK_FLIP_DISABLE_AI=true` — force quick flip into the heuristic-only fallback when Codex/API quota is unavailable or you want math-only behavior
+- `QUICK_FLIP_DAILY_LOSS_BUDGET_PCT`, `QUICK_FLIP_MAX_OPEN_POSITIONS`, `QUICK_FLIP_MAX_TRADES_PER_HOUR` — quick-flip risk limits
+- `LIVE_TRADE_DAILY_LOSS_BUDGET_PCT`, `LIVE_TRADE_MAX_OPEN_POSITIONS`, `LIVE_TRADE_MAX_TRADES_PER_HOUR` — live-trade loop risk limits
+- `SHADOW_DRIFT_AUTO_PAUSE_ENABLED=true` plus `SHADOW_DRIFT_*` thresholds — optionally halt strategies when paper/live shadow drift gets too large
+- `LIVE_TRADE_NOTIFY_URL` and `LIVE_TRADE_INTERNAL_REFRESH_TOKEN` — optional push-refresh hook from Python live-trade writes into the Node SSE hub
 - `DAILY_AI_COST_LIMIT=10.0` — hard cap for daily model spend
 - `DB_PATH`, `DASHBOARD_BRIDGE_PORT`, `DASHBOARD_WEB_PORT`, `DASHBOARD_SERVER_PORT`, `ANALYSIS_BRIDGE_URL`, `DASHBOARD_REFRESH_MS` — optional overrides for the dashboard stack
 
@@ -289,16 +310,17 @@ Command matrix:
 - `python cli.py run --paper`, `python cli.py run --shadow`, and `python cli.py run --live` all execute the embedded `run_live_trade_loop_cycle()` during the main job.
 - `python cli.py run --live-trade` is the dedicated loop-only runtime, and it now supports `paper`, `shadow`, or `live` execution semantics.
 
-Primary CLI is recommended for Beast Mode and dashboard workflows:
+`cli.py` is the primary entrypoint for runtime and dashboard workflows:
 
 ```bash
-python scripts/beast_mode_dashboard.py   # Legacy dashboard shim; use `python cli.py dashboard` for production path
-python cli.py run                     # Paper trading
-python cli.py run --live              # Live trading
+python cli.py run          # Paper trading by default
+python cli.py run --shadow # Paper execution plus shadow telemetry
+python cli.py run --live   # Live trading
 ```
 
 Use `python cli.py dashboard` for the current dashboard flow. That command owns the Next.js web app,
-Fastify API, and FastAPI analysis bridge.
+Fastify API, and FastAPI analysis bridge. `scripts/beast_mode_dashboard.py` remains only as a
+compatibility shim for older local workflows.
 
 ### Live-Trade Operator Loop
 
@@ -320,17 +342,22 @@ The unified `--paper` runtime now uses the same main SQLite database as live mod
 - resting simulated paper orders that reconcile against live market data
 - fee-aware closed paper trades in `trade_logs`
 
-The static dashboard reads paper-runtime data from `trading_system.db`.
+The Node dashboard reads the unified runtime database directly. A small static HTML report is also
+available for paper-only snapshots.
 
 ```bash
 # Main paper-trading runtime (mirrors the live bot without sending real orders)
 python cli.py run --paper
 
-# Dashboard output and runtime snapshot from the unified trading_system.db
+# Full local dashboard stack
 python cli.py dashboard
+
+# Optional static paper report written to docs/paper_dashboard.html
+python -m src.paper.dashboard
 ```
 
-The dashboard writes to `docs/paper_dashboard.html` — open locally or host via GitHub Pages.
+The static report reads paper-runtime rows from `trading_system.db`; there is no separate
+`paper_trader.py` loop or legacy signal table fallback.
 
 ---
 
@@ -349,9 +376,10 @@ kalshi-ai-trading-bot/
 │   ├── config/                # Settings and trading parameters
 │   ├── data/                  # News aggregation and sentiment analysis
 │   ├── events/                # Async event bus for real-time streaming
-│   ├── jobs/                  # Core pipeline: ingest, decide, execute, track, evaluate
+│   ├── jobs/                  # Core pipeline: ingest, decide, execute, track, evaluate, live_trade
+│   ├── paper/                 # Unified paper-runtime snapshot + static report helpers
 │   ├── runtime/               # Unified trading bot orchestrator (unified_bot.py)
-│   ├── strategies/            # Safe compounder, category scorer, portfolio enforcer
+│   ├── strategies/            # Ensemble, quick flip, safe compounder, category scorer, portfolio enforcer
 │   └── utils/                 # Database, logging, prompts, risk helpers
 │
 ├── scripts/                   # Utility and diagnostic scripts
@@ -437,6 +465,10 @@ python cli.py run --live-trade   # Dedicated live-trade loop (paper by default)
 python cli.py run --live-trade --live   # Dedicated live-trade loop with live execution
 ```
 
+`--live-trade` cannot be combined with `--safe-compounder`, `--beast`, or `--smoke`. Generic
+live-trade intents can execute live with `--live`; short-hold `QUICK_FLIP` live intents additionally
+require `ENABLE_LIVE_QUICK_FLIP=true`.
+
 Guardrails active:
 - Max drawdown: **15%**
 - Min confidence: **45%**
@@ -445,7 +477,24 @@ Guardrails active:
 - Kelly fraction: **0.25** (quarter-Kelly)
 - Category scoring — blocks categories with negative edge history
 
-### 2. Safe Compounder — `python cli.py run --safe-compounder`
+### 2. Quick Flip — opt-in unified-runtime lane
+
+Quick Flip is disabled by default in the unified runtime. Enable it explicitly when you want the
+fast scalp lane to participate in paper or shadow runs:
+
+```bash
+ENABLE_QUICK_FLIP=true QUICK_FLIP_ALLOCATION=0.05 python cli.py run --paper
+QUICK_FLIP_DISABLE_AI=true python cli.py run --paper  # heuristic-only fallback
+ENABLE_LIVE_QUICK_FLIP=true python cli.py run --live-trade --live  # live quick-flip intents
+```
+
+Current quick-flip safety behavior:
+- Entry candidates must pass price band, volume, spread, top-of-book depth, recent-trade, net-profit, and ROI filters.
+- AI movement analysis can degrade to the heuristic analyzer instead of blocking at zero confidence.
+- Paper and shadow execution use the same portfolio-enforcer budget labels as live.
+- Live quick-flip execution requires the dedicated `ENABLE_LIVE_QUICK_FLIP` opt-in.
+
+### 3. Safe Compounder — `python cli.py run --safe-compounder`
 
 The most conservative and historically validated strategy. **No AI models required** — pure math.
 
@@ -465,7 +514,7 @@ Strategy rules:
 
 This strategy is the closest thing to a pure edge play on Kalshi.
 
-### 3. Beast Mode — `python cli.py run --beast`
+### 4. Beast Mode — `python cli.py run --beast`
 
 > ⚠️ **Not recommended.** Aggressive settings with no category guardrails have historically led to significant losses in live prediction market trading.
 
@@ -605,7 +654,10 @@ If you want to initialize the database manually (e.g., to verify the schema befo
 python -m src.utils.database
 ```
 
-This creates all required tables: `markets`, `positions`, `trade_logs`, `market_analyses`, `daily_cost_tracking`, `llm_queries`, and `analysis_reports`.
+This creates all required tables, including `markets`, `positions`, `trade_logs`,
+`simulated_orders`, `shadow_orders`, `live_trade_decisions`, `live_trade_runtime_state`,
+`live_trade_decision_feedback`, `daily_cost_tracking`, `codex_quota_tracking`,
+`llm_queries`, `analysis_requests`, and `analysis_reports`.
 
 </details>
 

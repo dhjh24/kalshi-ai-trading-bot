@@ -21,7 +21,7 @@ We welcome:
 - Node.js 24+
 - Git
 - A Kalshi API account for integration testing
-- At least one LLM API key: `OPENAI_API_KEY` or `OPENROUTER_API_KEY`
+- At least one model route: a signed-in `codex` CLI, `OPENAI_API_KEY`, or `OPENROUTER_API_KEY`
 
 ### Local setup
 
@@ -40,6 +40,8 @@ python -m src.utils.database
 ```
 
 Optional: launch the dashboard locally with `python cli.py dashboard`.
+For model routing, `LLM_PROVIDER=auto` prefers the signed-in Codex CLI, then direct OpenAI,
+then OpenRouter.
 
 ## Code standards
 
@@ -71,6 +73,7 @@ Run the relevant suites for the code you changed.
 
 ```bash
 pytest tests/
+pytest tests/test_live_trade_job.py tests/test_quick_flip_scalping.py
 pytest tests/test_decide.py
 pytest --cov=src --cov-report=html
 

@@ -11,7 +11,8 @@ Foundation for W4 (shadow mode) and required before we flip to live.
    no other code reads it.
 2. `scripts/replay_paper.py` loads the last N days of snapshots into a
    `ReplayKalshiClient` (drop-in stand-in for `KalshiClient`) and a
-   `ReplayXAIClient` (deterministic synthetic AI), then runs the strategy's
+   router-shaped `ReplayXAIClient` stub (deterministic synthetic AI; name retained
+   for the strategy signature), then runs the strategy's
    public entry point (`run_quick_flip_strategy`) against a **parallel**
    `data/trading_system_replay.db` so the live DB is never touched.
 3. Report compares `trade_logs` from the replay DB vs the live DB (filtered
@@ -61,7 +62,7 @@ Same DB + same `--now` -> byte-identical report. Guaranteed by:
 
 - `random.seed(0xDEADBEEF)` + `PYTHONHASHSEED` at import time.
 - Snapshots consumed in `(timestamp ASC, id ASC)` order.
-- `ReplayXAIClient` echoes the required-exit price back from the prompt -
+- The replay AI stub echoes the required-exit price back from the prompt -
   no LLM calls, no clock-dependent logic.
 
 ## Adding a strategy
@@ -73,7 +74,7 @@ Each strategy lives in a single registry entry at the top of
 STRATEGIES["new_strat"] = StrategyRunner(
     name="new_strat",
     strategy_label="new_strat",                       # trade_logs.strategy value
-    run_fn_path="src.strategies.new_strat:run_new",   # async(db, kalshi, xai, capital)
+    run_fn_path="src.strategies.new_strat:run_new",   # async(db, kalshi, router, capital)
 )
 ```
 

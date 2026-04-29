@@ -29,11 +29,11 @@ This starts:
 ## Main routes
 
 - `/` - overview with portfolio metrics, ranked markets, latest analysis, BTC strip, and live scores
-- `/live-trade` - ranked short-dated event feed with category filters and batch manual analysis
+- `/live-trade` - ranked short-dated event feed with category filters, persisted decision feed, runtime heartbeat, feedback actions, and batch manual analysis
 - `/markets` - SQLite-backed market explorer
 - `/markets/[ticker]` - market detail page with order flow, related event/news, and sports or crypto context
 - `/events/[eventTicker]` - event detail page with related markets, news, and one-click analysis
-- `/portfolio` - current positions, recent trades, exposure, realized P&L, and AI spend
+- `/portfolio` - current positions, recent trades, exposure, realized P&L, AI spend, Codex quota snapshots, and paper-vs-live drift telemetry
 - `/analysis` - persisted manual analysis queue with live SSE updates
 
 ## API surface
@@ -45,9 +45,14 @@ This starts:
 - `GET /api/portfolio`
 - `GET /api/analysis/requests`
 - `GET /api/live-trade`
+- `GET /api/live-trade/decisions`
+- `GET /api/live-trade/decisions/:decisionId/feedback`
 - `POST /api/analysis/markets/:ticker`
 - `POST /api/analysis/events/:eventTicker`
+- `POST /api/live-trade/decisions/:decisionId/feedback`
+- `PUT /api/live-trade/decisions/:decisionId/feedback`
 - `GET /api/stream/:topic`
+- `POST /internal/live-trade/notify-refresh`
 
 ## SSE topics
 
@@ -55,6 +60,7 @@ This starts:
 - `btc`
 - `scores`
 - `analysis`
+- `live-trade-decisions`
 
 ## Notes
 
@@ -62,3 +68,4 @@ This starts:
 - Kalshi data remains the source of truth for markets and events.
 - Sports, crypto, and news context are hydrated on top of Kalshi data through replaceable service adapters.
 - Existing Python trading jobs still run independently; the dashboard is an observability and manual-analysis surface.
+- The live-trade decision stream uses `POST /internal/live-trade/notify-refresh` for low-latency Python-to-Node refresh when `LIVE_TRADE_NOTIFY_URL` and `LIVE_TRADE_INTERNAL_REFRESH_TOKEN` are configured, with cursor polling kept as the fallback.
