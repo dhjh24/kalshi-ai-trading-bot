@@ -29,6 +29,44 @@ const EMPTY_OVERVIEW: OverviewPayload = {
   recentAnalysis: []
 };
 
+const FEATURE_GUIDE = [
+  {
+    href: "/live-trade",
+    title: "Live Trade",
+    description:
+      "Watch the W5 decision queue, event filters, runtime heartbeat, and execution feed updates in near real time.",
+    action: "Open feed"
+  },
+  {
+    href: "/quick-flip",
+    title: "Quick Flip",
+    description:
+      "Inspect fast scalp candidates, maker and taker order activity, quick-flip settings, and guardrail decisions.",
+    action: "Review scalps"
+  },
+  {
+    href: "/markets",
+    title: "Markets",
+    description:
+      "Browse open contracts, drill into order book context, compare sibling markets, and request manual analysis.",
+    action: "Browse markets"
+  },
+  {
+    href: "/portfolio",
+    title: "Portfolio",
+    description:
+      "Track positions, realized P&L, paper versus live divergence, order drift, fees, and AI spend attribution.",
+    action: "View portfolio"
+  },
+  {
+    href: "/analysis",
+    title: "Analysis",
+    description:
+      "Monitor queued, running, completed, and failed manual LLM analysis requests as SSE updates arrive.",
+    action: "Open queue"
+  }
+];
+
 function summarizeOverviewError(error: unknown): string {
   if (error instanceof DashboardApiError) {
     if (error.status !== undefined) {
@@ -120,6 +158,26 @@ export default async function HomePage() {
           />
         </Panel>
       </section>
+
+      <Panel eyebrow="Feature Guide" title="Where to go from the homepage">
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
+          {FEATURE_GUIDE.map((feature) => (
+            <Link
+              key={feature.href}
+              href={feature.href}
+              className="rounded-2xl border border-slate-100 bg-slate-50/90 p-4 transition hover:border-signal hover:bg-white"
+            >
+              <h3 className="font-semibold text-steel">{feature.title}</h3>
+              <p className="mt-2 text-sm leading-6 text-slate-500">
+                {feature.description}
+              </p>
+              <p className="mt-4 text-sm font-semibold text-signal">
+                {feature.action}
+              </p>
+            </Link>
+          ))}
+        </div>
+      </Panel>
 
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
         <StatCard label="Active Positions" value={String(overview.metrics.activePositions)} />
