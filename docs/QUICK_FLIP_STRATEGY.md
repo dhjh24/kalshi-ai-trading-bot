@@ -52,6 +52,9 @@ QUICK_FLIP_MAX_ENTRY_PRICE=0.20
 QUICK_FLIP_MIN_PROFIT_MARGIN=0.10
 QUICK_FLIP_CAPITAL_PER_TRADE=50.0
 QUICK_FLIP_DAILY_LOSS_BUDGET_PCT=0.05
+# Max concurrent opportunities controls strategy-level candidate flow.
+QUICK_FLIP_MAX_CONCURRENT_POSITIONS=50
+# Max open positions controls portfolio-level simultaneous open position count.
 QUICK_FLIP_MAX_OPEN_POSITIONS=10
 QUICK_FLIP_MAX_TRADES_PER_HOUR=60
 QUICK_FLIP_MAX_HOLD_MINUTES=30
@@ -67,6 +70,11 @@ QUICK_FLIP_MAX_ENTRY_VS_RECENT_LAST_GAP=0.02
 QUICK_FLIP_RECENT_TRADE_WINDOW_SECONDS=3600
 QUICK_FLIP_MIN_RECENT_TRADE_COUNT=5
 ```
+
+There are two different position limits to tune:
+
+- `QUICK_FLIP_MAX_CONCURRENT_POSITIONS`: strategy-level throughput cap used while building opportunities and attempting entries.
+- `QUICK_FLIP_MAX_OPEN_POSITIONS`: portfolio-level hard cap enforced when positions are already open (paper/shadow/live).
 
 Most defaults live in `QuickFlipConfig` in `src/strategies/quick_flip_scalping.py`; runtime env overrides are read through `settings.trading` in `src/config/settings.py`.
 

@@ -121,7 +121,7 @@ const NUMBER_FIELDS = [
     label: "Max concurrent positions",
     step: "1",
     min: "0",
-    helpText: "Active quick-flip position cap."
+    helpText: "Strategy-level cap for opportunity throughput before portfolio-level open limits are applied."
   },
   {
     key: "capitalPerTrade",
@@ -142,7 +142,7 @@ const NUMBER_FIELDS = [
     label: "Max open positions",
     step: "1",
     min: "0",
-    helpText: "How many quick-flip positions may stay open at once."
+    helpText: "Portfolio-enforced hard cap for simultaneous open quick-flip positions."
   },
   {
     key: "maxTradesPerHour",

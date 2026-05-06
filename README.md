@@ -244,7 +244,7 @@ Common trading and dashboard env vars:
 - `ENABLE_QUICK_FLIP=true` and `QUICK_FLIP_ALLOCATION=0.05` — opt into the quick-flip lane inside the unified runtime
 - `ENABLE_LIVE_QUICK_FLIP=true` — allow live `QUICK_FLIP` intents; without this, live quick-flip attempts are blocked before execution
 - `QUICK_FLIP_DISABLE_AI=true` — force quick flip into the heuristic-only fallback when Codex/API quota is unavailable or you want math-only behavior
-- `QUICK_FLIP_DAILY_LOSS_BUDGET_PCT`, `QUICK_FLIP_MAX_OPEN_POSITIONS`, `QUICK_FLIP_MAX_TRADES_PER_HOUR` — quick-flip risk limits
+- `QUICK_FLIP_DAILY_LOSS_BUDGET_PCT`, `QUICK_FLIP_MAX_OPEN_POSITIONS`, `QUICK_FLIP_MAX_CONCURRENT_POSITIONS`, `QUICK_FLIP_MAX_TRADES_PER_HOUR` — quick-flip risk and throughput limits
 - `LIVE_TRADE_DAILY_LOSS_BUDGET_PCT`, `LIVE_TRADE_MAX_OPEN_POSITIONS`, `LIVE_TRADE_MAX_TRADES_PER_HOUR` — live-trade loop risk limits
 - `SHADOW_DRIFT_AUTO_PAUSE_ENABLED=true` plus `SHADOW_DRIFT_*` thresholds — optionally halt strategies when paper/live shadow drift gets too large
 - `LIVE_TRADE_NOTIFY_URL` and `LIVE_TRADE_INTERNAL_REFRESH_TOKEN` — optional push-refresh hook from Python live-trade writes into the Node SSE hub
