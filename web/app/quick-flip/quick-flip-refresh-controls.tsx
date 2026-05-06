@@ -5,13 +5,9 @@ import { useRouter } from "next/navigation";
 import { Badge } from "../../components/ui";
 import { formatTimestamp } from "../../lib/format";
 
-const AUTO_REFRESH_INTERVAL_MS = 20000;
+const AUTO_REFRESH_INTERVAL_MS = 15000;
 
-function formatAgeLabel(timestamp: string | null, now: number): string {
-  if (!timestamp) {
-    return "age unknown";
-  }
-
+function formatAgeLabel(timestamp: string, now: number): string {
   const parsed = Date.parse(timestamp);
   if (!Number.isFinite(parsed)) {
     return "n/a";
@@ -27,37 +23,27 @@ function formatAgeLabel(timestamp: string | null, now: number): string {
     return `${elapsedMinutes}m old`;
   }
 
-  const elapsedHours = Math.floor(elapsedMinutes / 60);
-  return `${elapsedHours}h old`;
+  return `${Math.floor(elapsedMinutes / 60)}h old`;
 }
 
 function formatCountdownLabel(milliseconds: number): string {
-  const seconds = Math.max(0, Math.ceil(milliseconds / 1000));
-  return `${seconds}s`;
+  return `${Math.max(0, Math.ceil(milliseconds / 1000))}s`;
 }
 
-function getStableInitialNow(timestamp: string | null): number {
-  if (!timestamp) {
-    return 0;
-  }
-
-  const parsed = Date.parse(timestamp);
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
-export function PortfolioRefreshControls({
+export function QuickFlipRefreshControls({
   generatedAt,
-  heartbeatAt
+  latestTradeAt,
+  latestOrderAt
 }: {
-  generatedAt: string | null;
-  heartbeatAt: string | null;
+  generatedAt: string;
+  latestTradeAt: string | null;
+  latestOrderAt: string | null;
 }) {
   const router = useRouter();
-  const initialNow = getStableInitialNow(generatedAt);
   const [autoRefresh, setAutoRefresh] = useState(true);
-  const [now, setNow] = useState(initialNow);
+  const [now, setNow] = useState(() => Date.now());
   const [isPending, startTransition] = useTransition();
-  const lastRefreshAtRef = useRef(initialNow);
+  const lastRefreshAtRef = useRef(Date.now());
 
   useEffect(() => {
     const timestamp = Date.now();
@@ -104,29 +90,6 @@ export function PortfolioRefreshControls({
     };
   }, [autoRefresh, triggerRefresh]);
 
-  useEffect(() => {
-    const refreshWhenVisible = () => {
-      if (!autoRefresh || document.visibilityState !== "visible") {
-        return;
-      }
-
-      const elapsedSinceLastRefresh = Date.now() - lastRefreshAtRef.current;
-      if (elapsedSinceLastRefresh < AUTO_REFRESH_INTERVAL_MS / 2) {
-        return;
-      }
-
-      triggerRefresh();
-    };
-
-    window.addEventListener("focus", refreshWhenVisible);
-    document.addEventListener("visibilitychange", refreshWhenVisible);
-
-    return () => {
-      window.removeEventListener("focus", refreshWhenVisible);
-      document.removeEventListener("visibilitychange", refreshWhenVisible);
-    };
-  }, [autoRefresh, triggerRefresh]);
-
   const nextRefreshIn = Math.max(
     AUTO_REFRESH_INTERVAL_MS - (now - lastRefreshAtRef.current),
     0
@@ -134,15 +97,16 @@ export function PortfolioRefreshControls({
 
   return (
     <div className="flex flex-wrap items-center gap-3 text-sm text-slate-500">
-      <span>Snapshot {generatedAt ? formatTimestamp(generatedAt) : "unknown"}.</span>
+      <span>Snapshot {formatTimestamp(generatedAt)}.</span>
       <span>{formatAgeLabel(generatedAt, now)}.</span>
-      {heartbeatAt ? <span>Worker heartbeat {formatTimestamp(heartbeatAt)}.</span> : null}
+      {latestTradeAt ? <span>Latest trade {formatTimestamp(latestTradeAt)}.</span> : null}
+      {latestOrderAt ? <span>Latest order {formatTimestamp(latestOrderAt)}.</span> : null}
       <Badge tone={isPending ? "warning" : autoRefresh ? "positive" : "neutral"}>
         {isPending
-          ? "Refreshing"
+          ? "Rechecking"
           : autoRefresh
             ? `Auto ${formatCountdownLabel(nextRefreshIn)}`
-            : "Manual refresh"}
+            : "Manual"}
       </Badge>
       <button
         type="button"
@@ -150,7 +114,7 @@ export function PortfolioRefreshControls({
         disabled={isPending}
         className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-steel transition hover:border-signal hover:text-signal disabled:cursor-not-allowed disabled:border-slate-200 disabled:text-slate-400"
       >
-        Refresh now
+        Recheck now
       </button>
       <button
         type="button"

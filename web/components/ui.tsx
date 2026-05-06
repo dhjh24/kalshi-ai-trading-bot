@@ -11,13 +11,17 @@ export function AppFrame({ children }: { children: ReactNode }) {
             <p className="text-xs uppercase tracking-[0.35em] text-signal">
               Kalshi AI Trading Bot
             </p>
-            <h1 className="font-serif text-2xl font-semibold text-steel">
-              Node Dashboard
-            </h1>
+            <div className="mt-1 flex flex-wrap items-center gap-3">
+              <h1 className="font-serif text-2xl font-semibold text-steel">
+                Node Dashboard
+              </h1>
+              <HeaderModeBadge />
+            </div>
           </div>
           <nav className="flex flex-wrap gap-2 text-sm font-medium text-slate-600">
             <NavLink href="/">Overview</NavLink>
             <NavLink href="/live-trade">Live Trade</NavLink>
+            <NavLink href="/quick-flip">Quick Flip</NavLink>
             <NavLink href="/markets">Markets</NavLink>
             <NavLink href="/portfolio">Portfolio</NavLink>
             <NavLink href="/analysis">Analysis</NavLink>
@@ -26,6 +30,48 @@ export function AppFrame({ children }: { children: ReactNode }) {
       </header>
       <main className="mx-auto max-w-7xl px-6 py-8">{children}</main>
     </div>
+  );
+}
+
+function parseEnvBoolean(value: string | undefined): boolean | null {
+  if (!value) {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on", "enabled"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off", "disabled"].includes(normalized)) {
+    return false;
+  }
+  return null;
+}
+
+function HeaderModeBadge() {
+  const live =
+    parseEnvBoolean(process.env.LIVE_TRADING_ENABLED) ??
+    parseEnvBoolean(process.env.NEXT_PUBLIC_LIVE_TRADING_ENABLED);
+  const shadow =
+    parseEnvBoolean(process.env.SHADOW_MODE_ENABLED) ??
+    parseEnvBoolean(process.env.NEXT_PUBLIC_SHADOW_MODE_ENABLED);
+  const paper =
+    parseEnvBoolean(process.env.PAPER_TRADING_MODE) ??
+    parseEnvBoolean(process.env.NEXT_PUBLIC_PAPER_TRADING_MODE) ??
+    (live === true || shadow === true ? false : true);
+  const label = live ? "Live default" : shadow ? "Shadow default" : paper ? "Paper mode" : "Mode unset";
+  const className = live
+    ? "border-rose-200 bg-rose-50 text-rose-700"
+    : shadow
+      ? "border-amber-200 bg-amber-50 text-amber-700"
+      : paper
+        ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+        : "border-slate-200 bg-slate-50 text-slate-600";
+
+  return (
+    <span className={clsx("rounded-full border px-3 py-1 text-xs font-semibold", className)}>
+      {label}
+    </span>
   );
 }
 

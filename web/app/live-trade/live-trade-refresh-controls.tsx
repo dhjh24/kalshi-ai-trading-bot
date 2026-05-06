@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useEffectEvent, useRef, useState, useTransition } from "react";
+import { useCallback, useEffect, useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { Badge } from "../../components/ui";
 import { formatTimestamp } from "../../lib/format";
@@ -32,6 +32,11 @@ function formatCountdownLabel(milliseconds: number): string {
   return `${seconds}s`;
 }
 
+function getStableInitialNow(timestamp: string): number {
+  const parsed = Date.parse(timestamp);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 export function LiveTradeRefreshControls({
   generatedAt,
   latestDecisionAt,
@@ -42,14 +47,16 @@ export function LiveTradeRefreshControls({
   latestAnalysisUpdatedAt: string | null;
 }) {
   const router = useRouter();
+  const initialNow = getStableInitialNow(generatedAt);
   const [autoRefresh, setAutoRefresh] = useState(true);
-  const [now, setNow] = useState(() => Date.now());
+  const [now, setNow] = useState(initialNow);
   const [isPending, startTransition] = useTransition();
-  const lastRefreshAtRef = useRef(Date.now());
+  const lastRefreshAtRef = useRef(initialNow);
 
   useEffect(() => {
-    lastRefreshAtRef.current = Date.now();
-    setNow(Date.now());
+    const timestamp = Date.now();
+    lastRefreshAtRef.current = timestamp;
+    setNow(timestamp);
   }, [generatedAt]);
 
   useEffect(() => {
@@ -62,7 +69,7 @@ export function LiveTradeRefreshControls({
     };
   }, []);
 
-  const triggerRefresh = useEffectEvent(() => {
+  const triggerRefresh = useCallback(() => {
     if (isPending) {
       return;
     }
@@ -71,7 +78,7 @@ export function LiveTradeRefreshControls({
     startTransition(() => {
       router.refresh();
     });
-  });
+  }, [isPending, router, startTransition]);
 
   useEffect(() => {
     if (!autoRefresh) {

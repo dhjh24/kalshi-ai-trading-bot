@@ -3,6 +3,7 @@ import cors from "@fastify/cors";
 import { z } from "zod";
 import { serverConfig } from "./config.js";
 import {
+  clearPaperTradingDataPayload,
   getAnalysisHistoryPayload,
   getEventDetailPayload,
   getLiveTradeDecisionFeedPayload,
@@ -12,6 +13,7 @@ import {
   getMarketsPayload,
   getOverviewPayload,
   getPortfolioPayload,
+  getQuickFlipPayload,
   submitLiveTradeDecisionFeedbackPayload
 } from "./services/dashboardService.js";
 import { queueAnalysisRequest } from "./services/analysisService.js";
@@ -71,6 +73,22 @@ export async function buildServer() {
   });
 
   app.get("/api/portfolio", async () => getPortfolioPayload());
+  app.get("/api/quick-flip", async () => getQuickFlipPayload());
+  app.post("/api/paper-trading/reset", async (request, reply) => {
+    z
+      .object({
+        confirmation: z.literal("CLEAR PAPER")
+      })
+      .parse(request.body);
+
+    const payload = clearPaperTradingDataPayload();
+    if (!payload.ok) {
+      reply.code(409);
+      return payload;
+    }
+
+    return payload;
+  });
   app.get("/api/analysis/requests", async () => getAnalysisHistoryPayload());
   app.get("/api/live-trade/decisions", async (request) => {
     const query = z

@@ -12,6 +12,8 @@ import {
 import { getBitcoinSnapshot } from "./external/cryptoService.js";
 import { resolveSportsContext } from "./external/sportsDataService.js";
 import { serverConfig } from "../config.js";
+import { parseJson } from "../utils/helpers.js";
+import type { AnalysisRequestRow } from "../types.js";
 
 type Topic = "markets" | "btc" | "scores" | "analysis" | "live-trade-decisions";
 // Cursor polling is the safety-net for the push-based refresh hook
@@ -32,6 +34,24 @@ function isClosedDatabaseError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   const code = "code" in error ? String((error as { code?: unknown }).code ?? "") : "";
   return code === "ERR_INVALID_STATE" || message.toLowerCase().includes("database is not open");
+}
+
+function mapAnalysisRequest(row: AnalysisRequestRow) {
+  return {
+    requestId: row.request_id,
+    targetType: row.target_type,
+    targetId: row.target_id,
+    status: row.status,
+    requestedAt: row.requested_at,
+    completedAt: row.completed_at,
+    provider: row.provider,
+    model: row.model,
+    costUsd: row.cost_usd,
+    sources: parseJson<string[]>(row.sources_json, []),
+    context: parseJson<Record<string, unknown> | null>(row.context_json, null),
+    response: parseJson<Record<string, unknown> | null>(row.response_json, null),
+    error: row.error
+  };
 }
 
 class LiveStreamHub {
@@ -141,7 +161,7 @@ class LiveStreamHub {
     };
 
     const refreshAnalysis = () => {
-      this.publish("analysis", listAnalysisRequests(20));
+      this.publish("analysis", listAnalysisRequests(20).map(mapAnalysisRequest));
     };
 
     this.runRefresh(refreshMarkets);

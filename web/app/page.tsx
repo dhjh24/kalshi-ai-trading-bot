@@ -3,15 +3,87 @@ import { AnalysisResultCard } from "../components/analysis-result-card";
 import { LiveBtcStrip } from "../components/live-btc-strip";
 import { LiveScoresStrip } from "../components/live-scores-strip";
 import { MarketTable } from "../components/market-table";
+import { RuntimeModePanel } from "../components/runtime-mode-panel";
 import { Panel, StatCard } from "../components/ui";
-import { getOverview } from "../lib/api";
+import {
+  DashboardApiError,
+  getOverview,
+  isNextDynamicServerUsageError
+} from "../lib/api";
 import { formatMoney } from "../lib/format";
+import type { OverviewPayload } from "../lib/types";
+
+const EMPTY_OVERVIEW: OverviewPayload = {
+  metrics: {
+    activePositions: 0,
+    realizedPnl: 0,
+    todayAiCost: 0,
+    totalTrades: 0,
+    openExposure: 0
+  },
+  positions: [],
+  trades: [],
+  rankedMarkets: [],
+  liveBtc: null,
+  liveScores: [],
+  recentAnalysis: []
+};
+
+function summarizeOverviewError(error: unknown): string {
+  if (error instanceof DashboardApiError) {
+    if (error.status !== undefined) {
+      const statusText = error.statusText ? ` ${error.statusText}` : "";
+      return `Dashboard API returned ${error.status}${statusText}.`;
+    }
+
+    return "Dashboard API could not be reached.";
+  }
+
+  return "Overview data could not be loaded.";
+}
+
+async function loadOverview(): Promise<{
+  overview: OverviewPayload;
+  error: string | null;
+}> {
+  try {
+    return {
+      overview: await getOverview(),
+      error: null
+    };
+  } catch (error) {
+    if (isNextDynamicServerUsageError(error)) {
+      throw error;
+    }
+
+    console.error("Failed to load dashboard overview", error);
+
+    return {
+      overview: EMPTY_OVERVIEW,
+      error: summarizeOverviewError(error)
+    };
+  }
+}
 
 export default async function HomePage() {
-  const overview = await getOverview();
+  const { overview, error } = await loadOverview();
 
   return (
     <div className="space-y-8">
+      {error ? (
+        <Panel
+          eyebrow="Dashboard API"
+          title="Overview data is temporarily unavailable"
+          className="border-rose-200 bg-rose-50/90"
+        >
+          <p className="max-w-3xl text-sm leading-6 text-rose-800">
+            {error} Showing an empty local fallback until the API responds.
+          </p>
+        </Panel>
+      ) : null}
+
+      <RuntimeModePanel source={overview} title="Configured trading mode" />
+
       <section className="grid gap-6 lg:grid-cols-[1.6fr_1fr]">
         <Panel eyebrow="Mission Control" title="Live market intelligence without rerun-based UI lag">
           <p className="max-w-2xl text-lg leading-8 text-slate-600">

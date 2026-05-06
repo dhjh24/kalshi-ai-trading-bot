@@ -14,6 +14,9 @@ import type {
   PortfolioDivergenceRollup,
   PortfolioModeSplit,
   PortfolioOrderDriftMetrics,
+  PaperTradingResetCounts,
+  QuickFlipMetrics,
+  QuickFlipOrderRow,
   PortfolioStrategyPnlBreakdown,
   PortfolioStrategyPnlRow,
   PositionRow,
@@ -992,6 +995,438 @@ export function getRecentTrades(limit = 25): TradeLogRow[] {
     )
       .all(limit)
   );
+}
+
+function qualifiedColumn(alias: string, column: string): string {
+  return alias ? `${alias}.${column}` : column;
+}
+
+function buildPaperPredicate(tableName: string, alias = ""): string {
+  if (!columnExists(tableName, "live")) {
+    return "1 = 1";
+  }
+
+  return `COALESCE(${qualifiedColumn(alias, "live")}, 0) = 0`;
+}
+
+function buildQuickFlipPredicate(tableName: string, alias = ""): string {
+  const conditions: string[] = [];
+
+  if (columnExists(tableName, "strategy")) {
+    conditions.push(
+      `LOWER(TRIM(COALESCE(CAST(${qualifiedColumn(alias, "strategy")} AS TEXT), ''))) IN ('quick_flip_scalping', 'quick_flip')`
+    );
+  }
+
+  if (columnExists(tableName, "rationale")) {
+    conditions.push(
+      `UPPER(COALESCE(CAST(${qualifiedColumn(alias, "rationale")} AS TEXT), '')) LIKE 'QUICK FLIP:%'`
+    );
+  }
+
+  return conditions.length > 0 ? `(${conditions.join(" OR ")})` : "0";
+}
+
+function buildQuickFlipDecisionPredicate(columns: Set<string>): string {
+  const conditions: string[] = [];
+
+  if (columns.has("strategy")) {
+    conditions.push(
+      "LOWER(TRIM(COALESCE(CAST(strategy AS TEXT), ''))) IN ('quick_flip_scalping', 'quick_flip')"
+    );
+  }
+
+  for (const column of ["rationale", "summary", "payload_json"]) {
+    if (columns.has(column)) {
+      conditions.push(`LOWER(COALESCE(CAST(${column} AS TEXT), '')) LIKE '%quick_flip%'`);
+    }
+  }
+
+  return conditions.length > 0 ? `(${conditions.join(" OR ")})` : "0";
+}
+
+function collectPaperMarketIds(): string[] {
+  const marketIds = new Set<string>();
+  const collect = (tableName: string, whereClause: string) => {
+    if (!tableExists(tableName) || !columnExists(tableName, "market_id")) {
+      return;
+    }
+
+    const rows = rowsAs<Array<{ market_id?: string | null }>>(
+      db
+        .prepare(
+          `
+            SELECT DISTINCT market_id
+            FROM ${tableName}
+            WHERE ${whereClause}
+              AND market_id IS NOT NULL
+              AND TRIM(CAST(market_id AS TEXT)) != ''
+          `
+        )
+        .all()
+    );
+
+    for (const row of rows) {
+      if (row.market_id) {
+        marketIds.add(row.market_id);
+      }
+    }
+  };
+
+  collect("positions", buildPaperPredicate("positions"));
+  collect("trade_logs", buildPaperPredicate("trade_logs"));
+  collect("simulated_orders", buildPaperPredicate("simulated_orders"));
+
+  return Array.from(marketIds);
+}
+
+function updateMarketPositionFlags(marketIds: string[]): void {
+  if (
+    marketIds.length === 0 ||
+    !tableExists("markets") ||
+    !tableExists("positions") ||
+    !columnExists("markets", "has_position")
+  ) {
+    return;
+  }
+
+  const openPredicate = columnExists("positions", "status") ? "p.status = 'open'" : "1 = 1";
+  const batchSize = 400;
+
+  for (let index = 0; index < marketIds.length; index += batchSize) {
+    const batch = marketIds.slice(index, index + batchSize);
+    const placeholders = batch.map(() => "?").join(", ");
+    db
+      .prepare(
+        `
+          UPDATE markets
+          SET has_position = CASE
+            WHEN EXISTS (
+              SELECT 1
+              FROM positions p
+              WHERE p.market_id = markets.market_id
+                AND ${openPredicate}
+            )
+            THEN 1
+            ELSE 0
+          END
+          WHERE market_id IN (${placeholders})
+        `
+      )
+      .run(...batch);
+  }
+}
+
+export function clearPaperTradingData(): {
+  clearedAt: string;
+  cleared: PaperTradingResetCounts;
+} {
+  const affectedMarketIds = collectPaperMarketIds();
+  const cleared: PaperTradingResetCounts = {
+    positions: 0,
+    tradeLogs: 0,
+    simulatedOrders: 0,
+    affectedMarkets: affectedMarketIds.length
+  };
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    if (tableExists("simulated_orders")) {
+      cleared.simulatedOrders = Number(
+        db
+          .prepare(`DELETE FROM simulated_orders WHERE ${buildPaperPredicate("simulated_orders")}`)
+          .run().changes
+      );
+    }
+
+    if (tableExists("positions")) {
+      cleared.positions = Number(
+        db
+          .prepare(`DELETE FROM positions WHERE ${buildPaperPredicate("positions")}`)
+          .run().changes
+      );
+    }
+
+    if (tableExists("trade_logs")) {
+      cleared.tradeLogs = Number(
+        db
+          .prepare(`DELETE FROM trade_logs WHERE ${buildPaperPredicate("trade_logs")}`)
+          .run().changes
+      );
+    }
+
+    updateMarketPositionFlags(affectedMarketIds);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+
+  return {
+    clearedAt: isoNow(),
+    cleared
+  };
+}
+
+export function listQuickFlipPositions(limit = 25): PositionRow[] {
+  if (!tableExists("positions")) {
+    return [];
+  }
+
+  const quickFlipPredicate = buildQuickFlipPredicate("positions");
+  const statusPredicate = columnExists("positions", "status") ? "status = 'open'" : "1 = 1";
+  const orderColumn = columnExists("positions", "timestamp") ? "timestamp" : "id";
+
+  return rowsAs<PositionRow[]>(
+    db
+      .prepare(
+        `
+          SELECT *
+          FROM positions
+          WHERE ${quickFlipPredicate}
+            AND ${statusPredicate}
+          ORDER BY ${orderColumn} DESC
+          LIMIT ?
+        `
+      )
+      .all(limit)
+  );
+}
+
+export function listQuickFlipTrades(limit = 50): TradeLogRow[] {
+  if (!tableExists("trade_logs")) {
+    return [];
+  }
+
+  const quickFlipPredicate = buildQuickFlipPredicate("trade_logs");
+  const orderColumn = columnExists("trade_logs", "exit_timestamp") ? "exit_timestamp" : "id";
+
+  return rowsAs<TradeLogRow[]>(
+    db
+      .prepare(
+        `
+          SELECT *
+          FROM trade_logs
+          WHERE ${quickFlipPredicate}
+          ORDER BY ${orderColumn} DESC
+          LIMIT ?
+        `
+      )
+      .all(limit)
+  );
+}
+
+export function listQuickFlipOrders(limit = 50): QuickFlipOrderRow[] {
+  if (!tableExists("simulated_orders")) {
+    return [];
+  }
+
+  const quickFlipPredicate = buildQuickFlipPredicate("simulated_orders");
+  const orderColumn = columnExists("simulated_orders", "placed_at") ? "placed_at" : "id";
+
+  return rowsAs<QuickFlipOrderRow[]>(
+    db
+      .prepare(
+        `
+          SELECT *
+          FROM simulated_orders
+          WHERE ${quickFlipPredicate}
+          ORDER BY ${orderColumn} DESC
+          LIMIT ?
+        `
+      )
+      .all(limit)
+  );
+}
+
+export function listQuickFlipLiveTradeDecisions(limit = 20): LiveTradeDecisionRecord[] {
+  if (!hasLiveTradeDecisionTable()) {
+    return [];
+  }
+
+  const columns = new Set(getTableColumns("live_trade_decisions"));
+  const quickFlipPredicate = buildQuickFlipDecisionPredicate(columns);
+  const orderColumn = getLiveTradeDecisionOrderColumn(columns);
+
+  const rows = rowsAs<SqlRow[]>(
+    db
+      .prepare(
+        `
+          SELECT rowid AS __rowid, *
+          FROM live_trade_decisions
+          WHERE ${quickFlipPredicate}
+          ORDER BY ${orderColumn} DESC, __rowid DESC
+          LIMIT ?
+        `
+      )
+      .all(limit)
+  );
+
+  return rows.map((row) => normalizeLiveTradeDecision(row));
+}
+
+export function getQuickFlipMetrics(): QuickFlipMetrics {
+  const metrics: QuickFlipMetrics = {
+    openPositions: 0,
+    paperOpenPositions: 0,
+    liveOpenPositions: 0,
+    openExposure: 0,
+    paperOpenExposure: 0,
+    liveOpenExposure: 0,
+    restingOrders: 0,
+    filledOrders24h: 0,
+    cancelledOrders24h: 0,
+    closedTrades24h: 0,
+    closedTrades7d: 0,
+    realizedPnl24h: 0,
+    realizedPnl7d: 0,
+    lifetimeTrades: 0,
+    lifetimeRealizedPnl: 0,
+    avgPnlPerTrade: 0,
+    winRatePct: 0,
+    latestTradeAt: null,
+    latestOrderAt: null
+  };
+
+  if (tableExists("positions")) {
+    const quickFlipPredicate = buildQuickFlipPredicate("positions");
+    const statusPredicate = columnExists("positions", "status") ? "status = 'open'" : "1 = 1";
+    const liveExpression = columnExists("positions", "live") ? "COALESCE(live, 0)" : "0";
+    const row = db
+      .prepare(
+        `
+          SELECT
+            COUNT(*) AS open_positions,
+            COALESCE(SUM(entry_price * quantity), 0) AS open_exposure,
+            COALESCE(SUM(CASE WHEN ${liveExpression} = 0 THEN 1 ELSE 0 END), 0) AS paper_open_positions,
+            COALESCE(SUM(CASE WHEN ${liveExpression} = 1 THEN 1 ELSE 0 END), 0) AS live_open_positions,
+            COALESCE(SUM(CASE WHEN ${liveExpression} = 0 THEN entry_price * quantity ELSE 0 END), 0) AS paper_open_exposure,
+            COALESCE(SUM(CASE WHEN ${liveExpression} = 1 THEN entry_price * quantity ELSE 0 END), 0) AS live_open_exposure
+          FROM positions
+          WHERE ${quickFlipPredicate}
+            AND ${statusPredicate}
+        `
+      )
+      .get() as
+      | {
+          open_positions?: number;
+          open_exposure?: number;
+          paper_open_positions?: number;
+          live_open_positions?: number;
+          paper_open_exposure?: number;
+          live_open_exposure?: number;
+        }
+      | undefined;
+
+    metrics.openPositions = toCount(row?.open_positions);
+    metrics.openExposure = toNumber(row?.open_exposure);
+    metrics.paperOpenPositions = toCount(row?.paper_open_positions);
+    metrics.liveOpenPositions = toCount(row?.live_open_positions);
+    metrics.paperOpenExposure = toNumber(row?.paper_open_exposure);
+    metrics.liveOpenExposure = toNumber(row?.live_open_exposure);
+  }
+
+  if (tableExists("trade_logs")) {
+    const quickFlipPredicate = buildQuickFlipPredicate("trade_logs");
+    const hasExitTimestamp = columnExists("trade_logs", "exit_timestamp");
+    const closed24hPredicate = hasExitTimestamp ? "julianday(exit_timestamp) >= julianday('now', ?)" : "0";
+    const closed7dPredicate = hasExitTimestamp ? "julianday(exit_timestamp) >= julianday('now', ?)" : "0";
+    const latestTradeAtExpression = hasExitTimestamp ? "MAX(exit_timestamp)" : "NULL";
+    const queryParams = hasExitTimestamp
+      ? ["-1 day", "-1 day", "-7 day", "-7 day"]
+      : [];
+    const row = db
+      .prepare(
+        `
+          SELECT
+            COUNT(*) AS lifetime_trades,
+            COALESCE(SUM(COALESCE(pnl, 0)), 0) AS lifetime_pnl,
+            COALESCE(AVG(COALESCE(pnl, 0)), 0) AS avg_pnl,
+            COALESCE(SUM(CASE WHEN COALESCE(pnl, 0) > 0 THEN 1 ELSE 0 END), 0) AS winning_trades,
+            COALESCE(SUM(CASE WHEN ${closed24hPredicate} THEN 1 ELSE 0 END), 0) AS closed_trades_24h,
+            COALESCE(SUM(CASE WHEN ${closed24hPredicate} THEN COALESCE(pnl, 0) ELSE 0 END), 0) AS pnl_24h,
+            COALESCE(SUM(CASE WHEN ${closed7dPredicate} THEN 1 ELSE 0 END), 0) AS closed_trades_7d,
+            COALESCE(SUM(CASE WHEN ${closed7dPredicate} THEN COALESCE(pnl, 0) ELSE 0 END), 0) AS pnl_7d,
+            ${latestTradeAtExpression} AS latest_trade_at
+          FROM trade_logs
+          WHERE ${quickFlipPredicate}
+        `
+      )
+      .get(...queryParams) as
+      | {
+          lifetime_trades?: number;
+          lifetime_pnl?: number;
+          avg_pnl?: number;
+          winning_trades?: number;
+          closed_trades_24h?: number;
+          pnl_24h?: number;
+          closed_trades_7d?: number;
+          pnl_7d?: number;
+          latest_trade_at?: string | null;
+        }
+      | undefined;
+
+    metrics.lifetimeTrades = toCount(row?.lifetime_trades);
+    metrics.lifetimeRealizedPnl = toNumber(row?.lifetime_pnl);
+    metrics.avgPnlPerTrade = toNumber(row?.avg_pnl, 4);
+    metrics.closedTrades24h = toCount(row?.closed_trades_24h);
+    metrics.closedTrades7d = toCount(row?.closed_trades_7d);
+    metrics.realizedPnl24h = toNumber(row?.pnl_24h);
+    metrics.realizedPnl7d = toNumber(row?.pnl_7d);
+    metrics.latestTradeAt = row?.latest_trade_at ?? null;
+    metrics.winRatePct =
+      metrics.lifetimeTrades > 0
+        ? toNumber((toCount(row?.winning_trades) / metrics.lifetimeTrades) * 100, 1)
+        : 0;
+  }
+
+  if (tableExists("simulated_orders")) {
+    const quickFlipPredicate = buildQuickFlipPredicate("simulated_orders");
+    const hasStatus = columnExists("simulated_orders", "status");
+    const hasPlacedAt = columnExists("simulated_orders", "placed_at");
+    const hasFilledAt = columnExists("simulated_orders", "filled_at");
+    const restingPredicate = hasStatus ? "status = 'resting'" : "0";
+    const filled24hPredicate =
+      hasStatus && hasFilledAt
+        ? "status = 'filled' AND filled_at IS NOT NULL AND julianday(filled_at) >= julianday('now', ?)"
+        : "0";
+    const cancelled24hPredicate =
+      hasStatus && hasPlacedAt
+        ? "status = 'cancelled' AND julianday(placed_at) >= julianday('now', ?)"
+        : "0";
+    const latestOrderAtExpression = hasPlacedAt ? "MAX(placed_at)" : "NULL";
+    const queryParams = [
+      ...(hasStatus && hasFilledAt ? ["-1 day"] : []),
+      ...(hasStatus && hasPlacedAt ? ["-1 day"] : [])
+    ];
+    const row = db
+      .prepare(
+        `
+          SELECT
+            COALESCE(SUM(CASE WHEN ${restingPredicate} THEN 1 ELSE 0 END), 0) AS resting_orders,
+            COALESCE(SUM(CASE WHEN ${filled24hPredicate} THEN 1 ELSE 0 END), 0) AS filled_orders_24h,
+            COALESCE(SUM(CASE WHEN ${cancelled24hPredicate} THEN 1 ELSE 0 END), 0) AS cancelled_orders_24h,
+            ${latestOrderAtExpression} AS latest_order_at
+          FROM simulated_orders
+          WHERE ${quickFlipPredicate}
+        `
+      )
+      .get(...queryParams) as
+      | {
+          resting_orders?: number;
+          filled_orders_24h?: number;
+          cancelled_orders_24h?: number;
+          latest_order_at?: string | null;
+        }
+      | undefined;
+
+    metrics.restingOrders = toCount(row?.resting_orders);
+    metrics.filledOrders24h = toCount(row?.filled_orders_24h);
+    metrics.cancelledOrders24h = toCount(row?.cancelled_orders_24h);
+    metrics.latestOrderAt = row?.latest_order_at ?? null;
+  }
+
+  return metrics;
 }
 
 export function getDailyAiCost(): number {

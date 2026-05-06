@@ -6,12 +6,15 @@ import { fileURLToPath } from "node:url";
 
 const mode = process.argv[2] === "start" ? "start" : "dev";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const concurrentlyExecutable = path.join(
+const concurrentlyScript = path.join(
   repoRoot,
   "node_modules",
-  ".bin",
-  process.platform === "win32" ? "concurrently.cmd" : "concurrently"
+  "concurrently",
+  "dist",
+  "bin",
+  "concurrently.js"
 );
+const PORT_SCAN_LIMIT = 20;
 
 function parsePort(rawValue, fallback, label) {
   const parsed = Number(rawValue ?? fallback);
@@ -23,6 +26,10 @@ function parsePort(rawValue, fallback, label) {
 
 function toPublicHost(host) {
   return host === "0.0.0.0" ? "127.0.0.1" : host;
+}
+
+function envIsSet(name) {
+  return process.env[name] !== undefined && process.env[name] !== "";
 }
 
 function checkPortAvailability(host, port) {
@@ -46,53 +53,77 @@ function checkPortAvailability(host, port) {
   });
 }
 
+async function findAvailablePort(host, startPort) {
+  const lastPort = Math.min(65535, startPort + PORT_SCAN_LIMIT);
+
+  for (let port = startPort; port <= lastPort; port += 1) {
+    try {
+      await checkPortAvailability(host, port);
+      return port;
+    } catch {
+      // Keep scanning nearby ports.
+    }
+  }
+
+  return null;
+}
+
+async function endpointIsHealthy(url) {
+  try {
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(2000)
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
 async function main() {
-  if (!fs.existsSync(concurrentlyExecutable)) {
+  if (!fs.existsSync(concurrentlyScript)) {
     console.error("Missing local dashboard dependencies. Run `npm install` first.");
     process.exit(1);
   }
 
   const bridgeHost = process.env.DASHBOARD_BRIDGE_HOST || "127.0.0.1";
-  const bridgePort = parsePort(
+  let bridgePort = parsePort(
     process.env.DASHBOARD_BRIDGE_PORT,
     8101,
     "DASHBOARD_BRIDGE_PORT"
   );
   const serverHost = process.env.DASHBOARD_SERVER_HOST || "127.0.0.1";
-  const serverPort = parsePort(
+  let serverPort = parsePort(
     process.env.DASHBOARD_SERVER_PORT,
     4000,
     "DASHBOARD_SERVER_PORT"
   );
-  const webPort = parsePort(
+  let webPort = parsePort(
     process.env.DASHBOARD_WEB_PORT,
     3000,
     "DASHBOARD_WEB_PORT"
   );
-
-  const localBridgeUrl = `http://${toPublicHost(bridgeHost)}:${bridgePort}`;
-  const dashboardApiUrl = `http://${toPublicHost(serverHost)}:${serverPort}`;
-  const analysisBridgeUrl =
-    process.env.ANALYSIS_BRIDGE_URL || localBridgeUrl;
 
   const services = [
     {
       name: "Python bridge",
       host: bridgeHost,
       port: bridgePort,
-      envVar: "DASHBOARD_BRIDGE_PORT"
+      envVar: "DASHBOARD_BRIDGE_PORT",
+      configured: envIsSet("DASHBOARD_BRIDGE_PORT")
     },
     {
       name: "Fastify API",
       host: serverHost,
       port: serverPort,
-      envVar: "DASHBOARD_SERVER_PORT"
+      envVar: "DASHBOARD_SERVER_PORT",
+      configured: envIsSet("DASHBOARD_SERVER_PORT")
     },
     {
       name: "Next.js web app",
       host: "0.0.0.0",
       port: webPort,
-      envVar: "DASHBOARD_WEB_PORT"
+      envVar: "DASHBOARD_WEB_PORT",
+      configured: envIsSet("DASHBOARD_WEB_PORT")
     }
   ];
 
@@ -107,16 +138,83 @@ async function main() {
   }
 
   if (portFailures.length > 0) {
-    console.error("Dashboard startup check failed:");
-    for (const { service, error } of portFailures) {
-      const detail = error?.code || error?.message || "unknown error";
-      console.error(
-        `- ${service.name}: ${service.host}:${service.port} is unavailable (${detail}). ` +
-          `Set ${service.envVar} to another port or stop the process already using it.`
-      );
+    const preferredBridgeUrl = `http://${toPublicHost(bridgeHost)}:${bridgePort}`;
+    const preferredApiUrl = `http://${toPublicHost(serverHost)}:${serverPort}`;
+    const preferredWebUrl = `http://127.0.0.1:${webPort}`;
+    const existingStackHealth = [
+      {
+        name: "Python bridge",
+        url: `${preferredBridgeUrl}/health`,
+        healthy: await endpointIsHealthy(`${preferredBridgeUrl}/health`)
+      },
+      {
+        name: "Fastify API",
+        url: `${preferredApiUrl}/api/dashboard/overview`,
+        healthy: await endpointIsHealthy(`${preferredApiUrl}/api/dashboard/overview`)
+      },
+      {
+        name: "Next.js web app",
+        url: preferredWebUrl,
+        healthy: await endpointIsHealthy(preferredWebUrl)
+      }
+    ];
+
+    if (existingStackHealth.every((check) => check.healthy)) {
+      console.log("Dashboard stack is already running.");
+      console.log(`- Web app: ${preferredWebUrl}`);
+      console.log(`- Fastify API: ${preferredApiUrl}`);
+      console.log(`- Python bridge: ${preferredBridgeUrl}`);
+      process.exitCode = 0;
+      return;
     }
-    process.exit(1);
+
+    const unresolvedFailures = [];
+    for (const failure of portFailures) {
+      const { service } = failure;
+      if (service.configured) {
+        unresolvedFailures.push(failure);
+        continue;
+      }
+
+      const fallbackPort = await findAvailablePort(service.host, service.port + 1);
+      if (fallbackPort === null) {
+        unresolvedFailures.push(failure);
+        continue;
+      }
+
+      console.warn(
+        `${service.name}: ${service.host}:${service.port} is unavailable; ` +
+          `using ${service.envVar}=${fallbackPort} for this run.`
+      );
+      service.port = fallbackPort;
+    }
+
+    if (unresolvedFailures.length === 0) {
+      bridgePort = services[0].port;
+      serverPort = services[1].port;
+      webPort = services[2].port;
+    } else {
+      console.error("Dashboard startup check failed:");
+      console.error("Health checks did not find a complete running dashboard stack:");
+      for (const check of existingStackHealth) {
+        console.error(`- ${check.name}: ${check.healthy ? "healthy" : "not responding"} (${check.url})`);
+      }
+      for (const { service, error } of unresolvedFailures) {
+        const detail = error?.code || error?.message || "unknown error";
+        console.error(
+          `- ${service.name}: ${service.host}:${service.port} is unavailable (${detail}). ` +
+            `Set ${service.envVar} to another port or stop the process already using it.`
+        );
+      }
+      process.exit(1);
+    }
   }
+
+  const localBridgeUrl = `http://${toPublicHost(bridgeHost)}:${bridgePort}`;
+  const dashboardApiUrl = `http://${toPublicHost(serverHost)}:${serverPort}`;
+  const dashboardWebUrl = `http://127.0.0.1:${webPort}`;
+  const analysisBridgeUrl =
+    process.env.ANALYSIS_BRIDGE_URL || localBridgeUrl;
 
   const bridgeCommand = [
     "python",
@@ -141,7 +239,7 @@ async function main() {
     `npm run ${mode} --workspace web`
   ];
 
-  const child = spawn(concurrentlyExecutable, concurrentlyArgs, {
+  const child = spawn(process.execPath, [concurrentlyScript, ...concurrentlyArgs], {
     cwd: repoRoot,
     stdio: "inherit",
     env: {

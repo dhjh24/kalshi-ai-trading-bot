@@ -67,6 +67,25 @@ export interface TradeLogRow {
   contracts_cost?: number;
 }
 
+export interface QuickFlipOrderRow {
+  id: number;
+  strategy: string;
+  market_id: string;
+  side: string;
+  action: string;
+  price: number;
+  quantity: number;
+  status: string;
+  live?: number;
+  order_id: string | null;
+  placed_at: string;
+  filled_at: string | null;
+  filled_price: number | null;
+  expected_profit: number | null;
+  target_price: number | null;
+  position_id: number | null;
+}
+
 export interface AnalysisRequestRow {
   request_id: string;
   target_type: AnalysisTargetType;
@@ -266,6 +285,7 @@ export interface OverviewPayload {
     totalTrades: number;
     openExposure: number;
   };
+  runtime?: RuntimeModeVisibility | null;
   positions: PositionRow[];
   trades: TradeLogRow[];
   rankedMarkets: MarketRow[];
@@ -464,6 +484,87 @@ export interface PortfolioPayload {
   divergence: PortfolioDivergenceMetrics;
   strategyPnl: PortfolioStrategyPnlBreakdown;
   aiSpend: PortfolioAiSpendMetrics;
+}
+
+export interface PaperTradingResetCounts {
+  positions: number;
+  tradeLogs: number;
+  simulatedOrders: number;
+  affectedMarkets: number;
+}
+
+export interface PaperTradingResetPayload {
+  ok: boolean;
+  generatedAt: string;
+  runtime: RuntimeModeVisibility;
+  message: string;
+  cleared: PaperTradingResetCounts;
+}
+
+export interface QuickFlipConfigVisibility {
+  enabled: boolean | null;
+  liveEnabled: boolean | null;
+  disableAi: boolean | null;
+  allocation: number;
+  minEntryPrice: number;
+  maxEntryPrice: number;
+  minProfitMargin: number;
+  maxPositionSize: number;
+  maxConcurrentPositions: number;
+  capitalPerTrade: number;
+  dailyLossBudgetPct: number;
+  maxOpenPositions: number;
+  maxTradesPerHour: number;
+  confidenceThreshold: number;
+  maxHoldMinutes: number;
+  minMarketVolume: number;
+  maxHoursToExpiry: number;
+  maxBidAskSpread: number;
+  minTopOfBookSize: number;
+  minNetProfit: number;
+  minNetRoi: number;
+  recentTradeWindowSeconds: number;
+  minRecentTradeCount: number;
+  makerEntryTimeoutSeconds: number;
+  makerEntryRepriceSeconds: number;
+  dynamicExitRepriceSeconds: number;
+  stopLossPct: number;
+}
+
+export interface QuickFlipMetrics {
+  openPositions: number;
+  paperOpenPositions: number;
+  liveOpenPositions: number;
+  openExposure: number;
+  paperOpenExposure: number;
+  liveOpenExposure: number;
+  restingOrders: number;
+  filledOrders24h: number;
+  cancelledOrders24h: number;
+  closedTrades24h: number;
+  closedTrades7d: number;
+  realizedPnl24h: number;
+  realizedPnl7d: number;
+  lifetimeTrades: number;
+  lifetimeRealizedPnl: number;
+  avgPnlPerTrade: number;
+  winRatePct: number;
+  latestTradeAt: string | null;
+  latestOrderAt: string | null;
+}
+
+export interface QuickFlipPayload {
+  generatedAt: string;
+  runtime: RuntimeModeVisibility;
+  config: QuickFlipConfigVisibility;
+  metrics: QuickFlipMetrics;
+  positions: PositionRow[];
+  trades: TradeLogRow[];
+  orders: QuickFlipOrderRow[];
+  decisions: {
+    available: boolean;
+    items: LiveTradeDecisionRecord[];
+  };
 }
 
 export interface LiveTradeDecisionMetrics {

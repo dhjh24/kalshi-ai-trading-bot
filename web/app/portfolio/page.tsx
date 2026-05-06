@@ -1,4 +1,5 @@
 import { RuntimeModePanel } from "../../components/runtime-mode-panel";
+import { PaperTradingResetControls } from "../../components/paper-trading-reset-controls";
 import { EmptyState, Panel, StatCard } from "../../components/ui";
 import { getPortfolio } from "../../lib/api";
 import { formatMoney, formatTimestamp } from "../../lib/format";
@@ -779,6 +780,10 @@ export default async function PortfolioPage() {
       </Panel>
 
       <RuntimeModePanel source={payload} title="Configured trading mode" />
+
+      <Panel title="Paper testing reset">
+        <PaperTradingResetControls runtime={payload.runtime} />
+      </Panel>
 
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         <StatCard

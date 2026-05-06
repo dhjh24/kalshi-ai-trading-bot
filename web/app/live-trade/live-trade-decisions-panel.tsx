@@ -78,6 +78,15 @@ function formatAgeSeconds(value: number | null): string {
   return `${hours}h old`;
 }
 
+function getStableInitialNow(timestamp: string | null | undefined): number {
+  if (!timestamp) {
+    return 0;
+  }
+
+  const parsed = Date.parse(timestamp);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 function formatConfidence(value: number | null): string {
   if (value === null || value === undefined) {
     return "n/a";
@@ -523,7 +532,9 @@ export function LiveTradeDecisionsPanel({
 }) {
   const [activeFilter, setActiveFilter] = useState<DecisionFilter>("all");
   const [query, setQuery] = useState("");
-  const [now, setNow] = useState(() => Date.now());
+  const [now, setNow] = useState(() =>
+    getStableInitialNow(initialFeed.generatedAt)
+  );
   const deferredQuery = useDeferredValue(query);
 
   const fetchFallback = useCallback(

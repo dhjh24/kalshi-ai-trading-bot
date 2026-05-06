@@ -1,5 +1,6 @@
 import { serverConfig } from "../config.js";
 import {
+  clearPaperTradingData,
   getDailyAiCost,
   getLiveTradeDecisionById,
   getLiveTradeDecisionFeedbackByDecisionId,
@@ -15,6 +16,7 @@ import {
   getPortfolioOrderDriftMetrics,
   getPortfolioStrategyPnlBreakdown,
   getPortfolioTradeDivergenceRollup,
+  getQuickFlipMetrics,
   getRealizedPnl,
   getRecentTrades,
   getTotalTrades,
@@ -25,6 +27,10 @@ import {
   listAnalysisRequests,
   listLiveTradeDecisionFeedbackByDecisionIds,
   listLiveTradeDecisions,
+  listQuickFlipLiveTradeDecisions,
+  listQuickFlipOrders,
+  listQuickFlipPositions,
+  listQuickFlipTrades,
   listMarkets,
   listMarketsByCategory,
   upsertLiveTradeDecisionFeedback,
@@ -43,7 +49,10 @@ import type {
   LiveTradePayload,
   MarketRow,
   OverviewPayload,
+  PaperTradingResetPayload,
   PortfolioPayload,
+  QuickFlipConfigVisibility,
+  QuickFlipPayload,
   RuntimeModeVisibility,
   SportsContext
 } from "../types.js";
@@ -112,6 +121,7 @@ export async function getOverviewPayload(): Promise<OverviewPayload> {
   const positions = getOpenPositions();
   const trades = getRecentTrades(10);
   const rankedMarkets = listMarkets({ limit: 12 });
+  const runtimeState = hasLiveTradeRuntimeStateTable() ? getLiveTradeRuntimeState() : null;
   const exposure = positions.reduce(
     (sum, position) => sum + position.entry_price * position.quantity,
     0
@@ -156,6 +166,7 @@ export async function getOverviewPayload(): Promise<OverviewPayload> {
       totalTrades: getTotalTrades(),
       openExposure: Number(exposure.toFixed(2))
     },
+    runtime: getLiveTradeRuntimeVisibility(runtimeState),
     positions,
     trades,
     rankedMarkets,
@@ -224,6 +235,16 @@ function parseEnvBoolean(value: string | undefined): boolean | null {
     return false;
   }
   return null;
+}
+
+function parseEnvNumber(name: string, fallback: number): number {
+  const value = process.env[name];
+  if (!value) {
+    return fallback;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 function heartbeatStatusFromTimestamp(
@@ -441,6 +462,88 @@ function getLiveTradeRuntimeVisibility(
     latestExecutionAt: runtimeState?.latestExecutionAt ?? null,
     latestExecutionStatus: runtimeState?.latestExecutionStatus ?? null,
     error: runtimeState?.error ?? null
+  };
+}
+
+function getQuickFlipConfigVisibility(): QuickFlipConfigVisibility {
+  return {
+    enabled: parseEnvBoolean(process.env.ENABLE_QUICK_FLIP),
+    liveEnabled: parseEnvBoolean(process.env.ENABLE_LIVE_QUICK_FLIP),
+    disableAi: parseEnvBoolean(process.env.QUICK_FLIP_DISABLE_AI),
+    allocation: parseEnvNumber("QUICK_FLIP_ALLOCATION", 0),
+    minEntryPrice: parseEnvNumber("QUICK_FLIP_MIN_ENTRY_PRICE", 0.01),
+    maxEntryPrice: parseEnvNumber("QUICK_FLIP_MAX_ENTRY_PRICE", 0.2),
+    minProfitMargin: parseEnvNumber("QUICK_FLIP_MIN_PROFIT_MARGIN", 0.1),
+    maxPositionSize: parseEnvNumber("QUICK_FLIP_MAX_POSITION_SIZE", 100),
+    maxConcurrentPositions: parseEnvNumber("QUICK_FLIP_MAX_CONCURRENT_POSITIONS", 50),
+    capitalPerTrade: parseEnvNumber("QUICK_FLIP_CAPITAL_PER_TRADE", 50),
+    dailyLossBudgetPct: parseEnvNumber("QUICK_FLIP_DAILY_LOSS_BUDGET_PCT", 0.05),
+    maxOpenPositions: parseEnvNumber("QUICK_FLIP_MAX_OPEN_POSITIONS", 10),
+    maxTradesPerHour: parseEnvNumber("QUICK_FLIP_MAX_TRADES_PER_HOUR", 60),
+    confidenceThreshold: parseEnvNumber("QUICK_FLIP_CONFIDENCE_THRESHOLD", 0.6),
+    maxHoldMinutes: parseEnvNumber("QUICK_FLIP_MAX_HOLD_MINUTES", 30),
+    minMarketVolume: parseEnvNumber("QUICK_FLIP_MIN_MARKET_VOLUME", 2000),
+    maxHoursToExpiry: parseEnvNumber("QUICK_FLIP_MAX_HOURS_TO_EXPIRY", 72),
+    maxBidAskSpread: parseEnvNumber("QUICK_FLIP_MAX_BID_ASK_SPREAD", 0.03),
+    minTopOfBookSize: parseEnvNumber("QUICK_FLIP_MIN_TOP_OF_BOOK_SIZE", 25),
+    minNetProfit: parseEnvNumber("QUICK_FLIP_MIN_NET_PROFIT", 0.1),
+    minNetRoi: parseEnvNumber("QUICK_FLIP_MIN_NET_ROI", 0.03),
+    recentTradeWindowSeconds: parseEnvNumber("QUICK_FLIP_RECENT_TRADE_WINDOW_SECONDS", 3600),
+    minRecentTradeCount: parseEnvNumber("QUICK_FLIP_MIN_RECENT_TRADE_COUNT", 5),
+    makerEntryTimeoutSeconds: parseEnvNumber("QUICK_FLIP_MAKER_ENTRY_TIMEOUT_SECONDS", 180),
+    makerEntryRepriceSeconds: parseEnvNumber("QUICK_FLIP_MAKER_ENTRY_REPRICE_SECONDS", 30),
+    dynamicExitRepriceSeconds: parseEnvNumber("QUICK_FLIP_DYNAMIC_EXIT_REPRICE_SECONDS", 60),
+    stopLossPct: parseEnvNumber("QUICK_FLIP_STOP_LOSS_PCT", 0.08)
+  };
+}
+
+export function clearPaperTradingDataPayload(): PaperTradingResetPayload {
+  const runtimeState = hasLiveTradeRuntimeStateTable() ? getLiveTradeRuntimeState() : null;
+  const runtime = getLiveTradeRuntimeVisibility(runtimeState);
+  const generatedAt = new Date().toISOString();
+  const emptyCleared = {
+    positions: 0,
+    tradeLogs: 0,
+    simulatedOrders: 0,
+    affectedMarkets: 0
+  };
+
+  if (runtime.paper !== true || runtime.live === true) {
+    return {
+      ok: false,
+      generatedAt,
+      runtime,
+      message: "Paper data was not cleared because the dashboard-visible runtime is not in paper mode.",
+      cleared: emptyCleared
+    };
+  }
+
+  const reset = clearPaperTradingData();
+  return {
+    ok: true,
+    generatedAt: reset.clearedAt,
+    runtime,
+    message: "Paper positions, simulated orders, and paper P&L rows were cleared.",
+    cleared: reset.cleared
+  };
+}
+
+export function getQuickFlipPayload(): QuickFlipPayload {
+  const runtimeState = hasLiveTradeRuntimeStateTable() ? getLiveTradeRuntimeState() : null;
+  const decisions = attachLiveTradeDecisionFeedback(listQuickFlipLiveTradeDecisions(20));
+
+  return {
+    generatedAt: new Date().toISOString(),
+    runtime: getLiveTradeRuntimeVisibility(runtimeState),
+    config: getQuickFlipConfigVisibility(),
+    metrics: getQuickFlipMetrics(),
+    positions: listQuickFlipPositions(40),
+    trades: listQuickFlipTrades(50),
+    orders: listQuickFlipOrders(50),
+    decisions: {
+      available: hasLiveTradeDecisionTable(),
+      items: decisions
+    }
   };
 }
 

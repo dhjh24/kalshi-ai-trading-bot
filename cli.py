@@ -704,13 +704,32 @@ def cmd_dashboard(args: argparse.Namespace) -> None:
     import shutil
 
     repo_root = Path(__file__).parent
+    node_executable = shutil.which("node") or shutil.which("node.exe")
     npm_executable = shutil.which("npm") or shutil.which("npm.cmd")
     root_package = repo_root / "package.json"
+    node_dashboard_runner = repo_root / "scripts" / "run-dashboard-stack.mjs"
 
-    if npm_executable and root_package.exists():
-        print("Launching Node dashboard stack...")
-        print("This starts the Python analysis bridge, Fastify API, and Next.js web app.")
-        subprocess.run([npm_executable, "run", "dashboard"], check=False, cwd=repo_root)
+    if root_package.exists() and (node_executable or npm_executable):
+        print("Launching Node dashboard stack...", flush=True)
+        print(
+            "This starts the Python analysis bridge, Fastify API, and Next.js web app.",
+            flush=True,
+        )
+        try:
+            if node_executable and node_dashboard_runner.exists():
+                subprocess.run(
+                    [node_executable, str(node_dashboard_runner), "dev"],
+                    check=False,
+                    cwd=repo_root,
+                )
+            else:
+                subprocess.run(
+                    [npm_executable, "run", "dashboard"],
+                    check=False,
+                    cwd=repo_root,
+                )
+        except KeyboardInterrupt:
+            print("\nDashboard stopped by user.")
         return
 
     # Legacy fallback only when the Node dashboard workspace is unavailable.

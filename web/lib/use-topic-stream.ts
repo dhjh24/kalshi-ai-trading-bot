@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createStreamUrl } from "./api";
 
 type TopicSubscriber = (payload: unknown) => void;
@@ -49,12 +49,19 @@ export function useTopicStream<T>(
   projector?: (payload: unknown, previous: T) => T
 ) {
   const [value, setValue] = useState<T>(initialValue);
+  const projectorRef = useRef(projector);
+
+  useEffect(() => {
+    projectorRef.current = projector;
+  }, [projector]);
 
   useEffect(() => {
     const connection = getTopicConnection(topic);
     const subscriber = (payload: unknown) => {
       setValue((previous) =>
-        projector ? projector(payload, previous) : (payload as T)
+        projectorRef.current
+          ? projectorRef.current(payload, previous)
+          : (payload as T)
       );
     };
 
@@ -68,7 +75,7 @@ export function useTopicStream<T>(
         topicConnections.delete(topic);
       }
     };
-  }, [projector, topic]);
+  }, [topic]);
 
   return value;
 }

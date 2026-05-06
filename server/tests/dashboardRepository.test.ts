@@ -642,6 +642,164 @@ describe("getPortfolioStrategyPnlBreakdown", () => {
   });
 });
 
+describe("clearPaperTradingData", () => {
+  it("deletes only non-live paper runtime rows and refreshes affected market flags", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "dashboard-repository-"));
+    const databasePath = path.join(tempDir, "dashboard.sqlite");
+    const scriptPath = path.join(tempDir, "paper-reset-check.mjs");
+    const repositoryUrl = pathToFileURL(
+      path.join(serverRoot, "src/repositories/dashboardRepository.ts")
+    ).href;
+    const dbUrl = pathToFileURL(path.join(serverRoot, "src/db.ts")).href;
+    tempDirs.push(tempDir);
+
+    writeFileSync(
+      scriptPath,
+      `
+        import { getDb } from ${JSON.stringify(dbUrl)};
+        import { clearPaperTradingData } from ${JSON.stringify(repositoryUrl)};
+
+        const db = getDb();
+
+        try {
+          db.exec(\`
+            CREATE TABLE markets (
+              market_id TEXT PRIMARY KEY,
+              title TEXT NOT NULL,
+              yes_price REAL NOT NULL,
+              no_price REAL NOT NULL,
+              volume INTEGER NOT NULL,
+              expiration_ts INTEGER NOT NULL,
+              category TEXT NOT NULL,
+              status TEXT NOT NULL,
+              last_updated TEXT NOT NULL,
+              has_position BOOLEAN NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE positions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              market_id TEXT NOT NULL,
+              side TEXT NOT NULL,
+              entry_price REAL NOT NULL,
+              quantity REAL NOT NULL,
+              timestamp TEXT NOT NULL,
+              rationale TEXT,
+              live BOOLEAN NOT NULL DEFAULT 0,
+              status TEXT DEFAULT 'open',
+              strategy TEXT
+            );
+
+            CREATE TABLE trade_logs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              market_id TEXT NOT NULL,
+              side TEXT NOT NULL,
+              entry_price REAL NOT NULL,
+              exit_price REAL NOT NULL,
+              quantity REAL NOT NULL,
+              pnl REAL NOT NULL,
+              entry_timestamp TEXT NOT NULL,
+              exit_timestamp TEXT NOT NULL,
+              rationale TEXT,
+              live BOOLEAN NOT NULL DEFAULT 0,
+              strategy TEXT
+            );
+
+            CREATE TABLE simulated_orders (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              strategy TEXT NOT NULL,
+              market_id TEXT NOT NULL,
+              side TEXT NOT NULL,
+              action TEXT NOT NULL,
+              price REAL NOT NULL,
+              quantity REAL NOT NULL,
+              status TEXT NOT NULL DEFAULT 'resting',
+              live BOOLEAN NOT NULL DEFAULT 0,
+              order_id TEXT,
+              placed_at TEXT NOT NULL,
+              filled_at TEXT,
+              filled_price REAL,
+              expected_profit REAL,
+              target_price REAL,
+              position_id INTEGER
+            );
+
+            INSERT INTO markets (
+              market_id, title, yes_price, no_price, volume, expiration_ts,
+              category, status, last_updated, has_position
+            )
+            VALUES
+              ('PAPER-OPEN', 'paper open', 0.40, 0.60, 1000, 2000000000, 'test', 'active', '2026-04-24T00:00:00Z', 1),
+              ('LIVE-OPEN', 'live open', 0.55, 0.45, 1000, 2000000000, 'test', 'active', '2026-04-24T00:00:00Z', 1),
+              ('PAPER-TRADE', 'paper trade', 0.30, 0.70, 1000, 2000000000, 'test', 'active', '2026-04-24T00:00:00Z', 1);
+
+            INSERT INTO positions (market_id, side, entry_price, quantity, timestamp, rationale, live, status, strategy)
+            VALUES
+              ('PAPER-OPEN', 'YES', 0.40, 10, '2026-04-24T00:00:00Z', 'paper', 0, 'open', 'quick_flip_scalping'),
+              ('LIVE-OPEN', 'YES', 0.55, 5, '2026-04-24T00:01:00Z', 'live', 1, 'open', 'quick_flip_scalping');
+
+            INSERT INTO trade_logs (
+              market_id, side, entry_price, exit_price, quantity, pnl,
+              entry_timestamp, exit_timestamp, rationale, live, strategy
+            )
+            VALUES
+              ('PAPER-TRADE', 'NO', 0.30, 0.20, 10, 1.25, '2026-04-24T01:00:00Z', '2026-04-24T02:00:00Z', 'paper', 0, 'quick_flip_scalping'),
+              ('LIVE-OPEN', 'YES', 0.50, 0.60, 5, 0.50, '2026-04-24T01:00:00Z', '2026-04-24T02:00:00Z', 'live', 1, 'quick_flip_scalping');
+
+            INSERT INTO simulated_orders (
+              strategy, market_id, side, action, price, quantity, status, live,
+              order_id, placed_at, target_price, position_id
+            )
+            VALUES
+              ('quick_flip_scalping', 'PAPER-OPEN', 'YES', 'sell', 0.45, 10, 'resting', 0, 'paper-order', '2026-04-24T03:00:00Z', 0.45, 1);
+          \`);
+
+          const reset = clearPaperTradingData();
+          const remaining = {
+            positions: db.prepare("SELECT COUNT(*) AS count FROM positions").get().count,
+            paperPositions: db.prepare("SELECT COUNT(*) AS count FROM positions WHERE live = 0").get().count,
+            livePositions: db.prepare("SELECT COUNT(*) AS count FROM positions WHERE live = 1").get().count,
+            tradeLogs: db.prepare("SELECT COUNT(*) AS count FROM trade_logs").get().count,
+            simulatedOrders: db.prepare("SELECT COUNT(*) AS count FROM simulated_orders").get().count,
+            paperMarketFlag: db.prepare("SELECT has_position FROM markets WHERE market_id = 'PAPER-OPEN'").get().has_position,
+            liveMarketFlag: db.prepare("SELECT has_position FROM markets WHERE market_id = 'LIVE-OPEN'").get().has_position
+          };
+
+          console.log(JSON.stringify({ reset, remaining }));
+        } finally {
+          db.close();
+        }
+      `
+    );
+
+    const result = JSON.parse(
+      execFileSync(process.execPath, ["--import", "tsx/esm", scriptPath], {
+        cwd: serverRoot,
+        env: {
+          ...process.env,
+          DB_PATH: databasePath
+        },
+        encoding: "utf8"
+      }).trim()
+    );
+
+    expect(result.reset.cleared).toEqual({
+      positions: 1,
+      tradeLogs: 1,
+      simulatedOrders: 1,
+      affectedMarkets: 2
+    });
+    expect(result.remaining).toEqual({
+      positions: 1,
+      paperPositions: 0,
+      livePositions: 1,
+      tradeLogs: 1,
+      simulatedOrders: 0,
+      paperMarketFlag: 0,
+      liveMarketFlag: 1
+    });
+  });
+});
+
 describe("live_trade_decisions repository helpers", () => {
   it("returns an empty result when the decision table is missing", () => {
     const tempDir = mkdtempSync(path.join(tmpdir(), "dashboard-repository-"));
