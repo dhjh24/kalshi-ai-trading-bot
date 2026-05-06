@@ -2,36 +2,30 @@ import clsx from "clsx";
 import Link from "next/link";
 import { ReactNode } from "react";
 
-const ROUTE_HELP = [
+const NAV_LINKS = [
   {
     href: "/",
-    label: "Overview",
-    description: "Portfolio snapshot, open exposure, and quick links into live and market workflows."
+    label: "Overview"
   },
   {
     href: "/live-trade",
-    label: "Live Trade",
-    description: "Watch W5 decision queue, event filters, and execution feed updates in near real time."
+    label: "Live Trade"
   },
   {
     href: "/quick-flip",
-    label: "Quick Flip",
-    description: "Inspect fast scalp candidates, maker/taker orders, and quick-flip execution guardrails."
+    label: "Quick Flip"
   },
   {
     href: "/markets",
-    label: "Markets",
-    description: "Find open markets, open a contract detail page, and launch manual analysis on demand."
+    label: "Markets"
   },
   {
     href: "/portfolio",
-    label: "Portfolio",
-    description: "Track closed/open positions, divergence between paper and live modes, and AI spend."
+    label: "Portfolio"
   },
   {
     href: "/analysis",
-    label: "Analysis",
-    description: "Monitor queued, running, and completed manual analysis requests and see status updates."
+    label: "Analysis"
   }
 ];
 
@@ -39,7 +33,7 @@ export function AppFrame({ children }: { children: ReactNode }) {
   return (
     <div className="min-h-screen bg-halo text-ink">
       <header className="border-b border-white/60 bg-white/80 backdrop-blur">
-        <div className="mx-auto flex max-w-7xl items-center justify-between px-6 py-5">
+        <div className="mx-auto flex max-w-7xl flex-col gap-4 px-6 py-5 lg:flex-row lg:items-center lg:justify-between">
           <div>
             <p className="text-xs uppercase tracking-[0.35em] text-signal">
               Kalshi AI Trading Bot
@@ -52,25 +46,12 @@ export function AppFrame({ children }: { children: ReactNode }) {
             </div>
           </div>
           <nav className="flex flex-wrap gap-2 text-sm font-medium text-slate-600">
-            {ROUTE_HELP.map((route) => (
+            {NAV_LINKS.map((route) => (
               <NavLink key={route.href} href={route.href}>
                 {route.label}
               </NavLink>
             ))}
           </nav>
-          <div className="mt-4 grid gap-2 text-xs md:grid-cols-2 xl:grid-cols-6">
-            {ROUTE_HELP.map((route) => (
-              <div
-                key={`help-${route.href}`}
-                className="rounded-[18px] border border-slate-100 bg-white/90 px-3 py-2"
-              >
-                <p className="font-medium text-steel">{route.label}</p>
-                <p className="mt-1 text-xs leading-relaxed text-slate-500">
-                  {route.description}
-                </p>
-              </div>
-            ))}
-          </div>
         </div>
       </header>
       <main className="mx-auto max-w-7xl px-6 py-8">{children}</main>
