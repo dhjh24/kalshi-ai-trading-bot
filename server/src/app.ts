@@ -14,6 +14,8 @@ import {
   getOverviewPayload,
   getPortfolioPayload,
   getQuickFlipPayload,
+  clearAllDataPayload,
+  updateQuickFlipConfigPayload,
   submitLiveTradeDecisionFeedbackPayload
 } from "./services/dashboardService.js";
 import { queueAnalysisRequest } from "./services/analysisService.js";
@@ -74,6 +76,19 @@ export async function buildServer() {
 
   app.get("/api/portfolio", async () => getPortfolioPayload());
   app.get("/api/quick-flip", async () => getQuickFlipPayload());
+  app.put("/api/quick-flip/config", async (request, reply) => {
+    const payload = updateQuickFlipConfigPayload(request.body);
+    if (!payload.ok) {
+      reply.code(
+        payload.message.startsWith("Invalid quick-flip config payload") ||
+          payload.message === "No quick-flip config values were provided for update."
+          ? 400
+          : 500
+      );
+    }
+
+    return payload;
+  });
   app.post("/api/paper-trading/reset", async (request, reply) => {
     z
       .object({
@@ -84,6 +99,21 @@ export async function buildServer() {
     const payload = clearPaperTradingDataPayload();
     if (!payload.ok) {
       reply.code(409);
+      return payload;
+    }
+
+    return payload;
+  });
+  app.post("/api/dashboard/reset", async (request, reply) => {
+    z
+      .object({
+        confirmation: z.literal("CLEAR ALL")
+      })
+      .parse(request.body);
+
+    const payload = clearAllDataPayload();
+    if (!payload.ok) {
+      reply.code(500);
       return payload;
     }
 

@@ -1,6 +1,10 @@
 import { serverConfig } from "../config.js";
+import fs from "node:fs";
+import path from "node:path";
+import { z } from "zod";
 import {
   clearPaperTradingData,
+  clearAllData,
   getDailyAiCost,
   getLiveTradeDecisionById,
   getLiveTradeDecisionFeedbackByDecisionId,
@@ -50,7 +54,10 @@ import type {
   MarketRow,
   OverviewPayload,
   PaperTradingResetPayload,
+  AllDataResetPayload,
   PortfolioPayload,
+  QuickFlipConfigUpdatePayload,
+  QuickFlipConfigUpdateResult,
   QuickFlipConfigVisibility,
   QuickFlipPayload,
   RuntimeModeVisibility,
@@ -245,6 +252,245 @@ function parseEnvNumber(name: string, fallback: number): number {
 
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+const QUICK_FLIP_CONFIG_ENV_BINDINGS: Array<{
+  payloadKey: keyof QuickFlipConfigUpdatePayload;
+  envKey: string;
+  numeric: boolean;
+}> = [
+  { payloadKey: "enabled", envKey: "ENABLE_QUICK_FLIP", numeric: false },
+  {
+    payloadKey: "liveEnabled",
+    envKey: "ENABLE_LIVE_QUICK_FLIP",
+    numeric: false
+  },
+  { payloadKey: "disableAi", envKey: "QUICK_FLIP_DISABLE_AI", numeric: false },
+  { payloadKey: "allocation", envKey: "QUICK_FLIP_ALLOCATION", numeric: true },
+  { payloadKey: "minEntryPrice", envKey: "QUICK_FLIP_MIN_ENTRY_PRICE", numeric: true },
+  { payloadKey: "maxEntryPrice", envKey: "QUICK_FLIP_MAX_ENTRY_PRICE", numeric: true },
+  {
+    payloadKey: "minProfitMargin",
+    envKey: "QUICK_FLIP_MIN_PROFIT_MARGIN",
+    numeric: true
+  },
+  {
+    payloadKey: "maxPositionSize",
+    envKey: "QUICK_FLIP_MAX_POSITION_SIZE",
+    numeric: true
+  },
+  {
+    payloadKey: "maxConcurrentPositions",
+    envKey: "QUICK_FLIP_MAX_CONCURRENT_POSITIONS",
+    numeric: true
+  },
+  { payloadKey: "capitalPerTrade", envKey: "QUICK_FLIP_CAPITAL_PER_TRADE", numeric: true },
+  {
+    payloadKey: "dailyLossBudgetPct",
+    envKey: "QUICK_FLIP_DAILY_LOSS_BUDGET_PCT",
+    numeric: true
+  },
+  {
+    payloadKey: "maxOpenPositions",
+    envKey: "QUICK_FLIP_MAX_OPEN_POSITIONS",
+    numeric: true
+  },
+  {
+    payloadKey: "maxTradesPerHour",
+    envKey: "QUICK_FLIP_MAX_TRADES_PER_HOUR",
+    numeric: true
+  },
+  {
+    payloadKey: "confidenceThreshold",
+    envKey: "QUICK_FLIP_CONFIDENCE_THRESHOLD",
+    numeric: true
+  },
+  { payloadKey: "maxHoldMinutes", envKey: "QUICK_FLIP_MAX_HOLD_MINUTES", numeric: true },
+  { payloadKey: "minMarketVolume", envKey: "QUICK_FLIP_MIN_MARKET_VOLUME", numeric: true },
+  { payloadKey: "maxHoursToExpiry", envKey: "QUICK_FLIP_MAX_HOURS_TO_EXPIRY", numeric: true },
+  {
+    payloadKey: "maxBidAskSpread",
+    envKey: "QUICK_FLIP_MAX_BID_ASK_SPREAD",
+    numeric: true
+  },
+  {
+    payloadKey: "minTopOfBookSize",
+    envKey: "QUICK_FLIP_MIN_TOP_OF_BOOK_SIZE",
+    numeric: true
+  },
+  { payloadKey: "minNetProfit", envKey: "QUICK_FLIP_MIN_NET_PROFIT", numeric: true },
+  { payloadKey: "minNetRoi", envKey: "QUICK_FLIP_MIN_NET_ROI", numeric: true },
+  {
+    payloadKey: "recentTradeWindowSeconds",
+    envKey: "QUICK_FLIP_RECENT_TRADE_WINDOW_SECONDS",
+    numeric: true
+  },
+  { payloadKey: "minRecentTradeCount", envKey: "QUICK_FLIP_MIN_RECENT_TRADE_COUNT", numeric: true },
+  {
+    payloadKey: "makerEntryTimeoutSeconds",
+    envKey: "QUICK_FLIP_MAKER_ENTRY_TIMEOUT_SECONDS",
+    numeric: true
+  },
+  {
+    payloadKey: "makerEntryRepriceSeconds",
+    envKey: "QUICK_FLIP_MAKER_ENTRY_REPRICE_SECONDS",
+    numeric: true
+  },
+  {
+    payloadKey: "dynamicExitRepriceSeconds",
+    envKey: "QUICK_FLIP_DYNAMIC_EXIT_REPRICE_SECONDS",
+    numeric: true
+  },
+  { payloadKey: "stopLossPct", envKey: "QUICK_FLIP_STOP_LOSS_PCT", numeric: true }
+];
+
+const quickFlipConfigUpdatePayloadSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    liveEnabled: z.boolean().optional(),
+    disableAi: z.boolean().optional(),
+    allocation: z.number().nonnegative().finite().optional(),
+    minEntryPrice: z.number().nonnegative().finite().optional(),
+    maxEntryPrice: z.number().nonnegative().finite().optional(),
+    minProfitMargin: z.number().nonnegative().finite().optional(),
+    maxPositionSize: z.number().nonnegative().finite().optional(),
+    maxConcurrentPositions: z.number().nonnegative().finite().optional(),
+    capitalPerTrade: z.number().nonnegative().finite().optional(),
+    dailyLossBudgetPct: z.number().nonnegative().finite().optional(),
+    maxOpenPositions: z.number().nonnegative().finite().optional(),
+    maxTradesPerHour: z.number().nonnegative().finite().optional(),
+    confidenceThreshold: z.number().nonnegative().finite().optional(),
+    maxHoldMinutes: z.number().nonnegative().finite().optional(),
+    minMarketVolume: z.number().nonnegative().finite().optional(),
+    maxHoursToExpiry: z.number().nonnegative().finite().optional(),
+    maxBidAskSpread: z.number().nonnegative().finite().optional(),
+    minTopOfBookSize: z.number().nonnegative().finite().optional(),
+    minNetProfit: z.number().nonnegative().finite().optional(),
+    minNetRoi: z.number().nonnegative().finite().optional(),
+    recentTradeWindowSeconds: z.number().nonnegative().finite().optional(),
+    minRecentTradeCount: z.number().nonnegative().finite().optional(),
+    makerEntryTimeoutSeconds: z.number().nonnegative().finite().optional(),
+    makerEntryRepriceSeconds: z.number().nonnegative().finite().optional(),
+    dynamicExitRepriceSeconds: z.number().nonnegative().finite().optional(),
+    stopLossPct: z.number().nonnegative().finite().optional()
+  })
+  .strict()
+  .refine((value) => Object.keys(value).length > 0, {
+    message: "Provide at least one quick-flip configuration value"
+  });
+
+function getQuickFlipEnvFilePath(): string {
+  return path.join(serverConfig.rootDir, ".env");
+}
+
+function buildQuickFlipEnvUpdates(payload: QuickFlipConfigUpdatePayload): Map<string, string> {
+  const updates = new Map<string, string>();
+
+  for (const binding of QUICK_FLIP_CONFIG_ENV_BINDINGS) {
+    const value = payload[binding.payloadKey];
+    if (value === undefined) {
+      continue;
+    }
+
+    updates.set(binding.envKey, binding.numeric ? String(value) : String(Boolean(value)));
+  }
+
+  return updates;
+}
+
+function upsertEnvLineMap(
+  lines: string[],
+  key: string,
+  value: string
+): { updatedLines: string[]; replaced: boolean } {
+  const assignment = `${key}=${value}`;
+  const pattern = /^([A-Za-z_][A-Za-z0-9_]*)\s*=/;
+  let replaced = false;
+
+  const updatedLines = lines.map((line) => {
+    const match = line.match(pattern);
+    if (!match || match[1] !== key) {
+      return line;
+    }
+
+    replaced = true;
+    return assignment;
+  });
+
+  return {
+    updatedLines,
+    replaced
+  };
+}
+
+function writeQuickFlipEnvFile(updates: Map<string, string>): void {
+  const envFilePath = getQuickFlipEnvFilePath();
+  const existingLines = fs.existsSync(envFilePath)
+    ? fs.readFileSync(envFilePath, "utf8").split(/\r?\n/)
+    : [];
+
+  const lines = [...existingLines];
+
+  for (const [key, value] of updates) {
+    const upsertResult = upsertEnvLineMap(lines, key, value);
+    if (upsertResult.replaced) {
+      lines.splice(0, lines.length, ...upsertResult.updatedLines);
+      continue;
+    }
+
+    lines.push(`${key}=${value}`);
+  }
+
+  const normalized = lines.join("\n");
+  fs.writeFileSync(
+    envFilePath,
+    normalized.endsWith("\n") ? normalized : `${normalized}\n`
+  );
+
+  for (const [key, value] of updates) {
+    process.env[key] = value;
+  }
+}
+
+export function updateQuickFlipConfigPayload(
+  payload: unknown
+): QuickFlipConfigUpdateResult {
+  const parsedPayloadResult = quickFlipConfigUpdatePayloadSchema.safeParse(payload);
+  if (!parsedPayloadResult.success) {
+    return {
+      ok: false,
+      message: `Invalid quick-flip config payload: ${parsedPayloadResult.error.issues
+        .map((issue) => `${issue.path.join(".") || "payload"} ${issue.message}`)
+        .join("; ")}`,
+      config: getQuickFlipConfigVisibility()
+    };
+  }
+
+  const parsedPayload = parsedPayloadResult.data;
+  const updates = buildQuickFlipEnvUpdates(parsedPayload);
+
+  if (updates.size === 0) {
+    return {
+      ok: false,
+      message: "No quick-flip config values were provided for update.",
+      config: getQuickFlipConfigVisibility()
+    };
+  }
+
+  try {
+    writeQuickFlipEnvFile(updates);
+    return {
+      ok: true,
+      message: "Quick-flip config has been saved to .env and applied to runtime.",
+      config: getQuickFlipConfigVisibility()
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      message: "Quick-flip config could not be written to .env.",
+      config: getQuickFlipConfigVisibility()
+    };
+  }
 }
 
 function heartbeatStatusFromTimestamp(
@@ -526,6 +772,38 @@ export function clearPaperTradingDataPayload(): PaperTradingResetPayload {
     message: "Paper positions, simulated orders, and paper P&L rows were cleared.",
     cleared: reset.cleared
   };
+}
+
+export function clearAllDataPayload(): AllDataResetPayload {
+  const runtimeState = hasLiveTradeRuntimeStateTable() ? getLiveTradeRuntimeState() : null;
+  const runtime = getLiveTradeRuntimeVisibility(runtimeState);
+  const generatedAt = new Date().toISOString();
+
+  try {
+    const cleared = clearAllData();
+    return {
+      ok: true,
+      generatedAt,
+      runtime,
+      message:
+        "All tracked dashboard data and telemetry have been cleared.",
+      cleared: {
+        totalRowsDeleted: cleared.totalRowsDeleted,
+        tables: cleared.tableRowsDeleted
+      }
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      generatedAt,
+      runtime,
+      message: error instanceof Error ? error.message : "All data clear operation failed.",
+      cleared: {
+        totalRowsDeleted: 0,
+        tables: []
+      }
+    };
+  }
 }
 
 export function getQuickFlipPayload(): QuickFlipPayload {

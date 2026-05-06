@@ -1499,3 +1499,160 @@ describe("live_trade_decision_feedback repository helpers", () => {
     expect(result.stored).toEqual(result.second);
   });
 });
+
+describe("clearAllData", () => {
+  it("clears rows from known dashboard tables and reports per-table counts", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "dashboard-repository-"));
+    const databasePath = path.join(tempDir, "dashboard.sqlite");
+    const scriptPath = path.join(tempDir, "clear-all-data-check.mjs");
+    const repositoryUrl = pathToFileURL(
+      path.join(serverRoot, "src/repositories/dashboardRepository.ts")
+    ).href;
+    const dbUrl = pathToFileURL(path.join(serverRoot, "src/db.ts")).href;
+    tempDirs.push(tempDir);
+
+    writeFileSync(
+      scriptPath,
+      `
+        import { getDb } from ${JSON.stringify(dbUrl)};
+        import { clearAllData } from ${JSON.stringify(repositoryUrl)};
+
+        const db = getDb();
+
+        try {
+          db.exec(\`
+            CREATE TABLE IF NOT EXISTS analysis_requests (
+              request_id TEXT PRIMARY KEY,
+              target_type TEXT NOT NULL,
+              target_id TEXT NOT NULL,
+              status TEXT NOT NULL,
+              requested_at TEXT NOT NULL,
+              completed_at TEXT,
+              provider TEXT,
+              model TEXT,
+              cost_usd REAL,
+              sources_json TEXT,
+              response_json TEXT,
+              context_json TEXT,
+              error TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS positions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              market_id TEXT NOT NULL,
+              side TEXT NOT NULL,
+              entry_price REAL NOT NULL,
+              quantity REAL NOT NULL,
+              timestamp TEXT NOT NULL,
+              rationale TEXT,
+              confidence REAL,
+              live INTEGER NOT NULL DEFAULT 0,
+              status TEXT,
+              strategy TEXT,
+              entry_fee REAL DEFAULT 0,
+              contracts_cost REAL DEFAULT 0,
+              entry_order_id TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS trade_logs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              market_id TEXT NOT NULL,
+              side TEXT NOT NULL,
+              entry_price REAL NOT NULL,
+              exit_price REAL NOT NULL,
+              quantity REAL NOT NULL,
+              pnl REAL NOT NULL,
+              entry_timestamp TEXT NOT NULL,
+              exit_timestamp TEXT NOT NULL,
+              rationale TEXT,
+              strategy TEXT,
+              live INTEGER NOT NULL DEFAULT 0,
+              entry_fee REAL DEFAULT 0,
+              exit_fee REAL DEFAULT 0,
+              fees_paid REAL DEFAULT 0,
+              contracts_cost REAL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS unrelated_keep_table (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              value TEXT
+            );
+
+            INSERT INTO analysis_requests (
+              request_id,
+              target_type,
+              target_id,
+              status,
+              requested_at
+            ) VALUES
+              ('req-1', 'market', 'mkt', 'completed', '2026-05-05T00:00:00Z');
+
+            INSERT INTO positions (
+              market_id,
+              side,
+              entry_price,
+              quantity,
+              timestamp,
+              rationale,
+              status
+            ) VALUES ('MKT-1', 'YES', 0.4, 3, '2026-05-05T00:00:00Z', 'test', 'open');
+
+            INSERT INTO trade_logs (
+              market_id,
+              side,
+              entry_price,
+              exit_price,
+              quantity,
+              pnl,
+              entry_timestamp,
+              exit_timestamp,
+              rationale
+            ) VALUES ('MKT-1', 'YES', 0.4, 0.6, 3, 0.6, '2026-05-05T00:00:00Z', '2026-05-05T01:00:00Z', 'test');
+
+            INSERT INTO unrelated_keep_table (value) VALUES ('stay');
+          \`);
+
+          const result = clearAllData();
+          const remaining = {
+            analysisRequests: Number(
+              db.prepare("SELECT COUNT(*) AS count FROM analysis_requests").get().count
+            ),
+            positions: Number(db.prepare("SELECT COUNT(*) AS count FROM positions").get().count),
+            tradeLogs: Number(db.prepare("SELECT COUNT(*) AS count FROM trade_logs").get().count),
+            unrelated: Number(
+              db.prepare("SELECT COUNT(*) AS count FROM unrelated_keep_table").get().count
+            )
+          };
+
+          console.log(JSON.stringify({ result, remaining }));
+        } finally {
+          db.close();
+        }
+      `
+    );
+
+    const result = JSON.parse(
+      execFileSync(process.execPath, ["--import", "tsx/esm", scriptPath], {
+        cwd: serverRoot,
+        env: {
+          ...process.env,
+          DB_PATH: databasePath
+        },
+        encoding: "utf8"
+      }).trim()
+    );
+
+    expect(result.remaining.analysisRequests).toBe(0);
+    expect(result.remaining.positions).toBe(0);
+    expect(result.remaining.tradeLogs).toBe(0);
+    expect(result.remaining.unrelated).toBe(1);
+    expect(result.result.totalRowsDeleted).toBe(3);
+    expect(result.result.tableRowsDeleted).toEqual(
+      expect.arrayContaining([
+        { table: "analysis_requests", rowsDeleted: 1 },
+        { table: "positions", rowsDeleted: 1 },
+        { table: "trade_logs", rowsDeleted: 1 }
+      ])
+    );
+  });
+});

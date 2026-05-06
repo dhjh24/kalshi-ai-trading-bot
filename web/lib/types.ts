@@ -461,6 +461,22 @@ export interface PaperTradingResetPayload {
   cleared: PaperTradingResetCounts;
 }
 
+export interface AllDataResetTableCount {
+  table: string;
+  rowsDeleted: number;
+}
+
+export interface AllDataResetPayload {
+  ok: boolean;
+  generatedAt: string;
+  runtime: RuntimeModeVisibility;
+  message: string;
+  cleared: {
+    totalRowsDeleted: number;
+    tables: AllDataResetTableCount[];
+  };
+}
+
 export interface QuickFlipConfigVisibility {
   enabled: boolean | null;
   liveEnabled: boolean | null;
@@ -489,6 +505,42 @@ export interface QuickFlipConfigVisibility {
   makerEntryRepriceSeconds: number;
   dynamicExitRepriceSeconds: number;
   stopLossPct: number;
+}
+
+export interface QuickFlipConfigUpdatePayload {
+  enabled?: boolean;
+  liveEnabled?: boolean;
+  disableAi?: boolean;
+  allocation?: number;
+  minEntryPrice?: number;
+  maxEntryPrice?: number;
+  minProfitMargin?: number;
+  maxPositionSize?: number;
+  maxConcurrentPositions?: number;
+  capitalPerTrade?: number;
+  dailyLossBudgetPct?: number;
+  maxOpenPositions?: number;
+  maxTradesPerHour?: number;
+  confidenceThreshold?: number;
+  maxHoldMinutes?: number;
+  minMarketVolume?: number;
+  maxHoursToExpiry?: number;
+  maxBidAskSpread?: number;
+  minTopOfBookSize?: number;
+  minNetProfit?: number;
+  minNetRoi?: number;
+  recentTradeWindowSeconds?: number;
+  minRecentTradeCount?: number;
+  makerEntryTimeoutSeconds?: number;
+  makerEntryRepriceSeconds?: number;
+  dynamicExitRepriceSeconds?: number;
+  stopLossPct?: number;
+}
+
+export interface QuickFlipConfigUpdateResult {
+  ok: boolean;
+  message: string;
+  config: QuickFlipConfigVisibility;
 }
 
 export interface QuickFlipMetrics {

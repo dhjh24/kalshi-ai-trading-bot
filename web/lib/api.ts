@@ -1,10 +1,13 @@
 import type {
   AnalysisRecord,
   EventDetailPayload,
+  QuickFlipConfigUpdatePayload,
+  QuickFlipConfigUpdateResult,
   LiveTradeDecisionFeedPayload,
   LiveTradePayload,
   MarketDetailPayload,
   OverviewPayload,
+  AllDataResetPayload,
   PaperTradingResetPayload,
   PortfolioPayload,
   QuickFlipPayload,
@@ -144,6 +147,16 @@ export async function postApi<T>(path: string, body?: unknown): Promise<T> {
   });
 }
 
+export async function putApi<T>(path: string, body?: unknown): Promise<T> {
+  return requestApi<T>(path, {
+    method: "PUT",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: body === undefined ? undefined : JSON.stringify(body)
+  });
+}
+
 export function createStreamUrl(topic: string): string {
   return `${API_BASE_URL}/api/stream/${topic}`;
 }
@@ -175,9 +188,19 @@ export async function getQuickFlip() {
   return fetchApi<QuickFlipPayload>("/api/quick-flip");
 }
 
+export async function updateQuickFlipConfig(payload: QuickFlipConfigUpdatePayload) {
+  return putApi<QuickFlipConfigUpdateResult>("/api/quick-flip/config", payload);
+}
+
 export async function clearPaperTradingData() {
   return postApi<PaperTradingResetPayload>("/api/paper-trading/reset", {
     confirmation: "CLEAR PAPER"
+  });
+}
+
+export async function clearAllData() {
+  return postApi<AllDataResetPayload>("/api/dashboard/reset", {
+    confirmation: "CLEAR ALL"
   });
 }
 

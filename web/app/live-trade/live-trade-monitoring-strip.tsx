@@ -43,7 +43,19 @@ function byRecordedAtDescending(
   return getTimestampValue(right.recordedAt) - getTimestampValue(left.recordedAt);
 }
 
-function getDecisionLabel(record: LiveTradeDecisionRecord): string | null {
+function isLiveTradeDecisionRecord(
+  value: unknown,
+): value is LiveTradeDecisionRecord {
+  return typeof value === "object" && value !== null;
+}
+
+function getDecisionLabel(
+  record: LiveTradeDecisionRecord | null | undefined,
+): string | null {
+  if (!record) {
+    return null;
+  }
+
   const label = `${record.decision ?? ""} ${record.status ?? ""}`.trim();
   if (label) {
     return label.toUpperCase();
@@ -185,9 +197,14 @@ function summarizeEventMonitoring(
   decisionFeed: LiveTradeDecisionFeedPayload,
 ): Map<string, EventMonitoringSnapshot> {
   const decisionsByEvent = new Map<string, LiveTradeDecisionRecord[]>();
-  const heartbeatMode = normalizeRuntimeMode(decisionFeed.heartbeat.runtimeMode);
+  const heartbeatMode = normalizeRuntimeMode(
+    decisionFeed.heartbeat?.runtimeMode,
+  );
+  const decisions = Array.isArray(decisionFeed.decisions)
+    ? decisionFeed.decisions.filter(isLiveTradeDecisionRecord)
+    : [];
 
-  for (const record of decisionFeed.decisions) {
+  for (const record of decisions) {
     if (!record.eventTicker) {
       continue;
     }
@@ -204,7 +221,7 @@ function summarizeEventMonitoring(
   return new Map(
     events.map((event) => {
       const records = decisionsByEvent.get(event.event_ticker) ?? [];
-      const latestRecord = records[0] ?? null;
+      const latestRecord = records.length > 0 ? records[0] : null;
       const latestError = getLatestErrorRecord(records);
       const observedModes = new Set(
         records

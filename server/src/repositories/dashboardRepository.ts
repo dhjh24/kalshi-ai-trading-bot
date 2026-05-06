@@ -1117,6 +1117,74 @@ function updateMarketPositionFlags(marketIds: string[]): void {
   }
 }
 
+const ALL_DATA_RESET_TABLES = [
+  "analysis_requests",
+  "analysis_reports",
+  "blocked_trades",
+  "codex_quota_tracking",
+  "daily_cost_tracking",
+  "fee_divergence_log",
+  "llm_queries",
+  "live_trade_decision_feedback",
+  "live_trade_decisions",
+  "live_trade_runtime_state",
+  "market_context_links",
+  "market_analyses",
+  "market_snapshots",
+  "positions",
+  "shadow_orders",
+  "simulated_orders",
+  "strategy_halts",
+  "trade_logs"
+] as const;
+
+function getTableRowsDeleted(tableName: string): number {
+  if (!tableExists(tableName)) {
+    return 0;
+  }
+
+  return Number(
+    db
+      .prepare(`SELECT COUNT(*) AS count FROM ${tableName}`)
+      .get()
+      ?.count ?? 0
+  );
+}
+
+export function clearAllData(): {
+  totalRowsDeleted: number;
+  tableRowsDeleted: { table: string; rowsDeleted: number }[];
+} {
+  const tableCounts = ALL_DATA_RESET_TABLES.map((tableName) => {
+    const rowsDeleted = getTableRowsDeleted(tableName);
+    if (rowsDeleted === 0) {
+      return { table: tableName, rowsDeleted: 0 };
+    }
+
+    return { table: tableName, rowsDeleted };
+  });
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    for (const table of tableCounts) {
+      if (table.rowsDeleted > 0) {
+        db.prepare(`DELETE FROM ${table.table}`).run();
+      }
+    }
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+
+  const totalRowsDeleted = tableCounts.reduce((sum, row) => sum + row.rowsDeleted, 0);
+
+  return {
+    totalRowsDeleted,
+    tableRowsDeleted: tableCounts.filter((table) => table.rowsDeleted > 0)
+  };
+}
+
 export function clearPaperTradingData(): {
   clearedAt: string;
   cleared: PaperTradingResetCounts;

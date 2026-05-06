@@ -782,7 +782,7 @@ export default async function PortfolioPage() {
       <RuntimeModePanel source={payload} title="Configured trading mode" />
 
       <Panel title="Paper testing reset">
-        <PaperTradingResetControls runtime={payload.runtime} />
+        <PaperTradingResetControls runtime={payload.runtime} showAllDataReset />
       </Panel>
 
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">

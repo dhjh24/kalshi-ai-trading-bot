@@ -11,6 +11,7 @@ import type {
   TradeLogRow
 } from "../../lib/types";
 import { QuickFlipRefreshControls } from "./quick-flip-refresh-controls";
+import { QuickFlipConfigEditor } from "./quick-flip-config-editor";
 
 function formatCount(value: number): string {
   return new Intl.NumberFormat("en-US", {
@@ -351,46 +352,7 @@ export default async function QuickFlipPage() {
             </Badge>
             <Badge tone={payload.config.disableAi ? "warning" : "neutral"}>{aiLabel}</Badge>
           </div>
-
-          <div className="grid gap-3 md:grid-cols-2">
-            <ConfigTile
-              label="Entry band"
-              value={`${formatPrice(payload.config.minEntryPrice)} - ${formatPrice(
-                payload.config.maxEntryPrice
-              )}`}
-            />
-            <ConfigTile
-              label="Capital / trade"
-              value={formatMoney(payload.config.capitalPerTrade)}
-            />
-            <ConfigTile
-              label="Min net target"
-              value={`${formatMoney(payload.config.minNetProfit)} / ${formatPercent(
-                payload.config.minNetRoi * 100
-              )}`}
-            />
-            <ConfigTile
-              label="Book quality"
-              value={`${formatPercent(payload.config.maxBidAskSpread * 100)} spread`}
-              helpText={`${formatCount(payload.config.minTopOfBookSize)} top-of-book contracts`}
-            />
-            <ConfigTile
-              label="Hold window"
-              value={`${formatCount(payload.config.maxHoldMinutes)} min`}
-            />
-            <ConfigTile
-              label="Stop loss"
-              value={formatPercent(payload.config.stopLossPct * 100)}
-            />
-            <ConfigTile
-              label="Candidate volume"
-              value={formatCount(payload.config.minMarketVolume)}
-            />
-            <ConfigTile
-              label="Max expiry"
-              value={`${formatCount(payload.config.maxHoursToExpiry)}h`}
-            />
-          </div>
+          <QuickFlipConfigEditor initialConfig={payload.config} />
         </Panel>
 
         <Panel title="Recent order activity">
