@@ -17,10 +17,10 @@ The strategy is no longer a standalone `paper_trader.py` workflow. It runs throu
 A candidate must pass the current `QuickFlipConfig` filters before execution:
 
 - Entry price between `0.01` and `0.20` by default.
-- Minimum market volume of `2000`.
+- Minimum market volume of `1000`.
 - Expiry within `72` hours.
 - Bid/ask spread no wider than `0.03`.
-- Top-of-book depth of at least `25` contracts.
+- Top-of-book depth of at least `10` contracts.
 - Recent-trade activity within the configured window.
 - Net profit of at least `$0.10` and net ROI of at least `3%` after fee estimates.
 - Confidence at or above `0.6` when the AI analyzer is active.
@@ -45,6 +45,8 @@ ENABLE_QUICK_FLIP=false
 ENABLE_LIVE_QUICK_FLIP=false
 QUICK_FLIP_DISABLE_AI=false
 QUICK_FLIP_ALLOCATION=0.05
+QUICK_FLIP_MAX_MARKET_CHECKS=100
+QUICK_FLIP_TARGET_OPPORTUNITY_BUFFER=6
 QUICK_FLIP_MIN_ENTRY_PRICE=0.01
 QUICK_FLIP_MAX_ENTRY_PRICE=0.20
 QUICK_FLIP_MIN_PROFIT_MARGIN=0.10
@@ -53,10 +55,17 @@ QUICK_FLIP_DAILY_LOSS_BUDGET_PCT=0.05
 QUICK_FLIP_MAX_OPEN_POSITIONS=10
 QUICK_FLIP_MAX_TRADES_PER_HOUR=60
 QUICK_FLIP_MAX_HOLD_MINUTES=30
-QUICK_FLIP_MIN_MARKET_VOLUME=2000
+QUICK_FLIP_MIN_MARKET_VOLUME=1000
 QUICK_FLIP_MAX_BID_ASK_SPREAD=0.03
+QUICK_FLIP_MIN_TOP_OF_BOOK_SIZE=10
 QUICK_FLIP_MIN_NET_PROFIT=0.10
 QUICK_FLIP_MIN_NET_ROI=0.03
+QUICK_FLIP_MAX_TARGET_VS_RECENT_TRADE_GAP=0.02
+QUICK_FLIP_MIN_RECENT_RANGE_TICKS=2
+QUICK_FLIP_MIN_RECENT_PRICE_POSITION=0.40
+QUICK_FLIP_MAX_ENTRY_VS_RECENT_LAST_GAP=0.02
+QUICK_FLIP_RECENT_TRADE_WINDOW_SECONDS=3600
+QUICK_FLIP_MIN_RECENT_TRADE_COUNT=5
 ```
 
 Most defaults live in `QuickFlipConfig` in `src/strategies/quick_flip_scalping.py`; runtime env overrides are read through `settings.trading` in `src/config/settings.py`.

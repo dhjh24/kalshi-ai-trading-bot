@@ -505,6 +505,13 @@ export interface QuickFlipConfigVisibility {
   makerEntryRepriceSeconds: number;
   dynamicExitRepriceSeconds: number;
   stopLossPct: number;
+  maxMarketChecks: number;
+  targetOpportunityBuffer: number;
+  maxTargetVsRecentTradeGap: number;
+  minRecentRangeTicks: number;
+  minRecentPricePosition: number;
+  maxEntryVsRecentLastGap: number;
+  makerEntryPollSeconds: number;
 }
 
 export interface QuickFlipConfigUpdatePayload {
@@ -535,6 +542,13 @@ export interface QuickFlipConfigUpdatePayload {
   makerEntryRepriceSeconds?: number;
   dynamicExitRepriceSeconds?: number;
   stopLossPct?: number;
+  maxMarketChecks?: number;
+  targetOpportunityBuffer?: number;
+  maxTargetVsRecentTradeGap?: number;
+  minRecentRangeTicks?: number;
+  minRecentPricePosition?: number;
+  maxEntryVsRecentLastGap?: number;
+  makerEntryPollSeconds?: number;
 }
 
 export interface QuickFlipConfigUpdateResult {

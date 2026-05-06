@@ -443,7 +443,13 @@ class TradingConfig:
         default_factory=lambda: _get_bool_env("QUICK_FLIP_DISABLE_AI")
     )
     quick_flip_allocation: float = field(
-        default_factory=lambda: float(os.getenv("QUICK_FLIP_ALLOCATION", "0.0"))
+        default_factory=lambda: float(os.getenv("QUICK_FLIP_ALLOCATION", "0.05"))
+    )
+    quick_flip_max_market_checks: int = field(
+        default_factory=lambda: int(os.getenv("QUICK_FLIP_MAX_MARKET_CHECKS", "100"))
+    )
+    quick_flip_target_opportunity_buffer: int = field(
+        default_factory=lambda: int(os.getenv("QUICK_FLIP_TARGET_OPPORTUNITY_BUFFER", "6"))
     )
     quick_flip_min_entry_price: float = field(
         default_factory=lambda: float(os.getenv("QUICK_FLIP_MIN_ENTRY_PRICE", "0.01"))
@@ -479,7 +485,7 @@ class TradingConfig:
         default_factory=lambda: int(os.getenv("QUICK_FLIP_MAX_HOLD_MINUTES", "30"))
     )
     quick_flip_min_market_volume: int = field(
-        default_factory=lambda: int(os.getenv("QUICK_FLIP_MIN_MARKET_VOLUME", "2000"))
+        default_factory=lambda: int(os.getenv("QUICK_FLIP_MIN_MARKET_VOLUME", "1000"))
     )
     quick_flip_max_hours_to_expiry: int = field(
         default_factory=lambda: int(os.getenv("QUICK_FLIP_MAX_HOURS_TO_EXPIRY", "72"))
@@ -488,7 +494,7 @@ class TradingConfig:
         default_factory=lambda: float(os.getenv("QUICK_FLIP_MAX_BID_ASK_SPREAD", "0.03"))
     )
     quick_flip_min_top_of_book_size: int = field(
-        default_factory=lambda: int(os.getenv("QUICK_FLIP_MIN_TOP_OF_BOOK_SIZE", "25"))
+        default_factory=lambda: int(os.getenv("QUICK_FLIP_MIN_TOP_OF_BOOK_SIZE", "10"))
     )
     quick_flip_min_net_profit: float = field(
         default_factory=lambda: float(os.getenv("QUICK_FLIP_MIN_NET_PROFIT", "0.10"))
@@ -503,7 +509,16 @@ class TradingConfig:
         default_factory=lambda: int(os.getenv("QUICK_FLIP_MIN_RECENT_TRADE_COUNT", "5"))
     )
     quick_flip_max_target_vs_recent_trade_gap: float = field(
-        default_factory=lambda: float(os.getenv("QUICK_FLIP_MAX_TARGET_VS_RECENT_TRADE_GAP", "0.01"))
+        default_factory=lambda: float(os.getenv("QUICK_FLIP_MAX_TARGET_VS_RECENT_TRADE_GAP", "0.02"))
+    )
+    quick_flip_min_recent_range_ticks: int = field(
+        default_factory=lambda: int(os.getenv("QUICK_FLIP_MIN_RECENT_RANGE_TICKS", "2"))
+    )
+    quick_flip_min_recent_price_position: float = field(
+        default_factory=lambda: float(os.getenv("QUICK_FLIP_MIN_RECENT_PRICE_POSITION", "0.4"))
+    )
+    quick_flip_max_entry_vs_recent_last_gap: float = field(
+        default_factory=lambda: float(os.getenv("QUICK_FLIP_MAX_ENTRY_VS_RECENT_LAST_GAP", "0.02"))
     )
     quick_flip_maker_entry_timeout_seconds: int = field(
         default_factory=lambda: int(os.getenv("QUICK_FLIP_MAKER_ENTRY_TIMEOUT_SECONDS", "180"))
@@ -716,6 +731,12 @@ class Settings:
         if self.trading.quick_flip_allocation < 0 or self.trading.quick_flip_allocation > 1:
             raise ValueError("quick_flip_allocation must be between 0 and 1")
 
+        if self.trading.quick_flip_max_market_checks <= 0:
+            raise ValueError("quick_flip_max_market_checks must be positive")
+
+        if self.trading.quick_flip_target_opportunity_buffer <= 0:
+            raise ValueError("quick_flip_target_opportunity_buffer must be positive")
+
         if self.trading.quick_flip_confidence_threshold <= 0 or self.trading.quick_flip_confidence_threshold > 1:
             raise ValueError("quick_flip_confidence_threshold must be between 0 and 1")
 
@@ -748,6 +769,21 @@ class Settings:
             or self.trading.quick_flip_max_target_vs_recent_trade_gap >= 1
         ):
             raise ValueError("quick_flip_max_target_vs_recent_trade_gap must be between 0 and 1")
+
+        if self.trading.quick_flip_min_recent_range_ticks < 0:
+            raise ValueError("quick_flip_min_recent_range_ticks must be non-negative")
+
+        if (
+            self.trading.quick_flip_min_recent_price_position < 0
+            or self.trading.quick_flip_min_recent_price_position > 1
+        ):
+            raise ValueError("quick_flip_min_recent_price_position must be between 0 and 1")
+
+        if (
+            self.trading.quick_flip_max_entry_vs_recent_last_gap < 0
+            or self.trading.quick_flip_max_entry_vs_recent_last_gap >= 1
+        ):
+            raise ValueError("quick_flip_max_entry_vs_recent_last_gap must be between 0 and 1")
 
         if self.trading.quick_flip_maker_entry_timeout_seconds <= 0:
             raise ValueError("quick_flip_maker_entry_timeout_seconds must be positive")

@@ -10,7 +10,7 @@ import {
   getOverview,
   isNextDynamicServerUsageError
 } from "../lib/api";
-import { formatMoney } from "../lib/format";
+import { formatMoney, formatTimestamp } from "../lib/format";
 import type { OverviewPayload } from "../lib/types";
 
 const EMPTY_OVERVIEW: OverviewPayload = {
@@ -67,6 +67,8 @@ async function loadOverview(): Promise<{
 
 export default async function HomePage() {
   const { overview, error } = await loadOverview();
+  const latestVisibleAnalysis =
+    overview.recentAnalysis.find((analysis) => analysis.status !== "failed") || null;
 
   return (
     <div className="space-y-8">
@@ -114,7 +116,7 @@ export default async function HomePage() {
         <Panel eyebrow="Latest Analysis" title="Manual-first AI review">
           <AnalysisResultCard
             title="Most recent request"
-            analysis={overview.recentAnalysis[0] || null}
+            analysis={latestVisibleAnalysis}
           />
         </Panel>
       </section>
@@ -147,22 +149,63 @@ export default async function HomePage() {
           <MarketTable items={overview.rankedMarkets} title="Open markets" />
         </Panel>
         <Panel eyebrow="Open Positions" title="What the bot is holding now">
-          <div className="space-y-3">
-            {overview.positions.slice(0, 10).map((position) => (
-              <div key={`${position.id}-${position.market_id}`} className="rounded-2xl border border-slate-100 p-4">
-                <div className="flex items-start justify-between gap-4">
-                  <div>
-                    <p className="font-medium text-steel">{position.market_id}</p>
-                    <p className="mt-1 text-sm text-slate-500">
-                      {position.side} · {position.strategy || "strategy n/a"}
+          <div className="space-y-6">
+            <div className="space-y-3">
+              {overview.positions.length === 0 ? (
+                <div className="rounded-2xl border border-dashed border-slate-200 p-4 text-sm text-slate-500">
+                  No open positions right now.
+                </div>
+              ) : null}
+              {overview.positions.slice(0, 10).map((position) => (
+                <div key={`${position.id}-${position.market_id}`} className="rounded-2xl border border-slate-100 p-4">
+                  <div className="flex items-start justify-between gap-4">
+                    <div>
+                      <p className="font-medium text-steel">{position.market_id}</p>
+                      <p className="mt-1 text-sm text-slate-500">
+                        {position.side} · {position.strategy || "strategy n/a"}
+                      </p>
+                      <p className="mt-2 text-xs uppercase tracking-[0.22em] text-slate-400">
+                        Entered {formatTimestamp(position.timestamp)}
+                      </p>
+                    </div>
+                    <p className="text-sm font-semibold text-slate-700">
+                      {formatMoney(position.entry_price * position.quantity)}
                     </p>
                   </div>
-                  <p className="text-sm font-semibold text-slate-700">
-                    {formatMoney(position.entry_price * position.quantity)}
-                  </p>
+                </div>
+              ))}
+            </div>
+
+            {overview.trades.length > 0 ? (
+              <div>
+                <p className="text-xs uppercase tracking-[0.28em] text-slate-400">
+                  Recent transactions
+                </p>
+                <div className="mt-3 space-y-3">
+                  {overview.trades.slice(0, 5).map((trade) => (
+                    <div key={`${trade.id}-${trade.market_id}`} className="rounded-2xl border border-slate-100 p-4">
+                      <div className="flex items-start justify-between gap-4">
+                        <div>
+                          <p className="font-medium text-steel">{trade.market_id}</p>
+                          <p className="mt-1 text-sm text-slate-500">
+                            {trade.side} · {trade.strategy || "strategy n/a"}
+                          </p>
+                          <p className="mt-2 text-xs uppercase tracking-[0.22em] text-slate-400">
+                            Entered {formatTimestamp(trade.entry_timestamp)}
+                          </p>
+                          <p className="mt-1 text-xs uppercase tracking-[0.22em] text-slate-400">
+                            Exited {formatTimestamp(trade.exit_timestamp)}
+                          </p>
+                        </div>
+                        <p className={trade.pnl >= 0 ? "text-sm font-semibold text-emerald-700" : "text-sm font-semibold text-rose-700"}>
+                          {formatMoney(trade.pnl)}
+                        </p>
+                      </div>
+                    </div>
+                  ))}
                 </div>
               </div>
-            ))}
+            ) : null}
           </div>
         </Panel>
       </section>

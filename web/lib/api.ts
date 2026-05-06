@@ -18,15 +18,31 @@ export const API_BASE_URL =
   process.env.NEXT_PUBLIC_DASHBOARD_API_URL || "http://127.0.0.1:4000";
 
 const MAX_ERROR_BODY_LENGTH = 500;
+const GLOBAL_API_REVALIDATE_SECONDS = Number.parseInt(
+  process.env.NEXT_PUBLIC_DASHBOARD_API_REVALIDATE_SECONDS || "8",
+  10
+);
+const DEFAULT_REVALIDATE_SECONDS = Number.isFinite(GLOBAL_API_REVALIDATE_SECONDS)
+  ? Math.max(0, GLOBAL_API_REVALIDATE_SECONDS)
+  : 8;
+const MAX_REVALIDATE_SECONDS = 60;
 
-type DashboardApiErrorOptions = {
-  path: string;
-  url: string;
-  status?: number;
-  statusText?: string;
-  body?: string;
-  cause?: unknown;
+type RequestApiOptions = RequestInit & {
+  next?: {
+    revalidate?: number;
+  };
 };
+
+const REVALIDATE_PATH_OVERRIDES: Array<{ prefix: string; seconds: number }> = [
+  { prefix: "/api/live-trade/decisions", seconds: 5 },
+  { prefix: "/api/live-trade", seconds: 5 },
+  { prefix: "/api/dashboard/overview", seconds: 5 },
+  { prefix: "/api/portfolio", seconds: 10 },
+  { prefix: "/api/quick-flip", seconds: 10 },
+  { prefix: "/api/analysis/requests", seconds: 8 },
+  { prefix: "/api/markets", seconds: 12 },
+  { prefix: "/api/events", seconds: 12 }
+];
 
 function getObjectStringField(value: unknown, field: string): string {
   if (typeof value !== "object" || value === null || !(field in value)) {
@@ -54,7 +70,12 @@ function buildDashboardApiErrorMessage({
   status,
   statusText,
   body
-}: DashboardApiErrorOptions): string {
+}: {
+  path: string;
+  status?: number;
+  statusText?: string;
+  body?: string;
+}): string {
   const statusLabel =
     status === undefined
       ? "network error"
@@ -87,7 +108,14 @@ export class DashboardApiError extends Error {
   readonly body?: string;
   readonly cause?: unknown;
 
-  constructor(options: DashboardApiErrorOptions) {
+  constructor(options: {
+    path: string;
+    url: string;
+    status?: number;
+    statusText?: string;
+    body?: string;
+    cause?: unknown;
+  }) {
     super(buildDashboardApiErrorMessage(options));
     this.name = "DashboardApiError";
     this.path = options.path;
@@ -99,15 +127,51 @@ export class DashboardApiError extends Error {
   }
 }
 
-async function requestApi<T>(path: string, init?: RequestInit): Promise<T> {
+function normalizeRevalidateSeconds(path: string): number {
+  const normalizedPath = path.replace(/\/+/g, "/");
+  const override = REVALIDATE_PATH_OVERRIDES.find((item) =>
+    normalizedPath.startsWith(item.prefix)
+  );
+  const resolved = override
+    ? override.seconds
+    : Math.min(MAX_REVALIDATE_SECONDS, DEFAULT_REVALIDATE_SECONDS);
+
+  return Number.isFinite(resolved) ? Math.max(0, resolved) : DEFAULT_REVALIDATE_SECONDS;
+}
+
+function requestDefaultsForGet(path: string): RequestInit & {
+  next?: { revalidate?: number };
+} {
+  const revalidate = normalizeRevalidateSeconds(path);
+  return {
+    cache: "force-cache",
+    next: { revalidate }
+  };
+}
+
+async function requestApi<T>(path: string, init?: RequestApiOptions): Promise<T> {
   const url = `${API_BASE_URL}${path}`;
+  const method = (init?.method || "GET").toUpperCase();
+  const isGet = method === "GET";
+  const requestInit: RequestInit & { next?: { revalidate?: number } } = {
+    ...(isGet ? requestDefaultsForGet(path) : {}),
+    ...init,
+    method
+  };
+
+  if (isGet) {
+    if (init?.next?.revalidate !== undefined) {
+      requestInit.next = {
+        ...(requestInit.next ?? {}),
+        revalidate: init.next.revalidate
+      };
+    }
+  }
+
   let response: Response;
 
   try {
-    response = await fetch(url, {
-      cache: "no-store",
-      ...init
-    });
+    response = await fetch(url, requestInit);
   } catch (error) {
     if (isNextDynamicServerUsageError(error)) {
       throw error;

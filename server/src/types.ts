@@ -522,6 +522,8 @@ export interface QuickFlipConfigVisibility {
   liveEnabled: boolean | null;
   disableAi: boolean | null;
   allocation: number;
+  maxMarketChecks: number;
+  targetOpportunityBuffer: number;
   minEntryPrice: number;
   maxEntryPrice: number;
   minProfitMargin: number;
@@ -539,9 +541,14 @@ export interface QuickFlipConfigVisibility {
   minTopOfBookSize: number;
   minNetProfit: number;
   minNetRoi: number;
+  maxTargetVsRecentTradeGap: number;
+  minRecentRangeTicks: number;
+  minRecentPricePosition: number;
+  maxEntryVsRecentLastGap: number;
   recentTradeWindowSeconds: number;
   minRecentTradeCount: number;
   makerEntryTimeoutSeconds: number;
+  makerEntryPollSeconds: number;
   makerEntryRepriceSeconds: number;
   dynamicExitRepriceSeconds: number;
   stopLossPct: number;
@@ -552,6 +559,8 @@ export interface QuickFlipConfigUpdatePayload {
   liveEnabled?: boolean;
   disableAi?: boolean;
   allocation?: number;
+  maxMarketChecks?: number;
+  targetOpportunityBuffer?: number;
   minEntryPrice?: number;
   maxEntryPrice?: number;
   minProfitMargin?: number;
@@ -569,9 +578,14 @@ export interface QuickFlipConfigUpdatePayload {
   minTopOfBookSize?: number;
   minNetProfit?: number;
   minNetRoi?: number;
+  maxTargetVsRecentTradeGap?: number;
+  minRecentRangeTicks?: number;
+  minRecentPricePosition?: number;
+  maxEntryVsRecentLastGap?: number;
   recentTradeWindowSeconds?: number;
   minRecentTradeCount?: number;
   makerEntryTimeoutSeconds?: number;
+  makerEntryPollSeconds?: number;
   makerEntryRepriceSeconds?: number;
   dynamicExitRepriceSeconds?: number;
   stopLossPct?: number;

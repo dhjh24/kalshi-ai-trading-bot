@@ -13,6 +13,8 @@ type QuickFlipBooleanField = "enabled" | "liveEnabled" | "disableAi";
 
 type QuickFlipNumericField =
   | "allocation"
+  | "maxMarketChecks"
+  | "targetOpportunityBuffer"
   | "minEntryPrice"
   | "maxEntryPrice"
   | "minProfitMargin"
@@ -30,9 +32,14 @@ type QuickFlipNumericField =
   | "minTopOfBookSize"
   | "minNetProfit"
   | "minNetRoi"
+  | "maxTargetVsRecentTradeGap"
+  | "minRecentRangeTicks"
+  | "minRecentPricePosition"
+  | "maxEntryVsRecentLastGap"
   | "recentTradeWindowSeconds"
   | "minRecentTradeCount"
   | "makerEntryTimeoutSeconds"
+  | "makerEntryPollSeconds"
   | "makerEntryRepriceSeconds"
   | "dynamicExitRepriceSeconds"
   | "stopLossPct";
@@ -65,7 +72,21 @@ const NUMBER_FIELDS = [
     label: "Allocation",
     step: "0.01",
     min: "0",
-    helpText: "Dollar budget applied to each quick flip candidate."
+    helpText: "Fraction of runtime capital reserved for quick flip when enabled."
+  },
+  {
+    key: "maxMarketChecks",
+    label: "Max market checks",
+    step: "1",
+    min: "1",
+    helpText: "Maximum fully hydrated candidate markets scanned per cycle."
+  },
+  {
+    key: "targetOpportunityBuffer",
+    label: "Candidate buffer",
+    step: "1",
+    min: "1",
+    helpText: "Extra candidates analyzed before final position slots are selected."
   },
   {
     key: "minEntryPrice",
@@ -187,6 +208,34 @@ const NUMBER_FIELDS = [
     helpText: "Minimum net return on investment target per trade."
   },
   {
+    key: "maxTargetVsRecentTradeGap",
+    label: "Max target vs recent high gap",
+    step: "0.001",
+    min: "0",
+    helpText: "Reject targets too far above the recent tape high."
+  },
+  {
+    key: "minRecentRangeTicks",
+    label: "Min recent range ticks",
+    step: "1",
+    min: "0",
+    helpText: "Minimum tape range, in ticks, required before entry."
+  },
+  {
+    key: "minRecentPricePosition",
+    label: "Min recent price position",
+    step: "0.01",
+    min: "0",
+    helpText: "Require the latest print to sit high enough within the recent range."
+  },
+  {
+    key: "maxEntryVsRecentLastGap",
+    label: "Max entry vs recent last gap",
+    step: "0.001",
+    min: "0",
+    helpText: "Reject entries that have already gapped above the latest print."
+  },
+  {
     key: "recentTradeWindowSeconds",
     label: "Recent trade window",
     step: "1",
@@ -206,6 +255,13 @@ const NUMBER_FIELDS = [
     step: "1",
     min: "0",
     helpText: "How long maker-entry pricing is retried before fallback."
+  },
+  {
+    key: "makerEntryPollSeconds",
+    label: "Maker poll interval",
+    step: "1",
+    min: "1",
+    helpText: "Seconds between maker entry fill checks."
   },
   {
     key: "makerEntryRepriceSeconds",
@@ -250,6 +306,8 @@ function buildBooleanState(config: QuickFlipConfigVisibility): BooleanState {
 function buildNumericState(config: QuickFlipConfigVisibility): NumericState {
   return {
     allocation: String(config.allocation),
+    maxMarketChecks: String(config.maxMarketChecks),
+    targetOpportunityBuffer: String(config.targetOpportunityBuffer),
     minEntryPrice: String(config.minEntryPrice),
     maxEntryPrice: String(config.maxEntryPrice),
     minProfitMargin: String(config.minProfitMargin),
@@ -267,9 +325,14 @@ function buildNumericState(config: QuickFlipConfigVisibility): NumericState {
     minTopOfBookSize: String(config.minTopOfBookSize),
     minNetProfit: String(config.minNetProfit),
     minNetRoi: String(config.minNetRoi),
+    maxTargetVsRecentTradeGap: String(config.maxTargetVsRecentTradeGap),
+    minRecentRangeTicks: String(config.minRecentRangeTicks),
+    minRecentPricePosition: String(config.minRecentPricePosition),
+    maxEntryVsRecentLastGap: String(config.maxEntryVsRecentLastGap),
     recentTradeWindowSeconds: String(config.recentTradeWindowSeconds),
     minRecentTradeCount: String(config.minRecentTradeCount),
     makerEntryTimeoutSeconds: String(config.makerEntryTimeoutSeconds),
+    makerEntryPollSeconds: String(config.makerEntryPollSeconds),
     makerEntryRepriceSeconds: String(config.makerEntryRepriceSeconds),
     dynamicExitRepriceSeconds: String(config.dynamicExitRepriceSeconds),
     stopLossPct: String(config.stopLossPct)
@@ -297,14 +360,17 @@ export function QuickFlipConfigEditor({
     buildNumericState(initialConfig)
   );
   const [isSaving, setIsSaving] = useState(false);
+  const [isEditing, setIsEditing] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isPending, startTransition] = useTransition();
 
   useEffect(() => {
-    setBooleanValues(buildBooleanState(initialConfig));
-    setNumberValues(buildNumericState(initialConfig));
-  }, [initialConfig]);
+    if (!isEditing) {
+      setBooleanValues(buildBooleanState(initialConfig));
+      setNumberValues(buildNumericState(initialConfig));
+    }
+  }, [initialConfig, isEditing]);
 
   const applyFromPayload = (config: QuickFlipConfigVisibility) => {
     setBooleanValues(buildBooleanState(config));
@@ -312,6 +378,9 @@ export function QuickFlipConfigEditor({
   };
 
   const handleBooleanChange = (key: QuickFlipBooleanField, value: boolean) => {
+    if (!isEditing) {
+      return;
+    }
     setBooleanValues((current) => ({
       ...current,
       [key]: value
@@ -319,6 +388,9 @@ export function QuickFlipConfigEditor({
   };
 
   const handleNumberChange = (key: QuickFlipNumericField, value: string) => {
+    if (!isEditing) {
+      return;
+    }
     setNumberValues((current) => ({
       ...current,
       [key]: value
@@ -327,6 +399,9 @@ export function QuickFlipConfigEditor({
 
   const save = async (event: FormEvent) => {
     event.preventDefault();
+    if (!isEditing) {
+      return;
+    }
     setMessage(null);
     setError(null);
 
@@ -336,6 +411,11 @@ export function QuickFlipConfigEditor({
         liveEnabled: booleanValues.liveEnabled,
         disableAi: booleanValues.disableAi,
         allocation: parseNumberField(numberValues.allocation, "Allocation"),
+        maxMarketChecks: parseNumberField(numberValues.maxMarketChecks, "Max market checks"),
+        targetOpportunityBuffer: parseNumberField(
+          numberValues.targetOpportunityBuffer,
+          "Candidate buffer"
+        ),
         minEntryPrice: parseNumberField(numberValues.minEntryPrice, "Min entry price"),
         maxEntryPrice: parseNumberField(numberValues.maxEntryPrice, "Max entry price"),
         minProfitMargin: parseNumberField(numberValues.minProfitMargin, "Min profit margin"),
@@ -359,6 +439,22 @@ export function QuickFlipConfigEditor({
         minTopOfBookSize: parseNumberField(numberValues.minTopOfBookSize, "Min top-of-book size"),
         minNetProfit: parseNumberField(numberValues.minNetProfit, "Min net profit"),
         minNetRoi: parseNumberField(numberValues.minNetRoi, "Min net ROI"),
+        maxTargetVsRecentTradeGap: parseNumberField(
+          numberValues.maxTargetVsRecentTradeGap,
+          "Max target vs recent high gap"
+        ),
+        minRecentRangeTicks: parseNumberField(
+          numberValues.minRecentRangeTicks,
+          "Min recent range ticks"
+        ),
+        minRecentPricePosition: parseNumberField(
+          numberValues.minRecentPricePosition,
+          "Min recent price position"
+        ),
+        maxEntryVsRecentLastGap: parseNumberField(
+          numberValues.maxEntryVsRecentLastGap,
+          "Max entry vs recent last gap"
+        ),
         recentTradeWindowSeconds: parseNumberField(
           numberValues.recentTradeWindowSeconds,
           "Recent trade window"
@@ -370,6 +466,10 @@ export function QuickFlipConfigEditor({
         makerEntryTimeoutSeconds: parseNumberField(
           numberValues.makerEntryTimeoutSeconds,
           "Maker entry timeout"
+        ),
+        makerEntryPollSeconds: parseNumberField(
+          numberValues.makerEntryPollSeconds,
+          "Maker poll interval"
         ),
         makerEntryRepriceSeconds: parseNumberField(
           numberValues.makerEntryRepriceSeconds,
@@ -390,6 +490,7 @@ export function QuickFlipConfigEditor({
       }
 
       applyFromPayload(result.config);
+      setIsEditing(false);
       setMessage(result.message);
       startTransition(() => {
         router.refresh();
@@ -401,11 +502,19 @@ export function QuickFlipConfigEditor({
     }
   };
 
+  const cancelEditing = () => {
+    setBooleanValues(buildBooleanState(initialConfig));
+    setNumberValues(buildNumericState(initialConfig));
+    setError(null);
+    setMessage(null);
+    setIsEditing(false);
+  };
+
   return (
     <form className="space-y-5" onSubmit={save}>
       <p className="text-sm text-slate-500">
-        Update QUICK_FLIP_* values directly. Changes are persisted to <code>.env</code> and applied to
-        runtime visibility immediately.
+        Review QUICK_FLIP_* values here. Use edit mode to change settings; saves are persisted to{" "}
+        <code>.env</code> and applied to runtime visibility immediately.
       </p>
 
       <div className="grid gap-3 md:grid-cols-3">
@@ -420,6 +529,7 @@ export function QuickFlipConfigEditor({
                 type="checkbox"
                 checked={booleanValues[field.key]}
                 onChange={(event) => handleBooleanChange(field.key, event.target.checked)}
+                disabled={!isEditing || isSaving || isPending}
                 className="h-4 w-4 rounded border-slate-300 text-signal focus:ring-signal"
               />
               <span>{booleanValues[field.key] ? "Enabled" : "Disabled"}</span>
@@ -442,7 +552,8 @@ export function QuickFlipConfigEditor({
               onChange={(event) => handleNumberChange(field.key, event.target.value)}
               step={field.step}
               min={field.min}
-              className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-steel"
+              disabled={!isEditing || isSaving || isPending}
+              className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-steel disabled:border-transparent disabled:bg-transparent disabled:px-0 disabled:py-0 disabled:text-lg disabled:font-semibold disabled:text-steel"
             />
             <p className="text-xs text-slate-500">{field.helpText}</p>
           </label>
@@ -450,14 +561,40 @@ export function QuickFlipConfigEditor({
       </div>
 
       <div className="flex flex-wrap items-center gap-3">
-        <button
-          type="submit"
-          disabled={isSaving || isPending}
-          className="rounded-full bg-steel px-5 py-3 text-sm font-semibold text-white transition hover:bg-signal disabled:cursor-not-allowed disabled:bg-slate-300"
-        >
-          {isSaving || isPending ? "Saving" : "Save quick-flip config"}
-        </button>
-        <Badge tone="neutral">Saved settings apply on next refresh and now.</Badge>
+        {isEditing ? (
+          <>
+            <button
+              type="submit"
+              disabled={isSaving || isPending}
+              className="rounded-full bg-steel px-5 py-3 text-sm font-semibold text-white transition hover:bg-signal disabled:cursor-not-allowed disabled:bg-slate-300"
+            >
+              {isSaving || isPending ? "Saving" : "Save quick-flip config"}
+            </button>
+            <button
+              type="button"
+              onClick={cancelEditing}
+              disabled={isSaving || isPending}
+              className="rounded-full border border-slate-200 px-5 py-3 text-sm font-semibold text-steel transition hover:border-signal hover:text-signal disabled:cursor-not-allowed disabled:text-slate-300"
+            >
+              Cancel
+            </button>
+          </>
+        ) : (
+          <button
+            type="button"
+            onClick={() => {
+              setMessage(null);
+              setError(null);
+              setIsEditing(true);
+            }}
+            className="rounded-full bg-steel px-5 py-3 text-sm font-semibold text-white transition hover:bg-signal"
+          >
+            Edit settings
+          </button>
+        )}
+        <Badge tone="neutral">
+          {isEditing ? "Editing enabled" : "Settings locked for review"}
+        </Badge>
       </div>
 
       {message ? (
@@ -473,4 +610,3 @@ export function QuickFlipConfigEditor({
     </form>
   );
 }
-

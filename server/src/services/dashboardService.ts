@@ -267,6 +267,12 @@ const QUICK_FLIP_CONFIG_ENV_BINDINGS: Array<{
   },
   { payloadKey: "disableAi", envKey: "QUICK_FLIP_DISABLE_AI", numeric: false },
   { payloadKey: "allocation", envKey: "QUICK_FLIP_ALLOCATION", numeric: true },
+  { payloadKey: "maxMarketChecks", envKey: "QUICK_FLIP_MAX_MARKET_CHECKS", numeric: true },
+  {
+    payloadKey: "targetOpportunityBuffer",
+    envKey: "QUICK_FLIP_TARGET_OPPORTUNITY_BUFFER",
+    numeric: true
+  },
   { payloadKey: "minEntryPrice", envKey: "QUICK_FLIP_MIN_ENTRY_PRICE", numeric: true },
   { payloadKey: "maxEntryPrice", envKey: "QUICK_FLIP_MAX_ENTRY_PRICE", numeric: true },
   {
@@ -321,6 +327,26 @@ const QUICK_FLIP_CONFIG_ENV_BINDINGS: Array<{
   { payloadKey: "minNetProfit", envKey: "QUICK_FLIP_MIN_NET_PROFIT", numeric: true },
   { payloadKey: "minNetRoi", envKey: "QUICK_FLIP_MIN_NET_ROI", numeric: true },
   {
+    payloadKey: "maxTargetVsRecentTradeGap",
+    envKey: "QUICK_FLIP_MAX_TARGET_VS_RECENT_TRADE_GAP",
+    numeric: true
+  },
+  {
+    payloadKey: "minRecentRangeTicks",
+    envKey: "QUICK_FLIP_MIN_RECENT_RANGE_TICKS",
+    numeric: true
+  },
+  {
+    payloadKey: "minRecentPricePosition",
+    envKey: "QUICK_FLIP_MIN_RECENT_PRICE_POSITION",
+    numeric: true
+  },
+  {
+    payloadKey: "maxEntryVsRecentLastGap",
+    envKey: "QUICK_FLIP_MAX_ENTRY_VS_RECENT_LAST_GAP",
+    numeric: true
+  },
+  {
     payloadKey: "recentTradeWindowSeconds",
     envKey: "QUICK_FLIP_RECENT_TRADE_WINDOW_SECONDS",
     numeric: true
@@ -329,6 +355,11 @@ const QUICK_FLIP_CONFIG_ENV_BINDINGS: Array<{
   {
     payloadKey: "makerEntryTimeoutSeconds",
     envKey: "QUICK_FLIP_MAKER_ENTRY_TIMEOUT_SECONDS",
+    numeric: true
+  },
+  {
+    payloadKey: "makerEntryPollSeconds",
+    envKey: "QUICK_FLIP_MAKER_ENTRY_POLL_SECONDS",
     numeric: true
   },
   {
@@ -350,6 +381,8 @@ const quickFlipConfigUpdatePayloadSchema = z
     liveEnabled: z.boolean().optional(),
     disableAi: z.boolean().optional(),
     allocation: z.number().nonnegative().finite().optional(),
+    maxMarketChecks: z.number().nonnegative().finite().optional(),
+    targetOpportunityBuffer: z.number().nonnegative().finite().optional(),
     minEntryPrice: z.number().nonnegative().finite().optional(),
     maxEntryPrice: z.number().nonnegative().finite().optional(),
     minProfitMargin: z.number().nonnegative().finite().optional(),
@@ -367,9 +400,14 @@ const quickFlipConfigUpdatePayloadSchema = z
     minTopOfBookSize: z.number().nonnegative().finite().optional(),
     minNetProfit: z.number().nonnegative().finite().optional(),
     minNetRoi: z.number().nonnegative().finite().optional(),
+    maxTargetVsRecentTradeGap: z.number().nonnegative().finite().optional(),
+    minRecentRangeTicks: z.number().nonnegative().finite().optional(),
+    minRecentPricePosition: z.number().nonnegative().finite().optional(),
+    maxEntryVsRecentLastGap: z.number().nonnegative().finite().optional(),
     recentTradeWindowSeconds: z.number().nonnegative().finite().optional(),
     minRecentTradeCount: z.number().nonnegative().finite().optional(),
     makerEntryTimeoutSeconds: z.number().nonnegative().finite().optional(),
+    makerEntryPollSeconds: z.number().nonnegative().finite().optional(),
     makerEntryRepriceSeconds: z.number().nonnegative().finite().optional(),
     dynamicExitRepriceSeconds: z.number().nonnegative().finite().optional(),
     stopLossPct: z.number().nonnegative().finite().optional()
@@ -716,7 +754,9 @@ function getQuickFlipConfigVisibility(): QuickFlipConfigVisibility {
     enabled: parseEnvBoolean(process.env.ENABLE_QUICK_FLIP),
     liveEnabled: parseEnvBoolean(process.env.ENABLE_LIVE_QUICK_FLIP),
     disableAi: parseEnvBoolean(process.env.QUICK_FLIP_DISABLE_AI),
-    allocation: parseEnvNumber("QUICK_FLIP_ALLOCATION", 0),
+    allocation: parseEnvNumber("QUICK_FLIP_ALLOCATION", 0.05),
+    maxMarketChecks: parseEnvNumber("QUICK_FLIP_MAX_MARKET_CHECKS", 100),
+    targetOpportunityBuffer: parseEnvNumber("QUICK_FLIP_TARGET_OPPORTUNITY_BUFFER", 6),
     minEntryPrice: parseEnvNumber("QUICK_FLIP_MIN_ENTRY_PRICE", 0.01),
     maxEntryPrice: parseEnvNumber("QUICK_FLIP_MAX_ENTRY_PRICE", 0.2),
     minProfitMargin: parseEnvNumber("QUICK_FLIP_MIN_PROFIT_MARGIN", 0.1),
@@ -728,15 +768,20 @@ function getQuickFlipConfigVisibility(): QuickFlipConfigVisibility {
     maxTradesPerHour: parseEnvNumber("QUICK_FLIP_MAX_TRADES_PER_HOUR", 60),
     confidenceThreshold: parseEnvNumber("QUICK_FLIP_CONFIDENCE_THRESHOLD", 0.6),
     maxHoldMinutes: parseEnvNumber("QUICK_FLIP_MAX_HOLD_MINUTES", 30),
-    minMarketVolume: parseEnvNumber("QUICK_FLIP_MIN_MARKET_VOLUME", 2000),
+    minMarketVolume: parseEnvNumber("QUICK_FLIP_MIN_MARKET_VOLUME", 1000),
     maxHoursToExpiry: parseEnvNumber("QUICK_FLIP_MAX_HOURS_TO_EXPIRY", 72),
     maxBidAskSpread: parseEnvNumber("QUICK_FLIP_MAX_BID_ASK_SPREAD", 0.03),
-    minTopOfBookSize: parseEnvNumber("QUICK_FLIP_MIN_TOP_OF_BOOK_SIZE", 25),
+    minTopOfBookSize: parseEnvNumber("QUICK_FLIP_MIN_TOP_OF_BOOK_SIZE", 10),
     minNetProfit: parseEnvNumber("QUICK_FLIP_MIN_NET_PROFIT", 0.1),
     minNetRoi: parseEnvNumber("QUICK_FLIP_MIN_NET_ROI", 0.03),
+    maxTargetVsRecentTradeGap: parseEnvNumber("QUICK_FLIP_MAX_TARGET_VS_RECENT_TRADE_GAP", 0.02),
+    minRecentRangeTicks: parseEnvNumber("QUICK_FLIP_MIN_RECENT_RANGE_TICKS", 2),
+    minRecentPricePosition: parseEnvNumber("QUICK_FLIP_MIN_RECENT_PRICE_POSITION", 0.4),
+    maxEntryVsRecentLastGap: parseEnvNumber("QUICK_FLIP_MAX_ENTRY_VS_RECENT_LAST_GAP", 0.02),
     recentTradeWindowSeconds: parseEnvNumber("QUICK_FLIP_RECENT_TRADE_WINDOW_SECONDS", 3600),
     minRecentTradeCount: parseEnvNumber("QUICK_FLIP_MIN_RECENT_TRADE_COUNT", 5),
     makerEntryTimeoutSeconds: parseEnvNumber("QUICK_FLIP_MAKER_ENTRY_TIMEOUT_SECONDS", 180),
+    makerEntryPollSeconds: parseEnvNumber("QUICK_FLIP_MAKER_ENTRY_POLL_SECONDS", 5),
     makerEntryRepriceSeconds: parseEnvNumber("QUICK_FLIP_MAKER_ENTRY_REPRICE_SECONDS", 30),
     dynamicExitRepriceSeconds: parseEnvNumber("QUICK_FLIP_DYNAMIC_EXIT_REPRICE_SECONDS", 60),
     stopLossPct: parseEnvNumber("QUICK_FLIP_STOP_LOSS_PCT", 0.08)

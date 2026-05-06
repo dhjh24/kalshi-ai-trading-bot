@@ -33,12 +33,14 @@ async function fetchKalshi<T>(
 }
 
 export async function getKalshiEvent(eventTicker: string): Promise<KalshiEvent | null> {
-  const response = await fetchKalshi<{ events?: KalshiEvent[] }>("/trade-api/v2/events", {
-    event_ticker: eventTicker,
-    with_nested_markets: "true"
-  });
+  const response = await fetchKalshi<{ event?: KalshiEvent }>(
+    `/trade-api/v2/events/${encodeURIComponent(eventTicker)}`,
+    {
+      with_nested_markets: "true"
+    }
+  );
 
-  return response.events?.[0] ?? null;
+  return response.event ?? null;
 }
 
 export async function getKalshiMarket(ticker: string): Promise<KalshiMarket | null> {
