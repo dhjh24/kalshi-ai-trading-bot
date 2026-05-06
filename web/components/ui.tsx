@@ -2,6 +2,39 @@ import clsx from "clsx";
 import Link from "next/link";
 import { ReactNode } from "react";
 
+const ROUTE_HELP = [
+  {
+    href: "/",
+    label: "Overview",
+    description: "Portfolio snapshot, open exposure, and quick links into live and market workflows."
+  },
+  {
+    href: "/live-trade",
+    label: "Live Trade",
+    description: "Watch W5 decision queue, event filters, and execution feed updates in near real time."
+  },
+  {
+    href: "/quick-flip",
+    label: "Quick Flip",
+    description: "Inspect fast scalp candidates, maker/taker orders, and quick-flip execution guardrails."
+  },
+  {
+    href: "/markets",
+    label: "Markets",
+    description: "Find open markets, open a contract detail page, and launch manual analysis on demand."
+  },
+  {
+    href: "/portfolio",
+    label: "Portfolio",
+    description: "Track closed/open positions, divergence between paper and live modes, and AI spend."
+  },
+  {
+    href: "/analysis",
+    label: "Analysis",
+    description: "Monitor queued, running, and completed manual analysis requests and see status updates."
+  }
+];
+
 export function AppFrame({ children }: { children: ReactNode }) {
   return (
     <div className="min-h-screen bg-halo text-ink">
@@ -19,13 +52,25 @@ export function AppFrame({ children }: { children: ReactNode }) {
             </div>
           </div>
           <nav className="flex flex-wrap gap-2 text-sm font-medium text-slate-600">
-            <NavLink href="/">Overview</NavLink>
-            <NavLink href="/live-trade">Live Trade</NavLink>
-            <NavLink href="/quick-flip">Quick Flip</NavLink>
-            <NavLink href="/markets">Markets</NavLink>
-            <NavLink href="/portfolio">Portfolio</NavLink>
-            <NavLink href="/analysis">Analysis</NavLink>
+            {ROUTE_HELP.map((route) => (
+              <NavLink key={route.href} href={route.href}>
+                {route.label}
+              </NavLink>
+            ))}
           </nav>
+          <div className="mt-4 grid gap-2 text-xs md:grid-cols-2 xl:grid-cols-6">
+            {ROUTE_HELP.map((route) => (
+              <div
+                key={`help-${route.href}`}
+                className="rounded-[18px] border border-slate-100 bg-white/90 px-3 py-2"
+              >
+                <p className="font-medium text-steel">{route.label}</p>
+                <p className="mt-1 text-xs leading-relaxed text-slate-500">
+                  {route.description}
+                </p>
+              </div>
+            ))}
+          </div>
         </div>
       </header>
       <main className="mx-auto max-w-7xl px-6 py-8">{children}</main>

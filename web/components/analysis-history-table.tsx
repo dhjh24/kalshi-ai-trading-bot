@@ -3,7 +3,7 @@
 import type { AnalysisRecord } from "../lib/types";
 import { useTopicStream } from "../lib/use-topic-stream";
 import { formatMoney, formatTimestamp } from "../lib/format";
-import { Badge } from "./ui";
+import { Badge, EmptyState } from "./ui";
 
 function asObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
@@ -23,6 +23,15 @@ export function AnalysisHistoryTable({
     initialValue,
     (payload) => (Array.isArray(payload) ? (payload as AnalysisRecord[]) : initialValue)
   );
+
+  if (records.length === 0) {
+    return (
+      <EmptyState
+        title="No analysis requests logged yet"
+        body="Manual analysis is always user triggered from a Market or Event page. Use the request button there and keep this view open for streaming status updates."
+      />
+    );
+  }
 
   return (
     <div className="overflow-hidden rounded-[22px] border border-slate-100">

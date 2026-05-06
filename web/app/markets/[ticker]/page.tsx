@@ -39,6 +39,12 @@ export default async function MarketDetailPage({
             <p className="text-sm text-slate-500">
               Last updated {formatTimestamp(detail.market.db?.last_updated || detail.market.live?.expirationTime || null)}
             </p>
+            <p className="max-w-3xl text-sm leading-6 text-slate-500">
+              Use this page to inspect order book depth, related contracts, and
+              sibling opportunities before requesting manual analysis. The
+              analysis result below is stored in SQLite and surfaced across
+              related market and event views.
+            </p>
           </div>
           <AnalysisButton
             targetType="market"

@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { formatDateShort } from "../lib/format";
 import type { MarketRow } from "../lib/types";
+import { EmptyState } from "./ui";
 
 export function MarketTable({
   items,
@@ -9,6 +10,15 @@ export function MarketTable({
   items: MarketRow[];
   title?: string;
 }) {
+  if (items.length === 0) {
+    return (
+      <EmptyState
+        title="No markets found for this selection"
+        body="No markets match the active selector. Try resetting the dashboard filters, updating the runtime mode, or checking that the Python job has written a fresh markets snapshot."
+      />
+    );
+  }
+
   return (
     <div>
       <h3 className="mb-4 text-lg font-semibold text-steel">{title}</h3>

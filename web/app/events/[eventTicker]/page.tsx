@@ -30,6 +30,10 @@ export default async function EventDetailPage({
               <Badge tone="positive">{detail.focusType}</Badge>
             </div>
             {detail.event.sub_title ? <p className="text-slate-600">{detail.event.sub_title}</p> : null}
+            <p className="max-w-3xl text-sm leading-6 text-slate-500">
+              Use this page to review the entire event bundle: markets, latest news,
+              and live analysis before drilling into a specific contract.
+            </p>
           </div>
           <AnalysisButton targetType="event" targetId={eventTicker} initialRecord={detail.latestAnalysis} />
         </div>
