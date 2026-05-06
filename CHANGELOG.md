@@ -13,6 +13,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Added current quick-flip allocation and filter knobs to `env.template`
 
 ### Changed
+- Canonical repository metadata and setup links now point to `https://github.com/cdavisv/kalshi-ai-trading-bot`.
 - Paper trading documentation now points to `python cli.py run --paper`, the Node dashboard, and the optional `python -m src.paper.dashboard` static report
 - Quick Flip documentation now reflects the current fee-aware, maker-entry, heuristic-fallback, paper/shadow/live strategy behavior
 - Performance-system docs now describe the current `ModelRouter` path instead of the removed legacy client shim

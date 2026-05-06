@@ -8,7 +8,7 @@
 
 ## Why this exists
 
-The W5 macro specialist needs to know, for a given Kalshi market, (a)
+The live-trade macro specialist needs to know, for a given Kalshi market, (a)
 what economic release the market is actually tracking (CPI, NFP, FOMC,
 …), (b) when the release lands relative to market close, and (c)
 whether the calendar confirms that release is imminent. No paid key is
@@ -51,7 +51,7 @@ required.
 ## Known limitations
 
 - RSS summaries from Trading Economics are terse; the adapter does not
-  attempt to parse structured "actual vs. forecast" numbers. If W5
+  attempt to parse structured "actual vs. forecast" numbers. If the macro specialist
   needs those, point the adapter at the ForexFactory / investing.com
   feeds (both free, same shape) and extend `_load_calendar`.
 - No country-of-release normalization beyond a coarse US / EU / UK

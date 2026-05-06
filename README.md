@@ -4,10 +4,10 @@
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![GitHub Stars](https://img.shields.io/github/stars/ryanfrigo/kalshi-ai-trading-bot?style=flat&color=yellow)](https://github.com/ryanfrigo/kalshi-ai-trading-bot/stargazers)
-[![GitHub Forks](https://img.shields.io/github/forks/ryanfrigo/kalshi-ai-trading-bot?style=flat&color=blue)](https://github.com/ryanfrigo/kalshi-ai-trading-bot/network)
-[![GitHub Issues](https://img.shields.io/github/issues/ryanfrigo/kalshi-ai-trading-bot)](https://github.com/ryanfrigo/kalshi-ai-trading-bot/issues)
-[![Last Commit](https://img.shields.io/github/last-commit/ryanfrigo/kalshi-ai-trading-bot)](https://github.com/ryanfrigo/kalshi-ai-trading-bot/commits/main)
+[![GitHub Stars](https://img.shields.io/github/stars/cdavisv/kalshi-ai-trading-bot?style=flat&color=yellow)](https://github.com/cdavisv/kalshi-ai-trading-bot/stargazers)
+[![GitHub Forks](https://img.shields.io/github/forks/cdavisv/kalshi-ai-trading-bot?style=flat&color=blue)](https://github.com/cdavisv/kalshi-ai-trading-bot/network)
+[![GitHub Issues](https://img.shields.io/github/issues/cdavisv/kalshi-ai-trading-bot)](https://github.com/cdavisv/kalshi-ai-trading-bot/issues)
+[![Last Commit](https://img.shields.io/github/last-commit/cdavisv/kalshi-ai-trading-bot)](https://github.com/cdavisv/kalshi-ai-trading-bot/commits/main)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
 **Multi-model Kalshi trading stack with selectable Codex CLI, OpenAI, and OpenRouter routing.**
@@ -29,6 +29,7 @@ Use a signed-in Codex CLI first, or fall back to direct OpenAI / OpenRouter bill
 
 ## Current Application
 
+- Canonical repository: `https://github.com/cdavisv/kalshi-ai-trading-bot`. This repo is maintained as the standalone `cdavisv` application and is the installation source for new clones.
 - Package version: `2.0.0` in `pyproject.toml`; unreleased runtime/docs changes are tracked in `CHANGELOG.md`.
 - Canonical runtime: `python cli.py run` instantiates `src.runtime.unified_bot.UnifiedTradingBot` for paper, shadow, live, and retained `--beast` settings-overrides.
 - Canonical paper path: `python cli.py run --paper`; the retired `paper_trader.py` and legacy signal-tracker fallback are no longer part of the app.
@@ -43,7 +44,7 @@ Use a signed-in Codex CLI first, or fall back to direct OpenAI / OpenRouter bill
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/ryanfrigo/kalshi-ai-trading-bot.git
+git clone https://github.com/cdavisv/kalshi-ai-trading-bot.git
 cd kalshi-ai-trading-bot
 python -m venv .venv
 source .venv/bin/activate        # macOS / Linux
@@ -192,7 +193,7 @@ Every decision is written to a local SQLite database. The dashboard and CLI comm
 ### Manual Installation (Recommended)
 
 ```bash
-git clone https://github.com/ryanfrigo/kalshi-ai-trading-bot.git
+git clone https://github.com/cdavisv/kalshi-ai-trading-bot.git
 cd kalshi-ai-trading-bot
 
 python -m venv .venv
@@ -383,15 +384,12 @@ kalshi-ai-trading-bot/
 │   └── utils/                 # Database, logging, prompts, risk helpers
 │
 ├── scripts/                   # Utility and diagnostic scripts
+├── server/                    # Fastify dashboard API and SSE streams
+├── web/                       # Next.js App Router dashboard frontend
+├── python_bridge/             # FastAPI bridge for manual analysis
 ├── docs/                      # Additional documentation + paper dashboard HTML
 └── tests/                     # Pytest test suite
 ```
-
-Current 2.x additions not shown in the legacy tree above:
-
-- `web/` — Next.js App Router frontend
-- `server/` — Fastify API + SSE streams
-- `python_bridge/` — FastAPI bridge for manual market and event analysis
 
 `src/clients/codex_client.py`, `src/clients/openai_client.py`, `src/clients/openrouter_client.py`, and `src/clients/model_router.py` now share the active provider-routing path.
 
@@ -414,7 +412,7 @@ min_confidence_to_trade = 0.45   # Minimum ensemble confidence to enter
 
 # AI settings
 llm_provider           = "auto"   # auto prefers Codex CLI, then OpenAI, then OpenRouter
-primary_model          = "codex/gpt-5-codex"  # default when Codex is available
+primary_model          = "codex/gpt-5.4"  # default when Codex is available
 ai_temperature         = 0       # Deterministic outputs
 ai_max_tokens          = 8000
 
@@ -789,13 +787,13 @@ Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for full guide
 
 **Quick steps:**
 
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/your-feature`
+1. Create a branch from `cdavisv/kalshi-ai-trading-bot`: `git checkout -b feature/your-feature`
+2. If you do not have write access, fork `cdavisv/kalshi-ai-trading-bot` first
 3. Make changes, add tests, run `pytest` and `black`
 4. Commit with [conventional commit](https://www.conventionalcommits.org/) format: `feat: add new model weight config`
 5. Open a Pull Request
 
-**Good first issues:** look for the [`good first issue`](https://github.com/ryanfrigo/kalshi-ai-trading-bot/issues?q=label%3A%22good+first+issue%22) label.
+**Good first issues:** look for the [`good first issue`](https://github.com/cdavisv/kalshi-ai-trading-bot/issues?q=label%3A%22good+first+issue%22) label.
 
 ---
 

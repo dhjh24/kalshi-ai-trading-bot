@@ -315,7 +315,21 @@ class OpenAIClient(TradingLoggerMixin):
         return True
 
     @staticmethod
+    def _is_insufficient_quota_error(exc: Exception) -> bool:
+        error_str = str(exc).lower()
+        return any(
+            indicator in error_str
+            for indicator in [
+                "insufficient_quota",
+                "exceeded your current quota",
+                "check your plan and billing",
+            ]
+        )
+
+    @staticmethod
     def _is_rate_limit_error(exc: Exception) -> bool:
+        if OpenAIClient._is_insufficient_quota_error(exc):
+            return False
         error_str = str(exc).lower()
         return any(
             indicator in error_str
@@ -324,6 +338,8 @@ class OpenAIClient(TradingLoggerMixin):
 
     @staticmethod
     def _is_retryable_error(exc: Exception) -> bool:
+        if OpenAIClient._is_insufficient_quota_error(exc):
+            return False
         error_str = str(exc).lower()
         return any(
             indicator in error_str

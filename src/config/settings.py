@@ -4,6 +4,9 @@ Manages trading parameters, API configurations, and risk management settings.
 """
 
 import os
+import shutil
+import subprocess
+import time
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
@@ -48,31 +51,86 @@ def _get_llm_provider() -> str:
     return os.getenv("LLM_PROVIDER", "auto").strip().lower() or "auto"
 
 
+_CODEX_AUTH_CACHE: Dict[str, tuple[bool, float]] = {}
+_CODEX_AUTH_CACHE_TTL_SECONDS = 30.0
+
+
+def _resolve_codex_cli_path_from_env() -> Optional[str]:
+    """Return the configured Codex CLI path without importing client modules."""
+    override = os.getenv("CODEX_CLI_PATH", "").strip()
+    if override:
+        if os.path.isfile(override):
+            return override
+        resolved = shutil.which(override)
+        return resolved
+    return shutil.which("codex")
+
+
 def _is_codex_cli_ready() -> bool:
     """
     Return ``True`` when the Codex CLI is both on PATH and authenticated.
 
-    Wrapped in a try/except because the Codex client is an optional
-    dependency; importing it must never hard-fail settings initialization.
-    The result is cached inside :mod:`src.clients.codex_client` so calling
-    this from multiple settings helpers is cheap.
+    This helper intentionally avoids importing :mod:`src.clients.codex_client`.
+    Settings are created while client modules may still be importing this
+    module, so probing directly avoids a circular import during startup.
     """
-    try:
-        # Local import to avoid a circular import at module load.
-        from src.clients.codex_client import (
-            is_codex_authenticated,
-            resolve_codex_cli_path,
-        )
-    except Exception:
+    if os.getenv("CODEX_DISABLE_AUTH_PROBE", "").strip().lower() in {"1", "true", "yes"}:
         return False
 
-    try:
-        path = resolve_codex_cli_path()
-        if not path:
-            return False
-        return bool(is_codex_authenticated(path))
-    except Exception:
+    path = _resolve_codex_cli_path_from_env()
+    if not path:
         return False
+
+    now = time.time()
+    cached = _CODEX_AUTH_CACHE.get(path)
+    if cached is not None:
+        value, expires_at = cached
+        if expires_at > now:
+            return value
+
+    authenticated = False
+    for argv in (
+        (path, "login", "status"),
+        (path, "auth", "status"),
+    ):
+        try:
+            result = subprocess.run(
+                argv,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            continue
+
+        combined = f"{result.stdout}\n{result.stderr}".lower()
+        if result.returncode != 0:
+            continue
+        if any(
+            marker in combined
+            for marker in (
+                "not signed in",
+                "not logged in",
+                "logged out",
+                "login required",
+                "please log in",
+                "please sign in",
+                "unauthorized",
+                "unauthenticated",
+            )
+        ):
+            continue
+        if combined.strip():
+            authenticated = True
+            break
+
+    _CODEX_AUTH_CACHE[path] = (
+        authenticated,
+        now + _CODEX_AUTH_CACHE_TTL_SECONDS,
+    )
+    return authenticated
 
 
 def _resolve_default_llm_provider() -> str:
@@ -101,7 +159,7 @@ def _get_default_primary_model() -> str:
 
     provider = _resolve_default_llm_provider()
     if provider == "codex":
-        return "codex/gpt-5-codex"
+        return "codex/gpt-5.4"
     if provider == "openai":
         return "openai/gpt-5.4"
     return "anthropic/claude-sonnet-4.5"
@@ -115,7 +173,7 @@ def _get_default_fallback_model() -> str:
 
     provider = _resolve_default_llm_provider()
     if provider == "codex":
-        return "codex/gpt-5.4-codex"
+        return "codex/gpt-5.4-mini"
     if provider == "openai":
         return "openai/o3"
     return "deepseek/deepseek-v3.2"
@@ -129,7 +187,7 @@ def _get_default_sentiment_model() -> str:
 
     provider = _resolve_default_llm_provider()
     if provider == "codex":
-        return "codex/gpt-5-codex"
+        return "codex/gpt-5.4-mini"
     if provider == "openai":
         return "openai/gpt-4.1"
     return "google/gemini-3.1-flash-lite-preview"
@@ -228,7 +286,16 @@ class EnsembleConfig:
     def get_role_model_map(self) -> Dict[str, str]:
         """Return role -> model mapping used by the ensemble/debate system."""
         provider = settings.api.resolve_llm_provider()
-        if provider == "openai":
+        if provider == "codex":
+            role_map = {
+                "forecaster": "codex/gpt-5.4-mini",
+                "news_analyst": "codex/gpt-5.4-mini",
+                "bull_researcher": "codex/gpt-5.4-mini",
+                "bear_researcher": "codex/gpt-5.4-mini",
+                "risk_manager": "codex/gpt-5.4",
+                "trader": "codex/gpt-5.4",
+            }
+        elif provider == "openai":
             role_map = {
                 cfg["role"]: model_id
                 for model_id, cfg in self.normalized_models().items()

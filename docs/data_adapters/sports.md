@@ -6,10 +6,10 @@
 
 ## Why this exists
 
-The W5 live-trade agents need live score / period / possession data
-without a round-trip through the Node server. This adapter ports the
+The live-trade agents need live score / period / possession data without a
+round-trip through the Node server. This adapter ports the
 team-alias matching and scoreboard fetch from the Node implementation
-into Python and exposes it via the uniform W6 contract.
+into Python and exposes it via the uniform adapter contract.
 
 ## Signals returned
 
@@ -44,7 +44,7 @@ Timeouts default to 3s with up to 2 retries and exponential backoff.
 
 The Node adapter also pulls `summary`, play-by-play, leaders, injuries,
 and boxscore blocks. Those are extra round-trips and are **not** part
-of the Python mirror today — the W5 specialists only need live state
+of the Python mirror today because the live-trade specialists only need live state
 (score/period/clock/possession) for short-horizon decisions. If a
 future specialist needs those blocks, extend `SportsAdapter` with a
 `fetch_summary(event_id, league)` method. Until then, anything that

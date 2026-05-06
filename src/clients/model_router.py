@@ -19,7 +19,7 @@ from src.clients.shared_types import (
 )
 from src.clients.openai_client import OpenAIClient
 from src.clients.openrouter_client import OpenRouterClient, MODEL_PRICING
-from src.clients.codex_client import CodexClient
+from src.clients.codex_client import CodexClient, is_codex_authenticated, resolve_codex_cli_path
 from src.config.settings import settings
 from src.utils.logging_setup import TradingLoggerMixin
 
@@ -90,29 +90,26 @@ OPENAI_FULL_FLEET: List[Tuple[str, str]] = [
 # invoked through subprocess, not via OpenAI billing.
 CODEX_CAPABILITY_MAP: Dict[str, List[Tuple[str, str]]] = {
     "fast": [
-        ("codex/gpt-5-codex", "codex"),
-        ("codex/gpt-5.4-codex", "codex"),
+        ("codex/gpt-5.4-mini", "codex"),
+        ("codex/gpt-5.4", "codex"),
     ],
     "cheap": [
-        ("codex/gpt-5-codex", "codex"),
-        ("codex/o3-codex", "codex"),
+        ("codex/gpt-5.4-mini", "codex"),
+        ("codex/gpt-5.4", "codex"),
     ],
     "reasoning": [
-        ("codex/gpt-5.4-codex", "codex"),
-        ("codex/o3-codex", "codex"),
-        ("codex/gpt-5-codex", "codex"),
+        ("codex/gpt-5.4", "codex"),
+        ("codex/gpt-5.4-mini", "codex"),
     ],
     "balanced": [
-        ("codex/gpt-5-codex", "codex"),
-        ("codex/gpt-5.4-codex", "codex"),
-        ("codex/o3-codex", "codex"),
+        ("codex/gpt-5.4", "codex"),
+        ("codex/gpt-5.4-mini", "codex"),
     ],
 }
 
 CODEX_FULL_FLEET: List[Tuple[str, str]] = [
-    ("codex/gpt-5-codex", "codex"),
-    ("codex/gpt-5.4-codex", "codex"),
-    ("codex/o3-codex", "codex"),
+    ("codex/gpt-5.4", "codex"),
+    ("codex/gpt-5.4-mini", "codex"),
 ]
 
 
@@ -178,7 +175,7 @@ class ModelHealth:
 
 class ModelRouter(TradingLoggerMixin):
     """
-    Unified routing layer that dispatches ALL AI requests through OpenRouter.
+    Unified routing layer that dispatches AI requests through the active provider.
 
     Usage::
 
@@ -197,8 +194,8 @@ class ModelRouter(TradingLoggerMixin):
         openrouter_client: Optional[OpenRouterClient] = None,
         codex_client: Optional[CodexClient] = None,
         db_manager: Any = None,
-        # xai_client param accepted for backward compat but ignored — all routing
-        # now goes through OpenRouter.
+        # xai_client param accepted for backward compat but ignored; routing
+        # now goes through the configured provider stack.
         xai_client: Any = None,
     ):
         self.db_manager = db_manager
@@ -217,12 +214,24 @@ class ModelRouter(TradingLoggerMixin):
             key = self._model_key(model_name, provider)
             self.model_health[key] = ModelHealth(model=model_name, provider=provider)
 
+        codex_cli_path = resolve_codex_cli_path()
+        codex_available = self.codex_client is not None or bool(
+            codex_cli_path and is_codex_authenticated(codex_cli_path)
+        )
+        openai_available = self.openai_client is not None or bool(
+            getattr(settings.api, "openai_api_key", "")
+        )
+        openrouter_available = self.openrouter_client is not None or bool(
+            getattr(settings.api, "openrouter_api_key", "")
+        )
+
         self.logger.info(
             "ModelRouter initialized",
             default_provider=self.default_provider,
-            openai_available=self.openai_client is not None,
-            openrouter_available=self.openrouter_client is not None,
-            codex_available=self.codex_client is not None,
+            openai_available=openai_available,
+            openrouter_available=openrouter_available,
+            codex_available=codex_available,
+            codex_cli_path=codex_cli_path,
             fleet_size=len(self._active_fleet()),
         )
 
@@ -387,20 +396,22 @@ class ModelRouter(TradingLoggerMixin):
         codex_bare_models = {name.split("/", 1)[-1] for name in codex_models}
         openai_bare_models = {name.split("/", 1)[-1] for name in openai_models}
 
-        if (
-            normalized in codex_models
-            or normalized.startswith("codex/")
-            or bare_name in codex_bare_models
-        ):
+        if normalized in codex_models or normalized.startswith("codex/"):
             return "codex"
         if self.default_provider == "openrouter":
             return "openrouter"
         if (
-            normalized in openai_models
-            or normalized.startswith("openai/")
-            or bare_name in openai_bare_models
+            self.default_provider == "codex"
+            and "/" not in normalized
+            and bare_name in codex_bare_models
         ):
+            return "codex"
+        if normalized in openai_models or normalized.startswith("openai/"):
             return "openai"
+        if bare_name in openai_bare_models:
+            return "openai"
+        if bare_name in codex_bare_models:
+            return "codex"
         return "openrouter"
 
     def _fleet_for_provider(self, provider: str) -> List[Tuple[str, str]]:
@@ -475,7 +486,7 @@ class ModelRouter(TradingLoggerMixin):
         health.record_failure()
 
     # ------------------------------------------------------------------
-    # Dispatch helpers — all through OpenRouter
+    # Dispatch helpers
     # ------------------------------------------------------------------
 
     async def _dispatch_completion(
@@ -573,7 +584,7 @@ class ModelRouter(TradingLoggerMixin):
         trace: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """
-        Get a completion routed to the best available model via OpenRouter.
+        Get a completion routed to the best available model/provider.
 
         Args:
             prompt: The user/system prompt.
@@ -739,7 +750,7 @@ class ModelRouter(TradingLoggerMixin):
         trace: Optional[Dict[str, Any]] = None,
     ) -> Optional[TradingDecision]:
         """
-        Get a trading decision from the best available model via OpenRouter.
+        Get a trading decision from the best available model/provider.
 
         Args:
             market_data: Market information dict.

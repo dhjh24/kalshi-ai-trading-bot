@@ -44,8 +44,8 @@ def _make_openrouter_client(db_manager) -> OpenRouterClient:
 
 def _make_codex_client(db_manager) -> CodexClient:
     with patch("src.clients.codex_client.settings") as mock_settings:
-        mock_settings.trading.primary_model = "codex/gpt-5-codex"
-        mock_settings.trading.fallback_model = "codex/gpt-5.4-codex"
+        mock_settings.trading.primary_model = "codex/gpt-5.4"
+        mock_settings.trading.fallback_model = "codex/gpt-5.4-mini"
         mock_settings.trading.ai_temperature = 0
         mock_settings.trading.ai_max_tokens = 8000
         mock_settings.trading.daily_ai_cost_limit = 10.0

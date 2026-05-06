@@ -47,6 +47,23 @@ def _mock_responses_api_response():
 class TestOpenAIClient:
     """Coverage for OpenAI researched completions."""
 
+    def test_insufficient_quota_is_not_retryable_or_rate_limit(self):
+        exc = Exception(
+            "Error code: 429 - {'error': {'type': 'insufficient_quota', "
+            "'message': 'You exceeded your current quota, please check your plan and billing details.'}}"
+        )
+
+        assert OpenAIClient._is_insufficient_quota_error(exc) is True
+        assert OpenAIClient._is_retryable_error(exc) is False
+        assert OpenAIClient._is_rate_limit_error(exc) is False
+
+    def test_rate_limit_remains_retryable(self):
+        exc = Exception("Error code: 429 - rate limit exceeded, too many requests")
+
+        assert OpenAIClient._is_insufficient_quota_error(exc) is False
+        assert OpenAIClient._is_retryable_error(exc) is True
+        assert OpenAIClient._is_rate_limit_error(exc) is True
+
     @pytest.mark.asyncio
     async def test_get_researched_completion_uses_responses_api(self):
         response = _mock_responses_api_response()

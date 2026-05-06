@@ -55,8 +55,8 @@ class _FakeProcess:
 def _make_client(**kwargs) -> CodexClient:
     """Instantiate a CodexClient without touching module-level settings state."""
     with patch("src.clients.codex_client.settings") as mock_settings:
-        mock_settings.trading.primary_model = "codex/gpt-5-codex"
-        mock_settings.trading.fallback_model = "codex/gpt-5.4-codex"
+        mock_settings.trading.primary_model = "codex/gpt-5.4"
+        mock_settings.trading.fallback_model = "codex/gpt-5.4-mini"
         mock_settings.trading.ai_temperature = 0
         mock_settings.trading.ai_max_tokens = 8000
         mock_settings.trading.daily_ai_cost_limit = 10.0
@@ -73,25 +73,24 @@ def _make_client(**kwargs) -> CodexClient:
 
 class TestHelpers:
     def test_canonical_model_accepts_codex_slash(self):
-        assert _canonical_codex_model("codex/gpt-5.4-codex") == "codex/gpt-5.4-codex"
+        assert _canonical_codex_model("codex/gpt-5.4-mini") == "codex/gpt-5.4-mini"
 
     def test_canonical_model_accepts_alias(self):
-        assert _canonical_codex_model("codex") == "codex/gpt-5-codex"
-        assert _canonical_codex_model("o3-codex") == "codex/o3-codex"
+        assert _canonical_codex_model("codex") == "codex/gpt-5.4"
+        assert _canonical_codex_model("o3-codex") == "codex/gpt-5.4-mini"
+        assert _canonical_codex_model("gpt-5-codex") == "codex/gpt-5.4"
 
     def test_canonical_model_maps_openai_prefix_to_default(self):
-        # openai/gpt-5.4 has no direct codex analog in the alias table, so
-        # we expect the canonical fallback rather than a bare string.
-        assert _canonical_codex_model("openai/gpt-5.4") == CODEX_FALLBACK_ORDER[0]
+        assert _canonical_codex_model("openai/gpt-5.4") == "codex/gpt-5.4"
 
     def test_canonical_model_empty_string_falls_back(self):
         assert _canonical_codex_model(None) == CODEX_FALLBACK_ORDER[0]
         assert _canonical_codex_model("") == CODEX_FALLBACK_ORDER[0]
 
     def test_build_fallback_chain_preserves_primary(self):
-        chain = _build_fallback_chain("codex/o3-codex", ["codex/gpt-5-codex"])
-        assert chain[0] == "codex/o3-codex"
-        assert "codex/gpt-5-codex" in chain
+        chain = _build_fallback_chain("codex/gpt-5.4-mini", ["codex/gpt-5.4"])
+        assert chain[0] == "codex/gpt-5.4-mini"
+        assert "codex/gpt-5.4" in chain
         # Must dedupe: every entry exactly once.
         assert len(chain) == len(set(chain))
 
@@ -196,6 +195,21 @@ class TestCliDiscovery:
             assert is_codex_authenticated("/usr/bin/codex") is True
             assert probe.call_count == 1
 
+    def test_auth_probe_uses_login_status(self, monkeypatch):
+        monkeypatch.delenv("CODEX_DISABLE_AUTH_PROBE", raising=False)
+        clear_codex_auth_cache()
+
+        result = SimpleNamespace(
+            returncode=0,
+            stdout="Logged in using ChatGPT",
+            stderr="",
+        )
+        with patch("subprocess.run", return_value=result) as run:
+            assert codex_module._run_auth_probe_sync("/usr/bin/codex") is True
+
+        argv = run.call_args.args[0]
+        assert tuple(argv) == ("/usr/bin/codex", "login", "status")
+
 
 # ---------------------------------------------------------------------------
 # Token extraction
@@ -241,6 +255,26 @@ class TestTokenExtraction:
 
     def test_extract_tokens_absent_returns_zeros(self):
         assert CodexClient._extract_token_counts("plain text", "") == (0, 0, 0, 0)
+
+    def test_extract_completion_text_from_jsonl_agent_message(self):
+        stdout = (
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": "OK"},
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "turn.completed",
+                    "usage": {"input_tokens": 10, "output_tokens": 1},
+                }
+            )
+            + "\n"
+        )
+
+        assert CodexClient._extract_completion_text(stdout) == "OK"
 
 
 # ---------------------------------------------------------------------------
@@ -504,6 +538,10 @@ class TestCodexClientCompletion:
         assert argv[0] == client.cli_path
         assert "exec" in argv
         assert "--json" in argv
+        assert "--color" in argv
+        assert "never" in argv
+        assert "--no-color" not in argv
+        assert argv[-1] == "-"
 
         metadata = client.last_request_metadata
         assert metadata.total_tokens == 75
@@ -558,8 +596,9 @@ class TestCodexClientCompletion:
 
         assert parsed == payload
         argv = create.await_args.args
-        # Structured-output flag was passed to the CLI.
-        assert "--structured-output" in argv
+        # Structured-output schema file was passed to the CLI.
+        assert "--output-schema" in argv
+        assert "--structured-output" not in argv
 
     @pytest.mark.asyncio
     async def test_trading_decision_round_trip(self):
@@ -611,8 +650,8 @@ class TestCodexClientCompletion:
         ):
             result = await client.get_completion(
                 "Retry please",
-                model="codex/gpt-5-codex",
-                fallback_models=["codex/gpt-5.4-codex"],
+                model="codex/gpt-5.4",
+                fallback_models=["codex/gpt-5.4-mini"],
             )
 
         assert result == "fallback ok"
@@ -620,7 +659,8 @@ class TestCodexClientCompletion:
 
     @pytest.mark.asyncio
     async def test_returns_none_when_cli_missing(self):
-        client = _make_client(cli_path=None)
+        with patch("src.clients.codex_client.resolve_codex_cli_path", return_value=None):
+            client = _make_client(cli_path=None)
         result = await client.get_completion("anything")
         assert result is None
 

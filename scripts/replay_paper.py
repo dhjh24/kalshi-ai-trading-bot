@@ -1,5 +1,5 @@
 """
-W3 — Paper-trading replay harness.
+Paper-trading replay harness.
 
 Re-runs recorded `market_snapshots` through the paper execution code path
 (`src/strategies/quick_flip_scalping.py` + `src/jobs/execute.py`) and compares

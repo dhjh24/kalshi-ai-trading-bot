@@ -1,8 +1,8 @@
-# Paper-Trading Replay Harness (W3)
+# Paper-Trading Replay Harness
 
 Re-runs recorded order-book snapshots + live trades through the paper
 execution code path, then asserts simulated P&L tracks live within tolerance.
-Foundation for W4 (shadow mode) and required before we flip to live.
+This is the reproducibility harness behind shadow-mode and live-mode parity checks.
 
 ## How it works
 
@@ -53,8 +53,8 @@ Tolerance defaults (both must pass; either flips the exit to `1`):
 
 - **PnL gate** - `|paper_pnl_per_100 - live_pnl_per_100| / |live_pnl_per_100| <= 5%`.
   Per-100-trades normalization makes the gate volume-insensitive.
-- **Fee gate** - `|avg_paper_fee - avg_live_fee| < $0.01`. Catches the fee
-  rounding edge case called out in W2.
+- **Fee gate** - `|avg_paper_fee - avg_live_fee| < $0.01`. Catches fee
+  rounding drift between the replay and live paths.
 
 ## Determinism
 
@@ -87,5 +87,5 @@ to the real API.
 
 The CLI sets `KALSHI_REPLAY_MODE=1` for the duration of the run. Nothing in
 `src/` currently reads it - the `ReplayKalshiClient` is sufficient - but it's
-the agreed escape hatch if W2's accuracy-hardening ever needs to short-circuit
+the agreed escape hatch if replay hardening ever needs to short-circuit
 a network call during replay. Check it, don't refactor around it.

@@ -26,7 +26,7 @@ We welcome:
 ### Local setup
 
 ```bash
-git clone https://github.com/yourusername/kalshi-ai-trading-bot.git
+git clone https://github.com/cdavisv/kalshi-ai-trading-bot.git
 cd kalshi-ai-trading-bot
 
 python -m venv .venv
@@ -85,13 +85,12 @@ Please avoid real external API calls in automated tests when mocks or fixtures a
 
 ## Workflow
 
-1. Fork the repository.
-2. Create a feature branch.
-3. Make your changes.
-4. Add or update tests.
-5. Update docs when behavior changes.
-6. Run the relevant checks locally.
-7. Open a pull request with a clear summary.
+1. Create a branch from `cdavisv/kalshi-ai-trading-bot`, or fork that repository first if you do not have write access.
+2. Make your changes.
+3. Add or update tests.
+4. Update docs when behavior changes.
+5. Run the relevant checks locally.
+6. Open a pull request with a clear summary.
 
 ## Commit messages
 

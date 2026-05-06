@@ -1,6 +1,7 @@
-# Focus-Type Data Adapters (W6)
+# Focus-Type Data Adapters
 
-Per-category enrichment adapters for the W5 live-trade multi-agent loop.
+Per-category enrichment adapters for the live-trade research service and
+multi-agent decision loop.
 Each adapter is a thin, cache-aware wrapper around a free or public data
 source and exposes the **same async contract** so the agents can treat
 every category uniformly.
@@ -17,7 +18,7 @@ Returning a normalized payload with the following keys:
 
 | Key                 | Type                | Notes                                                                       |
 | ------------------- | ------------------- | --------------------------------------------------------------------------- |
-| `category`          | `str`               | One of `"sports" | "crypto" | "macro"`.                                      |
+| `category`          | `str`               | One of `sports`, `crypto`, or `macro`.                                      |
 | `timestamp_utc`     | `str` (ISO-8601)    | When the adapter started the fetch.                                         |
 | `signals`           | `dict[str, Any]`    | Category-specific payload. See the per-adapter docs in this folder.         |
 | `freshness_seconds` | `int`               | Wall-clock seconds spent producing the payload (NOT source-data age).       |
@@ -30,8 +31,8 @@ return `error="..."` with whatever `signals` they managed to collect.
 
 ## Instantiation patterns
 
-For a production callsite that already owns an `httpx.AsyncClient` (e.g.
-the W5 scout/specialist loop), pass it in to pool connections and avoid
+For a production callsite that already owns an `httpx.AsyncClient` (for example,
+`LiveTradeResearchService`), pass it in to pool connections and avoid
 re-creating caches:
 
 ```python
@@ -48,12 +49,18 @@ from src.data.sports_adapter import fetch_context
 context = await fetch_context(market)
 ```
 
-## Additive-only
+## Production integration
 
-These modules are *additive*. They do not import or modify
-`src/data/live_trade_research.py`, because W5 is reshaping that file
-and this workstream (W6) runs in parallel. Nothing in the current
-production path calls these adapters yet.
+`src/data/live_trade_research.py` instantiates these adapters with its shared
+HTTP client and folds their payloads into event research bundles:
+
+- sports events call `SportsAdapter.fetch_context(...)`
+- bitcoin / crypto events call both `fetch_bitcoin_context(...)` and `CryptoAdapter.fetch_context(...)`
+- economics and general events call `MacroAdapter.fetch_context(...)`
+
+The Node dashboard consumes those enriched research payloads through the
+analysis bridge and still has its own replaceable service adapters for UI-side
+hydration.
 
 ## Degradation policy
 

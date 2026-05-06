@@ -544,7 +544,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         if beast or safe_compounder:
             print("Error: --live-trade cannot be combined with other runtime modes.")
             sys.exit(1)
-        print("📡  LIVE-TRADE LOOP MODE")
+        print("LIVE-TRADE LOOP MODE")
         if live_mode:
             print("   Live execution enabled for generic intents.")
             print("   Quick-flip live intents still require ENABLE_LIVE_QUICK_FLIP.")
@@ -561,10 +561,10 @@ def cmd_run(args: argparse.Namespace) -> None:
         return
 
     if live_mode:
-        print("⚠️  WARNING: LIVE TRADING MODE ENABLED")
+        print("WARNING: LIVE TRADING MODE ENABLED")
         print("   This will use real money and place actual trades.")
     elif shadow:
-        print("👥  SHADOW MODE ENABLED")
+        print("SHADOW MODE ENABLED")
         print("   No real orders will be placed.")
 
     # --safe-compounder mode: edge-based NO-side only
@@ -578,7 +578,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     # --beast mode: original aggressive settings (NOT default)
     if beast:
-        print("⚠️  BEAST MODE: Aggressive settings enabled.")
+        print("BEAST MODE: Aggressive settings enabled.")
         print("   WARNING: Aggressive settings with no guardrails. Use at your own risk.")
         if smoke:
             print("   Smoke safety mode enabled: startup + ingestion only, no OpenRouter calls.")
@@ -605,9 +605,17 @@ def cmd_run(args: argparse.Namespace) -> None:
             print("\nTrading bot stopped by user.")
         return
 
+    from src.config import settings as cfg
+
     # DEFAULT: AI Ensemble mode (disciplined settings active)
-    print("🤖  AI ENSEMBLE MODE (default)")
-    print("   5-model ensemble: Claude Sonnet 4.5 · Gemini 3.1 Pro Preview · GPT-5.4 · DeepSeek V3.2 · Grok 4.1 Fast")
+    provider = cfg.settings.api.resolve_llm_provider()
+    print("AI ENSEMBLE MODE (default)")
+    if provider == "codex":
+        print("   Codex CLI routing: GPT-5.4 + GPT-5.4 Mini via ChatGPT plan quota.")
+    elif provider == "openai":
+        print("   Direct OpenAI routing: GPT-5.4 / o3 / GPT-4.1 via OPENAI_API_KEY.")
+    else:
+        print("   5-model OpenRouter ensemble: Claude Sonnet 4.5, Gemini 3.1 Pro Preview, GPT-5.4, DeepSeek V3.2, Grok 4.1 Fast.")
     print("   Category scoring + portfolio guardrails active.")
     print("   Use --safe-compounder for conservative math-only mode.")
     print("   Use --beast to run without guardrails (not recommended).")
@@ -621,7 +629,6 @@ def cmd_run(args: argparse.Namespace) -> None:
     from src.strategies.portfolio_enforcer import PortfolioEnforcer
 
     # Apply disciplined settings overrides
-    from src.config import settings as cfg
     cfg.settings.trading.min_confidence_to_trade = 0.45  # LOOSENED from 0.65 (approved 2026-03-29)
     cfg.settings.trading.max_position_size_pct = 3.0
     cfg.settings.trading.kelly_fraction = 0.25
@@ -657,12 +664,12 @@ def _run_safe_compounder(
     from src.clients.kalshi_client import KalshiClient
     from src.strategies.safe_compounder import SafeCompounder
 
-    print("🔒 SAFE COMPOUNDER MODE")
+    print("SAFE COMPOUNDER MODE")
     print("   NO-side only | Edge-based | Near-certain outcomes")
     if shadow_mode:
-        print("   SHADOW RUN — dry-run execution until the strategy adds explicit shadow hooks")
+        print("   SHADOW RUN - dry-run execution until the strategy adds explicit shadow hooks")
     elif not live_mode:
-        print("   DRY RUN — no real orders will be placed")
+        print("   DRY RUN - no real orders will be placed")
 
     async def _run():
         client = KalshiClient()
@@ -1043,7 +1050,7 @@ def cmd_history(args: argparse.Namespace) -> None:
                         "(use 'python cli.py health' for details)"
                     )
                 if False:
-                    print(f"\n  â›” {r2[0]} trades blocked by portfolio enforcer (use 'python cli.py health' for details)")
+                    print(f"\n  [BLOCKED] {r2[0]} trades blocked by portfolio enforcer (use 'python cli.py health' for details)")
 
             print("=" * 70)
             return
@@ -1054,7 +1061,7 @@ def cmd_history(args: argparse.Namespace) -> None:
             """)
             r2 = await cursor2.fetchone()
             if r2 and r2[0]:
-                print(f"\n  ⛔ {r2[0]} trades blocked by portfolio enforcer (use 'python cli.py health' for details)")
+                print(f"\n  [BLOCKED] {r2[0]} trades blocked by portfolio enforcer (use 'python cli.py health' for details)")
 
             print("=" * 70)
 

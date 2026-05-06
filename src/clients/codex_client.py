@@ -20,8 +20,8 @@ Design notes:
   ``daily_cost_tracking`` observable without fabricating numbers.
 * ``cost_usd`` is always recorded as ``0.0`` because Codex plan usage is
   flat-rate via the ChatGPT plan, not metered per-request.
-* Auth detection is a quick subprocess probe (``codex auth status`` or
-  ``codex whoami``); results are cached for a short TTL so settings.py can
+* Auth detection is a quick subprocess probe (``codex login status``);
+  results are cached for a short TTL so settings.py can
   call it once per process without slowing startup.
 
 This module intentionally has no hard dependency on the Codex CLI being
@@ -38,6 +38,7 @@ import os
 import pickle
 import re
 import shutil
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -61,22 +62,23 @@ CODEX_MODEL_PRICING: Dict[str, Dict[str, float]] = {
     # Codex plan usage is flat-rate via the ChatGPT subscription, so per-token
     # cost is reported as $0 for spend tracking while still surfacing a
     # best-effort token count for quota visibility.
-    "codex/gpt-5-codex": {"input_per_1k": 0.0, "output_per_1k": 0.0},
-    "codex/gpt-5.4-codex": {"input_per_1k": 0.0, "output_per_1k": 0.0},
-    "codex/o3-codex": {"input_per_1k": 0.0, "output_per_1k": 0.0},
+    "codex/gpt-5.4": {"input_per_1k": 0.0, "output_per_1k": 0.0},
+    "codex/gpt-5.4-mini": {"input_per_1k": 0.0, "output_per_1k": 0.0},
 }
 
 CODEX_MODEL_ALIASES: Dict[str, str] = {
-    "codex": "codex/gpt-5-codex",
-    "gpt-5-codex": "codex/gpt-5-codex",
-    "gpt-5.4-codex": "codex/gpt-5.4-codex",
-    "o3-codex": "codex/o3-codex",
+    "codex": "codex/gpt-5.4",
+    "gpt-5.4": "codex/gpt-5.4",
+    "gpt-5.4-mini": "codex/gpt-5.4-mini",
+    # Legacy aliases kept so older config/env values continue to work.
+    "gpt-5-codex": "codex/gpt-5.4",
+    "gpt-5.4-codex": "codex/gpt-5.4",
+    "o3-codex": "codex/gpt-5.4-mini",
 }
 
 CODEX_FALLBACK_ORDER: List[str] = [
-    "codex/gpt-5-codex",
-    "codex/gpt-5.4-codex",
-    "codex/o3-codex",
+    "codex/gpt-5.4",
+    "codex/gpt-5.4-mini",
 ]
 
 SHARED_USAGE_FILE = "logs/daily_ai_usage.pkl"
@@ -134,21 +136,22 @@ def _run_auth_probe_sync(cli_path: str, timeout: float = 5.0) -> bool:
     """
     Synchronously probe whether the Codex CLI is signed in.
 
-    We try ``codex auth status`` first (newer CLIs) and fall back to
-    ``codex whoami``. Any non-zero exit code, or stdout containing an
+    We try ``codex login status`` first, with ``codex auth status`` retained
+    as a compatibility fallback. Any non-zero exit code, or stdout containing an
     obvious "not signed in" / "login required" phrase, is treated as
     unauthenticated.
     """
     import subprocess
 
     probes = (
+        (cli_path, "login", "status"),
         (cli_path, "auth", "status"),
-        (cli_path, "whoami"),
     )
     for argv in probes:
         try:
             result = subprocess.run(
                 argv,
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -165,6 +168,7 @@ def _run_auth_probe_sync(cli_path: str, timeout: float = 5.0) -> bool:
             for marker in (
                 "not signed in",
                 "not logged in",
+                "logged out",
                 "login required",
                 "please log in",
                 "please sign in",
@@ -397,29 +401,34 @@ class CodexClient(TradingLoggerMixin):
             "--model",
             sdk_model,
             "--json",
-            "--no-color",
+            "--color",
+            "never",
         ]
+        schema_path: Optional[str] = None
         if schema is not None:
-            # Newer codex CLIs support ``--response-format=json_schema=<path>``
-            # or ``--json-schema``; we pass via stdin metadata so we don't
-            # rely on writing temp files for every call.
-            argv.extend(["--structured-output", "1"])
+            schema_payload = schema.get("schema", schema) if isinstance(schema, dict) else schema
+            schema_file = tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".json",
+                prefix="codex-schema-",
+                delete=False,
+                encoding="utf-8",
+            )
+            try:
+                json.dump(schema_payload, schema_file)
+                schema_path = schema_file.name
+            finally:
+                schema_file.close()
+            argv.extend(["--output-schema", schema_path])
+
+        argv.append("-")
 
         env = os.environ.copy()
         # Prevent pager / interactive mode regardless of user shell setup.
         env.setdefault("CODEX_NO_PAGER", "1")
         env.setdefault("TERM", "dumb")
 
-        stdin_payload: Dict[str, Any] = {
-            "prompt": prompt,
-            "model": sdk_model,
-        }
-        if schema is not None:
-            stdin_payload["response_format"] = {
-                "type": "json_schema",
-                "json_schema": schema,
-            }
-        stdin_bytes = (json.dumps(stdin_payload) + "\n").encode("utf-8")
+        stdin_bytes = (prompt + "\n").encode("utf-8")
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -430,6 +439,11 @@ class CodexClient(TradingLoggerMixin):
                 env=env,
             )
         except (FileNotFoundError, OSError) as exc:
+            if schema_path:
+                try:
+                    os.unlink(schema_path)
+                except OSError:
+                    pass
             raise CodexUnavailableError(f"Failed to launch Codex CLI: {exc}") from exc
 
         effective_timeout = timeout if timeout is not None else self.TIMEOUT_SECONDS
@@ -443,9 +457,20 @@ class CodexClient(TradingLoggerMixin):
                 proc.kill()
             except ProcessLookupError:
                 pass
+            if schema_path:
+                try:
+                    os.unlink(schema_path)
+                except OSError:
+                    pass
             raise CodexUnavailableError(
                 f"Codex CLI timed out after {effective_timeout}s"
             ) from exc
+        finally:
+            if schema_path:
+                try:
+                    os.unlink(schema_path)
+                except OSError:
+                    pass
 
         stdout = (stdout_b or b"").decode("utf-8", errors="replace")
         stderr = (stderr_b or b"").decode("utf-8", errors="replace")
@@ -801,6 +826,43 @@ class CodexClient(TradingLoggerMixin):
     @staticmethod
     def _extract_completion_text(stdout: str) -> str:
         """Extract assistant text content from the Codex CLI stdout."""
+        saw_json_event = False
+        last_event_text: Optional[str] = None
+
+        for line in stdout.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("{") or not stripped.endswith("}"):
+                continue
+            try:
+                event = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            if "type" in event:
+                saw_json_event = True
+
+            item = event.get("item")
+            if event.get("type") == "item.completed" and isinstance(item, dict):
+                if item.get("type") in {"agent_message", "message"}:
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        last_event_text = text
+                    content = item.get("content")
+                    if isinstance(content, str) and content.strip():
+                        last_event_text = content
+            for key in ("content", "output", "text", "message", "response"):
+                value = event.get(key)
+                if isinstance(value, str) and value.strip():
+                    last_event_text = value
+                if key == "message" and isinstance(value, dict):
+                    inner = value.get("content") or value.get("text")
+                    if isinstance(inner, str) and inner.strip():
+                        last_event_text = inner
+
+        if last_event_text:
+            return last_event_text.strip()
+
         parsed = CodexClient._extract_last_json_object(stdout)
         if isinstance(parsed, dict):
             for key in ("content", "output", "text", "message", "response"):
@@ -824,6 +886,9 @@ class CodexClient(TradingLoggerMixin):
                     text = first.get("text")
                     if isinstance(text, str):
                         return text
+
+        if saw_json_event:
+            return ""
 
         # Fall back to raw stdout (trim CLI banners when possible).
         return stdout.strip()
@@ -1388,7 +1453,12 @@ def _canonical_codex_model(model: Optional[str]) -> str:
     if name in CODEX_MODEL_ALIASES:
         return CODEX_MODEL_ALIASES[name]
     if name.startswith("codex/"):
-        return name
+        base = name.split("/", 1)[1]
+        if base in CODEX_MODEL_ALIASES:
+            return CODEX_MODEL_ALIASES[base]
+        if name in CODEX_MODEL_PRICING:
+            return name
+        return CODEX_FALLBACK_ORDER[0]
     # Try to map OpenAI/OpenRouter-style names onto Codex equivalents.
     if name.startswith("openai/") or "/" not in name:
         base = name.split("/", 1)[-1]

@@ -1,5 +1,5 @@
 """
-Python-side sports data adapter for the live-trade agent loop (W6).
+Python-side sports data adapter for the live-trade agent loop.
 
 Mirrors the relevant pieces of
 ``server/src/services/external/sportsDataService.ts`` so agents running in
@@ -11,15 +11,14 @@ Public surface:
 
     from src.data.sports_adapter import SportsAdapter, fetch_context
 
-Both expose the uniform W6 contract::
+Both expose the uniform adapter contract::
 
     async def fetch_context(market: dict) -> dict
 
 Returning the normalized dict described in ``docs/data_adapters/README.md``.
 
-The adapter is *additive* — it does not alter
-``src/data/live_trade_research.py``. W5 will import from here once the
-multi-agent loop is wired up.
+``src/data/live_trade_research.py`` owns this adapter in production and
+injects its payload into sports-focused research bundles.
 """
 
 from __future__ import annotations
@@ -43,7 +42,7 @@ DEFAULT_SCOREBOARD_TTL = 20.0  # seconds — matches the Node TTL
 DEFAULT_TEAM_DIRECTORY_TTL = 60 * 60.0  # 1 hour
 
 # Leagues we care about for Kalshi live-trade markets today.
-# NCAAB / NBA / NFL are the primary focus per the W6 spec; NHL / MLB / WNBA /
+# NCAAB / NBA / NFL are the primary focus for live-trade coverage; NHL / MLB / WNBA /
 # NCAAF are kept because the Node adapter already handles them and the agent
 # loop may expand to them later.
 SPORTS_LEAGUE_ENDPOINTS: Dict[str, Dict[str, str]] = {
@@ -111,7 +110,7 @@ class SportsAdapter(TradingLoggerMixin):
     """
     Live-sports enrichment adapter.
 
-    Exposes ``fetch_context(market)`` returning the uniform W6 contract and
+    Exposes ``fetch_context(market)`` returning the uniform adapter contract and
     caches ESPN responses in-process. Pass your own ``httpx.AsyncClient`` to
     reuse the live-trade loop's client; otherwise one will be created and
     owned by this adapter.
@@ -145,7 +144,7 @@ class SportsAdapter(TradingLoggerMixin):
             await self.http_client.aclose()
 
     # ------------------------------------------------------------------ #
-    # Public W6 contract
+    # Public adapter contract
     # ------------------------------------------------------------------ #
     async def fetch_context(self, market: Mapping[str, Any]) -> Dict[str, Any]:
         """Return normalized sports context for a Kalshi market/event dict."""
@@ -167,7 +166,7 @@ class SportsAdapter(TradingLoggerMixin):
 
         try:
             match = await self._match_teams_from_title(title)
-        except Exception as exc:  # graceful degrade — W5 depends on this
+        except Exception as exc:  # graceful degrade; live-trade depends on this
             self.logger.warning("sports match lookup failed", error=str(exc))
             payload["error"] = f"match_failed:{exc.__class__.__name__}"
             payload["freshness_seconds"] = int(time.monotonic() - start)
@@ -423,10 +422,10 @@ async def fetch_context(
     *,
     http_client: Optional[httpx.AsyncClient] = None,
 ) -> Dict[str, Any]:
-    """Convenience wrapper matching the uniform W6 contract.
+    """Convenience wrapper matching the uniform adapter contract.
 
     Creates a throwaway :class:`SportsAdapter` on each call. Production
-    callers (the W5 agent loop) should instantiate ``SportsAdapter`` once
+    callers (``LiveTradeResearchService``) should instantiate ``SportsAdapter`` once
     and reuse it so caches and HTTP connections are pooled.
     """
     adapter = SportsAdapter(http_client=http_client)

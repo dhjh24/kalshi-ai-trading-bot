@@ -360,7 +360,7 @@ class TestModelRouter:
         codex_client = MagicMock()
         codex_client.get_completion = AsyncMock(return_value="codex-ok")
         codex_client.last_request_metadata = SimpleNamespace(
-            actual_model="codex/gpt-5-codex"
+            actual_model="codex/gpt-5.4"
         )
         openrouter_client = MagicMock()
         openrouter_client.get_completion = AsyncMock(return_value="unexpected")
@@ -374,14 +374,14 @@ class TestModelRouter:
                 openrouter_client=openrouter_client,
             )
 
-        result = await router.get_completion("hello", model="codex/gpt-5-codex")
+        result = await router.get_completion("hello", model="codex/gpt-5.4")
 
         assert result == "codex-ok"
         codex_client.get_completion.assert_awaited()
         openrouter_client.get_completion.assert_not_awaited()
         kwargs = codex_client.get_completion.await_args.kwargs
-        assert kwargs["model"] == "codex/gpt-5-codex"
-        assert "codex/gpt-5.4-codex" in kwargs["fallback_models"]
+        assert kwargs["model"] == "codex/gpt-5.4"
+        assert "codex/gpt-5.4-mini" in kwargs["fallback_models"]
         assert "anthropic/claude-sonnet-4.5" not in kwargs["fallback_models"]
 
     @pytest.mark.asyncio

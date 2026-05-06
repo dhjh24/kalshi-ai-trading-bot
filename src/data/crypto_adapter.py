@@ -1,11 +1,10 @@
 """
-Python-side crypto data adapter for the live-trade agent loop (W6).
+Python-side crypto data adapter for the live-trade agent loop.
 
-Extends the BTC-only fetch in ``src/data/live_trade_research.py`` (around
-lines 555-593) by pulling:
+Complements the BTC compatibility helper in ``src/data/live_trade_research.py``
+by pulling:
 
-- CoinGecko spot price + 24h change + 24h volume (BTC and, when
-  trivial, ETH).
+- CoinGecko spot price + 24h change + 24h volume for BTC, ETH, SOL, XRP, and DOGE.
 - CoinGecko ``market_chart`` 1-day history downsampled to 1m/5m bars so
   agents see short-horizon momentum.
 - Binance public futures funding rate (``fapi.binance.com``) for
@@ -22,12 +21,11 @@ Public surface::
 
     async def fetch_context(market: dict) -> dict
 
-returning the normalized W6 payload described in
+returning the normalized adapter payload described in
 ``docs/data_adapters/README.md``.
 
-This module is *additive* — it does not modify
-``live_trade_research.py``. W5 will flip to it once the new agent
-loop lands.
+``live_trade_research.py`` owns this adapter in production and injects its
+payload into crypto-focused research bundles.
 """
 
 from __future__ import annotations
@@ -126,7 +124,7 @@ class CryptoAdapter(TradingLoggerMixin):
             await self.http_client.aclose()
 
     # ------------------------------------------------------------------ #
-    # Public W6 contract
+# Public adapter contract
     # ------------------------------------------------------------------ #
     async def fetch_context(self, market: Mapping[str, Any]) -> Dict[str, Any]:
         start = time.monotonic()
@@ -289,7 +287,7 @@ class CryptoAdapter(TradingLoggerMixin):
         # Last 60 points ≈ last 5 hours at 5m resolution.
         bars_5m = bars[-60:]
         # 1m bars aren't available from CoinGecko free tier; expose the last
-        # 12 points as a short-window lookalike so W5 consumers can treat
+        # 12 points as a short-window lookalike so live-trade consumers can treat
         # them as "recent" without a separate code path.
         bars_1m = bars[-12:]
         result = {"bars_5m": bars_5m, "bars_1m": bars_1m}
@@ -349,7 +347,7 @@ async def fetch_context(
     *,
     http_client: Optional[httpx.AsyncClient] = None,
 ) -> Dict[str, Any]:
-    """Module-level wrapper that honours the uniform W6 adapter contract."""
+    """Module-level wrapper that honours the uniform adapter contract."""
     adapter = CryptoAdapter(http_client=http_client)
     try:
         return await adapter.fetch_context(market)

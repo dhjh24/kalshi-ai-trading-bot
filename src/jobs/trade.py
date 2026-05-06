@@ -1,5 +1,5 @@
 ﻿"""
-Enhanced Trading Job - Beast Mode ðŸš€
+Enhanced Trading Job - Beast Mode
 
 This job now uses the Unified Advanced Trading System that orchestrates:
 1. Market Making Strategy (40% allocation)
@@ -79,9 +79,9 @@ async def run_trading_job(*, shadow_mode: Optional[bool] = None) -> Optional[Tra
             if shadow_mode is None
             else bool(shadow_mode)
         )
-        logger.info("ðŸš€ Starting Enhanced Trading Job - Beast Mode Activated!")
+        logger.info("Starting Enhanced Trading Job - Beast Mode Activated")
         if shadow_mode:
-            logger.info("ðŸ‘¥ Shadow mode active - paper executions will log live-side counterparts")
+            logger.info("Shadow mode active - paper executions will log live-side counterparts")
         
         # Initialize clients
         db_manager = DatabaseManager()
@@ -120,7 +120,7 @@ async def run_trading_job(*, shadow_mode: Optional[bool] = None) -> Optional[Tra
         )
         
         # Execute the unified trading system
-        logger.info("ðŸŽ¯ Executing Unified Advanced Trading System")
+        logger.info("Executing Unified Advanced Trading System")
         results = await run_unified_trading_system(
             db_manager, kalshi_client, xai_client, config
         )
@@ -146,30 +146,30 @@ async def run_trading_job(*, shadow_mode: Optional[bool] = None) -> Optional[Tra
         )
         if results.total_positions > 0:
             logger.info(
-                f"âœ… TRADING JOB COMPLETE - BEAST MODE RESULTS:\n"
-                f"ðŸ“Š PERFORMANCE:\n"
-                f"  â€¢ Total Positions: {results.total_positions}\n"
-                f"  â€¢ Capital Used: ${results.total_capital_used:.0f} ({results.capital_efficiency:.1%})\n"
-                f"  â€¢ Expected Annual Return: {results.expected_annual_return:.1%}\n"
-                f"  â€¢ Portfolio Sharpe Ratio: {results.portfolio_sharpe_ratio:.2f}\n"
-                f"  â€¢ Portfolio Volatility: {results.portfolio_volatility:.1%}\n"
+                f"TRADING JOB COMPLETE - BEAST MODE RESULTS:\n"
+                f"PERFORMANCE:\n"
+                f"  - Total Positions: {results.total_positions}\n"
+                f"  - Capital Used: ${results.total_capital_used:.0f} ({results.capital_efficiency:.1%})\n"
+                f"  - Expected Annual Return: {results.expected_annual_return:.1%}\n"
+                f"  - Portfolio Sharpe Ratio: {results.portfolio_sharpe_ratio:.2f}\n"
+                f"  - Portfolio Volatility: {results.portfolio_volatility:.1%}\n"
                 f"\n"
-                f"ðŸ’° STRATEGIES:\n"
-                f"  â€¢ Market Making: {results.market_making_orders} orders, ${results.market_making_expected_profit:.2f} profit\n"
-                f"  • Paper Market Making: {results.market_making_paper_entries_filled} entries, "
+                f"STRATEGIES:\n"
+                f"  - Market Making: {results.market_making_orders} orders, ${results.market_making_expected_profit:.2f} profit\n"
+                f"  - Paper Market Making: {results.market_making_paper_entries_filled} entries, "
                 f"{results.market_making_paper_exits_filled} exits, "
                 f"${results.market_making_realized_pnl:.2f} realized PnL\n"
-                f"  â€¢ Directional: {results.directional_positions} positions, ${results.directional_expected_return:.2f} return\n"
-                f"  â€¢ Quick Flip: {results.quick_flip_positions} positions, ${results.quick_flip_expected_profit:.2f} expected profit\n"
-                f"  â€¢ Live Trade Loop: "
+                f"  - Directional: {results.directional_positions} positions, ${results.directional_expected_return:.2f} return\n"
+                f"  - Quick Flip: {results.quick_flip_positions} positions, ${results.quick_flip_expected_profit:.2f} expected profit\n"
+                f"  - Live Trade Loop: "
                 f"{0 if live_trade_summary is None else live_trade_summary.executed_positions} {live_trade_runtime_label} positions, "
                 f"{0 if live_trade_summary is None else live_trade_summary.specialist_candidates} specialist candidates\n"
                 f"\n"
-                f"âš¡ SYSTEM STATUS: MAXIMUM CAPITAL EFFICIENCY ACHIEVED!"
+                f"SYSTEM STATUS: MAXIMUM CAPITAL EFFICIENCY ACHIEVED"
             )
         else:
             logger.info(
-                f"ðŸ“Š Trading job complete - no new positions created this cycle\n"
+                f"Trading job complete - no new positions created this cycle\n"
                 f"   Reasons: Market conditions, risk limits, or insufficient opportunities"
             )
             if live_trade_summary is not None:
@@ -188,7 +188,7 @@ async def run_trading_job(*, shadow_mode: Optional[bool] = None) -> Optional[Tra
     except Exception as e:
         logger.error(f"Error in enhanced trading job: {e}")
         # Fallback to legacy system if unified system fails
-        logger.warning("ðŸ”„ Falling back to legacy decision-making system")
+        logger.warning("Falling back to legacy decision-making system")
         return await _fallback_legacy_trading(shadow_mode=shadow_mode)
     finally:
         if xai_client is not None:
@@ -209,7 +209,7 @@ async def _fallback_legacy_trading(
     xai_client: Optional[ModelRouter] = None
 
     try:
-        logger.info("ðŸ”„ Executing fallback legacy trading system")
+        logger.info("Executing fallback legacy trading system")
         
         # Initialize components
         db_manager = DatabaseManager()
@@ -254,7 +254,7 @@ async def _fallback_legacy_trading(
                     if success:
                         positions_created += 1
                         total_exposure += position.entry_price * position.quantity
-                        logger.info(f"âœ… Legacy: Created position for {market.market_id}")
+                        logger.info(f"Legacy: Created position for {market.market_id}")
                 
             except Exception as e:
                 logger.error(f"Error processing market {market.market_id}: {e}")
@@ -283,5 +283,5 @@ async def _fallback_legacy_trading(
 async def run_legacy_trading():
     """Legacy entry point - redirects to enhanced system."""
     logger = get_trading_logger("legacy_redirect")
-    logger.info("ðŸ”„ Legacy trading call redirected to enhanced system")
+    logger.info("Legacy trading call redirected to enhanced system")
     return await run_trading_job() 

@@ -2,15 +2,14 @@
 
 **File:** `src/data/crypto_adapter.py`
 **Sources:** CoinGecko v3 (`api.coingecko.com`) + Binance Futures (`fapi.binance.com`)
-**Extends:** `src/data/live_trade_research.py::fetch_bitcoin_context`
-(currently BTC-only, lines ~555-593).
+**Used by:** `src/data/live_trade_research.py`
 
 ## Why this exists
 
-The existing live-trade research grabs a CoinGecko spot + hourly chart for
-BTC only. The W5 agents need more coverage than that:
+The live-trade research service keeps a BTC compatibility helper, but the
+agents need broader crypto context than spot + hourly chart data:
 
-- BTC **and** ETH (cheapest trivial extension).
+- BTC, ETH, SOL, XRP, and DOGE coverage through the shared asset registry.
 - Short-horizon bars (1m / 5m) for momentum signals.
 - Perpetual-futures **funding rate** — the strongest leading indicator
   for short-dated crypto Kalshi markets.
@@ -37,7 +36,7 @@ keyless.
 CoinGecko free tier returns ~5-minute resolution when `days=1`; true 1m
 data requires a paid plan. `bars_1m` therefore exposes the last 12 raw
 CoinGecko points so agents can treat them as the "most recent" slice
-uniformly, but they are NOT actual 1-minute candles. If W5 finds this
+uniformly, but they are NOT actual 1-minute candles. If that becomes
 insufficient, swap the source to Binance's `/fapi/v1/klines?interval=1m`
 inside `_bars` without changing the adapter's external contract.
 
