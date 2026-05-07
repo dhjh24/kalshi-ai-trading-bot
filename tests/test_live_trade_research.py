@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from src.data.live_trade_research import LiveTradeResearchService
@@ -184,6 +185,39 @@ async def test_build_event_research_payload_uses_crypto_adapter_for_crypto_focus
     assert sports_adapter.calls == []
     assert crypto_adapter.calls == [event]
     assert macro_adapter.calls == []
+
+
+@pytest.mark.asyncio
+async def test_bitcoin_context_rate_limit_returns_partial_payload():
+    service = LiveTradeResearchService(
+        kalshi_client=MagicMock(),
+        news_aggregator=MagicMock(),
+        http_client=MagicMock(),
+    )
+    request = httpx.Request("GET", "https://api.coingecko.com/api/v3/simple/price")
+    rate_limited_response = httpx.Response(429, request=request)
+    price_response = MagicMock(spec=httpx.Response)
+    price_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "rate limited",
+        request=request,
+        response=rate_limited_response,
+    )
+    chart_response = MagicMock(spec=httpx.Response)
+    chart_response.raise_for_status.return_value = None
+    chart_response.json.return_value = {
+        "prices": [
+            [1761200000000, 94100.5],
+            [1761200300000, 94120.0],
+        ]
+    }
+    service.http_client.get = AsyncMock(side_effect=[price_response, chart_response])
+
+    payload = await service.fetch_bitcoin_context()
+
+    assert payload["asset"] == "bitcoin"
+    assert payload["price_usd"] == 0.0
+    assert len(payload["chart_points"]) == 2
+    assert payload["error"] == "price:HTTPStatusError"
 
 
 @pytest.mark.asyncio

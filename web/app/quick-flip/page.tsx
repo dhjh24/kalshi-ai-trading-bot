@@ -150,8 +150,8 @@ function OrdersPanel({ orders }: { orders: QuickFlipOrderRow[] }) {
   }
 
   return (
-    <div className="overflow-hidden rounded-[22px] border border-slate-100">
-      <table className="min-w-full divide-y divide-slate-100">
+    <div className="overflow-x-auto rounded-[22px] border border-slate-100">
+      <table className="w-full min-w-[900px] divide-y divide-slate-100">
         <thead className="bg-slate-50/80 text-left text-xs uppercase tracking-[0.24em] text-slate-500">
           <tr>
             <th className="px-4 py-3">Placed</th>

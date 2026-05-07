@@ -1,6 +1,5 @@
 import type { Metadata } from "next";
 import { ReactNode } from "react";
-import { QueryProvider } from "../components/query-provider";
 import { AppFrame } from "../components/ui";
 import "./globals.css";
 
@@ -13,9 +12,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en">
       <body>
-        <QueryProvider>
-          <AppFrame>{children}</AppFrame>
-        </QueryProvider>
+        <AppFrame>{children}</AppFrame>
       </body>
     </html>
   );

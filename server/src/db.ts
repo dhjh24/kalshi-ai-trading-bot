@@ -5,7 +5,8 @@ let database: DatabaseSync | null = null;
 
 export function getDb(): DatabaseSync {
   if (!database) {
-    database = new DatabaseSync(serverConfig.databasePath);
+    database = new DatabaseSync(serverConfig.databasePath, { timeout: 5000 });
+    database.exec("PRAGMA busy_timeout = 5000");
     database.exec(`
       CREATE TABLE IF NOT EXISTS analysis_requests (
         request_id TEXT PRIMARY KEY,

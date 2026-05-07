@@ -232,7 +232,19 @@ export async function getOverview() {
 export async function getMarkets(queryString = "") {
   return fetchApi<{
     items: MarketRow[];
-    appliedFilters: { search: string; category: string; limit: number };
+    appliedFilters: {
+      search: string;
+      ticker: string;
+      title: string;
+      category: string;
+      minVolume: number | null;
+      maxVolume: number | null;
+      expiryFrom: string;
+      expiryTo: string;
+      sortBy: "market_id" | "title" | "category" | "volume" | "expiration_ts";
+      sortDir: "asc" | "desc";
+      limit: number;
+    };
   }>(`/api/markets${queryString ? `?${queryString}` : ""}`);
 }
 

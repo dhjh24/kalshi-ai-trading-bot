@@ -1,14 +1,11 @@
 import Link from "next/link";
-import { AnalysisButton } from "../../components/analysis-button";
+import dynamic from "next/dynamic";
 import { AnalysisResultCard } from "../../components/analysis-result-card";
-import { CandlestickChart, LineChart } from "../../components/charts";
-import { LiveBtcStrip } from "../../components/live-btc-strip";
-import { LiveTradeBatchControls } from "../../components/live-trade-batch-controls";
 import { RuntimeModePanel } from "../../components/runtime-mode-panel";
 import { Badge, EmptyState, Panel, StatCard } from "../../components/ui";
+import { QueryProvider } from "../../components/query-provider";
 import { getLiveTrade } from "../../lib/api";
 import { formatMoney, formatTimestamp } from "../../lib/format";
-import { LiveTradeDecisionsPanel } from "./live-trade-decisions-panel";
 import { LiveTradeAttentionBoard } from "./live-trade-attention-board";
 import {
   LiveTradeEventMonitoringStrip,
@@ -19,6 +16,36 @@ import { LiveTradeRefreshControls } from "./live-trade-refresh-controls";
 const CATEGORY_OPTIONS = ["Sports", "Financials", "Crypto", "Economics"];
 const VISIBLE_EVENT_OPTIONS = [12, 24, 36, 48];
 const MAX_HOURS_OPTIONS = [12, 24, 48, 72, 168];
+const LineChart = dynamic(
+  () => import("../../components/charts").then((module) => module.LineChart),
+  { ssr: false }
+);
+const CandlestickChart = dynamic(
+  () => import("../../components/charts").then((module) => module.CandlestickChart),
+  { ssr: false }
+);
+const LiveBtcStrip = dynamic(
+  () => import("../../components/live-btc-strip").then((module) => module.LiveBtcStrip),
+  { ssr: false }
+);
+const AnalysisButton = dynamic(
+  () => import("../../components/analysis-button").then((module) => module.AnalysisButton),
+  { ssr: false }
+);
+const LiveTradeBatchControls = dynamic(
+  () =>
+    import("../../components/live-trade-batch-controls").then(
+      (module) => module.LiveTradeBatchControls
+    ),
+  { ssr: false }
+);
+const LiveTradeDecisionsPanel = dynamic(
+  () =>
+    import("./live-trade-decisions-panel").then(
+      (module) => module.LiveTradeDecisionsPanel
+    ),
+  { ssr: false }
+);
 type RuntimeMode = "paper" | "shadow" | "live" | "unknown";
 type RuntimeBanner = {
   primaryMode: RuntimeMode;
@@ -482,24 +509,28 @@ export default async function LiveTradePage({
               >
                 Apply Filters
               </button>
-              <LiveTradeRefreshControls
-                generatedAt={payload.generatedAt}
-                latestDecisionAt={payload.decisionFeed.latestRecordedAt}
-                latestAnalysisUpdatedAt={payload.latestAnalysisUpdatedAt}
-              />
+              <QueryProvider>
+                <LiveTradeRefreshControls
+                  generatedAt={payload.generatedAt}
+                  latestDecisionAt={payload.decisionFeed.latestRecordedAt}
+                  latestAnalysisUpdatedAt={payload.latestAnalysisUpdatedAt}
+                />
+              </QueryProvider>
             </div>
           </form>
         </Panel>
 
         <Panel title="Batch analysis">
-          <LiveTradeBatchControls
-            eventTickers={payload.events.map((event) => event.event_ticker)}
-            defaultAnalysisLimit={Math.min(
-              12,
-              Math.max(payload.events.length, 1),
-            )}
-            defaultUseWebResearch
-          />
+          <QueryProvider>
+            <LiveTradeBatchControls
+              eventTickers={payload.events.map((event) => event.event_ticker)}
+              defaultAnalysisLimit={Math.min(
+                12,
+                Math.max(payload.events.length, 1)
+              )}
+              defaultUseWebResearch
+            />
+          </QueryProvider>
           <p className="mt-4 text-sm text-slate-500">
             Latest stored analysis update{" "}
             {formatTimestamp(payload.latestAnalysisUpdatedAt)}.
@@ -541,7 +572,9 @@ export default async function LiveTradePage({
         decisionFeed={payload.decisionFeed}
       />
 
-      <LiveTradeDecisionsPanel initialFeed={payload.decisionFeed} />
+      <QueryProvider>
+        <LiveTradeDecisionsPanel initialFeed={payload.decisionFeed} />
+      </QueryProvider>
 
       {shouldShowBtc && payload.liveBtc ? (
         <section className="space-y-6">
@@ -582,7 +615,8 @@ export default async function LiveTradePage({
         />
       ) : null}
 
-      <section className="space-y-6">
+      <QueryProvider>
+        <section className="space-y-6">
         {payload.events.map((event) => (
           <Panel
             key={event.event_ticker}
@@ -647,8 +681,8 @@ export default async function LiveTradePage({
               decisionFeed={payload.decisionFeed}
             />
 
-            <div className="mt-6 overflow-hidden rounded-[22px] border border-slate-100">
-              <table className="min-w-full divide-y divide-slate-100">
+            <div className="mt-6 overflow-x-auto rounded-[22px] border border-slate-100">
+              <table className="w-full min-w-[900px] divide-y divide-slate-100">
                 <thead className="bg-slate-50/80 text-left text-xs uppercase tracking-[0.28em] text-slate-500">
                   <tr>
                     <th className="px-4 py-3">Ticker</th>
@@ -717,7 +751,8 @@ export default async function LiveTradePage({
             </div>
           </Panel>
         ))}
-      </section>
+        </section>
+      </QueryProvider>
     </div>
   );
 }

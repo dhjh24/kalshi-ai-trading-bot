@@ -59,7 +59,11 @@ async function callBridge(
   });
 
   if (!response.ok) {
-    throw new Error(`Analysis bridge failed: ${response.status} ${response.statusText}`);
+    const detail = await response.text().catch(() => "");
+    const suffix = detail.trim() ? `: ${detail.trim().slice(0, 500)}` : "";
+    throw new Error(
+      `Analysis bridge failed: ${response.status} ${response.statusText}${suffix}`
+    );
   }
 
   return (await response.json()) as BridgeResponse;

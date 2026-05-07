@@ -15,6 +15,10 @@ config.json
 /.claude
 
 # Database files
+*.db-wal
+*.db-shm
+*.db-journal
+test-artifacts/db-recovery/
 *.db
 *.sqlite
 *.sqlite3
@@ -222,6 +226,7 @@ dashboard_*.json
 # Node.js
 node_modules/
 web/.next/
+web/.next-dev/
 web/out/
 server/dist/
 *.tsbuildinfo

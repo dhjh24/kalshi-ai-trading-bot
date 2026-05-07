@@ -584,13 +584,34 @@ class LiveTradeResearchService(TradingLoggerMixin):
         price_response, chart_response = await asyncio.gather(
             self.http_client.get(price_url),
             self.http_client.get(chart_url),
+            return_exceptions=True,
         )
-        price_response.raise_for_status()
-        chart_response.raise_for_status()
+        errors: List[str] = []
+        price_payload: Dict[str, Any] = {}
+        prices: List[Any] = []
 
-        price_payload = price_response.json().get("bitcoin", {})
-        chart_payload = chart_response.json()
-        prices = chart_payload.get("prices", [])
+        if isinstance(price_response, Exception):
+            errors.append(f"price:{price_response.__class__.__name__}")
+            self.logger.warning("Bitcoin price context fetch failed", error=str(price_response))
+        else:
+            try:
+                price_response.raise_for_status()
+                price_payload = price_response.json().get("bitcoin", {})
+            except Exception as exc:
+                errors.append(f"price:{exc.__class__.__name__}")
+                self.logger.warning("Bitcoin price context fetch failed", error=str(exc))
+
+        if isinstance(chart_response, Exception):
+            errors.append(f"chart:{chart_response.__class__.__name__}")
+            self.logger.warning("Bitcoin chart context fetch failed", error=str(chart_response))
+        else:
+            try:
+                chart_response.raise_for_status()
+                chart_payload = chart_response.json()
+                prices = chart_payload.get("prices", [])
+            except Exception as exc:
+                errors.append(f"chart:{exc.__class__.__name__}")
+                self.logger.warning("Bitcoin chart context fetch failed", error=str(exc))
 
         return {
             "asset": "bitcoin",
@@ -608,6 +629,7 @@ class LiveTradeResearchService(TradingLoggerMixin):
                 }
                 for point in prices
             ],
+            "error": ";".join(errors) if errors else None,
         }
 
     async def build_event_research_payload(self, event: Dict[str, Any]) -> Dict[str, Any]:

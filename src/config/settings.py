@@ -443,7 +443,7 @@ class TradingConfig:
         default_factory=lambda: _get_bool_env("QUICK_FLIP_DISABLE_AI")
     )
     quick_flip_allocation: float = field(
-        default_factory=lambda: float(os.getenv("QUICK_FLIP_ALLOCATION", "0.05"))
+        default_factory=lambda: float(os.getenv("QUICK_FLIP_ALLOCATION", "0.00"))
     )
     quick_flip_max_market_checks: int = field(
         default_factory=lambda: int(os.getenv("QUICK_FLIP_MAX_MARKET_CHECKS", "100"))

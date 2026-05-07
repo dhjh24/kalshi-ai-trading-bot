@@ -5,19 +5,40 @@ import { getMarkets } from "../../lib/api";
 export default async function MarketsPage({
   searchParams
 }: {
-  searchParams: Promise<{ search?: string; category?: string; limit?: string }>;
+  searchParams: Promise<{
+    search?: string;
+    ticker?: string;
+    title?: string;
+    category?: string;
+    minVolume?: string;
+    maxVolume?: string;
+    expiryFrom?: string;
+    expiryTo?: string;
+    sortBy?: string;
+    sortDir?: string;
+    limit?: string;
+  }>;
 }) {
   const params = await searchParams;
   const query = new URLSearchParams();
-  if (params.search) {
-    query.set("search", params.search);
-  }
-  if (params.category) {
-    query.set("category", params.category);
-  }
-  if (params.limit) {
-    query.set("limit", params.limit);
-  }
+  [
+    "search",
+    "ticker",
+    "title",
+    "category",
+    "minVolume",
+    "maxVolume",
+    "expiryFrom",
+    "expiryTo",
+    "sortBy",
+    "sortDir",
+    "limit"
+  ].forEach((key) => {
+    const value = params[key as keyof typeof params];
+    if (value) {
+      query.set(key, value);
+    }
+  });
 
   const payload = await getMarkets(query.toString());
 
@@ -31,7 +52,7 @@ export default async function MarketsPage({
         </p>
       </Panel>
       <Panel title="Open Markets">
-        <MarketTable items={payload.items} />
+        <MarketTable items={payload.items} filters={payload.appliedFilters} />
       </Panel>
     </div>
   );

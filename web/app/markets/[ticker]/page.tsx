@@ -1,13 +1,30 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { AnalysisButton } from "../../../components/analysis-button";
+import dynamic from "next/dynamic";
 import { AnalysisResultCard } from "../../../components/analysis-result-card";
-import { CandlestickChart, LineChart } from "../../../components/charts";
 import { NewsList } from "../../../components/news-list";
-import { SportsDetail } from "../../../components/sports-detail";
 import { Badge, Panel } from "../../../components/ui";
+import { QueryProvider } from "../../../components/query-provider";
 import { getMarketDetail } from "../../../lib/api";
 import { formatMoney, formatTimestamp } from "../../../lib/format";
+
+const CandlestickChart = dynamic(
+  () =>
+    import("../../../components/charts").then((module) => module.CandlestickChart),
+  { ssr: false }
+);
+const LineChart = dynamic(
+  () => import("../../../components/charts").then((module) => module.LineChart),
+  { ssr: false }
+);
+const SportsDetail = dynamic(
+  () => import("../../../components/sports-detail").then((module) => module.SportsDetail),
+  { ssr: false }
+);
+const AnalysisButton = dynamic(
+  () => import("../../../components/analysis-button").then((module) => module.AnalysisButton),
+  { ssr: false }
+);
 
 export default async function MarketDetailPage({
   params
@@ -46,11 +63,13 @@ export default async function MarketDetailPage({
               related market and event views.
             </p>
           </div>
-          <AnalysisButton
-            targetType="market"
-            targetId={ticker}
-            initialRecord={detail.latestAnalysis}
-          />
+          <QueryProvider>
+            <AnalysisButton
+              targetType="market"
+              targetId={ticker}
+              initialRecord={detail.latestAnalysis}
+            />
+          </QueryProvider>
         </div>
       </Panel>
 

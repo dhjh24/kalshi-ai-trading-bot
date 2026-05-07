@@ -30,6 +30,11 @@ function formatCountdownLabel(milliseconds: number): string {
   return `${Math.max(0, Math.ceil(milliseconds / 1000))}s`;
 }
 
+function getStableInitialNow(timestamp: string): number {
+  const parsed = Date.parse(timestamp);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 export function QuickFlipRefreshControls({
   generatedAt,
   latestTradeAt,
@@ -40,10 +45,11 @@ export function QuickFlipRefreshControls({
   latestOrderAt: string | null;
 }) {
   const router = useRouter();
+  const initialNow = getStableInitialNow(generatedAt);
   const [autoRefresh, setAutoRefresh] = useState(true);
-  const [now, setNow] = useState(() => Date.now());
+  const [now, setNow] = useState(initialNow);
   const [isPending, startTransition] = useTransition();
-  const lastRefreshAtRef = useRef(Date.now());
+  const lastRefreshAtRef = useRef(initialNow);
 
   useEffect(() => {
     const timestamp = Date.now();

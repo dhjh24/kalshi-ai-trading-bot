@@ -15,6 +15,8 @@ const concurrentlyScript = path.join(
   "concurrently.js"
 );
 const PORT_SCAN_LIMIT = 20;
+const POSIX_TEMP_DIR = "/tmp";
+const MIN_NODE_MAJOR = 24;
 
 function parsePort(rawValue, fallback, label) {
   const parsed = Number(rawValue ?? fallback);
@@ -24,12 +26,47 @@ function parsePort(rawValue, fallback, label) {
   return parsed;
 }
 
+function getNodeMajorVersion(version) {
+  const match = /^v?(\d+)\./.exec(version);
+  return match ? Number(match[1]) : NaN;
+}
+
 function toPublicHost(host) {
   return host === "0.0.0.0" ? "127.0.0.1" : host;
 }
 
 function envIsSet(name) {
   return process.env[name] !== undefined && process.env[name] !== "";
+}
+
+function shellQuote(value) {
+  const escaped = String(value).replace(/"/g, '\\"');
+  if (process.platform === "win32") {
+    return `"${escaped}"`;
+  }
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+function normalizeChildTempEnv(env) {
+  if (process.platform === "win32") {
+    return env;
+  }
+
+  const tempCandidates = [env.TMPDIR, env.TMP, env.TEMP].filter(Boolean);
+  const hasMountedWindowsTemp = tempCandidates.some((value) =>
+    value.startsWith("/mnt/")
+  );
+
+  if (!hasMountedWindowsTemp) {
+    return env;
+  }
+
+  return {
+    ...env,
+    TMPDIR: env.TMPDIR && !env.TMPDIR.startsWith("/mnt/") ? env.TMPDIR : POSIX_TEMP_DIR,
+    TMP: env.TMP && !env.TMP.startsWith("/mnt/") ? env.TMP : POSIX_TEMP_DIR,
+    TEMP: env.TEMP && !env.TEMP.startsWith("/mnt/") ? env.TEMP : POSIX_TEMP_DIR
+  };
 }
 
 function checkPortAvailability(host, port) {
@@ -80,6 +117,18 @@ async function endpointIsHealthy(url) {
 }
 
 async function main() {
+  const nodeMajor = getNodeMajorVersion(process.version);
+  if (!Number.isFinite(nodeMajor) || nodeMajor < MIN_NODE_MAJOR) {
+    console.error(
+      `Dashboard startup requires Node ${MIN_NODE_MAJOR}+ because the API server uses node:sqlite. ` +
+        `Current runtime is ${process.version}.`
+    );
+    console.error(
+      "Use a Node 24+ shell before running `npm run dev`, or run this launcher with a Node 24 binary."
+    );
+    process.exit(1);
+  }
+
   if (!fs.existsSync(concurrentlyScript)) {
     console.error("Missing local dashboard dependencies. Run `npm install` first.");
     process.exit(1);
@@ -215,6 +264,8 @@ async function main() {
   const dashboardWebUrl = `http://127.0.0.1:${webPort}`;
   const analysisBridgeUrl =
     process.env.ANALYSIS_BRIDGE_URL || localBridgeUrl;
+  const dashboardDbPath =
+    process.env.DB_PATH || path.join(repoRoot, "trading_system.db");
 
   const bridgeCommand = [
     "python",
@@ -225,7 +276,15 @@ async function main() {
     bridgeHost,
     "--port",
     String(bridgePort),
-    ...(mode === "dev" ? ["--reload"] : [])
+    ...(mode === "dev"
+      ? [
+          "--reload",
+          "--reload-dir",
+          "python_bridge",
+          "--reload-dir",
+          "src"
+        ]
+      : [])
   ].join(" ");
 
   const concurrentlyArgs = [
@@ -235,14 +294,14 @@ async function main() {
     "-c",
     "green,blue,magenta",
     bridgeCommand,
-    `npm run ${mode} --workspace server`,
+    `${shellQuote(process.execPath)} scripts/wait-for-url.mjs ${shellQuote(`${analysisBridgeUrl}/health`)} && npm run ${mode} --workspace server`,
     `npm run ${mode} --workspace web`
   ];
 
   const child = spawn(process.execPath, [concurrentlyScript, ...concurrentlyArgs], {
     cwd: repoRoot,
     stdio: "inherit",
-    env: {
+    env: normalizeChildTempEnv({
       ...process.env,
       DASHBOARD_BRIDGE_HOST: bridgeHost,
       DASHBOARD_BRIDGE_PORT: String(bridgePort),
@@ -250,12 +309,13 @@ async function main() {
       DASHBOARD_SERVER_PORT: String(serverPort),
       DASHBOARD_WEB_PORT: String(webPort),
       ANALYSIS_BRIDGE_URL: analysisBridgeUrl,
+      DB_PATH: dashboardDbPath,
       DASHBOARD_API_URL:
         process.env.DASHBOARD_API_URL || dashboardApiUrl,
       NEXT_PUBLIC_DASHBOARD_API_URL:
         process.env.NEXT_PUBLIC_DASHBOARD_API_URL || dashboardApiUrl,
       PORT: String(webPort)
-    }
+    })
   });
 
   for (const signal of ["SIGINT", "SIGTERM"]) {

@@ -20,12 +20,10 @@ import {
 } from "./services/dashboardService.js";
 import { queueAnalysisRequest } from "./services/analysisService.js";
 import { liveStreamHub } from "./services/liveStreamHub.js";
+import { buildDashboardOrigins } from "./corsOrigins.js";
 
 const streamTopicSchema = z.enum(["markets", "btc", "scores", "analysis", "live-trade-decisions"]);
-const dashboardOrigins = new Set([
-  "http://127.0.0.1:3000",
-  "http://localhost:3000"
-]);
+const dashboardOrigins = buildDashboardOrigins();
 
 export async function buildServer() {
   const app = Fastify({
@@ -47,7 +45,15 @@ export async function buildServer() {
   app.get("/api/markets", async (request) => {
     const querySchema = z.object({
       search: z.string().optional(),
+      ticker: z.string().optional(),
+      title: z.string().optional(),
       category: z.string().optional(),
+      minVolume: z.coerce.number().min(0).optional(),
+      maxVolume: z.coerce.number().min(0).optional(),
+      expiryFrom: z.string().optional(),
+      expiryTo: z.string().optional(),
+      sortBy: z.enum(["market_id", "title", "category", "volume", "expiration_ts"]).optional(),
+      sortDir: z.enum(["asc", "desc"]).optional(),
       limit: z.coerce.number().min(1).max(250).optional()
     });
     const query = querySchema.parse(request.query);

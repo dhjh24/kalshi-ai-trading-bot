@@ -754,7 +754,7 @@ function getQuickFlipConfigVisibility(): QuickFlipConfigVisibility {
     enabled: parseEnvBoolean(process.env.ENABLE_QUICK_FLIP),
     liveEnabled: parseEnvBoolean(process.env.ENABLE_LIVE_QUICK_FLIP),
     disableAi: parseEnvBoolean(process.env.QUICK_FLIP_DISABLE_AI),
-    allocation: parseEnvNumber("QUICK_FLIP_ALLOCATION", 0.05),
+    allocation: parseEnvNumber("QUICK_FLIP_ALLOCATION", 0),
     maxMarketChecks: parseEnvNumber("QUICK_FLIP_MAX_MARKET_CHECKS", 100),
     targetOpportunityBuffer: parseEnvNumber("QUICK_FLIP_TARGET_OPPORTUNITY_BUFFER", 6),
     minEntryPrice: parseEnvNumber("QUICK_FLIP_MIN_ENTRY_PRICE", 0.01),
@@ -1193,14 +1193,30 @@ export async function getLiveTradePayload(query?: {
 
 export function getMarketsPayload(query?: {
   search?: string;
+  ticker?: string;
+  title?: string;
   category?: string;
+  minVolume?: number;
+  maxVolume?: number;
+  expiryFrom?: string;
+  expiryTo?: string;
+  sortBy?: "market_id" | "title" | "category" | "volume" | "expiration_ts";
+  sortDir?: "asc" | "desc";
   limit?: number;
 }) {
   return {
     items: listMarkets(query),
     appliedFilters: {
       search: query?.search || "",
-      category: query?.category || "All",
+      ticker: query?.ticker || "",
+      title: query?.title || "",
+      category: query?.category || "",
+      minVolume: query?.minVolume ?? null,
+      maxVolume: query?.maxVolume ?? null,
+      expiryFrom: query?.expiryFrom || "",
+      expiryTo: query?.expiryTo || "",
+      sortBy: query?.sortBy || "volume",
+      sortDir: query?.sortDir || "desc",
       limit: query?.limit ?? 100
     }
   };

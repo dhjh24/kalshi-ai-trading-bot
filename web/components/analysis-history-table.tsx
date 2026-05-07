@@ -34,8 +34,8 @@ export function AnalysisHistoryTable({
   }
 
   return (
-    <div className="overflow-hidden rounded-[22px] border border-slate-100">
-      <table className="min-w-full divide-y divide-slate-100">
+    <div className="overflow-x-auto rounded-[22px] border border-slate-100">
+      <table className="w-full min-w-[760px] divide-y divide-slate-100">
         <thead className="bg-slate-50/80 text-left text-xs uppercase tracking-[0.28em] text-slate-500">
           <tr>
             <th className="px-4 py-3">Target</th>
@@ -59,6 +59,7 @@ export function AnalysisHistoryTable({
               typeof response.used_web_research === "boolean"
                 ? response.used_web_research
                 : null;
+            const error = asString(record.error);
 
             return (
               <tr key={record.requestId}>
@@ -80,6 +81,9 @@ export function AnalysisHistoryTable({
                   </div>
                   {summary ? (
                     <p className="mt-2 max-w-xl text-sm text-slate-500">{summary}</p>
+                  ) : null}
+                  {record.status === "failed" && error ? (
+                    <p className="mt-2 max-w-xl text-sm text-red-600">{error}</p>
                   ) : null}
                 </td>
                 <td className="px-4 py-3">

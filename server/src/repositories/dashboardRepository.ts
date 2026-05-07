@@ -26,23 +26,62 @@ import { getDb } from "../db.js";
 import { isoNow, parseJson } from "../utils/helpers.js";
 
 const db = getDb();
+const SQLITE_METADATA_RETRY_DELAY_MS = 50;
+const SQLITE_TRANSIENT_ERROR_CODES = new Set([14, 1802, 5898]);
 
 function rowsAs<T>(value: unknown): T {
   return value as T;
 }
 
+function isSqliteTransientMetadataError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) {
+    return false;
+  }
+
+  const candidate = error as { code?: unknown; errcode?: unknown };
+  return (
+    candidate.code === "ERR_SQLITE_ERROR" &&
+    SQLITE_TRANSIENT_ERROR_CODES.has(Number(candidate.errcode))
+  );
+}
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function withSqliteMetadataRetry<T>(operation: () => T): T {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return operation();
+    } catch (error) {
+      if (!isSqliteTransientMetadataError(error)) {
+        throw error;
+      }
+      lastError = error;
+      sleepSync(SQLITE_METADATA_RETRY_DELAY_MS * (attempt + 1));
+    }
+  }
+
+  throw lastError;
+}
+
 function tableExists(tableName: string): boolean {
-  const row = db
-    .prepare(
-      `
-        SELECT 1 AS table_exists
-        FROM sqlite_master
-        WHERE type = 'table'
-          AND name = ?
-        LIMIT 1
-      `
-    )
-    .get(tableName) as { table_exists?: number } | undefined;
+  const row = withSqliteMetadataRetry(
+    () =>
+      db
+        .prepare(
+          `
+            SELECT 1 AS table_exists
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name = ?
+            LIMIT 1
+          `
+        )
+        .get(tableName) as { table_exists?: number } | undefined
+  );
 
   return Boolean(row?.table_exists);
 }
@@ -52,7 +91,9 @@ function columnExists(tableName: string, columnName: string): boolean {
     return false;
   }
 
-  const columns = rowsAs<Array<{ name?: string }>>(db.prepare(`PRAGMA table_info(${tableName})`).all());
+  const columns = withSqliteMetadataRetry(() =>
+    rowsAs<Array<{ name?: string }>>(db.prepare(`PRAGMA table_info(${tableName})`).all())
+  );
   return columns.some((column) => column.name === columnName);
 }
 
@@ -61,7 +102,9 @@ function getTableColumns(tableName: string): string[] {
     return [];
   }
 
-  return rowsAs<Array<{ name?: string }>>(db.prepare(`PRAGMA table_info(${tableName})`).all())
+  return withSqliteMetadataRetry(() =>
+    rowsAs<Array<{ name?: string }>>(db.prepare(`PRAGMA table_info(${tableName})`).all())
+  )
     .map((column) => column.name)
     .filter((column): column is string => Boolean(column));
 }
@@ -891,7 +934,15 @@ function getOrderTableSnapshot(
 
 export function listMarkets(options?: {
   search?: string;
+  ticker?: string;
+  title?: string;
   category?: string;
+  minVolume?: number;
+  maxVolume?: number;
+  expiryFrom?: string;
+  expiryTo?: string;
+  sortBy?: "market_id" | "title" | "category" | "volume" | "expiration_ts";
+  sortDir?: "asc" | "desc";
   limit?: number;
 }): MarketRow[] {
   if (!tableExists("markets")) {
@@ -901,15 +952,66 @@ export function listMarkets(options?: {
   const limit = options?.limit ?? 100;
   const params: Array<string | number> = [];
   const where: string[] = ["status = 'active'"];
+  const sortColumns = {
+    market_id: "market_id",
+    title: "title",
+    category: "category",
+    volume: "volume",
+    expiration_ts: "expiration_ts"
+  } satisfies Record<NonNullable<NonNullable<typeof options>["sortBy"]>, string>;
+  const sortBy = options?.sortBy || "volume";
+  const sortColumn = sortColumns[sortBy] || sortColumns.volume;
+  const sortDir = options?.sortDir === "asc" ? "ASC" : "DESC";
+
+  const parseDateSeconds = (value: string | undefined, endOfDay = false): number | null => {
+    if (!value) {
+      return null;
+    }
+
+    const timestamp = Date.parse(`${value}T${endOfDay ? "23:59:59" : "00:00:00"}Z`);
+    return Number.isFinite(timestamp) ? Math.floor(timestamp / 1000) : null;
+  };
 
   if (options?.category) {
-    where.push("category = ?");
-    params.push(options.category);
+    where.push("category LIKE ?");
+    params.push(`%${options.category}%`);
   }
 
   if (options?.search) {
     where.push("(market_id LIKE ? OR title LIKE ?)");
     params.push(`%${options.search}%`, `%${options.search}%`);
+  }
+
+  if (options?.ticker) {
+    where.push("market_id LIKE ?");
+    params.push(`%${options.ticker}%`);
+  }
+
+  if (options?.title) {
+    where.push("title LIKE ?");
+    params.push(`%${options.title}%`);
+  }
+
+  if (options?.minVolume !== undefined) {
+    where.push("volume >= ?");
+    params.push(options.minVolume);
+  }
+
+  if (options?.maxVolume !== undefined) {
+    where.push("volume <= ?");
+    params.push(options.maxVolume);
+  }
+
+  const expiryFrom = parseDateSeconds(options?.expiryFrom);
+  if (expiryFrom !== null) {
+    where.push("expiration_ts >= ?");
+    params.push(expiryFrom);
+  }
+
+  const expiryTo = parseDateSeconds(options?.expiryTo, true);
+  if (expiryTo !== null) {
+    where.push("expiration_ts <= ?");
+    params.push(expiryTo);
   }
 
   params.push(limit);
@@ -920,7 +1022,7 @@ export function listMarkets(options?: {
         SELECT *
         FROM markets
         WHERE ${where.join(" AND ")}
-        ORDER BY volume DESC, expiration_ts ASC
+        ORDER BY ${sortColumn} ${sortDir}, market_id ASC
         LIMIT ?
       `
     )

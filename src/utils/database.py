@@ -3,6 +3,7 @@ Database manager for the Kalshi trading system.
 """
 
 import aiosqlite
+import os
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 from typing import Any, Optional, List, Dict
@@ -259,15 +260,14 @@ class LiveTradeRuntimeState:
 class DatabaseManager(TradingLoggerMixin):
     """Manages database operations for the trading system."""
 
-    def __init__(self, db_path: str = "trading_system.db"):
+    def __init__(self, db_path: Optional[str] = None):
         """Initialize database connection."""
-        self.db_path = db_path
-        self.logger.info("Initializing database manager", db_path=db_path)
+        self.db_path = db_path or os.getenv("DB_PATH", "trading_system.db")
+        self.logger.info("Initializing database manager", db_path=self.db_path)
 
     async def initialize(self) -> None:
         """Initialize database schema and run migrations."""
         # Ensure the parent directory exists (e.g. data/ on a fresh clone)
-        import os
         db_dir = os.path.dirname(os.path.abspath(self.db_path))
         os.makedirs(db_dir, exist_ok=True)
 

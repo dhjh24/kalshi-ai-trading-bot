@@ -2,8 +2,8 @@
   "name": "@kalshi/dashboard-web",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
+    "dev": "node scripts/next-with-dist.mjs dev .next-dev",
+    "build": "node scripts/next-with-dist.mjs build .next",
     "start": "node -e \"const fs=require('fs'); const path=require('path'); const copy=(from,to)=>{ if (fs.existsSync(from)) fs.cpSync(from,to,{ recursive:true, force:true }); }; copy(path.join('.next','static'), path.join('.next','standalone','web','.next','static')); copy('public', path.join('.next','standalone','web','public'));\" && node .next/standalone/web/server.js",
     "test": "vitest run",
     "lint": "tsc --noEmit"
