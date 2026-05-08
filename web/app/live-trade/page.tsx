@@ -1,6 +1,9 @@
 import Link from "next/link";
-import dynamic from "next/dynamic";
+import { AnalysisButton } from "../../components/analysis-button";
 import { AnalysisResultCard } from "../../components/analysis-result-card";
+import { CandlestickChart, LineChart } from "../../components/charts";
+import { LiveBtcStrip } from "../../components/live-btc-strip";
+import { LiveTradeBatchControls } from "../../components/live-trade-batch-controls";
 import { RuntimeModePanel } from "../../components/runtime-mode-panel";
 import { Badge, EmptyState, Panel, StatCard } from "../../components/ui";
 import { QueryProvider } from "../../components/query-provider";
@@ -11,41 +14,12 @@ import {
   LiveTradeEventMonitoringStrip,
   LiveTradeMonitoringRollup,
 } from "./live-trade-monitoring-strip";
+import { LiveTradeDecisionsPanel } from "./live-trade-decisions-panel";
 import { LiveTradeRefreshControls } from "./live-trade-refresh-controls";
 
 const CATEGORY_OPTIONS = ["Sports", "Financials", "Crypto", "Economics"];
 const VISIBLE_EVENT_OPTIONS = [12, 24, 36, 48];
 const MAX_HOURS_OPTIONS = [12, 24, 48, 72, 168];
-const LineChart = dynamic(
-  () => import("../../components/charts").then((module) => module.LineChart),
-  { ssr: false }
-);
-const CandlestickChart = dynamic(
-  () => import("../../components/charts").then((module) => module.CandlestickChart),
-  { ssr: false }
-);
-const LiveBtcStrip = dynamic(
-  () => import("../../components/live-btc-strip").then((module) => module.LiveBtcStrip),
-  { ssr: false }
-);
-const AnalysisButton = dynamic(
-  () => import("../../components/analysis-button").then((module) => module.AnalysisButton),
-  { ssr: false }
-);
-const LiveTradeBatchControls = dynamic(
-  () =>
-    import("../../components/live-trade-batch-controls").then(
-      (module) => module.LiveTradeBatchControls
-    ),
-  { ssr: false }
-);
-const LiveTradeDecisionsPanel = dynamic(
-  () =>
-    import("./live-trade-decisions-panel").then(
-      (module) => module.LiveTradeDecisionsPanel
-    ),
-  { ssr: false }
-);
 type RuntimeMode = "paper" | "shadow" | "live" | "unknown";
 type RuntimeBanner = {
   primaryMode: RuntimeMode;

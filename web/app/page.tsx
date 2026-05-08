@@ -1,6 +1,7 @@
 import Link from "next/link";
-import dynamic from "next/dynamic";
 import { AnalysisResultCard } from "../components/analysis-result-card";
+import { LiveBtcStrip } from "../components/live-btc-strip";
+import { LiveScoresStrip } from "../components/live-scores-strip";
 import { MarketTable } from "../components/market-table";
 import { RuntimeModePanel } from "../components/runtime-mode-panel";
 import { Panel, StatCard } from "../components/ui";
@@ -11,16 +12,6 @@ import {
 } from "../lib/api";
 import { formatMoney, formatTimestamp } from "../lib/format";
 import type { OverviewPayload } from "../lib/types";
-
-const LiveBtcStrip = dynamic(
-  () => import("../components/live-btc-strip").then((module) => module.LiveBtcStrip),
-  { ssr: false }
-);
-
-const LiveScoresStrip = dynamic(
-  () => import("../components/live-scores-strip").then((module) => module.LiveScoresStrip),
-  { ssr: false }
-);
 
 const EMPTY_OVERVIEW: OverviewPayload = {
   metrics: {

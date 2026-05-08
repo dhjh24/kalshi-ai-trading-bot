@@ -15,11 +15,11 @@ config.json
 /.claude
 
 # Database files
+*.db
 *.db-wal
 *.db-shm
 *.db-journal
 test-artifacts/db-recovery/
-*.db
 *.sqlite
 *.sqlite3
 trading_system.db

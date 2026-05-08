@@ -127,6 +127,72 @@ def test_event_analysis_accepts_camel_case_web_research(monkeypatch):
     assert payload["response"]["used_web_research"] is False
 
 
+def test_event_analysis_falls_back_to_market_ticker(monkeypatch):
+    async def fake_initialize(self):
+        return None
+
+    async def fake_close(self):
+        return None
+
+    async def fake_event_snapshot(_state, event_ticker):
+        raise bridge_main.HTTPException(
+            status_code=404,
+            detail=f"Event {event_ticker} could not be normalized for analysis",
+        )
+
+    async def fake_market_snapshot(_state, ticker):
+        assert ticker == "KXBTCD-26MAY0717"
+        return {
+            "event_ticker": ticker,
+            "title": "Bitcoin daily market",
+            "markets": [{"ticker": ticker}],
+        }
+
+    async def fake_analysis(_state, snapshot, use_web_research, target_ticker=None):
+        assert target_ticker is None
+        return {
+            "event_ticker": snapshot["event_ticker"],
+            "focus_ticker": target_ticker,
+            "provider": "openai",
+            "model": "openai/gpt-5.4",
+            "cost_usd": 0.0,
+            "sources": [],
+            "response": {
+                "analysis": {"summary": "Synthetic market event analyzed"},
+                "used_web_research": use_web_research,
+            },
+        }
+
+    monkeypatch.setattr(bridge_main.BridgeState, "initialize", fake_initialize)
+    monkeypatch.setattr(bridge_main.BridgeState, "close", fake_close)
+    monkeypatch.setattr(
+        bridge_main,
+        "_event_snapshot_from_event_ticker",
+        fake_event_snapshot,
+    )
+    monkeypatch.setattr(
+        bridge_main,
+        "_event_snapshot_from_market_ticker",
+        fake_market_snapshot,
+    )
+    monkeypatch.setattr(
+        bridge_main,
+        "_run_analysis_for_event_snapshot",
+        fake_analysis,
+    )
+
+    with TestClient(bridge_main.app) as client:
+        response = client.post(
+            "/analysis/event",
+            json={"event_ticker": "KXBTCD-26MAY0717", "useWebResearch": True},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["event_ticker"] == "KXBTCD-26MAY0717"
+    assert payload["response"]["analysis"]["summary"] == "Synthetic market event analyzed"
+
+
 def test_live_trade_events_contract(monkeypatch):
     async def fake_initialize(self):
         return None

@@ -366,7 +366,14 @@ async def live_trade_events(
 async def analyze_event(request: EventAnalysisRequest) -> Dict[str, Any]:
     """Run manual event analysis for the Node dashboard."""
     state: BridgeState = app.state.bridge
-    snapshot = await _event_snapshot_from_event_ticker(state, request.event_ticker)
+    try:
+        snapshot = await _event_snapshot_from_event_ticker(state, request.event_ticker)
+    except HTTPException as event_error:
+        try:
+            snapshot = await _event_snapshot_from_market_ticker(state, request.event_ticker)
+        except HTTPException:
+            raise event_error
+
     return await _run_analysis_for_event_snapshot(
         state,
         snapshot,
