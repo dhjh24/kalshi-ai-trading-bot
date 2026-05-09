@@ -3071,16 +3071,40 @@ export function completeAnalysisRequest(
   );
 }
 
-export function failAnalysisRequest(requestId: string, error: string): void {
+export function failAnalysisRequest(
+  requestId: string,
+  error: string,
+  payload: {
+    provider?: string | null;
+    model?: string | null;
+    costUsd?: number | null;
+    sources?: string[];
+    response?: unknown;
+  } = {}
+): void {
   db.prepare(
     `
       UPDATE analysis_requests
       SET status = 'failed',
           completed_at = ?,
-          error = ?
+          error = ?,
+          provider = COALESCE(?, provider),
+          model = COALESCE(?, model),
+          cost_usd = COALESCE(?, cost_usd),
+          sources_json = COALESCE(?, sources_json),
+          response_json = COALESCE(?, response_json)
       WHERE request_id = ?
     `
-  ).run(isoNow(), error, requestId);
+  ).run(
+    isoNow(),
+    error,
+    payload.provider ?? null,
+    payload.model ?? null,
+    payload.costUsd ?? null,
+    payload.sources === undefined ? null : JSON.stringify(payload.sources),
+    payload.response === undefined ? null : JSON.stringify(payload.response),
+    requestId
+  );
 }
 
 export function upsertMarketContextLink(payload: {

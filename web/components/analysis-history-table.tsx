@@ -14,6 +14,20 @@ function asString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
+function getModelDisplay(record: AnalysisRecord): string {
+  if (record.model?.trim()) {
+    return record.model;
+  }
+
+  if (record.status === "pending") {
+    return "awaiting response";
+  }
+
+  return record.provider?.trim()
+    ? `${record.provider} (model not reported)`
+    : "model not reported";
+}
+
 export function AnalysisHistoryTable({
   initialValue
 }: {
@@ -65,7 +79,10 @@ export function AnalysisHistoryTable({
               typeof response.used_web_research === "boolean"
                 ? response.used_web_research
                 : null;
-            const error = asString(record.error);
+            const responseError = asString(response.error);
+            const error = asString(record.error) || responseError;
+            const statusLabel =
+              record.status === "completed" && responseError ? "no result" : record.status;
 
             return (
               <tr key={record.requestId} id={`analysis-request-${record.requestId}`}>
@@ -102,28 +119,36 @@ export function AnalysisHistoryTable({
                   {summary ? (
                     <p className="mt-2 max-w-xl text-sm text-slate-500">{summary}</p>
                   ) : null}
-                  {record.status === "failed" && error ? (
-                    <p className="mt-2 max-w-xl text-sm text-red-600">{error}</p>
+                  {error ? (
+                    <p
+                      className={
+                        record.status === "failed"
+                          ? "mt-2 max-w-xl text-sm text-red-600"
+                          : "mt-2 max-w-xl text-sm text-amber-700"
+                      }
+                    >
+                      {error}
+                    </p>
                   ) : null}
                 </td>
                 <td className="px-4 py-3">
                   <Badge
                     tone={
-                      record.status === "completed"
+                      statusLabel === "completed"
                         ? "positive"
-                        : record.status === "failed"
+                        : statusLabel === "failed"
                           ? "negative"
                           : "warning"
                     }
                   >
-                    {record.status}
+                    {statusLabel}
                   </Badge>
                 </td>
                 <td className="px-4 py-3 text-sm text-slate-600">
                   {formatTimestamp(record.requestedAt)}
                 </td>
                 <td className="px-4 py-3 text-sm text-slate-600">
-                  {record.model || "pending"}
+                  {getModelDisplay(record)}
                 </td>
                 <td className="px-4 py-3 text-sm text-slate-600">
                   {record.costUsd !== null && record.costUsd !== undefined

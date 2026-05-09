@@ -44,6 +44,8 @@ type QuickFlipNumericField =
   | "dynamicExitRepriceSeconds"
   | "stopLossPct";
 
+type NumericUnit = "$" | "%";
+
 const BOOLEAN_FIELDS = [
   {
     key: "enabled",
@@ -72,6 +74,7 @@ const NUMBER_FIELDS = [
     label: "Allocation",
     step: "0.01",
     min: "0",
+    unit: "%",
     helpText: "Fraction of runtime capital reserved for quick flip when enabled."
   },
   {
@@ -93,6 +96,7 @@ const NUMBER_FIELDS = [
     label: "Min entry price",
     step: "0.001",
     min: "0",
+    unit: "$",
     helpText: "Lower bound on accepted YES contract entry price."
   },
   {
@@ -100,6 +104,7 @@ const NUMBER_FIELDS = [
     label: "Max entry price",
     step: "0.001",
     min: "0",
+    unit: "$",
     helpText: "Upper bound on accepted YES contract entry price."
   },
   {
@@ -107,6 +112,7 @@ const NUMBER_FIELDS = [
     label: "Min profit margin",
     step: "0.001",
     min: "0",
+    unit: "%",
     helpText: "Minimum margin required before taking a scalp."
   },
   {
@@ -128,6 +134,7 @@ const NUMBER_FIELDS = [
     label: "Capital per trade",
     step: "0.01",
     min: "0",
+    unit: "$",
     helpText: "Maximum cash allocation for one trade attempt."
   },
   {
@@ -135,6 +142,7 @@ const NUMBER_FIELDS = [
     label: "Daily loss budget",
     step: "0.01",
     min: "0",
+    unit: "%",
     helpText: "Absolute risk budget per day as a decimal fraction."
   },
   {
@@ -156,6 +164,7 @@ const NUMBER_FIELDS = [
     label: "Confidence threshold",
     step: "0.001",
     min: "0",
+    unit: "%",
     helpText: "Minimum model confidence required to execute quick flip."
   },
   {
@@ -184,6 +193,7 @@ const NUMBER_FIELDS = [
     label: "Max bid/ask spread",
     step: "0.001",
     min: "0",
+    unit: "$",
     helpText: "Reject trades where spread is wider than this threshold."
   },
   {
@@ -198,6 +208,7 @@ const NUMBER_FIELDS = [
     label: "Min net profit",
     step: "0.01",
     min: "0",
+    unit: "$",
     helpText: "Minimum net expected profit target per trade."
   },
   {
@@ -205,6 +216,7 @@ const NUMBER_FIELDS = [
     label: "Min net ROI",
     step: "0.001",
     min: "0",
+    unit: "%",
     helpText: "Minimum net return on investment target per trade."
   },
   {
@@ -212,6 +224,7 @@ const NUMBER_FIELDS = [
     label: "Max target vs recent high gap",
     step: "0.001",
     min: "0",
+    unit: "$",
     helpText: "Reject targets too far above the recent tape high."
   },
   {
@@ -226,6 +239,7 @@ const NUMBER_FIELDS = [
     label: "Min recent price position",
     step: "0.01",
     min: "0",
+    unit: "%",
     helpText: "Require the latest print to sit high enough within the recent range."
   },
   {
@@ -233,6 +247,7 @@ const NUMBER_FIELDS = [
     label: "Max entry vs recent last gap",
     step: "0.001",
     min: "0",
+    unit: "$",
     helpText: "Reject entries that have already gapped above the latest print."
   },
   {
@@ -282,6 +297,7 @@ const NUMBER_FIELDS = [
     label: "Stop loss",
     step: "0.001",
     min: "0",
+    unit: "%",
     helpText: "Hard stop-loss cap on trade risk."
   }
 ] as const satisfies Array<{
@@ -289,6 +305,7 @@ const NUMBER_FIELDS = [
   label: string;
   step: string;
   min: string;
+  unit?: NumericUnit;
   helpText: string;
 }>;
 
@@ -545,7 +562,14 @@ export function QuickFlipConfigEditor({
             key={field.key}
             className="flex flex-col gap-2 rounded-2xl border border-slate-100 bg-slate-50/70 p-4"
           >
-            <span className="text-sm font-medium text-steel">{field.label}</span>
+            <span className="flex items-center justify-between gap-2 text-sm font-medium text-steel">
+              <span>{field.label}</span>
+              {"unit" in field && field.unit ? (
+                <span className="rounded-full bg-slate-200 px-2 py-0.5 text-xs text-slate-600">
+                  {field.unit}
+                </span>
+              ) : null}
+            </span>
             <input
               type="number"
               value={numberValues[field.key]}

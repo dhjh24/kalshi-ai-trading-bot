@@ -36,6 +36,23 @@ function buildStoredResponse(payload: BridgeResponse): Record<string, unknown> {
   return response;
 }
 
+function getAnalysisFailure(payload: BridgeResponse): string | null {
+  const response =
+    payload.response && typeof payload.response === "object" ? payload.response : {};
+  const responseError = response.error;
+  const analysis = response.analysis;
+
+  if (typeof responseError === "string" && responseError.trim().length > 0) {
+    return responseError.trim();
+  }
+
+  if (analysis === null) {
+    return "Analysis bridge returned no structured analysis.";
+  }
+
+  return null;
+}
+
 async function callBridge(
   targetType: AnalysisTargetType,
   targetId: string,
@@ -77,12 +94,26 @@ async function processAnalysisRequest(
 ) {
   try {
     const payload = await callBridge(targetType, targetId, body);
+    const storedResponse = buildStoredResponse(payload);
+    const analysisFailure = getAnalysisFailure(payload);
+
+    if (analysisFailure) {
+      failAnalysisRequest(requestId, analysisFailure, {
+        provider: payload.provider ?? null,
+        model: payload.model ?? null,
+        costUsd: payload.cost_usd ?? null,
+        sources: payload.sources ?? [],
+        response: storedResponse
+      });
+      return;
+    }
+
     completeAnalysisRequest(requestId, {
       provider: payload.provider ?? null,
       model: payload.model ?? null,
       costUsd: payload.cost_usd ?? null,
       sources: payload.sources ?? [],
-      response: buildStoredResponse(payload)
+      response: storedResponse
     });
   } catch (error) {
     failAnalysisRequest(

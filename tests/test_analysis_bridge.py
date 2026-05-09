@@ -1,4 +1,5 @@
 from fastapi.testclient import TestClient
+from types import SimpleNamespace
 
 from python_bridge.app import main as bridge_main
 
@@ -20,6 +21,29 @@ def test_bridge_health_shape(monkeypatch):
     payload = response.json()
     assert payload["ok"] is True
     assert "provider" in payload
+
+
+def test_extract_router_metadata_reports_codex_model():
+    router = SimpleNamespace(
+        default_provider="codex",
+        codex_client=SimpleNamespace(
+            last_request_metadata=SimpleNamespace(
+                actual_model="codex/gpt-5.4",
+                requested_model="codex/gpt-5.4-mini",
+                cost=0.0,
+            )
+        ),
+        openai_client=None,
+        openrouter_client=None,
+    )
+
+    metadata = bridge_main._extract_router_metadata(router)
+
+    assert metadata == {
+        "provider": "codex",
+        "model": "codex/gpt-5.4",
+        "cost_usd": 0.0,
+    }
 
 
 def test_event_analysis_contract(monkeypatch):

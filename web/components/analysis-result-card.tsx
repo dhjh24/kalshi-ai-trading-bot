@@ -31,6 +31,24 @@ function recommendationTone(action: string): "positive" | "warning" | "neutral" 
   return "neutral";
 }
 
+function getStatusLabel(analysis: AnalysisRecord, responseError: string | null): string {
+  return analysis.status === "completed" && responseError ? "no result" : analysis.status;
+}
+
+function getModelDisplay(analysis: AnalysisRecord): string | null {
+  if (analysis.model?.trim()) {
+    return analysis.model;
+  }
+
+  if (analysis.status === "pending") {
+    return "awaiting response";
+  }
+
+  return analysis.provider?.trim()
+    ? `${analysis.provider} (model not reported)`
+    : null;
+}
+
 export function AnalysisResultCard({
   analysis,
   title
@@ -48,7 +66,12 @@ export function AnalysisResultCard({
 
   const response = asObject(analysis.response);
   const analysisPayload = asObject(response.analysis);
-  const summary = String(analysisPayload.summary || "No summary available.");
+  const responseError = asString(response.error);
+  const summary = String(
+    analysisPayload.summary || responseError || "No summary available."
+  );
+  const statusLabel = getStatusLabel(analysis, responseError);
+  const modelDisplay = getModelDisplay(analysis);
   const confidence = asNumber(analysisPayload.confidence);
   const drivers = Array.isArray(analysisPayload.key_drivers)
     ? analysisPayload.key_drivers
@@ -82,14 +105,14 @@ export function AnalysisResultCard({
         <div className="flex items-center gap-2">
           <Badge
             tone={
-              analysis.status === "completed"
+              statusLabel === "completed"
                 ? "positive"
-                : analysis.status === "failed"
+                : statusLabel === "failed"
                   ? "negative"
                   : "warning"
             }
           >
-            {analysis.status}
+            {statusLabel}
           </Badge>
           {analysis.costUsd !== null && analysis.costUsd !== undefined ? (
             <Badge tone="neutral">{formatMoney(analysis.costUsd)}</Badge>
@@ -103,7 +126,7 @@ export function AnalysisResultCard({
           Confidence {formatPercent(confidence)}
         </Badge>
         {analysis.provider ? <Badge tone="neutral">{analysis.provider}</Badge> : null}
-        {analysis.model ? <Badge tone="neutral">{analysis.model}</Badge> : null}
+        {modelDisplay ? <Badge tone="neutral">{modelDisplay}</Badge> : null}
         {usedWebResearch !== null ? (
           <Badge tone={usedWebResearch ? "positive" : "neutral"}>
             {usedWebResearch ? "Web research used" : "No web research"}

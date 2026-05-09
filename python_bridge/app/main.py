@@ -127,6 +127,14 @@ def _extract_router_metadata(model_router: ModelRouter) -> Dict[str, Any]:
     """Return provider/model/cost information from the last routed request."""
     provider = model_router.default_provider
 
+    if provider == "codex" and model_router.codex_client is not None:
+        metadata = model_router.codex_client.last_request_metadata
+        return {
+            "provider": "codex",
+            "model": metadata.actual_model or metadata.requested_model,
+            "cost_usd": metadata.cost,
+        }
+
     if provider == "openai" and model_router.openai_client is not None:
         metadata = model_router.openai_client.last_request_metadata
         return {
