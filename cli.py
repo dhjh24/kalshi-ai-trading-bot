@@ -632,8 +632,8 @@ def cmd_run(args: argparse.Namespace) -> None:
     cfg.settings.trading.min_confidence_to_trade = 0.45  # LOOSENED from 0.65 (approved 2026-03-29)
     cfg.settings.trading.max_position_size_pct = 3.0
     cfg.settings.trading.kelly_fraction = 0.25
-    cfg.max_drawdown = 0.15
-    cfg.max_sector_exposure = 0.30
+    cfg.settings.trading.max_drawdown = 0.15
+    cfg.settings.trading.max_sector_exposure = 0.30
 
     if shadow and not _class_accepts_kwarg(UnifiedTradingBot, "shadow_mode"):
         print("   Shadow runtime hook not available yet; falling back to paper execution semantics.")
@@ -674,12 +674,9 @@ def _run_safe_compounder(
     async def _run():
         client = KalshiClient()
         try:
-            compounder = _construct_runtime(
-                SafeCompounder,
-                client=client,
-                dry_run=not live_mode,
-                shadow_mode=shadow_mode,
-            )
+            # SafeCompounder has no explicit shadow execution hooks yet, so shadow
+            # mode must remain paper-style dry-run semantics.
+            compounder = SafeCompounder(client=client, dry_run=not live_mode)
             stats = await compounder.run()
             return stats
         finally:

@@ -239,7 +239,12 @@ async def _fallback_legacy_trading(
             try:
                 # Make decision
                 position = await make_decision_for_market(
-                    market, db_manager, xai_client, kalshi_client
+                    market,
+                    db_manager,
+                    xai_client,
+                    kalshi_client,
+                    live_mode=live_mode,
+                    shadow_mode=shadow_mode,
                 )
                 
                 if position:

@@ -89,7 +89,7 @@ class UnifiedTradingBot:
 
         self.logger.info(
             f"Unified Trading Bot initialized - "
-            f"Mode: {'LIVE TRADING' if live_mode else 'PAPER TRADING'}"
+            f"Mode: {'LIVE TRADING' if live_mode else 'SHADOW TRADING' if shadow_mode else 'PAPER TRADING'}"
         )
         self.logger.info(f"CLI live_mode parameter: {live_mode}")
         self.logger.info(f"settings.trading.live_trading_enabled: {settings.trading.live_trading_enabled}")
@@ -173,7 +173,10 @@ class UnifiedTradingBot:
         kalshi_client: Optional[KalshiClient] = None
         try:
             self.logger.info("UNIFIED TRADING BOT STARTED")
-            self.logger.info(f"Trading Mode: {'LIVE' if self.live_mode else 'PAPER'}")
+            self.logger.info(
+                "Trading Mode: "
+                f"{'LIVE' if self.live_mode else 'SHADOW' if self.shadow_mode else 'PAPER'}"
+            )
             self.logger.info(f"Daily AI Budget: ${settings.trading.daily_ai_budget}")
             self.logger.info(f"Features: Market Making + Portfolio Optimization + Dynamic Exits")
 

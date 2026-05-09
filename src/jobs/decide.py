@@ -222,12 +222,26 @@ async def make_decision_for_market(
     xai_client: Any,
     kalshi_client: KalshiClient,
     model_router: Optional[ModelRouter] = None,
+    live_mode: Optional[bool] = None,
+    shadow_mode: Optional[bool] = None,
 ) -> Optional[Position]:
     """
     Analyzes a single market and makes a trading decision with performance optimizations.
     Now includes cost controls and deduplication.
     """
     logger = get_trading_logger("decision_engine")
+    live_mode = (
+        bool(getattr(settings.trading, "live_trading_enabled", False))
+        if live_mode is None
+        else bool(live_mode)
+    )
+    shadow_mode = (
+        bool(getattr(settings.trading, "shadow_mode_enabled", False))
+        if shadow_mode is None
+        else bool(shadow_mode)
+    )
+    from src.strategies.portfolio_enforcer import MODE_LIVE, MODE_PAPER
+    decision_enforcement_mode = MODE_LIVE if (live_mode or shadow_mode) else MODE_PAPER
     logger.info(f"Analyzing market: {market.title} ({market.market_id})")
 
     try:
@@ -322,6 +336,7 @@ async def make_decision_for_market(
                             trade_value=trade_value,
                             portfolio_value=portfolio_value,
                             db_manager=db_manager,
+                            enforcement_mode=decision_enforcement_mode,
                         )
                         if not allowed:
                             logger.info(f"🚫 PORTFOLIO ENFORCER BLOCKED: {market.market_id} - {reason}")
@@ -353,7 +368,7 @@ async def make_decision_for_market(
                             timestamp=datetime.now(),
                             rationale="High-confidence near-expiry YES bet.",
                             confidence=decision.confidence,
-                            live=False,
+                            live=live_mode,
                             strategy="directional_trading",
                             
                             # Enhanced exit strategy fields using Grok4 recommendations
@@ -612,6 +627,7 @@ async def make_decision_for_market(
                     trade_value=trade_value,
                     portfolio_value=portfolio_value,
                     db_manager=db_manager,
+                    enforcement_mode=decision_enforcement_mode,
                 )
                 if not allowed:
                     logger.info(f"🚫 PORTFOLIO ENFORCER BLOCKED: {market.market_id} - {reason}")
@@ -644,7 +660,7 @@ async def make_decision_for_market(
                     timestamp=datetime.now(),
                     rationale=rationale,
                     confidence=confidence,
-                    live=False,
+                    live=live_mode,
                     strategy="directional_trading",
                     
                     # Enhanced exit strategy fields using Grok4 recommendations

@@ -165,3 +165,66 @@ async def test_run_trading_job_fails_open_when_embedded_live_trade_loop_raises(m
             settings.trading.live_trading_enabled,
             settings.trading.shadow_mode_enabled,
         ) = previous_values
+
+
+@pytest.mark.asyncio
+async def test_run_trading_job_fallback_legacy_mode_respects_runtime_flags(monkeypatch):
+    previous_values = (
+        settings.trading.live_trading_enabled,
+        settings.trading.shadow_mode_enabled,
+    )
+    try:
+        settings.trading.live_trading_enabled = False
+        settings.trading.shadow_mode_enabled = False
+
+        captured_flags = {}
+
+        async def fake_run_unified(*_args, **_kwargs):
+            raise RuntimeError("force fallback")
+
+        fake_db = SimpleNamespace(
+            get_eligible_markets=AsyncMock(
+                return_value=[
+                    SimpleNamespace(
+                        market_id="M1",
+                        title="Market 1",
+                        volume=1000,
+                        expiration_ts=0,
+                    )
+                ]
+            ),
+            close=AsyncMock(),
+        )
+        fake_kalshi_client = SimpleNamespace(close=AsyncMock())
+        fake_xai_client = SimpleNamespace(close=AsyncMock())
+
+        async def fake_make_decision(
+            market,
+            db_manager,
+            xai_client,
+            kalshi_client,
+            *args,
+            live_mode: bool = False,
+            shadow_mode: bool = False,
+            **_kwargs,
+        ):
+            captured_flags["live_mode"] = live_mode
+            captured_flags["shadow_mode"] = shadow_mode
+            return None
+
+        monkeypatch.setattr(trade, "DatabaseManager", lambda: fake_db)
+        monkeypatch.setattr(trade, "KalshiClient", lambda: fake_kalshi_client)
+        monkeypatch.setattr(trade, "ModelRouter", lambda db_manager=None: fake_xai_client)
+        monkeypatch.setattr(trade, "run_unified_trading_system", fake_run_unified)
+        monkeypatch.setattr(trade, "make_decision_for_market", fake_make_decision)
+        monkeypatch.setattr(trade, "get_trading_logger", lambda _: MagicMock())
+
+        await trade.run_trading_job(shadow_mode=True)
+
+        assert captured_flags["live_mode"] is False
+        assert captured_flags["shadow_mode"] is True
+    finally:
+        (
+            settings.trading.live_trading_enabled,
+            settings.trading.shadow_mode_enabled,
+        ) = previous_values
