@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
-from src.clients.kalshi_client import KalshiClient
+from src.clients.kalshi_client import KalshiAPIError, KalshiClient
 from src.clients.model_router import ModelRouter
 from src.data.live_trade_research import LiveTradeResearchService
 from src.utils.database import DatabaseManager
@@ -244,7 +244,17 @@ async def _event_snapshot_from_market_ticker(
     ticker: str,
 ) -> Dict[str, Any]:
     """Build an event or synthetic snapshot from one market ticker."""
-    response = await state.kalshi_client.get_market(ticker)
+    try:
+        response = await state.kalshi_client.get_market(ticker)
+    except KalshiAPIError as exc:
+        message = str(exc)
+        if "HTTP 404" in message:
+            raise HTTPException(status_code=404, detail=f"Market {ticker} not found") from exc
+        raise HTTPException(
+            status_code=502,
+            detail=f"Kalshi market lookup failed for {ticker}: {message}",
+        ) from exc
+
     market = response.get("market")
     if not market:
         raise HTTPException(status_code=404, detail=f"Market {ticker} not found")

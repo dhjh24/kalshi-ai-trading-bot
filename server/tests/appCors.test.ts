@@ -3,12 +3,21 @@ import { buildDashboardOrigins } from "../src/corsOrigins";
 
 describe("dashboard API CORS", () => {
   it("allows fallback dashboard web ports selected by the launcher", () => {
-    const origins = buildDashboardOrigins({ DASHBOARD_WEB_PORT: "3001" });
+    const origins = buildDashboardOrigins({});
 
     expect(origins.has("http://127.0.0.1:3000")).toBe(true);
     expect(origins.has("http://localhost:3000")).toBe(true);
     expect(origins.has("http://127.0.0.1:3001")).toBe(true);
     expect(origins.has("http://localhost:3001")).toBe(true);
+    expect(origins.has("http://127.0.0.1:3020")).toBe(true);
+    expect(origins.has("http://localhost:3020")).toBe(true);
+  });
+
+  it("allows an explicitly configured dashboard web port outside the fallback range", () => {
+    const origins = buildDashboardOrigins({ DASHBOARD_WEB_PORT: "5173" });
+
+    expect(origins.has("http://127.0.0.1:5173")).toBe(true);
+    expect(origins.has("http://localhost:5173")).toBe(true);
   });
 
   it("allows explicit extra dashboard origins", () => {

@@ -193,6 +193,71 @@ def test_event_analysis_falls_back_to_market_ticker(monkeypatch):
     assert payload["response"]["analysis"]["summary"] == "Synthetic market event analyzed"
 
 
+def test_event_analysis_preserves_event_404_when_market_fallback_is_not_found(monkeypatch):
+    async def fake_initialize(self):
+        return None
+
+    async def fake_close(self):
+        return None
+
+    async def fake_event_snapshot(_state, event_ticker):
+        raise bridge_main.HTTPException(
+            status_code=404,
+            detail=f"Event {event_ticker} could not be normalized for analysis",
+        )
+
+    async def fake_get_market(self, ticker):
+        raise bridge_main.KalshiAPIError(
+            'HTTP 404: {"error":{"code":"not_found","message":"not found"}}'
+        )
+
+    monkeypatch.setattr(bridge_main.BridgeState, "initialize", fake_initialize)
+    monkeypatch.setattr(bridge_main.BridgeState, "close", fake_close)
+    monkeypatch.setattr(
+        bridge_main,
+        "_event_snapshot_from_event_ticker",
+        fake_event_snapshot,
+    )
+    monkeypatch.setattr(bridge_main.KalshiClient, "get_market", fake_get_market)
+
+    with TestClient(bridge_main.app) as client:
+        response = client.post(
+            "/analysis/event",
+            json={"event_ticker": "KXBTCD-26MAY0719", "useWebResearch": True},
+        )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == (
+        "Event KXBTCD-26MAY0719 could not be normalized for analysis"
+    )
+
+
+def test_market_analysis_returns_404_for_missing_kalshi_market(monkeypatch):
+    async def fake_initialize(self):
+        return None
+
+    async def fake_close(self):
+        return None
+
+    async def fake_get_market(self, ticker):
+        raise bridge_main.KalshiAPIError(
+            'HTTP 404: {"error":{"code":"not_found","message":"not found"}}'
+        )
+
+    monkeypatch.setattr(bridge_main.BridgeState, "initialize", fake_initialize)
+    monkeypatch.setattr(bridge_main.BridgeState, "close", fake_close)
+    monkeypatch.setattr(bridge_main.KalshiClient, "get_market", fake_get_market)
+
+    with TestClient(bridge_main.app) as client:
+        response = client.post(
+            "/analysis/market",
+            json={"ticker": "KXBTCD-26MAY0719", "useWebResearch": True},
+        )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Market KXBTCD-26MAY0719 not found"
+
+
 def test_live_trade_events_contract(monkeypatch):
     async def fake_initialize(self):
         return None
