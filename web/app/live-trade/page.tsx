@@ -5,7 +5,7 @@ import { CandlestickChart, LineChart } from "../../components/charts";
 import { LiveBtcStrip } from "../../components/live-btc-strip";
 import { LiveTradeBatchControls } from "../../components/live-trade-batch-controls";
 import { RuntimeModePanel } from "../../components/runtime-mode-panel";
-import { Badge, EmptyState, Panel, StatCard } from "../../components/ui";
+import { Badge, EmptyState, LlmTokenBadge, Panel, StatCard } from "../../components/ui";
 import { QueryProvider } from "../../components/query-provider";
 import { getLiveTrade } from "../../lib/api";
 import { formatMoney, formatTimestamp } from "../../lib/format";
@@ -371,6 +371,9 @@ export default async function LiveTradePage({
         eyebrow="Live Trade"
         title="Ranked event feed for the W5 decision loop"
       >
+        <div className="mb-3 flex justify-end">
+          <LlmTokenBadge>LLM decision + analysis flow</LlmTokenBadge>
+        </div>
         <p className="max-w-3xl text-slate-600">
           This route tracks the short-dated event queue, category filters,
           crypto context, manual analysis controls, and persisted scout,

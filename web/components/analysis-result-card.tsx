@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { formatMoney, formatTimestamp } from "../lib/format";
 import type { AnalysisRecord } from "../lib/types";
-import { Badge } from "./ui";
+import { Badge, LlmTokenBadge } from "./ui";
 
 function asObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
@@ -94,6 +94,7 @@ export function AnalysisResultCard({
           {analysis.costUsd !== null && analysis.costUsd !== undefined ? (
             <Badge tone="neutral">{formatMoney(analysis.costUsd)}</Badge>
           ) : null}
+          <LlmTokenBadge>LLM result</LlmTokenBadge>
         </div>
       </div>
       <p className="mt-4 text-base text-slate-700">{summary}</p>

@@ -889,11 +889,38 @@ document.addEventListener('DOMContentLoaded', function () {
 		<!-- Freesoul Deactivate Plugins has disabled 1 plugins on this page. -->
 		<script type="module" src="https://votehub.com/wp-includes/js/dist/script-modules/block-library/navigation/view.min.js?ver=b0f909c3ec791c383210" id="@wordpress/block-library/navigation/view-js-module" fetchpriority="low" data-wp-router-options="{&quot;loadOnClientNavigation&quot;:true}"></script>
 <script type="module" src="https://votehub.com/wp-includes/js/dist/script-modules/block-library/search/view.min.js?ver=94fc611a7464b5de290a" id="@wordpress/block-library/search/view-js-module" fetchpriority="low" data-wp-router-options="{&quot;loadOnClientNavigation&quot;:true}"></script>
+<!-- Runtime Firebase config must be injected by deployment (do not hardcode apiKey in source). -->
+<!-- Example generated file: /votehub-firebase-runtime-config.js -->
+<script src="/votehub-firebase-runtime-config.js" id="votehub-firebase-runtime-config-js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js?ver=10.7.1" id="firebase-app-js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-auth-compat.js?ver=10.7.1" id="firebase-auth-js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore-compat.js?ver=10.7.1" id="firebase-firestore-js"></script>
 <script id="votehub-firebase-init-js-extra">
-var firebaseConfig = {"apiKey":"AIzaSyC4NqZZp_AjDZa1TKVJ8bZQ1NWw1DYF55o","authDomain":"votehub-com.firebaseapp.com","projectId":"votehub-com","storageBucket":"votehub-com.firebasestorage.app","messagingSenderId":"105153001002","appId":"1:105153001002:web:234a552b3becf7b3b63553"};
+// Firebase config is injected at deploy/runtime and must not be embedded in source.
+var firebaseConfig = Object.assign(
+  {
+    apiKey: "",
+    authDomain: "votehub-com.firebaseapp.com",
+    projectId: "votehub-com",
+    storageBucket: "votehub-com.firebasestorage.app",
+    messagingSenderId: "105153001002",
+    appId: "1:105153001002:web:234a552b3becf7b3b63553"
+  },
+  window.__FIREBASE_RUNTIME_CONFIG__ ||
+  window.__FIREBASE_CONFIG__ ||
+  {}
+);
+
+if (!firebaseConfig.apiKey) {
+  if (window.console && window.console.warn) {
+    window.console.warn("Firebase API key is missing. Set window.__FIREBASE_RUNTIME_CONFIG__ (or __FIREBASE_CONFIG__) with a valid firebaseConfig before this script loads.");
+  }
+  window.__FIREBASE_CONFIG__ = null;
+  window.__FIREBASE_READY__ = false;
+} else {
+  window.__FIREBASE_CONFIG__ = firebaseConfig;
+  window.__FIREBASE_READY__ = true;
+}
 //# sourceURL=votehub-firebase-init-js-extra
 </script>
 <script src="https://votehub.com/wp-content/plugins/votehub-firebase-wp/assets/js/firebase-init.js?ver=1.0.5" id="votehub-firebase-init-js"></script>
@@ -1014,4 +1041,11 @@ Retrieved 4075 objects (1 MB) from Redis using PhpRedis (v6.3.0).
 
 <!-- Page cached by LiteSpeed Cache 7.8.1 on 2026-05-07 16:55:58 -->
 <!-- All data displayed on this site is the proprietary property of VoteHub. Any scraping, automated collection, or reproduction of our data without prior written permission is strictly prohibited. Unauthorized use may violate applicable law, and we reserve the right to pursue legal action in response. To obtain a license or request permission, please contact us directly. -->
+
+
+
+
+
+
+
 

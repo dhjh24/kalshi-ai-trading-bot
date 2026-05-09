@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { API_BASE_URL } from "../lib/api";
+import { LlmTokenBadge } from "./ui";
 
 const ANALYSIS_LIMIT_OPTIONS = [4, 8, 12, 24, 36];
 
@@ -58,7 +59,10 @@ export function LiveTradeBatchControls({
   const effectiveLimit = Math.min(analysisLimit, visibleCount);
 
   return (
-    <div className="rounded-[24px] border border-slate-100 bg-slate-50/80 p-5">
+      <div className="rounded-[24px] border border-slate-100 bg-slate-50/80 p-5">
+      <div className="mb-3 flex items-center justify-end">
+        <LlmTokenBadge>LLM batch queue</LlmTokenBadge>
+      </div>
       <div className="flex flex-wrap items-end gap-4">
         <label className="flex flex-col gap-2 text-sm text-slate-600">
           <span>Analyze Top Events</span>

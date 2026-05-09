@@ -5,6 +5,7 @@ import { useMutation } from "@tanstack/react-query";
 import { API_BASE_URL } from "../lib/api";
 import type { AnalysisRecord, AnalysisTargetType } from "../lib/types";
 import { useTopicStream } from "../lib/use-topic-stream";
+import { LlmTokenBadge } from "./ui";
 
 function selectLatest(
   payload: unknown,
@@ -78,6 +79,7 @@ export function AnalysisButton({
 
   return (
     <div className="flex flex-col items-end gap-3">
+      <LlmTokenBadge>LLM call (tokenized)</LlmTokenBadge>
       <label
         htmlFor={inputId}
         className="flex items-center gap-2 text-sm text-slate-600"

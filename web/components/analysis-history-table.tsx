@@ -1,9 +1,10 @@
 "use client";
 
+import Link from "next/link";
 import type { AnalysisRecord } from "../lib/types";
 import { useTopicStream } from "../lib/use-topic-stream";
 import { formatMoney, formatTimestamp } from "../lib/format";
-import { Badge, EmptyState } from "./ui";
+import { Badge, EmptyState, LlmTokenBadge } from "./ui";
 
 function asObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
@@ -51,6 +52,11 @@ export function AnalysisHistoryTable({
             const analysis = asObject(response.analysis);
             const focusTicker = asString(response.focus_ticker);
             const summary = asString(analysis.summary);
+            const targetHref =
+              record.targetType === "event"
+                ? `/events/${encodeURIComponent(record.targetId)}#analysis`
+                : `/markets/${encodeURIComponent(record.targetId)}#analysis`;
+            const requestHref = `/analysis#analysis-request-${encodeURIComponent(record.requestId)}`;
             const requestedWebResearch =
               typeof record.context?.useWebResearch === "boolean"
                 ? record.context.useWebResearch
@@ -62,11 +68,25 @@ export function AnalysisHistoryTable({
             const error = asString(record.error);
 
             return (
-              <tr key={record.requestId}>
+              <tr key={record.requestId} id={`analysis-request-${record.requestId}`}>
                 <td className="px-4 py-3">
-                  <p className="font-medium text-steel">{record.targetId}</p>
+                  <Link
+                    href={targetHref}
+                    className="font-medium text-steel hover:text-signal"
+                  >
+                    {record.targetId}
+                  </Link>
+                  <div className="mt-2">
+                    <Link
+                      href={requestHref}
+                      className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500 hover:text-signal"
+                    >
+                      Open request {record.requestId}
+                    </Link>
+                  </div>
                   <div className="mt-2 flex flex-wrap gap-2">
                     <Badge tone="neutral">{record.targetType}</Badge>
+                    <LlmTokenBadge>LLM request</LlmTokenBadge>
                     {focusTicker ? <Badge tone="warning">focus {focusTicker}</Badge> : null}
                     {requestedWebResearch !== null ? (
                       <Badge tone={requestedWebResearch ? "positive" : "neutral"}>

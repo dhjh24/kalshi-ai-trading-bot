@@ -46,9 +46,11 @@ export default async function EventDetailPage({
         </div>
       </Panel>
 
-      <Panel title="Latest event analysis">
-        <AnalysisResultCard title="Event analysis" analysis={detail.latestAnalysis} />
-      </Panel>
+      <section id="analysis">
+        <Panel title="Latest event analysis">
+          <AnalysisResultCard title="Event analysis" analysis={detail.latestAnalysis} />
+        </Panel>
+      </section>
 
       {detail.sports ? (
         <Panel eyebrow="Live Sports View" title="Scoreboard, player notes, and play-by-play">

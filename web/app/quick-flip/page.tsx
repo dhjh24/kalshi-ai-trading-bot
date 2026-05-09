@@ -1,6 +1,6 @@
 import { PaperTradingResetControls } from "../../components/paper-trading-reset-controls";
 import { RuntimeModePanel } from "../../components/runtime-mode-panel";
-import { Badge, EmptyState, Panel, StatCard } from "../../components/ui";
+import { Badge, EmptyState, LlmTokenBadge, Panel, StatCard } from "../../components/ui";
 import { getQuickFlip } from "../../lib/api";
 import { formatMoney, formatPercent, formatTimestamp } from "../../lib/format";
 import type {
@@ -351,6 +351,9 @@ export default async function QuickFlipPage() {
               {payload.config.liveEnabled ? "Live quick flip enabled" : "Paper-first quick flip"}
             </Badge>
             <Badge tone={payload.config.disableAi ? "warning" : "neutral"}>{aiLabel}</Badge>
+            <LlmTokenBadge>
+              {payload.config.disableAi ? "LLM disabled for quick flip" : "LLM tokenized quick flip"}
+            </LlmTokenBadge>
           </div>
           <QuickFlipConfigEditor initialConfig={payload.config} />
         </Panel>

@@ -191,6 +191,15 @@ export function Badge({
   );
 }
 
+export function LlmTokenBadge({ children = "LLM" }: { children?: string }) {
+  return (
+    <span className="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-700">
+      <span className="h-1.5 w-1.5 rounded-full bg-amber-500" />
+      {children}
+    </span>
+  );
+}
+
 export function EmptyState({
   title,
   body

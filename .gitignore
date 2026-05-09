@@ -239,3 +239,4 @@ secrets.yaml
 *.pem
 *.key
 .env*
+votehub-firebase-runtime-config.js

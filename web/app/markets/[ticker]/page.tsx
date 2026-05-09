@@ -80,7 +80,7 @@ export default async function MarketDetailPage({
         </Panel>
       </div>
 
-      <section className="grid gap-6 xl:grid-cols-[1.15fr_0.85fr]">
+      <section id="analysis" className="grid gap-6 xl:grid-cols-[1.15fr_0.85fr]">
         <Panel title="Latest analysis">
           <AnalysisResultCard title="Market analysis" analysis={latestAnalysis} />
         </Panel>
