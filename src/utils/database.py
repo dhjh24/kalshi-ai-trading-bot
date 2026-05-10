@@ -3,6 +3,7 @@ Database manager for the Kalshi trading system.
 """
 
 import aiosqlite
+import json
 import os
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
@@ -255,6 +256,35 @@ class LiveTradeRuntimeState:
     latest_execution_at: Optional[str] = None
     latest_execution_status: Optional[str] = None
     error: Optional[str] = None
+
+
+@dataclass
+class AnomalyRejection:
+    """Represents a pre-execution safety rejection."""
+    ticker: str
+    side: str
+    reason: str
+    score: float
+    details_json: str
+    rejected_at: datetime
+    id: Optional[int] = None
+
+
+@dataclass
+class ArbitrageAlert:
+    """Represents an alert-only cross-market opportunity."""
+    kalshi_ticker: str
+    polymarket_id: str
+    side: str
+    kalshi_price: float
+    polymarket_price: float
+    estimated_edge: float
+    mapping_confidence: float
+    freshness_seconds: int
+    execution_mode: str
+    payload_json: str
+    scanned_at: datetime
+    id: Optional[int] = None
 
 
 class DatabaseManager(TradingLoggerMixin):
@@ -711,10 +741,92 @@ class DatabaseManager(TradingLoggerMixin):
                 "ON strategy_halts(strategy, halt_date)"
             )
 
+            await self._create_reddit_feature_tables(db)
+
             await self._migrate_existing_strategy_data(db)
             await db.commit()
         except Exception as e:
             self.logger.error(f"Error running migrations: {e}")
+
+    async def _create_reddit_feature_tables(self, db: aiosqlite.Connection) -> None:
+        """Create additive tables for safety, adapters, arbitrage, and calibration."""
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS source_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                source TEXT NOT NULL,
+                status TEXT NOT NULL,
+                freshness_seconds INTEGER NOT NULL DEFAULT 0,
+                payload_json TEXT,
+                captured_at TEXT NOT NULL
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_source_snapshots_category_time "
+            "ON source_snapshots(category, captured_at DESC)"
+        )
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS arbitrage_candidates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kalshi_ticker TEXT NOT NULL,
+                polymarket_id TEXT NOT NULL,
+                side TEXT NOT NULL,
+                kalshi_price REAL NOT NULL,
+                polymarket_price REAL NOT NULL,
+                estimated_edge REAL NOT NULL,
+                mapping_confidence REAL NOT NULL,
+                freshness_seconds INTEGER NOT NULL DEFAULT 0,
+                execution_mode TEXT NOT NULL DEFAULT 'alert_only',
+                payload_json TEXT,
+                scanned_at TEXT NOT NULL
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_arbitrage_candidates_scanned_at "
+            "ON arbitrage_candidates(scanned_at DESC)"
+        )
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS anomaly_rejections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker TEXT NOT NULL,
+                side TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                score REAL NOT NULL DEFAULT 0,
+                details_json TEXT,
+                rejected_at TEXT NOT NULL
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_anomaly_rejections_rejected_at "
+            "ON anomaly_rejections(rejected_at DESC)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_anomaly_rejections_ticker "
+            "ON anomaly_rejections(ticker, rejected_at DESC)"
+        )
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS settlement_calibration (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_id TEXT NOT NULL,
+                strategy TEXT,
+                category TEXT,
+                predicted_probability REAL NOT NULL,
+                outcome INTEGER NOT NULL,
+                brier_score REAL NOT NULL,
+                realized_ev REAL,
+                pnl REAL,
+                source TEXT NOT NULL DEFAULT 'trade_logs',
+                settled_at TEXT NOT NULL,
+                payload_json TEXT
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_settlement_calibration_settled_at "
+            "ON settlement_calibration(settled_at DESC)"
+        )
 
     async def _migrate_simulated_orders_resting_uniqueness(
         self, db: aiosqlite.Connection
@@ -1472,6 +1584,8 @@ class DatabaseManager(TradingLoggerMixin):
             "CREATE INDEX IF NOT EXISTS idx_fee_divergence_market "
             "ON fee_divergence_log(market_id, recorded_at)"
         )
+
+        await self._create_reddit_feature_tables(db)
 
         self.logger.info("Tables created or already exist.")
 
@@ -3265,6 +3379,243 @@ class DatabaseManager(TradingLoggerMixin):
             row_dict["timestamp"] = datetime.fromisoformat(row_dict["timestamp"])
             snapshots.append(MarketSnapshot(**row_dict))
         return snapshots
+
+    async def get_latest_market_snapshot(self, ticker: str) -> Optional[Dict[str, Any]]:
+        """Return the newest raw market snapshot for a ticker."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT *
+                FROM market_snapshots
+                WHERE ticker = ?
+                ORDER BY timestamp DESC, id DESC
+                LIMIT 1
+                """,
+                (ticker,),
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def record_source_snapshot(
+        self,
+        *,
+        category: str,
+        source: str,
+        status: str,
+        freshness_seconds: int = 0,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Persist a data-source health snapshot."""
+        captured_at = datetime.now().isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO source_snapshots (
+                    category, source, status, freshness_seconds, payload_json, captured_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    category,
+                    source,
+                    status,
+                    int(freshness_seconds or 0),
+                    json.dumps(payload or {}, sort_keys=True),
+                    captured_at,
+                ),
+            )
+            await db.commit()
+            return int(cursor.lastrowid)
+
+    async def get_latest_source_snapshot(
+        self,
+        *,
+        category: str,
+        source: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the most recent source-health row for a category/source pair."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            if source:
+                cursor = await db.execute(
+                    """
+                    SELECT * FROM source_snapshots
+                    WHERE category = ? AND source = ?
+                    ORDER BY captured_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (category, source),
+                )
+            else:
+                cursor = await db.execute(
+                    """
+                    SELECT * FROM source_snapshots
+                    WHERE category = ?
+                    ORDER BY captured_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (category,),
+                )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def record_anomaly_rejection(
+        self,
+        *,
+        ticker: str,
+        side: str,
+        reason: str,
+        score: float = 0.0,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Persist a blocked pre-execution attempt."""
+        rejected_at = datetime.now().isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO anomaly_rejections (
+                    ticker, side, reason, score, details_json, rejected_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ticker,
+                    side,
+                    reason,
+                    float(score or 0.0),
+                    json.dumps(details or {}, sort_keys=True),
+                    rejected_at,
+                ),
+            )
+            await db.commit()
+            return int(cursor.lastrowid)
+
+    async def record_arbitrage_candidate(self, payload: Dict[str, Any]) -> int:
+        """Persist one alert-only cross-market opportunity."""
+        scanned_at = datetime.now().isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO arbitrage_candidates (
+                    kalshi_ticker, polymarket_id, side, kalshi_price,
+                    polymarket_price, estimated_edge, mapping_confidence,
+                    freshness_seconds, execution_mode, payload_json, scanned_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload.get("kalshi_ticker"),
+                    payload.get("polymarket_id"),
+                    payload.get("side"),
+                    float(payload.get("kalshi_price") or 0.0),
+                    float(payload.get("polymarket_price") or 0.0),
+                    float(payload.get("estimated_edge") or 0.0),
+                    float(payload.get("mapping_confidence") or 0.0),
+                    int(payload.get("freshness_seconds") or 0),
+                    payload.get("execution_mode") or "alert_only",
+                    json.dumps(payload, sort_keys=True),
+                    scanned_at,
+                ),
+            )
+            await db.commit()
+            return int(cursor.lastrowid)
+
+    async def refresh_settlement_calibration(self) -> int:
+        """
+        Rebuild settlement calibration rows from closed trade logs.
+
+        For each trade we prefer (in order):
+          1. The latest matching position row's `confidence`, treated as the
+             held-side decision probability emitted by the strategy.
+          2. The entry-price heuristic (treats fill price as the implied
+             probability of the held side).
+
+        The chosen probability is recorded along with the source flag so the
+        dashboard can display calibration both for entries with explicit
+        decision probabilities and for entries that fall back to the heuristic.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("DELETE FROM settlement_calibration WHERE source = 'trade_logs'")
+            cursor = await db.execute(
+                """
+                SELECT
+                    t.market_id,
+                    t.strategy,
+                    m.category,
+                    t.side,
+                    t.entry_price,
+                    t.exit_price,
+                    t.pnl,
+                    t.exit_timestamp,
+                    (
+                        SELECT p.confidence
+                        FROM positions p
+                        WHERE p.market_id = t.market_id
+                          AND p.side = t.side
+                          AND p.confidence IS NOT NULL
+                        ORDER BY p.timestamp DESC
+                        LIMIT 1
+                    ) AS decision_confidence
+                FROM trade_logs t
+                LEFT JOIN markets m ON m.market_id = t.market_id
+                """
+            )
+            rows = await cursor.fetchall()
+            inserted = 0
+            for row in rows:
+                (
+                    market_id,
+                    strategy,
+                    category,
+                    side,
+                    entry_price,
+                    exit_price,
+                    pnl,
+                    exit_ts,
+                    decision_confidence,
+                ) = row
+                predicted_source = "decision_confidence"
+                predicted: Optional[float]
+                if decision_confidence is not None:
+                    predicted = max(0.0, min(1.0, float(decision_confidence)))
+                else:
+                    predicted_source = "entry_price_heuristic"
+                    predicted = max(0.0, min(1.0, float(entry_price or 0.0)))
+                    if str(side).upper() == "NO":
+                        predicted = max(0.0, min(1.0, 1.0 - predicted))
+                outcome = 1 if float(exit_price or 0.0) >= 0.99 else 0
+                brier = (predicted - outcome) ** 2
+                realized_ev = float(pnl or 0.0)
+                await db.execute(
+                    """
+                    INSERT INTO settlement_calibration (
+                        market_id, strategy, category, predicted_probability,
+                        outcome, brier_score, realized_ev, pnl, source, settled_at,
+                        payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'trade_logs', ?, ?)
+                    """,
+                    (
+                        market_id,
+                        strategy,
+                        category,
+                        predicted,
+                        outcome,
+                        brier,
+                        realized_ev,
+                        float(pnl or 0.0),
+                        exit_ts,
+                        json.dumps(
+                            {
+                                "side": side,
+                                "entry_price": entry_price,
+                                "predicted_source": predicted_source,
+                                "decision_confidence": decision_confidence,
+                            },
+                            sort_keys=True,
+                        ),
+                    ),
+                )
+                inserted += 1
+            await db.commit()
+            return inserted
 
     async def get_performance_by_strategy(self) -> Dict[str, Dict]:
         """

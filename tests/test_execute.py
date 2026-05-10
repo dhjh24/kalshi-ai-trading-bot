@@ -2,7 +2,7 @@ import os
 import pytest
 from typing import Any, Dict
 from unittest.mock import AsyncMock
-from datetime import datetime
+from datetime import datetime, timezone
 
 from src.jobs.execute import (
     execute_position,
@@ -10,7 +10,7 @@ from src.jobs.execute import (
     place_sell_limit_order,
     reconcile_simulated_exit_orders,
 )
-from src.utils.database import DatabaseManager, Position
+from src.utils.database import DatabaseManager, MarketSnapshot, Position
 from src.utils.trade_pricing import estimate_kalshi_fee
 from tests.test_database import TEST_DB
 
@@ -259,6 +259,216 @@ async def test_execute_position_live_mode_rejects_ask_above_approved_limit():
             }
         }
     )
+    mock_kalshi_client.place_order = AsyncMock()
+
+    try:
+        result = await execute_position(
+            position=test_position,
+            live_mode=True,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+        )
+
+        assert result is False
+        mock_kalshi_client.place_order.assert_not_called()
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+async def test_execute_position_paper_mode_blocks_market_data_unavailable():
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+
+    test_position = Position(
+        market_id="PAPER-MARKET-DOWN",
+        side="YES",
+        entry_price=0.50,
+        quantity=4,
+        timestamp=datetime.now(),
+        rationale="Paper unavailable data block",
+        confidence=0.70,
+        live=False,
+    )
+    test_position.id = await db_manager.add_position(test_position)
+
+    mock_kalshi_client = AsyncMock()
+    mock_kalshi_client.get_market.side_effect = RuntimeError("kalshi unavailable")
+
+    try:
+        result = await execute_position(
+            position=test_position,
+            live_mode=False,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+        )
+
+        assert result is False
+        simulated_buys = await db_manager.get_simulated_orders(
+            strategy="directional_trading",
+            market_id="PAPER-MARKET-DOWN",
+            side="YES",
+            action="buy",
+            status="filled",
+        )
+        assert simulated_buys == []
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+async def test_execute_position_live_mode_blocks_market_data_unavailable():
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+
+    test_position = Position(
+        market_id="LIVE-MARKET-DOWN",
+        side="YES",
+        entry_price=0.50,
+        quantity=4,
+        timestamp=datetime.now(),
+        rationale="Live unavailable data block",
+        confidence=0.70,
+        live=False,
+    )
+    test_position.id = await db_manager.add_position(test_position)
+
+    mock_kalshi_client = AsyncMock()
+    mock_kalshi_client.get_market.side_effect = RuntimeError("kalshi unavailable")
+    mock_kalshi_client.place_order = AsyncMock()
+
+    try:
+        result = await execute_position(
+            position=test_position,
+            live_mode=True,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+        )
+
+        assert result is False
+        mock_kalshi_client.place_order.assert_not_called()
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+async def test_execute_position_paper_mode_blocks_quote_movement(monkeypatch):
+    monkeypatch.setenv("EXECUTION_SAFETY_MAX_QUOTE_MOVE_CENTS", "10")
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+    await db_manager.add_market_snapshot(
+        MarketSnapshot(
+            timestamp=datetime.now(timezone.utc),
+            ticker="PAPER-QUOTE-MOVE",
+            yes_bid=0.38,
+            yes_ask=0.40,
+            no_bid=0.58,
+            no_ask=0.60,
+            book_top_5_json="{}",
+        )
+    )
+
+    test_position = Position(
+        market_id="PAPER-QUOTE-MOVE",
+        side="YES",
+        entry_price=0.60,
+        quantity=4,
+        timestamp=datetime.now(),
+        rationale="Paper quote movement block",
+        confidence=0.70,
+        live=False,
+    )
+    test_position.id = await db_manager.add_position(test_position)
+
+    mock_kalshi_client = AsyncMock()
+    mock_kalshi_client.get_market.return_value = {
+        "market": {
+            "ticker": "PAPER-QUOTE-MOVE",
+            "yes_bid_dollars": 0.53,
+            "yes_ask_dollars": 0.55,
+            "yes_ask_size_fp": "20.00",
+            "no_bid_dollars": 0.45,
+            "no_ask_dollars": 0.47,
+        }
+    }
+
+    try:
+        result = await execute_position(
+            position=test_position,
+            live_mode=False,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+        )
+
+        assert result is False
+        simulated_buys = await db_manager.get_simulated_orders(
+            strategy="directional_trading",
+            market_id="PAPER-QUOTE-MOVE",
+            side="YES",
+            action="buy",
+            status="filled",
+        )
+        assert simulated_buys == []
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+async def test_execute_position_live_mode_blocks_quote_movement(monkeypatch):
+    monkeypatch.setenv("EXECUTION_SAFETY_MAX_QUOTE_MOVE_CENTS", "10")
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+    await db_manager.add_market_snapshot(
+        MarketSnapshot(
+            timestamp=datetime.now(timezone.utc),
+            ticker="LIVE-QUOTE-MOVE",
+            yes_bid=0.38,
+            yes_ask=0.40,
+            no_bid=0.58,
+            no_ask=0.60,
+            book_top_5_json="{}",
+        )
+    )
+
+    test_position = Position(
+        market_id="LIVE-QUOTE-MOVE",
+        side="YES",
+        entry_price=0.60,
+        quantity=4,
+        timestamp=datetime.now(),
+        rationale="Live quote movement block",
+        confidence=0.70,
+        live=False,
+    )
+    test_position.id = await db_manager.add_position(test_position)
+
+    mock_kalshi_client = AsyncMock()
+    mock_kalshi_client.get_market.return_value = {
+        "market": {
+            "ticker": "LIVE-QUOTE-MOVE",
+            "yes_bid_dollars": 0.53,
+            "yes_ask_dollars": 0.55,
+            "yes_ask_size_fp": "20.00",
+            "no_bid_dollars": 0.45,
+            "no_ask_dollars": 0.47,
+        }
+    }
     mock_kalshi_client.place_order = AsyncMock()
 
     try:

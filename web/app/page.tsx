@@ -59,6 +59,13 @@ const FEATURE_GUIDE = [
     action: "View portfolio"
   },
   {
+    href: "/safety",
+    title: "Safety",
+    description:
+      "Review execution safety blocks, weather contract interpretation, arbitrage alerts, and settlement calibration.",
+    action: "Check guards"
+  },
+  {
     href: "/analysis",
     title: "Analysis",
     description:
@@ -160,7 +167,7 @@ export default async function HomePage() {
       </section>
 
       <Panel eyebrow="Feature Guide" title="Where to go from the homepage">
-        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
           {FEATURE_GUIDE.map((feature) => (
             <Link
               key={feature.href}

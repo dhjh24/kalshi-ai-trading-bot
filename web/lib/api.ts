@@ -11,7 +11,8 @@ import type {
   PaperTradingResetPayload,
   PortfolioPayload,
   QuickFlipPayload,
-  MarketRow
+  MarketRow,
+  SafetyPayload
 } from "./types";
 
 export const API_BASE_URL =
@@ -38,6 +39,7 @@ const REVALIDATE_PATH_OVERRIDES: Array<{ prefix: string; seconds: number }> = [
   { prefix: "/api/live-trade", seconds: 5 },
   { prefix: "/api/dashboard/overview", seconds: 5 },
   { prefix: "/api/portfolio", seconds: 10 },
+  { prefix: "/api/safety", seconds: 10 },
   { prefix: "/api/quick-flip", seconds: 10 },
   { prefix: "/api/analysis/requests", seconds: 8 },
   { prefix: "/api/markets", seconds: 12 },
@@ -227,6 +229,10 @@ export function createStreamUrl(topic: string): string {
 
 export async function getOverview() {
   return fetchApi<OverviewPayload>("/api/dashboard/overview");
+}
+
+export async function getSafety() {
+  return fetchApi<SafetyPayload>("/api/safety");
 }
 
 export async function getMarkets(queryString = "") {

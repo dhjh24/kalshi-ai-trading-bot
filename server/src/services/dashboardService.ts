@@ -6,6 +6,7 @@ import {
   clearPaperTradingData,
   clearAllData,
   getDailyAiCost,
+  getCalibrationSummary,
   getLiveTradeDecisionById,
   getLiveTradeDecisionFeedbackByDecisionId,
   getLiveTradeRuntimeState,
@@ -23,12 +24,16 @@ import {
   getQuickFlipMetrics,
   getRealizedPnl,
   getRecentTrades,
+  getSafetyMetricCounts,
   getTotalTrades,
   hasLiveTradeDecisionFeedbackTable,
   hasLiveTradeDecisionTable,
   hasLiveTradeRuntimeStateTable,
   getMarketRow,
   listAnalysisRequests,
+  listArbitrageCandidates,
+  listExecutionSafetyRejections,
+  listSourceHealthSnapshots,
   listLiveTradeDecisionFeedbackByDecisionIds,
   listLiveTradeDecisions,
   listQuickFlipLiveTradeDecisions,
@@ -61,7 +66,11 @@ import type {
   QuickFlipConfigVisibility,
   QuickFlipPayload,
   RuntimeModeVisibility,
-  SportsContext
+  SafetyPayload,
+  SportsContext,
+  WeatherContractInterpretation,
+  WeatherEventBucket,
+  WeatherEventInterpretation
 } from "../types.js";
 import { parseJson } from "../utils/helpers.js";
 import { eventToSearchText, inferFocusType } from "../utils/marketFocus.js";
@@ -202,6 +211,324 @@ function mapLatestAnalysis(row: AnalysisRequestRow | null) {
     context: parseJson<Record<string, unknown> | null>(row.context_json, null),
     response: parseJson<Record<string, unknown> | null>(row.response_json, null),
     error: row.error
+  };
+}
+
+function emptyWeatherInterpretation(notes: string): WeatherContractInterpretation {
+  return {
+    detected: false,
+    confidence: 0,
+    bucketLabel: null,
+    threshold: null,
+    lowerBound: null,
+    upperBound: null,
+    settlementSource: null,
+    notes,
+    blockReason: null,
+    canTrade: false,
+    metric: "temperature",
+    unit: "F",
+    direction: "unknown",
+    inclusiveEndpoints: null
+  };
+}
+
+function detectMetric(text: string): { metric: string; unitDefault: string } {
+  const normalized = text.toLowerCase();
+  if (/(rainfall|rain |precipitation|precip)/.test(normalized)) {
+    return { metric: "rainfall", unitDefault: "inches" };
+  }
+  if (/(snowfall|snow )/.test(normalized)) {
+    return { metric: "snowfall", unitDefault: "inches" };
+  }
+  if (/(wind|gust)/.test(normalized)) {
+    return { metric: "wind", unitDefault: "mph" };
+  }
+  if (/humidity/.test(normalized)) {
+    return { metric: "humidity", unitDefault: "%" };
+  }
+  return { metric: "temperature", unitDefault: "F" };
+}
+
+function detectUnit(text: string, fallback: string): string {
+  if (/\b(inches|inch|in\.|")\b/i.test(text)) {
+    return "inches";
+  }
+  if (/\b(mph|miles per hour)\b/i.test(text)) {
+    return "mph";
+  }
+  if (/\b(degrees?\s*c|°\s*c)\b/i.test(text)) {
+    return "C";
+  }
+  if (/\b(degrees?\s*f|°\s*f)\b/i.test(text)) {
+    return "F";
+  }
+  return fallback;
+}
+
+function detectDirection(normalized: string): string {
+  if (
+    /\b(below|under|less than|lower than|at or below|no (?:higher|greater) than|not (?:above|over|exceed|exceeding)|at most|max(?:imum)? of|do(?:es)? not exceed)\b/.test(
+      normalized
+    )
+  ) {
+    return "below";
+  }
+  if (
+    /\b(above|over|greater than|higher than|at least|at or above|not (?:below|under)|no (?:lower|less) than|min(?:imum)? of|exceed|exceeds|exceeding)\b/.test(
+      normalized
+    )
+  ) {
+    return "above";
+  }
+  if (/\bbetween\b|\bfrom\b|\bto\b|\bthrough\b|-/.test(normalized)) {
+    return "bucket";
+  }
+  return "unknown";
+}
+
+function detectInclusive(normalized: string): boolean | null {
+  if (/\binclusive\b|\binclusively\b|\bat or (above|below)\b/.test(normalized)) {
+    return true;
+  }
+  if (/\bexclusive\b|\bexclusively\b|\bnot inclusive\b/.test(normalized)) {
+    return false;
+  }
+  return null;
+}
+
+function interpretWeatherContract(market: Record<string, unknown> | null): WeatherContractInterpretation {
+  if (!market) {
+    return emptyWeatherInterpretation("No live market payload was available for interpretation.");
+  }
+
+  const text = [
+    market.ticker,
+    market.event_ticker,
+    market.title,
+    market.sub_title,
+    market.yes_sub_title,
+    market.no_sub_title,
+    market.rules_primary
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const normalized = text.toLowerCase();
+  const detected =
+    /temperature|high temp|low temp|weather|rainfall|snowfall|precipitation|wind|gust|humidity|heat index/.test(
+      normalized
+    );
+  const { metric, unitDefault } = detectMetric(text);
+  const unit = detectUnit(text, unitDefault);
+  const direction = detectDirection(normalized);
+  const inclusiveEndpoints = detectInclusive(normalized);
+
+  if (!detected) {
+    return {
+      ...emptyWeatherInterpretation("No weather-specific contract pattern detected."),
+      metric,
+      unit,
+      direction,
+      inclusiveEndpoints
+    };
+  }
+
+  const rangeMatch = text.match(
+    /\b(?:between|from)\s+(\d{1,3}(?:\.5)?)\s+(?:and|to|through|-)\s+(\d{1,3}(?:\.5)?)\b|(?<!\d)(\d{1,3}(?:\.5)?)\s*(?:-|to|through)\s*(\d{1,3}(?:\.5)?)(?!\d)/i
+  );
+  const rangeLower = rangeMatch ? Number(rangeMatch[1] ?? rangeMatch[3]) : null;
+  const rangeUpper = rangeMatch ? Number(rangeMatch[2] ?? rangeMatch[4]) : null;
+  const parsedRange =
+    rangeLower !== null &&
+    rangeUpper !== null &&
+    Number.isFinite(rangeLower) &&
+    Number.isFinite(rangeUpper) &&
+    rangeLower !== rangeUpper
+      ? {
+          lower: Math.min(rangeLower, rangeUpper),
+          upper: Math.max(rangeLower, rangeUpper)
+        }
+      : null;
+  const thresholdMatch = text.match(/(?<!\d)(\d{1,3}(?:\.5)?)(?!\d)/);
+  const threshold = thresholdMatch ? Number(thresholdMatch[1]) : null;
+  const settlementSource = /asos/i.test(text)
+    ? "ASOS station report"
+    : /nws|national weather service/i.test(text)
+      ? "NWS report"
+      : /noaa/i.test(text)
+        ? "NOAA/NWS weather source"
+        : "Kalshi market rules";
+
+  if (parsedRange) {
+    const inclusiveNote =
+      inclusiveEndpoints === true
+        ? "Bounded weather bucket parsed; settlement rules describe the endpoints as inclusive."
+        : inclusiveEndpoints === false
+          ? "Bounded weather bucket parsed; settlement rules describe the endpoints as exclusive."
+          : "Bounded weather bucket parsed from the market text; confirm endpoint inclusivity before live execution.";
+    return {
+      detected: true,
+      confidence: inclusiveEndpoints === null ? 0.82 : 0.85,
+      bucketLabel: `${metric} between ${parsedRange.lower}-${parsedRange.upper}${unit}`,
+      threshold: null,
+      lowerBound: parsedRange.lower,
+      upperBound: parsedRange.upper,
+      settlementSource,
+      notes: inclusiveNote,
+      blockReason: null,
+      canTrade: true,
+      metric,
+      unit,
+      direction: "bucket",
+      inclusiveEndpoints
+    };
+  }
+
+  if (threshold === null || !Number.isFinite(threshold)) {
+    return {
+      detected: true,
+      confidence: 0.35,
+      bucketLabel: null,
+      threshold: null,
+      lowerBound: null,
+      upperBound: null,
+      settlementSource,
+      notes: "Weather contract detected, but no numeric threshold could be parsed.",
+      blockReason: "weather_bucket_ambiguous",
+      canTrade: false,
+      metric,
+      unit,
+      direction,
+      inclusiveEndpoints
+    };
+  }
+
+  if (direction === "below") {
+    return {
+      detected: true,
+      confidence: 0.78,
+      bucketLabel: `${metric} below ${threshold}${unit}`,
+      threshold,
+      lowerBound: null,
+      upperBound: threshold,
+      settlementSource,
+      notes: "API threshold is interpreted as the cutoff; confirm the final settlement source before live execution.",
+      blockReason: null,
+      canTrade: true,
+      metric,
+      unit,
+      direction,
+      inclusiveEndpoints
+    };
+  }
+
+  if (direction === "above") {
+    return {
+      detected: true,
+      confidence: 0.78,
+      bucketLabel: `${metric} above ${threshold}${unit}`,
+      threshold,
+      lowerBound: threshold,
+      upperBound: null,
+      settlementSource,
+      notes: "API threshold is interpreted as the cutoff; confirm the final settlement source before live execution.",
+      blockReason: null,
+      canTrade: true,
+      metric,
+      unit,
+      direction,
+      inclusiveEndpoints
+    };
+  }
+
+  if (threshold % 1 === 0.5) {
+    return {
+      detected: true,
+      confidence: 0.72,
+      bucketLabel: `${threshold - 0.5}-${threshold + 0.5}${unit} displayed bucket`,
+      threshold,
+      lowerBound: threshold - 0.5,
+      upperBound: threshold + 0.5,
+      settlementSource,
+      notes: "Half-degree threshold likely represents the boundary around an integer temperature bucket.",
+      blockReason: null,
+      canTrade: true,
+      metric,
+      unit,
+      direction,
+      inclusiveEndpoints
+    };
+  }
+
+  return {
+    detected: true,
+    confidence: 0.55,
+    bucketLabel: `threshold ${threshold}${unit}`,
+    threshold,
+    lowerBound: null,
+    upperBound: null,
+    settlementSource,
+    notes: "Weather threshold parsed, but the contract direction was not explicit.",
+    blockReason: "weather_bucket_ambiguous",
+    canTrade: false,
+    metric,
+    unit,
+    direction,
+    inclusiveEndpoints
+  };
+}
+
+function interpretEventWeatherBuckets(
+  event:
+    | { event_ticker?: string | null; title?: string | null; markets?: Array<Record<string, unknown>> }
+    | null
+): WeatherEventInterpretation | null {
+  if (!event || !Array.isArray(event.markets) || event.markets.length === 0) {
+    return null;
+  }
+  const buckets = event.markets
+    .map((market) => {
+      const interpretation = interpretWeatherContract(market);
+      if (!interpretation.detected) {
+        return null;
+      }
+      const yesPriceCandidate =
+        Number(market.last_price ?? market.yes_ask_dollars ?? market.yes_bid_dollars ?? 0) || 0;
+      return {
+        ticker: typeof market.ticker === "string" ? market.ticker : "",
+        title:
+          typeof market.title === "string"
+            ? market.title
+            : typeof market.yes_sub_title === "string"
+              ? (market.yes_sub_title as string)
+              : "",
+        yesPrice: Number(yesPriceCandidate.toFixed(4)),
+        bucketLabel: interpretation.bucketLabel,
+        lowerBound: interpretation.lowerBound,
+        upperBound: interpretation.upperBound,
+        threshold: interpretation.threshold,
+        unit: interpretation.unit,
+        metric: interpretation.metric,
+        canTrade: interpretation.canTrade,
+        blockReason: interpretation.blockReason
+      } satisfies WeatherEventBucket;
+    })
+    .filter((entry): entry is WeatherEventBucket => entry !== null);
+
+  if (buckets.length === 0) {
+    return null;
+  }
+
+  buckets.sort((a, b) => {
+    const aLower = a.lowerBound ?? a.threshold ?? Number.POSITIVE_INFINITY;
+    const bLower = b.lowerBound ?? b.threshold ?? Number.POSITIVE_INFINITY;
+    return aLower - bLower;
+  });
+
+  return {
+    eventTicker: event.event_ticker ?? null,
+    eventTitle: event.title ?? null,
+    buckets
   };
 }
 
@@ -994,6 +1321,18 @@ export async function getMarketDetailPayload(ticker: string) {
       live: liveMarketSnapshot,
       raw: liveMarket
     },
+    contractInterpreter: {
+      weather: interpretWeatherContract(liveMarket ? (liveMarket as Record<string, unknown>) : null),
+      eventWeather: interpretEventWeatherBuckets(
+        event
+          ? {
+              event_ticker: event.event_ticker,
+              title: event.title,
+              markets: (event.markets || []) as Array<Record<string, unknown>>
+            }
+          : null
+      )
+    },
     event,
     siblings: (event?.markets || []).map((market) => normalizeMarketSnapshot(market)),
     orderbook,
@@ -1097,6 +1436,36 @@ export function getPortfolioPayload(): PortfolioPayload {
       byStrategy: getPortfolioAiSpendByStrategy(),
       byRole: getPortfolioAiSpendByRole()
     }
+  };
+}
+
+export interface SafetyPayloadQuery {
+  arbitrageSide?: "YES" | "NO";
+  arbitrageMinNetEdge?: number;
+  arbitrageMinMappingConfidence?: number;
+  arbitrageSortBy?: "net_edge" | "estimated_edge" | "scanned_at" | "mapping_confidence";
+  sourceCategories?: string[];
+  sourceStatus?: string;
+}
+
+export function getSafetyPayload(query: SafetyPayloadQuery = {}): SafetyPayload {
+  return {
+    generatedAt: new Date().toISOString(),
+    metrics: getSafetyMetricCounts(),
+    sourceHealth: listSourceHealthSnapshots({
+      limit: 24,
+      categories: query.sourceCategories,
+      status: query.sourceStatus
+    }),
+    rejections: listExecutionSafetyRejections(40),
+    arbitrage: listArbitrageCandidates({
+      limit: 40,
+      side: query.arbitrageSide,
+      minNetEdge: query.arbitrageMinNetEdge,
+      minMappingConfidence: query.arbitrageMinMappingConfidence,
+      sortBy: query.arbitrageSortBy ?? "net_edge"
+    }),
+    calibration: getCalibrationSummary()
   };
 }
 

@@ -1212,6 +1212,215 @@ def cmd_health(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def cmd_mcp(args: argparse.Namespace) -> None:
+    """Run the localhost operator API with MCP-style tool endpoints."""
+    import uvicorn
+
+    host = getattr(args, "host", "127.0.0.1")
+    port = getattr(args, "port", 8765)
+    print("Starting localhost operator API")
+    print(f"  URL: http://{host}:{port}")
+    print("  Tools: GET /mcp/tools and POST /mcp/call/{tool_name}")
+    print("  Live order calls require OPERATOR_API_ALLOW_LIVE_ORDERS=true")
+    uvicorn.run("src.operator_api:app", host=host, port=port, log_level="info")
+
+
+def cmd_explain_market(args: argparse.Namespace) -> None:
+    """Explain contract mechanics for a market ticker."""
+
+    async def _explain() -> None:
+        from src.clients.kalshi_client import KalshiClient
+        from src.data.weather_adapter import interpret_temperature_market
+
+        client = KalshiClient()
+        try:
+            response = await client.get_market(args.ticker)
+            market = response.get("market", response) if isinstance(response, dict) else {}
+            interpretation = interpret_temperature_market(market)
+            print("=" * 70)
+            print(f"  MARKET EXPLANATION: {args.ticker}")
+            print("=" * 70)
+            print(f"  Title: {market.get('title', 'n/a')}")
+            print(f"  Status: {market.get('status', 'n/a')}")
+            print()
+            if interpretation.detected:
+                print("  Weather contract interpreter")
+                print(f"  Bucket:            {interpretation.bucket_label or 'unknown'}")
+                print(f"  Threshold:         {interpretation.threshold if interpretation.threshold is not None else 'unknown'}")
+                print(f"  Settlement source: {interpretation.settlement_source or 'unknown'}")
+                print(f"  Confidence:        {interpretation.confidence:.0%}")
+                print(f"  Tradeable:         {'yes' if interpretation.can_trade else 'blocked'}")
+                if interpretation.block_reason:
+                    print(f"  Block reason:      {interpretation.block_reason}")
+                print(f"  Notes:             {interpretation.notes}")
+            else:
+                print("  No specialized contract interpreter matched this market yet.")
+            print("=" * 70)
+        finally:
+            await client.close()
+
+    asyncio.run(_explain())
+
+
+def cmd_scan_arb(args: argparse.Namespace) -> None:
+    """Run an alert-only Kalshi vs Polymarket scan."""
+
+    async def _scan() -> None:
+        from src.clients.kalshi_client import KalshiClient
+        from src.data.polymarket_adapter import PolymarketAdapter
+        from src.utils.database import DatabaseManager
+
+        client = KalshiClient()
+        adapter = PolymarketAdapter()
+        db = DatabaseManager()
+        try:
+            await db.initialize()
+            response = await client.get_markets(limit=args.kalshi_limit, status="open")
+            markets = response.get("markets", []) if isinstance(response, dict) else []
+            candidates = await adapter.scan_kalshi_markets(
+                markets,
+                limit=args.polymarket_limit,
+                min_mapping_confidence=args.min_confidence,
+                min_edge=args.min_edge,
+            )
+            await db.record_source_snapshot(
+                category="cross_market",
+                source="polymarket.gamma",
+                status="healthy",
+                freshness_seconds=max((c.freshness_seconds for c in candidates), default=0),
+                payload={"candidate_count": len(candidates)},
+            )
+            for candidate in candidates[: args.limit]:
+                await db.record_arbitrage_candidate(candidate.to_dict())
+            print("=" * 96)
+            print("  CROSS-MARKET ARBITRAGE WATCHLIST (alert-only)")
+            print("=" * 96)
+            if not candidates:
+                print("  No candidates passed the configured edge and mapping thresholds.")
+                return
+            print(
+                f"  {'Kalshi':<22} {'Side':>4} {'K':>6} {'Poly':>6}"
+                f" {'Gross':>6} {'Net':>6} {'Map':>6}  Notes / Question"
+            )
+            print(
+                f"  {'-'*22} {'-'*4} {'-'*6} {'-'*6} {'-'*6} {'-'*6} {'-'*6}  {'-'*32}"
+            )
+            for candidate in candidates[: args.limit]:
+                detail = (
+                    candidate.notes
+                    if candidate.notes and candidate.notes != "ok"
+                    else candidate.polymarket_question[:48]
+                )
+                print(
+                    f"  {candidate.kalshi_ticker[:22]:<22} {candidate.side:>4} "
+                    f"{candidate.kalshi_price:>6.2f} {candidate.polymarket_price:>6.2f} "
+                    f"{candidate.estimated_edge:>6.2f} {candidate.net_edge:>6.2f} "
+                    f"{candidate.mapping_confidence:>6.0%}  "
+                    f"{detail}"
+                )
+            print()
+            print("  These are not executable orders. Confirm mapping, fees, and fillability manually.")
+        finally:
+            await adapter.aclose()
+            await client.close()
+
+    asyncio.run(_scan())
+
+
+def cmd_refresh_calibration(args: argparse.Namespace) -> None:
+    """Rebuild settlement calibration rows from trade logs."""
+
+    async def _refresh() -> None:
+        from src.utils.database import DatabaseManager
+
+        db = DatabaseManager()
+        await db.initialize()
+        refreshed = await db.refresh_settlement_calibration()
+        print(f"Refreshed {refreshed} calibration rows from trade_logs.")
+
+    asyncio.run(_refresh())
+
+
+def cmd_safety_status(args: argparse.Namespace) -> None:
+    """Show recent execution safety blocks and source-health snapshots."""
+
+    async def _status() -> None:
+        import aiosqlite
+
+        from src.utils.calibration_metrics import (
+            expected_calibration_error,
+            probability_buckets,
+        )
+        from src.utils.database import DatabaseManager
+
+        db = DatabaseManager()
+        await db.initialize()
+        refreshed = await db.refresh_settlement_calibration()
+        async with aiosqlite.connect(db.db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            print("=" * 72)
+            print("  EXECUTION SAFETY STATUS")
+            print("=" * 72)
+            print(f"  Calibration rows refreshed from trade logs: {refreshed}")
+
+            cursor = await conn.execute(
+                "SELECT predicted_probability, outcome FROM settlement_calibration"
+            )
+            samples = [
+                (float(row["predicted_probability"] or 0.0), int(row["outcome"] or 0))
+                for row in await cursor.fetchall()
+            ]
+            if samples:
+                ece = expected_calibration_error(samples)
+                buckets = probability_buckets(samples)
+                non_empty = [bucket for bucket in buckets if bucket.count > 0]
+                print(
+                    f"  Calibration samples: {len(samples)} | ECE: {ece:.3f} "
+                    f"| populated buckets: {len(non_empty)}/{len(buckets)}"
+                )
+            cursor = await conn.execute(
+                """
+                SELECT rejected_at, ticker, side, reason, score
+                FROM anomaly_rejections
+                ORDER BY rejected_at DESC, id DESC
+                LIMIT ?
+                """,
+                (args.limit,),
+            )
+            rows = await cursor.fetchall()
+            if rows:
+                print(f"  {'Time':<19} {'Ticker':<24} {'Side':>4} {'Reason':<28} {'Score':>5}")
+                print(f"  {'-'*19} {'-'*24} {'-'*4} {'-'*28} {'-'*5}")
+                for row in rows:
+                    print(
+                        f"  {str(row['rejected_at'])[:19]:<19} {row['ticker'][:24]:<24} "
+                        f"{row['side']:>4} {row['reason'][:28]:<28} {float(row['score'] or 0):>5.2f}"
+                    )
+            else:
+                print("  No execution-safety rejections recorded.")
+
+            cursor = await conn.execute(
+                """
+                SELECT category, source, status, freshness_seconds, captured_at
+                FROM source_snapshots
+                ORDER BY captured_at DESC, id DESC
+                LIMIT 8
+                """
+            )
+            sources = await cursor.fetchall()
+            if sources:
+                print()
+                print("  Recent source snapshots")
+                for row in sources:
+                    print(
+                        f"  {row['captured_at'][:19]} {row['category']}/{row['source']} "
+                        f"{row['status']} ({row['freshness_seconds']}s)"
+                    )
+            print("=" * 72)
+
+    asyncio.run(_status())
+
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -1239,6 +1448,11 @@ def build_parser() -> argparse.ArgumentParser:
             "  python cli.py history                  Show trade history + category breakdown\n"
             "  python cli.py status                   Check portfolio balance and positions\n"
             "  python cli.py health                   Verify all connections and config\n"
+            "  python cli.py mcp                      Run localhost operator API tools\n"
+            "  python cli.py explain-market TICKER    Explain contract mechanics\n"
+            "  python cli.py scan-arb                 Alert-only Kalshi/Polymarket scan\n"
+            "  python cli.py safety-status            Show blocked execution attempts\n"
+            "  python cli.py refresh-calibration      Rebuild settlement calibration rows\n"
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1372,6 +1586,55 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run a series of diagnostic checks: .env presence, API key configuration, Kalshi API connectivity, database initialization, and Python version.",
     )
     p_health.set_defaults(func=cmd_health)
+
+    # --- mcp/operator API ---
+    p_mcp = subparsers.add_parser(
+        "mcp",
+        help="Run the localhost operator API with MCP-style tool endpoints",
+        description="Expose local market, book, portfolio, fill, and paper/live-gated order tools over HTTP.",
+    )
+    p_mcp.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
+    p_mcp.add_argument("--port", type=int, default=8765, help="Bind port (default: 8765)")
+    p_mcp.set_defaults(func=cmd_mcp)
+
+    # --- explain-market ---
+    p_explain = subparsers.add_parser(
+        "explain-market",
+        help="Explain market contract mechanics",
+        description="Fetch a market and run specialized contract interpreters such as weather bucket parsing.",
+    )
+    p_explain.add_argument("ticker", help="Kalshi market ticker to explain")
+    p_explain.set_defaults(func=cmd_explain_market)
+
+    # --- scan-arb ---
+    p_arb = subparsers.add_parser(
+        "scan-arb",
+        help="Run an alert-only Kalshi vs Polymarket opportunity scan",
+        description="Rank likely cross-market pricing gaps without placing orders.",
+    )
+    p_arb.add_argument("--limit", type=int, default=20, help="Candidates to print and persist")
+    p_arb.add_argument("--kalshi-limit", type=int, default=100, help="Open Kalshi markets to scan")
+    p_arb.add_argument("--polymarket-limit", type=int, default=100, help="Polymarket markets to fetch")
+    p_arb.add_argument("--min-edge", type=float, default=0.03, help="Minimum estimated edge")
+    p_arb.add_argument("--min-confidence", type=float, default=0.28, help="Minimum mapping confidence")
+    p_arb.set_defaults(func=cmd_scan_arb)
+
+    # --- safety-status ---
+    p_safety = subparsers.add_parser(
+        "safety-status",
+        help="Show recent execution safety rejections",
+        description="Display anomaly guard rejections and recent source-health snapshots.",
+    )
+    p_safety.add_argument("--limit", type=int, default=20, help="Rows to show")
+    p_safety.set_defaults(func=cmd_safety_status)
+
+    # --- refresh-calibration ---
+    p_calib = subparsers.add_parser(
+        "refresh-calibration",
+        help="Rebuild settlement calibration rows from trade logs",
+        description="Refresh the settlement_calibration table using stored trade outcomes.",
+    )
+    p_calib.set_defaults(func=cmd_refresh_calibration)
 
     return parser
 

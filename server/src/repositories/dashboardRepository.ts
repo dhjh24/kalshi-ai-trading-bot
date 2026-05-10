@@ -2,6 +2,9 @@ import type {
   AnalysisRequestRow,
   AnalysisRequestStatus,
   AnalysisTargetType,
+  ArbitrageCandidateRow,
+  CalibrationSummary,
+  ExecutionSafetyRejectionRow,
   LiveTradeDecisionFeedbackRecord,
   LiveTradeDecisionFeedbackValue,
   LiveTradeDecisionRecord,
@@ -19,6 +22,7 @@ import type {
   QuickFlipOrderRow,
   PortfolioStrategyPnlBreakdown,
   PortfolioStrategyPnlRow,
+  SourceHealthSnapshotRow,
   PositionRow,
   TradeLogRow
 } from "../types.js";
@@ -2608,6 +2612,421 @@ export function getPortfolioAiSpendByRole(): PortfolioAiSpendBreakdown {
     sourceField: "role",
     tokensField: "tokens_used"
   });
+}
+
+export function listExecutionSafetyRejections(limit = 25): ExecutionSafetyRejectionRow[] {
+  if (!tableExists("anomaly_rejections")) {
+    return [];
+  }
+
+  const rows = rowsAs<SqlRow[]>(
+    db.prepare(
+      `
+        SELECT *
+        FROM anomaly_rejections
+        ORDER BY rejected_at DESC, id DESC
+        LIMIT ?
+      `
+    ).all(limit)
+  );
+
+  return rows.map((row) => ({
+    id: toCount(row.id),
+    ticker: toNullableText(row.ticker) ?? "",
+    side: toNullableText(row.side) ?? "",
+    reason: toNullableText(row.reason) ?? "unknown",
+    score: toNumber(row.score, 4),
+    details: toJsonObject(row.details_json),
+    rejectedAt: toNullableText(row.rejected_at) ?? ""
+  }));
+}
+
+export interface ListArbitrageCandidatesOptions {
+  limit?: number;
+  side?: "YES" | "NO";
+  minNetEdge?: number;
+  minMappingConfidence?: number;
+  sortBy?: "net_edge" | "estimated_edge" | "scanned_at" | "mapping_confidence";
+}
+
+export function listArbitrageCandidates(
+  optionsOrLimit: ListArbitrageCandidatesOptions | number = 25
+): ArbitrageCandidateRow[] {
+  if (!tableExists("arbitrage_candidates")) {
+    return [];
+  }
+
+  const options: ListArbitrageCandidatesOptions =
+    typeof optionsOrLimit === "number" ? { limit: optionsOrLimit } : optionsOrLimit;
+  const limit = Math.max(1, Math.min(options.limit ?? 25, 200));
+  const sortBy = options.sortBy ?? "scanned_at";
+  const orderClauses: Record<string, string> = {
+    net_edge: "estimated_edge DESC, id DESC",
+    estimated_edge: "estimated_edge DESC, id DESC",
+    scanned_at: "scanned_at DESC, estimated_edge DESC, id DESC",
+    mapping_confidence: "mapping_confidence DESC, id DESC"
+  };
+
+  const where: string[] = [];
+  const params: Array<string | number> = [];
+  if (options.side) {
+    where.push("side = ?");
+    params.push(options.side);
+  }
+  if (typeof options.minMappingConfidence === "number") {
+    where.push("mapping_confidence >= ?");
+    params.push(options.minMappingConfidence);
+  }
+
+  const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+
+  const rows = rowsAs<SqlRow[]>(
+    db
+      .prepare(
+        `
+          SELECT *
+          FROM arbitrage_candidates
+          ${whereSql}
+          ORDER BY ${orderClauses[sortBy]}
+          LIMIT ?
+        `
+      )
+      .all(...params, limit)
+  );
+
+  const items = rows.map((row) => {
+    const payload = toJsonObject(row.payload_json) ?? {};
+    const numberFromPayload = (key: string, decimals = 4): number => {
+      const value = (payload as Record<string, unknown>)[key];
+      const numeric = typeof value === "number" ? value : Number(value);
+      return Number.isFinite(numeric) ? Number(numeric.toFixed(decimals)) : 0;
+    };
+    const stringFromPayload = (key: string): string | null => {
+      const value = (payload as Record<string, unknown>)[key];
+      if (typeof value === "string" && value.trim().length > 0) {
+        return value.trim();
+      }
+      return null;
+    };
+    return {
+      id: toCount(row.id),
+      kalshiTicker: toNullableText(row.kalshi_ticker) ?? "",
+      polymarketId: toNullableText(row.polymarket_id) ?? "",
+      side: toNullableText(row.side) ?? "",
+      kalshiPrice: toNumber(row.kalshi_price, 4),
+      polymarketPrice: toNumber(row.polymarket_price, 4),
+      estimatedEdge: toNumber(row.estimated_edge, 4),
+      netEdge: numberFromPayload("net_edge"),
+      feesEstimated: numberFromPayload("fees_estimated"),
+      kalshiSpread: numberFromPayload("kalshi_spread"),
+      kalshiTopLiquidity: numberFromPayload("kalshi_top_liquidity", 2),
+      polymarketVolumeUsd: numberFromPayload("polymarket_volume_usd", 2),
+      polymarketLiquidityUsd: numberFromPayload("polymarket_liquidity_usd", 2),
+      notes: stringFromPayload("notes"),
+      mappingConfidence: toNumber(row.mapping_confidence, 4),
+      freshnessSeconds: toCount(row.freshness_seconds),
+      executionMode: toNullableText(row.execution_mode) ?? "alert_only",
+      payload,
+      scannedAt: toNullableText(row.scanned_at) ?? ""
+    };
+  });
+
+  let filtered = items;
+  if (typeof options.minNetEdge === "number") {
+    filtered = filtered.filter((item) => item.netEdge >= (options.minNetEdge ?? 0));
+  }
+  if (sortBy === "net_edge") {
+    filtered = filtered.slice().sort((a, b) => b.netEdge - a.netEdge);
+  } else if (sortBy === "mapping_confidence") {
+    filtered = filtered.slice().sort((a, b) => b.mappingConfidence - a.mappingConfidence);
+  }
+  return filtered;
+}
+
+export interface ListSourceHealthOptions {
+  limit?: number;
+  categories?: string[];
+  status?: string;
+}
+
+export function listSourceHealthSnapshots(
+  optionsOrLimit: ListSourceHealthOptions | number = 12
+): SourceHealthSnapshotRow[] {
+  if (!tableExists("source_snapshots")) {
+    return [];
+  }
+
+  const options: ListSourceHealthOptions =
+    typeof optionsOrLimit === "number" ? { limit: optionsOrLimit } : optionsOrLimit;
+  const limit = Math.max(1, Math.min(options.limit ?? 12, 200));
+  const categories = (options.categories ?? []).filter(
+    (entry): entry is string => typeof entry === "string" && entry.trim().length > 0
+  );
+
+  const where: string[] = [];
+  const params: Array<string | number> = [];
+  if (categories.length > 0) {
+    const placeholders = categories.map(() => "?").join(", ");
+    where.push(`category IN (${placeholders})`);
+    params.push(...categories);
+  }
+  if (options.status) {
+    where.push("LOWER(status) = LOWER(?)");
+    params.push(options.status);
+  }
+  const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+
+  const rows = rowsAs<SqlRow[]>(
+    db
+      .prepare(
+        `
+          SELECT *
+          FROM source_snapshots
+          WHERE id IN (
+            SELECT MAX(id)
+            FROM source_snapshots
+            ${whereSql}
+            GROUP BY category, source
+          )
+          ORDER BY captured_at DESC, id DESC
+          LIMIT ?
+        `
+      )
+      .all(...params, limit)
+  );
+
+  return rows.map((row) => ({
+    id: toCount(row.id),
+    category: toNullableText(row.category) ?? "unknown",
+    source: toNullableText(row.source) ?? "unknown",
+    status: toNullableText(row.status) ?? "unknown",
+    freshnessSeconds: toCount(row.freshness_seconds),
+    payload: toJsonObject(row.payload_json),
+    capturedAt: toNullableText(row.captured_at) ?? ""
+  }));
+}
+
+export function getSafetyMetricCounts(): {
+  rejections24h: number;
+  arbitrageCandidates24h: number;
+  calibrationSamples: number;
+} {
+  const sinceExpression = "datetime('now', '-1 day')";
+  const rejections24h = tableExists("anomaly_rejections")
+    ? toCount(
+        (db
+          .prepare(
+            `SELECT COUNT(*) AS count FROM anomaly_rejections WHERE rejected_at >= ${sinceExpression}`
+          )
+          .get() as { count?: number } | undefined)?.count
+      )
+    : 0;
+  const arbitrageCandidates24h = tableExists("arbitrage_candidates")
+    ? toCount(
+        (db
+          .prepare(
+            `SELECT COUNT(*) AS count FROM arbitrage_candidates WHERE scanned_at >= ${sinceExpression}`
+          )
+          .get() as { count?: number } | undefined)?.count
+      )
+    : 0;
+  const calibrationSamples = tableExists("settlement_calibration")
+    ? toCount(
+        (db
+          .prepare("SELECT COUNT(*) AS count FROM settlement_calibration")
+          .get() as { count?: number } | undefined)?.count
+      )
+    : 0;
+
+  return { rejections24h, arbitrageCandidates24h, calibrationSamples };
+}
+
+interface CalibrationSample {
+  predicted: number;
+  outcome: number;
+}
+
+const CALIBRATION_BUCKET_COUNT = 10;
+
+function loadCalibrationSamples(filter?: { strategy?: string }): CalibrationSample[] {
+  const where = filter?.strategy
+    ? "WHERE COALESCE(NULLIF(strategy, ''), 'unknown') = ?"
+    : "";
+  const params = filter?.strategy ? [filter.strategy] : [];
+  const rows = rowsAs<SqlRow[]>(
+    db
+      .prepare(
+        `SELECT predicted_probability AS predicted_probability, outcome AS outcome FROM settlement_calibration ${where}`
+      )
+      .all(...params)
+  );
+  return rows
+    .map((row) => ({
+      predicted: Number(row.predicted_probability ?? 0),
+      outcome: Number(row.outcome ?? 0)
+    }))
+    .filter(
+      (sample) =>
+        Number.isFinite(sample.predicted) &&
+        sample.predicted >= 0 &&
+        sample.predicted <= 1
+    );
+}
+
+function bucketSamples(samples: CalibrationSample[], bucketCount = CALIBRATION_BUCKET_COUNT) {
+  const width = 1 / bucketCount;
+  const buckets = Array.from({ length: bucketCount }, (_, idx) => ({
+    lower: idx * width,
+    upper: idx === bucketCount - 1 ? 1 : (idx + 1) * width,
+    count: 0,
+    averagePredicted: 0,
+    realizedRate: 0,
+    absGap: 0,
+    _sumPredicted: 0,
+    _sumOutcome: 0
+  }));
+  for (const sample of samples) {
+    const idx = Math.min(Math.floor(sample.predicted / width), bucketCount - 1);
+    const bucket = buckets[idx];
+    bucket.count += 1;
+    bucket._sumPredicted += sample.predicted;
+    bucket._sumOutcome += sample.outcome ? 1 : 0;
+  }
+  return buckets.map((bucket) => {
+    const avgPred = bucket.count === 0 ? 0 : bucket._sumPredicted / bucket.count;
+    const realized = bucket.count === 0 ? 0 : bucket._sumOutcome / bucket.count;
+    return {
+      lower: Number(bucket.lower.toFixed(2)),
+      upper: Number(bucket.upper.toFixed(2)),
+      count: bucket.count,
+      averagePredicted: Number(avgPred.toFixed(4)),
+      realizedRate: Number(realized.toFixed(4)),
+      absGap: Number(Math.abs(avgPred - realized).toFixed(4))
+    };
+  });
+}
+
+function expectedCalibrationError(samples: CalibrationSample[]): number {
+  if (samples.length === 0) {
+    return 0;
+  }
+  const buckets = bucketSamples(samples);
+  let weighted = 0;
+  for (const bucket of buckets) {
+    if (bucket.count === 0) {
+      continue;
+    }
+    weighted += (bucket.count / samples.length) * bucket.absGap;
+  }
+  return Number(weighted.toFixed(4));
+}
+
+export function getCalibrationSummary(): CalibrationSummary {
+  if (!tableExists("settlement_calibration")) {
+    return {
+      sampleSize: 0,
+      averageBrierScore: null,
+      winRate: null,
+      realizedEv: 0,
+      ece: 0,
+      byStrategy: [],
+      byCategory: [],
+      buckets: bucketSamples([])
+    };
+  }
+
+  const summary = db
+    .prepare(
+      `
+        SELECT
+          COUNT(*) AS sample_size,
+          AVG(brier_score) AS avg_brier,
+          AVG(outcome) AS win_rate,
+          SUM(COALESCE(realized_ev, 0)) AS realized_ev
+        FROM settlement_calibration
+      `
+    )
+    .get() as
+    | {
+        sample_size?: number;
+        avg_brier?: number | null;
+        win_rate?: number | null;
+        realized_ev?: number | null;
+      }
+    | undefined;
+
+  const strategyRows = rowsAs<SqlRow[]>(
+    db.prepare(
+      `
+        SELECT
+          COALESCE(NULLIF(strategy, ''), 'unknown') AS strategy,
+          COUNT(*) AS sample_size,
+          AVG(brier_score) AS avg_brier,
+          AVG(outcome) AS win_rate,
+          SUM(COALESCE(realized_ev, 0)) AS realized_ev
+        FROM settlement_calibration
+        GROUP BY COALESCE(NULLIF(strategy, ''), 'unknown')
+        ORDER BY sample_size DESC, strategy ASC
+        LIMIT 12
+      `
+    ).all()
+  );
+
+  const categoryRows = rowsAs<SqlRow[]>(
+    db.prepare(
+      `
+        SELECT
+          COALESCE(NULLIF(category, ''), 'uncategorized') AS category,
+          COUNT(*) AS sample_size,
+          AVG(brier_score) AS avg_brier,
+          AVG(outcome) AS win_rate,
+          SUM(COALESCE(realized_ev, 0)) AS realized_ev
+        FROM settlement_calibration
+        GROUP BY COALESCE(NULLIF(category, ''), 'uncategorized')
+        ORDER BY sample_size DESC, category ASC
+        LIMIT 12
+      `
+    ).all()
+  );
+
+  const samples = loadCalibrationSamples();
+
+  return {
+    sampleSize: toCount(summary?.sample_size),
+    averageBrierScore:
+      summary?.avg_brier === null || summary?.avg_brier === undefined
+        ? null
+        : toNumber(summary.avg_brier, 4),
+    winRate:
+      summary?.win_rate === null || summary?.win_rate === undefined
+        ? null
+        : toNumber(summary.win_rate, 4),
+    realizedEv: toNumber(summary?.realized_ev, 2),
+    ece: expectedCalibrationError(samples),
+    byStrategy: strategyRows.map((row) => ({
+      strategy: toNullableText(row.strategy) ?? "unknown",
+      sampleSize: toCount(row.sample_size),
+      averageBrierScore:
+        row.avg_brier === null || row.avg_brier === undefined
+          ? null
+          : toNumber(row.avg_brier, 4),
+      winRate:
+        row.win_rate === null || row.win_rate === undefined ? null : toNumber(row.win_rate, 4),
+      realizedEv: toNumber(row.realized_ev, 2)
+    })),
+    byCategory: categoryRows.map((row) => ({
+      category: toNullableText(row.category) ?? "uncategorized",
+      sampleSize: toCount(row.sample_size),
+      averageBrierScore:
+        row.avg_brier === null || row.avg_brier === undefined
+          ? null
+          : toNumber(row.avg_brier, 4),
+      winRate:
+        row.win_rate === null || row.win_rate === undefined ? null : toNumber(row.win_rate, 4),
+      realizedEv: toNumber(row.realized_ev, 2)
+    })),
+    buckets: bucketSamples(samples)
+  };
 }
 
 function getLiveTradeDecisionOrderColumn(columns: Set<string>): string {

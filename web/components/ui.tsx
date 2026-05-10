@@ -24,6 +24,10 @@ const NAV_LINKS = [
     label: "Portfolio"
   },
   {
+    href: "/safety",
+    label: "Safety"
+  },
+  {
     href: "/analysis",
     label: "Analysis"
   }
@@ -45,7 +49,7 @@ export function AppFrame({ children }: { children: ReactNode }) {
               <HeaderModeBadge />
             </div>
           </div>
-          <nav className="flex flex-wrap gap-2 text-sm font-medium text-slate-600">
+          <nav className="grid w-full grid-cols-2 gap-2 text-sm font-medium text-slate-600 sm:flex sm:w-auto sm:flex-wrap">
             {NAV_LINKS.map((route) => (
               <NavLink key={route.href} href={route.href}>
                 {route.label}
@@ -105,7 +109,7 @@ function NavLink({ href, children }: { href: string; children: ReactNode }) {
   return (
     <Link
       href={href}
-      className="rounded-full border border-slate-200 bg-white px-4 py-2 transition hover:border-signal hover:text-signal"
+      className="rounded-full border border-slate-200 bg-white px-4 py-2 text-center transition hover:border-signal hover:text-signal"
     >
       {children}
     </Link>

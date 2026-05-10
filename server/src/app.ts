@@ -15,6 +15,7 @@ import {
   getPortfolioPayload,
   getQuickFlipPayload,
   clearAllDataPayload,
+  getSafetyPayload,
   updateQuickFlipConfigPayload,
   submitLiveTradeDecisionFeedbackPayload
 } from "./services/dashboardService.js";
@@ -81,6 +82,27 @@ export async function buildServer() {
   });
 
   app.get("/api/portfolio", async () => getPortfolioPayload());
+  app.get("/api/safety", async (request) => {
+    const safetyQuerySchema = z.object({
+      arbitrageSide: z.enum(["YES", "NO"]).optional(),
+      arbitrageMinNetEdge: z.coerce.number().min(0).max(1).optional(),
+      arbitrageMinMappingConfidence: z.coerce.number().min(0).max(1).optional(),
+      arbitrageSortBy: z
+        .enum(["net_edge", "estimated_edge", "scanned_at", "mapping_confidence"])
+        .optional(),
+      sourceCategories: z
+        .union([z.string(), z.array(z.string())])
+        .transform((value) =>
+          (Array.isArray(value) ? value : value.split(","))
+            .map((entry) => entry.trim())
+            .filter((entry) => entry.length > 0)
+        )
+        .optional(),
+      sourceStatus: z.string().optional()
+    });
+    const query = safetyQuerySchema.parse(request.query);
+    return getSafetyPayload(query);
+  });
   app.get("/api/quick-flip", async () => getQuickFlipPayload());
   app.put("/api/quick-flip/config", async (request, reply) => {
     const payload = updateQuickFlipConfigPayload(request.body);

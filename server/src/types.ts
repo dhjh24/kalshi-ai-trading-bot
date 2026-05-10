@@ -486,6 +486,43 @@ export interface PortfolioPayload {
   aiSpend: PortfolioAiSpendMetrics;
 }
 
+export interface WeatherContractInterpretation {
+  detected: boolean;
+  confidence: number;
+  bucketLabel: string | null;
+  threshold: number | null;
+  lowerBound: number | null;
+  upperBound: number | null;
+  settlementSource: string | null;
+  notes: string;
+  blockReason: string | null;
+  canTrade: boolean;
+  metric: string;
+  unit: string;
+  direction: string;
+  inclusiveEndpoints: boolean | null;
+}
+
+export interface WeatherEventBucket {
+  ticker: string;
+  title: string;
+  yesPrice: number;
+  bucketLabel: string | null;
+  lowerBound: number | null;
+  upperBound: number | null;
+  threshold: number | null;
+  unit: string;
+  metric: string;
+  canTrade: boolean;
+  blockReason: string | null;
+}
+
+export interface WeatherEventInterpretation {
+  eventTicker: string | null;
+  eventTitle: string | null;
+  buckets: WeatherEventBucket[];
+}
+
 export interface PaperTradingResetCounts {
   positions: number;
   tradeLogs: number;
@@ -788,6 +825,93 @@ export interface LiveTradePayload {
       } | null;
     }
   >;
+}
+
+export interface ExecutionSafetyRejectionRow {
+  id: number;
+  ticker: string;
+  side: string;
+  reason: string;
+  score: number;
+  details: Record<string, unknown> | null;
+  rejectedAt: string;
+}
+
+export interface ArbitrageCandidateRow {
+  id: number;
+  kalshiTicker: string;
+  polymarketId: string;
+  side: string;
+  kalshiPrice: number;
+  polymarketPrice: number;
+  estimatedEdge: number;
+  netEdge: number;
+  feesEstimated: number;
+  kalshiSpread: number;
+  kalshiTopLiquidity: number;
+  polymarketVolumeUsd: number;
+  polymarketLiquidityUsd: number;
+  notes: string | null;
+  mappingConfidence: number;
+  freshnessSeconds: number;
+  executionMode: string;
+  payload: Record<string, unknown> | null;
+  scannedAt: string;
+}
+
+export interface SourceHealthSnapshotRow {
+  id: number;
+  category: string;
+  source: string;
+  status: string;
+  freshnessSeconds: number;
+  payload: Record<string, unknown> | null;
+  capturedAt: string;
+}
+
+export interface CalibrationBucket {
+  lower: number;
+  upper: number;
+  count: number;
+  averagePredicted: number;
+  realizedRate: number;
+  absGap: number;
+}
+
+export interface CalibrationSummary {
+  sampleSize: number;
+  averageBrierScore: number | null;
+  winRate: number | null;
+  realizedEv: number;
+  ece: number;
+  byStrategy: Array<{
+    strategy: string;
+    sampleSize: number;
+    averageBrierScore: number | null;
+    winRate: number | null;
+    realizedEv: number;
+  }>;
+  byCategory: Array<{
+    category: string;
+    sampleSize: number;
+    averageBrierScore: number | null;
+    winRate: number | null;
+    realizedEv: number;
+  }>;
+  buckets: CalibrationBucket[];
+}
+
+export interface SafetyPayload {
+  generatedAt: string;
+  metrics: {
+    rejections24h: number;
+    arbitrageCandidates24h: number;
+    calibrationSamples: number;
+  };
+  sourceHealth: SourceHealthSnapshotRow[];
+  rejections: ExecutionSafetyRejectionRow[];
+  arbitrage: ArbitrageCandidateRow[];
+  calibration: CalibrationSummary;
 }
 
 export interface StreamEnvelope<T> {

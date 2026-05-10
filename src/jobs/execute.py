@@ -18,6 +18,7 @@ from src.utils.database import (
     SimulatedOrder,
     TradeLog,
 )
+from src.utils.execution_safety import evaluate_pre_execution_safety
 from src.utils.kalshi_normalization import (
     build_limit_order_price_fields,
     dollars_to_cents,
@@ -1241,6 +1242,21 @@ async def execute_position(
                 error=str(exc),
             )
 
+        safety = await evaluate_pre_execution_safety(
+            kalshi_client=kalshi_client,
+            db_manager=db_manager,
+            position=position,
+            live_mode=False,
+            market_info=market_info,
+        )
+        if not safety.allowed:
+            logger.warning(
+                "Skipping paper entry for %s: execution safety rejected trade (%s)",
+                position.market_id,
+                safety.reason,
+            )
+            return False
+
         if _entry_price_exceeds_limit(
             executable_price=top_of_book_price,
             limit_price=position.entry_price,
@@ -1389,11 +1405,45 @@ async def execute_position(
 
     try:
         side_lower = position.side.lower()
-        ask_dollars, displayed_ask_size, market_info = await _get_current_executable_entry_quote(
+        try:
+            ask_dollars, displayed_ask_size, market_info = await _get_current_executable_entry_quote(
+                kalshi_client=kalshi_client,
+                ticker=position.market_id,
+                side=position.side,
+            )
+        except Exception as exc:
+            safety = await evaluate_pre_execution_safety(
+                kalshi_client=kalshi_client,
+                db_manager=db_manager,
+                position=position,
+                live_mode=True,
+            )
+            if not safety.allowed:
+                logger.warning(
+                    "Skipping live entry for %s: execution safety rejected trade (%s)",
+                    position.market_id,
+                    safety.reason,
+                )
+                return False
+            logger.warning(
+                f"Skipping live entry for {position.market_id}: market data unavailable",
+                error=str(exc),
+            )
+            return False
+        safety = await evaluate_pre_execution_safety(
             kalshi_client=kalshi_client,
-            ticker=position.market_id,
-            side=position.side,
+            db_manager=db_manager,
+            position=position,
+            live_mode=True,
+            market_info=market_info,
         )
+        if not safety.allowed:
+            logger.warning(
+                "Skipping live entry for %s: execution safety rejected trade (%s)",
+                position.market_id,
+                safety.reason,
+            )
+            return False
         if _entry_price_exceeds_limit(
             executable_price=ask_dollars,
             limit_price=position.entry_price,

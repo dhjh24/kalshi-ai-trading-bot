@@ -23,6 +23,8 @@ export default async function MarketDetailPage({
   }
 
   const latestAnalysis = detail.latestAnalysis || detail.latestEventAnalysis;
+  const weatherInterpretation = detail.contractInterpreter?.weather;
+  const eventWeather = detail.contractInterpreter?.eventWeather ?? null;
 
   return (
     <div className="space-y-6">
@@ -79,6 +81,71 @@ export default async function MarketDetailPage({
           </p>
         </Panel>
       </div>
+
+      {weatherInterpretation?.detected ? (
+        <Panel eyebrow="Contract Interpreter" title="Weather bucket mapping">
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            <div>
+              <p className="text-xs uppercase tracking-[0.24em] text-slate-400">Bucket</p>
+              <p className="mt-2 text-lg font-semibold text-steel">
+                {weatherInterpretation.bucketLabel || "Unknown"}
+              </p>
+              {weatherInterpretation.metric ? (
+                <p className="mt-1 text-xs uppercase tracking-[0.18em] text-slate-400">
+                  {weatherInterpretation.metric} ({weatherInterpretation.unit})
+                </p>
+              ) : null}
+            </div>
+            <div>
+              <p className="text-xs uppercase tracking-[0.24em] text-slate-400">Settlement</p>
+              <p className="mt-2 text-lg font-semibold text-steel">
+                {weatherInterpretation.settlementSource || "Kalshi rules"}
+              </p>
+            </div>
+            <div>
+              <p className="text-xs uppercase tracking-[0.24em] text-slate-400">Guardrail</p>
+              <div className="mt-2">
+                <Badge tone={weatherInterpretation.canTrade ? "positive" : "warning"}>
+                  {weatherInterpretation.canTrade ? "Mapped" : weatherInterpretation.blockReason || "Review"}
+                </Badge>
+              </div>
+            </div>
+          </div>
+          <p className="mt-4 max-w-3xl text-sm leading-6 text-slate-600">
+            {weatherInterpretation.notes}
+          </p>
+        </Panel>
+      ) : null}
+
+      {eventWeather && eventWeather.buckets.length > 0 ? (
+        <Panel
+          eyebrow="Event Weather Buckets"
+          title={eventWeather.eventTitle || "Mutually exclusive buckets"}
+        >
+          <p className="text-sm text-slate-500">
+            Sibling markets in the parent event, ordered by lower bound. Use this to spot
+            mispriced buckets and confirm exhaustive coverage before a bucket-trade.
+          </p>
+          <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+            {eventWeather.buckets.map((bucket) => (
+              <div key={bucket.ticker} className="rounded-[20px] border border-slate-100 p-4">
+                <p className="font-semibold text-steel break-words">{bucket.ticker}</p>
+                <p className="mt-1 text-sm text-slate-500">
+                  {bucket.bucketLabel || "Unmapped"}
+                </p>
+                <p className="mt-2 text-sm font-semibold text-steel">
+                  YES {Math.round((bucket.yesPrice || 0) * 100)}¢
+                </p>
+                {!bucket.canTrade ? (
+                  <p className="mt-2 text-xs text-amber-700">
+                    Blocked: {bucket.blockReason || "review"}
+                  </p>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        </Panel>
+      ) : null}
 
       <section id="analysis" className="grid gap-6 xl:grid-cols-[1.15fr_0.85fr]">
         <Panel title="Latest analysis">

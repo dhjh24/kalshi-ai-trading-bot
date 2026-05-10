@@ -80,6 +80,10 @@ hydration.
   futures funding rate.
 - `src/data/macro_adapter.py` — Trading Economics free RSS calendar +
   Kalshi description scraping.
+- `src/data/weather_adapter.py` — Kalshi temperature-bucket interpreter for
+  UI/API threshold confusion and settlement-source notes.
+- `src/data/polymarket_adapter.py` — alert-only Polymarket normalization and
+  Kalshi mapping for cross-market watchlists.
 
 ## Tests
 

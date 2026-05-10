@@ -642,6 +642,163 @@ describe("getPortfolioStrategyPnlBreakdown", () => {
   });
 });
 
+describe("safety repository readers", () => {
+  it("normalizes execution safety, arbitrage, and calibration rows", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "dashboard-repository-"));
+    const databasePath = path.join(tempDir, "dashboard.sqlite");
+    const scriptPath = path.join(tempDir, "safety-check.mjs");
+    const repositoryUrl = pathToFileURL(
+      path.join(serverRoot, "src/repositories/dashboardRepository.ts")
+    ).href;
+    const dbUrl = pathToFileURL(path.join(serverRoot, "src/db.ts")).href;
+    tempDirs.push(tempDir);
+
+    writeFileSync(
+      scriptPath,
+      `
+        import { getDb } from ${JSON.stringify(dbUrl)};
+        import {
+          getCalibrationSummary,
+          getSafetyMetricCounts,
+          listArbitrageCandidates,
+          listExecutionSafetyRejections,
+          listSourceHealthSnapshots
+        } from ${JSON.stringify(repositoryUrl)};
+
+        const db = getDb();
+
+        try {
+          db.exec(\`
+            CREATE TABLE anomaly_rejections (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ticker TEXT NOT NULL,
+              side TEXT NOT NULL,
+              reason TEXT NOT NULL,
+              score REAL NOT NULL,
+              details_json TEXT,
+              rejected_at TEXT NOT NULL
+            );
+            CREATE TABLE arbitrage_candidates (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              kalshi_ticker TEXT NOT NULL,
+              polymarket_id TEXT NOT NULL,
+              side TEXT NOT NULL,
+              kalshi_price REAL NOT NULL,
+              polymarket_price REAL NOT NULL,
+              estimated_edge REAL NOT NULL,
+              mapping_confidence REAL NOT NULL,
+              freshness_seconds INTEGER NOT NULL,
+              execution_mode TEXT NOT NULL,
+              payload_json TEXT,
+              scanned_at TEXT NOT NULL
+            );
+            CREATE TABLE settlement_calibration (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              market_id TEXT NOT NULL,
+              strategy TEXT,
+              category TEXT,
+              predicted_probability REAL NOT NULL,
+              outcome INTEGER NOT NULL,
+              brier_score REAL NOT NULL,
+              realized_ev REAL,
+              pnl REAL,
+              source TEXT,
+              settled_at TEXT NOT NULL,
+              payload_json TEXT
+            );
+            CREATE TABLE source_snapshots (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              category TEXT NOT NULL,
+              source TEXT NOT NULL,
+              status TEXT NOT NULL,
+              freshness_seconds INTEGER NOT NULL,
+              payload_json TEXT,
+              captured_at TEXT NOT NULL
+            );
+            INSERT INTO anomaly_rejections (ticker, side, reason, score, details_json, rejected_at)
+            VALUES ('KXTEST', 'YES', 'quote_move_exceeds_guard', 0.75, '{"previous":0.4}', '2999-01-01T00:00:00');
+            INSERT INTO arbitrage_candidates (
+              kalshi_ticker, polymarket_id, side, kalshi_price, polymarket_price,
+              estimated_edge, mapping_confidence, freshness_seconds, execution_mode,
+              payload_json, scanned_at
+            )
+            VALUES ('KXTEST', 'pm-1', 'YES', 0.42, 0.52, 0.1, 0.8, 2, 'alert_only', '{"foo":"bar"}', '2999-01-01T00:00:00');
+            INSERT INTO settlement_calibration (
+              market_id, strategy, category, predicted_probability, outcome,
+              brier_score, realized_ev, pnl, source, settled_at
+            )
+            VALUES ('KXTEST', 'live_trade', 'Sports', 0.7, 1, 0.09, 3.5, 3.5, 'trade_logs', '2999-01-01T00:00:00');
+            INSERT INTO source_snapshots (
+              category, source, status, freshness_seconds, payload_json, captured_at
+            )
+            VALUES
+              ('kalshi', 'kalshi.public-api', 'healthy', 2, '{"latencyMs":120}', '2999-01-01T00:00:00'),
+              ('kalshi', 'kalshi.public-api', 'stale', 900, '{"latencyMs":999}', '2999-01-01T01:00:00'),
+              ('weather', 'kalshi.weather-contract-interpreter', 'healthy', 0, '{}', '2999-01-01T00:30:00');
+          \`);
+
+          console.log(JSON.stringify({
+            rejections: listExecutionSafetyRejections(5),
+            arbitrage: listArbitrageCandidates(5),
+            sourceHealth: listSourceHealthSnapshots(5),
+            counts: getSafetyMetricCounts(),
+            calibration: getCalibrationSummary()
+          }));
+        } finally {
+          db.close();
+        }
+      `
+    );
+
+    const result = JSON.parse(
+      execFileSync(process.execPath, ["--import", "tsx/esm", scriptPath], {
+        cwd: serverRoot,
+        env: {
+          ...process.env,
+          DB_PATH: databasePath
+        },
+        encoding: "utf8"
+      }).trim()
+    );
+
+    expect(result.rejections[0]).toMatchObject({
+      ticker: "KXTEST",
+      reason: "quote_move_exceeds_guard",
+      details: { previous: 0.4 }
+    });
+    expect(result.arbitrage[0]).toMatchObject({
+      kalshiTicker: "KXTEST",
+      executionMode: "alert_only",
+      payload: { foo: "bar" }
+    });
+    expect(result.sourceHealth).toEqual([
+      expect.objectContaining({
+        category: "kalshi",
+        source: "kalshi.public-api",
+        status: "stale",
+        freshnessSeconds: 900,
+        payload: { latencyMs: 999 }
+      }),
+      expect.objectContaining({
+        category: "weather",
+        source: "kalshi.weather-contract-interpreter",
+        status: "healthy"
+      })
+    ]);
+    expect(result.counts).toMatchObject({
+      rejections24h: 1,
+      arbitrageCandidates24h: 1,
+      calibrationSamples: 1
+    });
+    expect(result.calibration).toMatchObject({
+      sampleSize: 1,
+      averageBrierScore: 0.09,
+      winRate: 1,
+      realizedEv: 3.5
+    });
+  });
+});
+
 describe("clearPaperTradingData", () => {
   it("deletes only non-live paper runtime rows and refreshes affected market flags", () => {
     const tempDir = mkdtempSync(path.join(tmpdir(), "dashboard-repository-"));
