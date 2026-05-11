@@ -275,7 +275,7 @@ async def _check_exchange_health(
         snapshot = await fetcher(category="kalshi", source="kalshi.public-api")
     except Exception:
         return None
-    if not snapshot:
+    if not snapshot or not isinstance(snapshot, Mapping):
         return None
     status = str(snapshot.get("status") or "").lower()
     if status in {"error", "failed", "unavailable", "down"}:
@@ -401,7 +401,7 @@ async def evaluate_pre_execution_safety(
     latest_snapshot_getter = getattr(db_manager, "get_latest_market_snapshot", None)
     if callable(latest_snapshot_getter):
         snapshot = await latest_snapshot_getter(position.market_id)
-        if snapshot:
+        if snapshot and isinstance(snapshot, Mapping):
             timestamp = _parse_iso(snapshot.get("timestamp"))
             if timestamp:
                 age_seconds = (datetime.now(timezone.utc) - timestamp).total_seconds()

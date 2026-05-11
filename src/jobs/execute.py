@@ -1213,6 +1213,7 @@ async def execute_position(
     kalshi_client: KalshiClient,
     *,
     shadow_mode: Optional[bool] = None,
+    paper_market_info: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """
     Execute a single trade position.
@@ -1233,9 +1234,17 @@ async def execute_position(
                 side=position.side,
             )
         except Exception as exc:
-            top_of_book_price = position.entry_price
-            displayed_ask_size = 0.0
-            market_info = {}
+            if paper_market_info:
+                top_of_book_price = position.entry_price
+                market_info = dict(paper_market_info)
+                displayed_ask_size = _resolve_displayed_entry_liquidity(
+                    market_info=market_info,
+                    side=position.side,
+                )
+            else:
+                top_of_book_price = position.entry_price
+                displayed_ask_size = 0.0
+                market_info = {}
             logger.warning(
                 f"Could not fetch live market data for paper entry on {position.market_id}; "
                 f"falling back to requested entry price {top_of_book_price:.4f}",

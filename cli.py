@@ -608,7 +608,9 @@ def cmd_run(args: argparse.Namespace) -> None:
     from src.config import settings as cfg
 
     # DEFAULT: AI Ensemble mode (disciplined settings active)
-    provider = cfg.settings.api.resolve_llm_provider()
+    api_settings = getattr(cfg.settings, "api", None)
+    resolve_provider = getattr(api_settings, "resolve_llm_provider", None)
+    provider = resolve_provider() if callable(resolve_provider) else "openrouter"
     print("AI ENSEMBLE MODE (default)")
     if provider == "codex":
         print("   Codex CLI routing: GPT-5.4 + GPT-5.4 Mini via ChatGPT plan quota.")

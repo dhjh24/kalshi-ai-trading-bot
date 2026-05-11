@@ -1726,6 +1726,8 @@ class LiveTradeDecisionLoop:
             live_mode=live_mode,
             db_manager=self.db_manager,
             kalshi_client=self.kalshi_client,
+            shadow_mode=runtime_mode == "shadow",
+            paper_market_info=selected_market if not live_mode else None,
         )
         if success:
             await self.db_manager.update_position_execution_details(
