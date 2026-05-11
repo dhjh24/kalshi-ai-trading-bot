@@ -898,6 +898,13 @@ export interface CalibrationSummary {
     winRate: number | null;
     realizedEv: number;
   }>;
+  byModel: Array<{
+    model: string;
+    sampleSize: number;
+    averageBrierScore: number | null;
+    winRate: number | null;
+    realizedEv: number;
+  }>;
   buckets: CalibrationBucket[];
 }
 

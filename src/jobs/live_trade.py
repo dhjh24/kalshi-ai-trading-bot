@@ -46,6 +46,7 @@ from src.utils.kalshi_normalization import (
     get_portfolio_value_dollars,
 )
 from src.utils.logging_setup import get_trading_logger
+from src.utils.source_health import record_research_payload_snapshots
 
 
 SCOUT_SCHEMA: Dict[str, Any] = {
@@ -1256,6 +1257,20 @@ class LiveTradeDecisionLoop:
             payload = {"event": event}
             self.logger.warning(
                 "Falling back to event-only payload for specialist analysis",
+                event_ticker=event.get("event_ticker"),
+                error=str(exc),
+            )
+
+        # Best-effort source-health emission so the safety dashboard can
+        # surface sports/crypto/macro/news adapter health alongside the
+        # Kalshi/weather snapshots that the execution-safety guard already
+        # records. Failures here must not break the specialist step, so the
+        # helper swallows DB errors internally.
+        try:
+            await record_research_payload_snapshots(self.db_manager, payload)
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            self.logger.debug(
+                "Source-health snapshot recording skipped",
                 event_ticker=event.get("event_ticker"),
                 error=str(exc),
             )

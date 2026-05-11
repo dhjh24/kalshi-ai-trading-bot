@@ -106,12 +106,63 @@ def _parse_jsonish(value: Any) -> Any:
         return value
 
 
+_STOPWORDS = frozenset(
+    {
+        "will",
+        "market",
+        "markets",
+        "kalshi",
+        "polymarket",
+        "the",
+        "and",
+        "for",
+        "with",
+        "that",
+        "this",
+        "from",
+        "have",
+        "has",
+        "into",
+        "than",
+        "over",
+        "above",
+        "below",
+        "before",
+        "after",
+        "within",
+        "during",
+        "between",
+        "today",
+        "tonight",
+        "tomorrow",
+    }
+)
+
+
 def _tokenize(value: str) -> set[str]:
     return {
         token
         for token in re.sub(r"[^a-z0-9]+", " ", value.lower()).split()
-        if len(token) > 2 and token not in {"will", "market", "kalshi", "polymarket"}
+        if len(token) > 2 and token not in _STOPWORDS
     }
+
+
+_PROPER_NOUN_PATTERN = re.compile(r"\b([A-Z][A-Za-z0-9]{2,})\b")
+_DIGIT_TOKEN_PATTERN = re.compile(r"\b(\d{2,})\b")
+
+
+def _entity_tokens(value: str) -> set[str]:
+    """Pull out proper-noun-ish tokens (capitalized words and multi-digit numbers).
+
+    These carry much higher matching signal than ordinary content words. A
+    Lakers/Lakers proper-noun overlap or a 2026/2026 year overlap should pull
+    a candidate over the mapping threshold even when the rest of the title
+    differs in phrasing.
+    """
+
+    proper = {match.lower() for match in _PROPER_NOUN_PATTERN.findall(value or "")}
+    digits = {match for match in _DIGIT_TOKEN_PATTERN.findall(value or "")}
+    return {token for token in proper | digits if token not in _STOPWORDS and len(token) > 2}
 
 
 def mapping_confidence(left: str, right: str) -> float:
@@ -121,7 +172,18 @@ def mapping_confidence(left: str, right: str) -> float:
         return 0.0
     overlap = left_tokens & right_tokens
     union = left_tokens | right_tokens
-    return round(len(overlap) / len(union), 4)
+    base = len(overlap) / len(union)
+
+    # Entity overlap is far more diagnostic than ordinary word overlap. Each
+    # shared proper-noun-ish token adds a fixed boost up to a small cap; this
+    # keeps the score in [0, 1] but lets a Lakers/Lakers match clear thresholds
+    # that a pure Jaccard score would miss.
+    left_entities = _entity_tokens(left)
+    right_entities = _entity_tokens(right)
+    shared_entities = len(left_entities & right_entities)
+    entity_bonus = min(0.25, 0.08 * shared_entities)
+
+    return round(min(1.0, base + entity_bonus), 4)
 
 
 def _extract_outcome_price(raw: Mapping[str, Any], outcome_name: str) -> float:
@@ -286,6 +348,7 @@ class PolymarketAdapter:
         min_kalshi_top_liquidity: float = DEFAULT_KALSHI_MIN_TOP_LIQUIDITY,
         min_polymarket_volume_usd: float = DEFAULT_POLYMARKET_MIN_VOLUME_USD,
         polymarket_stale_after_seconds: int = DEFAULT_POLYMARKET_STALE_AFTER_SECONDS,
+        strict: bool = False,
     ) -> List[ArbitrageCandidate]:
         payload = await self.fetch_markets(limit=limit)
         started_at = time.monotonic()
@@ -304,6 +367,15 @@ class PolymarketAdapter:
                 kalshi_market.get("ticker") or kalshi_market.get("market_id") or ""
             ).strip()
             if not kalshi_title or not kalshi_ticker:
+                continue
+            # Skip Kalshi markets that are explicitly non-tradeable. Callers
+            # that fetch with status="open" already filter most of these out,
+            # but direct invocations (e.g. backfills) can pass settled rows
+            # whose stale prices would still surface as "edges". Missing
+            # status fields fall through unchanged to preserve compatibility
+            # with sparse fixtures.
+            kalshi_status = str(kalshi_market.get("status") or "").strip().lower()
+            if kalshi_status and kalshi_status not in {"open", "active"}:
                 continue
             yes_bid, yes_ask, no_bid, no_ask = get_market_prices(dict(kalshi_market))
             kalshi_spread = _kalshi_spread(yes_bid, yes_ask, no_bid, no_ask)
@@ -352,6 +424,13 @@ class PolymarketAdapter:
                             f" < ${min_polymarket_volume_usd:.0f}"
                         )
 
+                    # Strict mode drops anything that violated a quality
+                    # guard so callers that want a clean list (e.g. an
+                    # auto-trader experimenting with cross-market hedges)
+                    # don't have to filter out annotated rows themselves.
+                    if strict and notes_parts:
+                        continue
+
                     notes = "; ".join(notes_parts) if notes_parts else "ok"
                     candidates.append(
                         ArbitrageCandidate(
@@ -396,6 +475,7 @@ async def scan_kalshi_markets(
     min_kalshi_top_liquidity: float = DEFAULT_KALSHI_MIN_TOP_LIQUIDITY,
     min_polymarket_volume_usd: float = DEFAULT_POLYMARKET_MIN_VOLUME_USD,
     polymarket_stale_after_seconds: int = DEFAULT_POLYMARKET_STALE_AFTER_SECONDS,
+    strict: bool = False,
 ) -> List[ArbitrageCandidate]:
     adapter = PolymarketAdapter()
     try:
@@ -410,6 +490,7 @@ async def scan_kalshi_markets(
             min_kalshi_top_liquidity=min_kalshi_top_liquidity,
             min_polymarket_volume_usd=min_polymarket_volume_usd,
             polymarket_stale_after_seconds=polymarket_stale_after_seconds,
+            strict=strict,
         )
     finally:
         await adapter.aclose()

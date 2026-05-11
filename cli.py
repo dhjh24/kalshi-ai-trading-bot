@@ -1282,6 +1282,7 @@ def cmd_scan_arb(args: argparse.Namespace) -> None:
                 limit=args.polymarket_limit,
                 min_mapping_confidence=args.min_confidence,
                 min_edge=args.min_edge,
+                strict=getattr(args, "strict", False),
             )
             await db.record_source_snapshot(
                 category="cross_market",
@@ -1617,6 +1618,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_arb.add_argument("--polymarket-limit", type=int, default=100, help="Polymarket markets to fetch")
     p_arb.add_argument("--min-edge", type=float, default=0.03, help="Minimum estimated edge")
     p_arb.add_argument("--min-confidence", type=float, default=0.28, help="Minimum mapping confidence")
+    p_arb.add_argument(
+        "--strict",
+        action="store_true",
+        help=(
+            "Drop candidates that fail any quality guard "
+            "(stale Polymarket trade, wide Kalshi spread, thin top "
+            "liquidity, low Polymarket volume) instead of annotating them."
+        ),
+    )
     p_arb.set_defaults(func=cmd_scan_arb)
 
     # --- safety-status ---

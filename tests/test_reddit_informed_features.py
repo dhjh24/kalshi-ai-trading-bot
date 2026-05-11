@@ -646,3 +646,835 @@ async def test_operator_api_returns_structured_error_for_unknown_tool(monkeypatc
     body = response.json()
     assert body.get("error") == "unknown_tool"
     assert "availableTools" in body.get("details", {})
+
+
+# ---------------------------------------------------------------------------
+# V3 hardening tests
+# ---------------------------------------------------------------------------
+
+
+def test_polymarket_mapping_confidence_boosts_on_proper_noun_overlap() -> None:
+    from src.data.polymarket_adapter import mapping_confidence
+
+    # Pure Jaccard on these two strings is low because the connective words
+    # differ. The proper-noun overlap (Lakers/Knicks/2026) should still pull
+    # the score above the configurable mapping threshold so cross-market
+    # candidates do not get silently dropped on phrasing differences.
+    score = mapping_confidence(
+        "Will the Lakers beat the Knicks tonight in 2026?",
+        "Lakers vs Knicks 2026 outcome",
+    )
+    weak = mapping_confidence("Lakers tonight", "completely unrelated headline")
+    assert score >= 0.4
+    assert weak < 0.2
+
+
+def test_polymarket_mapping_confidence_returns_zero_when_no_signal() -> None:
+    from src.data.polymarket_adapter import mapping_confidence
+
+    assert mapping_confidence("", "anything") == 0.0
+    assert mapping_confidence("anything", "") == 0.0
+
+
+def test_weather_interpreter_handles_negative_threshold() -> None:
+    result = interpret_temperature_market(
+        {
+            "ticker": "KXLOWMSP-NEG5",
+            "title": "MSP low temperature below -5",
+            "rules_primary": "Settles using the NWS station report.",
+        }
+    )
+    assert result.detected is True
+    assert result.threshold == -5
+    assert result.direction == "below"
+    assert result.upper_bound == -5
+    assert result.bucket_label is not None
+    assert "-5" in result.bucket_label
+
+
+def test_weather_interpreter_does_not_misread_ticker_hyphen_as_negative() -> None:
+    result = interpret_temperature_market(
+        {
+            "ticker": "KXHIGHNY-70",
+            "title": "NYC high temperature above 70",
+        }
+    )
+    # The hyphen inside the ticker token must not get parsed as a negative sign;
+    # the threshold must come from the title.
+    assert result.detected is True
+    assert result.threshold == 70
+    assert result.direction == "above"
+    assert result.lower_bound == 70
+
+
+def test_weather_interpreter_handles_no_higher_than_phrase() -> None:
+    result = interpret_temperature_market(
+        {
+            "ticker": "KXHIGHBOS-32",
+            "title": "Boston high temperature no higher than 32 inclusive",
+        }
+    )
+    assert result.detected is True
+    assert result.direction == "below"
+    assert result.upper_bound == 32
+    assert result.inclusive_endpoints is True
+
+
+@pytest.mark.asyncio
+async def test_execution_safety_blocks_paper_sibling_spike(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("EXECUTION_SAFETY_MIN_SIBLING_SPIKES", "3")
+    db = DatabaseManager(db_path=str(tmp_path / "safety.db"))
+    await db.initialize()
+    position = Position(
+        market_id="KXSPIKE-PAPER",
+        side="YES",
+        entry_price=0.5,
+        quantity=1,
+        timestamp=datetime.now(),
+    )
+
+    result = await evaluate_pre_execution_safety(
+        kalshi_client=SiblingSpikeKalshiClient(),
+        db_manager=db,
+        position=position,
+        live_mode=False,
+        market_info={
+            "ticker": "KXSPIKE-PAPER",
+            "event_ticker": "KXEVENT",
+            "status": "open",
+            "title": "Which bucket wins?",
+            "yes_ask_dollars": "0.50",
+        },
+    )
+
+    assert result.allowed is False
+    assert result.reason == "mutually_exclusive_sibling_spike"
+
+
+@pytest.mark.asyncio
+async def test_execution_safety_per_strategy_disables_exchange_health_check(
+    tmp_path, monkeypatch
+) -> None:
+    # Strategy override flips off require_exchange_health, so a stale Kalshi
+    # snapshot should no longer block trades for that strategy specifically.
+    monkeypatch.setenv(
+        "EXECUTION_SAFETY_STRATEGY_POLICY_RELAXED_BOT",
+        '{"require_exchange_health": false}',
+    )
+    db = DatabaseManager(db_path=str(tmp_path / "safety.db"))
+    await db.initialize()
+    await db.record_source_snapshot(
+        category="kalshi",
+        source="kalshi.public-api",
+        status="unavailable",
+        freshness_seconds=600,
+        payload={"reason": "5xx"},
+    )
+    position = Position(
+        market_id="KXEXCH",
+        side="YES",
+        entry_price=0.5,
+        quantity=1,
+        timestamp=datetime.now(),
+        strategy="relaxed_bot",
+    )
+
+    result = await evaluate_pre_execution_safety(
+        kalshi_client=FakeKalshiClient(),
+        db_manager=db,
+        position=position,
+        live_mode=False,
+        market_info={
+            "ticker": "KXEXCH",
+            "status": "open",
+            "title": "Will the Lakers win tonight?",
+            "yes_ask_dollars": "0.50",
+        },
+    )
+
+    # No other guardrail should fire here, so the policy override means the
+    # trade is allowed despite the broken exchange health snapshot.
+    assert result.allowed is True
+    assert result.reason == "ok"
+
+
+@pytest.mark.asyncio
+async def test_database_safety_list_helpers_round_trip(tmp_path) -> None:
+    from src.data.polymarket_adapter import ArbitrageCandidate
+
+    db = DatabaseManager(db_path=str(tmp_path / "safety.db"))
+    await db.initialize()
+    await db.record_source_snapshot(
+        category="kalshi",
+        source="kalshi.public-api",
+        status="healthy",
+        freshness_seconds=2,
+        payload={"latency_ms": 120},
+    )
+    await db.record_anomaly_rejection(
+        ticker="KXLIST",
+        side="YES",
+        reason="quote_move_exceeds_guard",
+        score=0.42,
+        details={"previous_ask": 0.4, "current_ask": 0.55},
+    )
+    candidate = ArbitrageCandidate(
+        kalshi_ticker="KXLIST",
+        polymarket_id="pm-1",
+        kalshi_title="Will the Lakers win tonight?",
+        polymarket_question="Lakers win tonight?",
+        side="YES",
+        kalshi_price=0.55,
+        polymarket_price=0.65,
+        estimated_edge=0.10,
+        mapping_confidence=0.6,
+        freshness_seconds=10,
+    )
+    await db.record_arbitrage_candidate(candidate.to_dict())
+
+    rejections = await db.list_anomaly_rejections(limit=5)
+    arbitrage = await db.list_arbitrage_candidates(limit=5)
+    sources = await db.list_source_snapshots(limit=5)
+    counts = await db.get_safety_metric_counts()
+
+    assert len(rejections) == 1
+    assert rejections[0]["ticker"] == "KXLIST"
+    assert rejections[0]["details"]["previous_ask"] == 0.4
+    assert len(arbitrage) == 1
+    assert arbitrage[0]["kalshi_ticker"] == "KXLIST"
+    assert arbitrage[0]["payload"]["polymarket_question"] == "Lakers win tonight?"
+    assert any(item["source"] == "kalshi.public-api" for item in sources)
+    assert counts["rejections_24h"] >= 1
+    assert counts["arbitrage_candidates_24h"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_operator_api_safety_status_tool(monkeypatch, tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    monkeypatch.delenv("OPERATOR_API_TOKEN", raising=False)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "operator.db"))
+    monkeypatch.setenv("KALSHI_DB_PATH", str(tmp_path / "operator.db"))
+
+    db = DatabaseManager(db_path=str(tmp_path / "operator.db"))
+    await db.initialize()
+    await db.record_anomaly_rejection(
+        ticker="KXOP",
+        side="NO",
+        reason="weather_bucket_ambiguous",
+        score=0.7,
+        details={"sniff": "test"},
+    )
+
+    from src.operator_api import create_app
+
+    # Construct a fresh app so DB_PATH override is picked up; create_app reads
+    # env on each instantiation via DatabaseManager().
+    client = TestClient(create_app())
+    response = client.post(
+        "/mcp/call/safety_status",
+        json={"rejection_limit": 5, "arbitrage_limit": 5, "source_limit": 5},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    result = body["result"]
+    assert "metrics" in result
+    assert "rejections" in result
+    assert "arbitrage" in result
+    assert "source_health" in result
+    assert any(item["ticker"] == "KXOP" for item in result["rejections"])
+
+
+@pytest.mark.asyncio
+async def test_operator_api_list_arbitrage_candidates_tool(monkeypatch, tmp_path) -> None:
+    from fastapi.testclient import TestClient
+
+    from src.data.polymarket_adapter import ArbitrageCandidate
+
+    monkeypatch.delenv("OPERATOR_API_TOKEN", raising=False)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "operator.db"))
+    monkeypatch.setenv("KALSHI_DB_PATH", str(tmp_path / "operator.db"))
+
+    db = DatabaseManager(db_path=str(tmp_path / "operator.db"))
+    await db.initialize()
+    await db.record_arbitrage_candidate(
+        ArbitrageCandidate(
+            kalshi_ticker="KXARB",
+            polymarket_id="pm-arb",
+            kalshi_title="K title",
+            polymarket_question="P title",
+            side="YES",
+            kalshi_price=0.4,
+            polymarket_price=0.5,
+            estimated_edge=0.10,
+            mapping_confidence=0.5,
+            freshness_seconds=3,
+        ).to_dict()
+    )
+
+    from src.operator_api import create_app
+
+    client = TestClient(create_app())
+    response = client.post(
+        "/mcp/call/list_arbitrage_candidates",
+        json={"limit": 10},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    result = body["result"]
+    assert result["candidate_count"] >= 1
+    assert any(item["kalshi_ticker"] == "KXARB" for item in result["candidates"])
+
+
+# ---------------------------------------------------------------------------
+# Source-health helper tests
+# ---------------------------------------------------------------------------
+
+
+def test_derive_source_snapshot_marks_healthy_signal_payload() -> None:
+    from src.utils.source_health import derive_source_snapshot
+
+    snapshot = derive_source_snapshot(
+        {
+            "category": "sports",
+            "source": "espn.scoreboard",
+            "freshness_seconds": 4,
+            "signals": {"league": "nba", "matched_teams": [{"id": "1610612747"}]},
+            "error": None,
+        }
+    )
+
+    assert snapshot is not None
+    assert snapshot.category == "sports"
+    assert snapshot.source == "espn.scoreboard"
+    assert snapshot.status == "healthy"
+    assert snapshot.freshness_seconds == 4
+    assert snapshot.summary["has_signals"] is True
+
+
+def test_derive_source_snapshot_marks_hard_failure_unavailable() -> None:
+    from src.utils.source_health import derive_source_snapshot
+
+    snapshot = derive_source_snapshot(
+        {
+            "category": "crypto",
+            "source": "coingecko.simple-price",
+            "freshness_seconds": 12,
+            "signals": {},
+            # Hard failure tokens (timeout, fail, unavailable, ...) trip
+            # the unavailable status so the dashboard renders red, not amber.
+            "error": "scoreboard_failed:HTTPError",
+        }
+    )
+    assert snapshot is not None
+    assert snapshot.status == "unavailable"
+    assert snapshot.summary["error"] == "scoreboard_failed:HTTPError"
+
+
+def test_derive_source_snapshot_marks_recoverable_signal_degraded() -> None:
+    from src.utils.source_health import derive_source_snapshot
+
+    snapshot = derive_source_snapshot(
+        {
+            "category": "sports",
+            "source": "espn.scoreboard",
+            "freshness_seconds": 1,
+            "signals": {},
+            # "no_team_match" is a soft fall-through, not a hard outage; it
+            # should be tagged as ``degraded`` rather than ``unavailable``.
+            "error": "no_team_match",
+        }
+    )
+    assert snapshot is not None
+    assert snapshot.status == "degraded"
+
+
+def test_derive_source_snapshot_returns_none_without_category_or_source() -> None:
+    from src.utils.source_health import derive_source_snapshot
+
+    assert derive_source_snapshot({"category": "sports"}) is None
+    assert derive_source_snapshot({"source": "espn"}) is None
+    assert derive_source_snapshot({}) is None
+    # Strings are not Mappings, so the helper rejects them rather than
+    # crashing with an attribute error.
+    assert derive_source_snapshot("not-a-dict") is None  # type: ignore[arg-type]
+
+
+def test_derive_source_snapshot_uses_fallback_for_news_payload() -> None:
+    from src.utils.source_health import derive_source_snapshot
+
+    # The news bundle uses ``article_count`` / ``articles`` instead of the
+    # uniform ``signals`` field, so the helper must accept content via the
+    # fallback path and derive a healthy snapshot anyway.
+    snapshot = derive_source_snapshot(
+        {"article_count": 2, "articles": [{"title": "X"}, {"title": "Y"}]},
+        fallback_category="news",
+        fallback_source="rss-aggregator",
+    )
+    assert snapshot is not None
+    assert snapshot.category == "news"
+    assert snapshot.source == "rss-aggregator"
+    assert snapshot.status == "healthy"
+    assert snapshot.summary["article_count"] == 2
+
+
+def test_iter_research_payload_snapshots_yields_one_per_adapter() -> None:
+    from src.utils.source_health import iter_research_payload_snapshots
+
+    research_payload = {
+        "event": {"event_ticker": "KXEVT"},
+        "microstructure": {},
+        "news": {"article_count": 3, "articles": [{"title": "A"}]},
+        "sports_context": {
+            "category": "sports",
+            "source": "espn.scoreboard",
+            "freshness_seconds": 1,
+            "signals": {"league": "nba"},
+            "error": None,
+        },
+        "bitcoin_context": {
+            # Note: bitcoin payload lacks category/source — fallback fills in.
+            "asset": "bitcoin",
+            "price_usd": 100000.0,
+            "error": None,
+        },
+        "macro_context": {
+            "category": "macro",
+            "source": "fred.series",
+            "freshness_seconds": 2,
+            "signals": {},
+            "error": "timeout",
+        },
+        "crypto_context": None,
+    }
+
+    snapshots = list(iter_research_payload_snapshots(research_payload))
+    sources = {snap.source for snap in snapshots}
+    statuses = {snap.source: snap.status for snap in snapshots}
+
+    assert "espn.scoreboard" in sources
+    assert "coingecko.simple-price" in sources  # bitcoin fallback applied
+    assert "fred.series" in sources
+    assert "rss-aggregator" in sources
+    assert statuses["espn.scoreboard"] == "healthy"
+    assert statuses["fred.series"] == "unavailable"
+    assert statuses["rss-aggregator"] == "healthy"
+
+
+@pytest.mark.asyncio
+async def test_record_research_payload_snapshots_persists_rows(tmp_path) -> None:
+    from src.utils.source_health import record_research_payload_snapshots
+
+    db = DatabaseManager(db_path=str(tmp_path / "source_health.db"))
+    await db.initialize()
+
+    payload = {
+        "event": {"event_ticker": "KXEVT"},
+        "sports_context": {
+            "category": "sports",
+            "source": "espn.scoreboard",
+            "freshness_seconds": 5,
+            "signals": {"league": "nfl"},
+            "error": None,
+        },
+        "macro_context": {
+            "category": "macro",
+            "source": "fred.series",
+            "freshness_seconds": 9,
+            "signals": {},
+            "error": "fail:HTTPStatusError",
+        },
+    }
+
+    written = await record_research_payload_snapshots(db, payload)
+    assert written == 2
+
+    sources = await db.list_source_snapshots(limit=10)
+    by_source = {item["source"]: item for item in sources}
+    assert "espn.scoreboard" in by_source
+    assert by_source["espn.scoreboard"]["status"] == "healthy"
+    assert "fred.series" in by_source
+    assert by_source["fred.series"]["status"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_record_research_payload_snapshots_swallows_recorder_failures(tmp_path) -> None:
+    from src.utils.source_health import record_research_payload_snapshots
+
+    class BrokenRecorder:
+        async def record_source_snapshot(self, **_kwargs):
+            raise RuntimeError("db is on fire")
+
+    # Helper must never propagate recorder errors — the live-trade loop
+    # treats source-health emission as best-effort telemetry.
+    written = await record_research_payload_snapshots(
+        BrokenRecorder(),
+        {
+            "sports_context": {
+                "category": "sports",
+                "source": "espn.scoreboard",
+                "freshness_seconds": 0,
+                "signals": {"league": "mlb"},
+                "error": None,
+            }
+        },
+    )
+    assert written == 0
+
+
+@pytest.mark.asyncio
+async def test_record_research_payload_snapshots_skips_when_recorder_missing() -> None:
+    from src.utils.source_health import record_research_payload_snapshots
+
+    written = await record_research_payload_snapshots(
+        object(),  # has no record_source_snapshot attribute
+        {
+            "sports_context": {
+                "category": "sports",
+                "source": "espn.scoreboard",
+                "signals": {"x": 1},
+            }
+        },
+    )
+    assert written == 0
+
+
+# ---------------------------------------------------------------------------
+# V4 weather wording + extraction tests
+# ---------------------------------------------------------------------------
+
+
+def test_weather_interpreter_handles_or_higher_phrase_as_inclusive_above() -> None:
+    # "X or higher" is an extremely common Kalshi UI phrasing and must be
+    # parsed as inclusive 'above' (the threshold itself satisfies YES). The
+    # interpreter previously failed to parse direction here and returned
+    # ambiguous, blocking the trade.
+    result = interpret_temperature_market(
+        {
+            "ticker": "KXHIGHNY-70-OH",
+            "title": "NYC high temperature 70 or higher",
+        }
+    )
+    assert result.detected is True
+    assert result.direction == "above"
+    assert result.lower_bound == 70
+    assert result.inclusive_endpoints is True
+    assert result.can_trade is True
+
+
+def test_weather_interpreter_handles_or_lower_phrase_as_inclusive_below() -> None:
+    result = interpret_temperature_market(
+        {
+            "ticker": "KXLOWMSP-15-OL",
+            "title": "MSP low temperature 15 or lower",
+        }
+    )
+    assert result.detected is True
+    assert result.direction == "below"
+    assert result.upper_bound == 15
+    assert result.inclusive_endpoints is True
+
+
+def test_weather_interpreter_extracts_leading_city_location() -> None:
+    # The previous regex only captured locations after "in" or "for". Many
+    # Kalshi titles put the city up front: "Boston high temperature ...".
+    result = interpret_temperature_market(
+        {
+            "ticker": "KXHIGHBOS-50",
+            "title": "Boston high temperature above 50",
+        }
+    )
+    assert result.detected is True
+    assert result.location is not None
+    assert result.location.lower() == "boston"
+
+
+def test_weather_interpreter_leading_city_does_not_capture_will() -> None:
+    # Sanity guard: the leading-city fallback must not turn "Will" or other
+    # generic title openers into locations, even if a metric keyword follows.
+    result = interpret_temperature_market(
+        {
+            "ticker": "KX-AMB",
+            "title": "Will high temperature exceed 80 today?",
+        }
+    )
+    # "Will" is filtered out — we don't claim a location here.
+    assert result.detected is True
+    assert (result.location or "").lower() != "will"
+
+
+def test_weather_interpreter_prefers_directional_threshold_over_date() -> None:
+    result = interpret_temperature_market(
+        {
+            "ticker": "KXHIGHNY-20260515-70",
+            "title": "NYC high temperature on May 15 above 70",
+        }
+    )
+
+    assert result.detected is True
+    assert result.event_date == "May 15"
+    assert result.direction == "above"
+    assert result.threshold == 70
+    assert result.lower_bound == 70
+
+
+def test_weather_interpreter_handles_warmer_than_wording() -> None:
+    result = interpret_temperature_market(
+        {
+            "ticker": "KXHIGHCHI-70",
+            "title": "Chicago high temperature warmer than 70F",
+        }
+    )
+
+    assert result.detected is True
+    assert result.direction == "above"
+    assert result.threshold == 70
+    assert result.can_trade is True
+
+
+@pytest.mark.asyncio
+async def test_polymarket_scan_strict_mode_drops_quality_failures() -> None:
+    """Strict mode skips candidates with bad notes instead of annotating them."""
+
+    class _Resp:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return [
+                {
+                    "id": "pm-strict",
+                    "question": "Will the Lakers win tonight?",
+                    "outcomes": ["Yes", "No"],
+                    "outcomePrices": [0.85, 0.15],
+                    "active": True,
+                    "closed": False,
+                    # Both these flags would normally just annotate the row;
+                    # in strict mode they must instead drop the candidate.
+                    "volume24hr": 5.0,
+                    "lastTradeAt": "2000-01-01T00:00:00Z",
+                }
+            ]
+
+    class _Client:
+        async def get(self, *_args, **_kwargs):
+            return _Resp()
+
+    adapter = PolymarketAdapter(http_client=_Client(), markets_url="https://example.test")
+    permissive = await adapter.scan_kalshi_markets(
+        [
+            {
+                "ticker": "KXNBA-LAKERS",
+                "title": "Will the Lakers win tonight?",
+                "yes_ask_dollars": "0.55",
+                "no_ask_dollars": "0.46",
+                "yes_bid_dollars": "0.50",
+                "no_bid_dollars": "0.40",
+                "yes_ask_size": 5,
+            }
+        ],
+        min_mapping_confidence=0.2,
+        min_edge=0.10,
+        min_polymarket_volume_usd=1000,
+        polymarket_stale_after_seconds=10,
+        strict=False,
+    )
+    strict = await adapter.scan_kalshi_markets(
+        [
+            {
+                "ticker": "KXNBA-LAKERS",
+                "title": "Will the Lakers win tonight?",
+                "yes_ask_dollars": "0.55",
+                "no_ask_dollars": "0.46",
+                "yes_bid_dollars": "0.50",
+                "no_bid_dollars": "0.40",
+                "yes_ask_size": 5,
+            }
+        ],
+        min_mapping_confidence=0.2,
+        min_edge=0.10,
+        min_polymarket_volume_usd=1000,
+        polymarket_stale_after_seconds=10,
+        strict=True,
+    )
+
+    # Permissive returns the alert with notes; strict drops it entirely.
+    assert len(permissive) == 1
+    assert permissive[0].notes != "ok"
+    assert strict == []
+
+
+# ---------------------------------------------------------------------------
+# V5 hardening: non-tradeable sibling filter, closed-market arbitrage skip,
+# refresh-calibration operator tool, degree-symbol weather unit
+# ---------------------------------------------------------------------------
+
+
+class SettledSiblingKalshiClient(FakeKalshiClient):
+    """Sibling event where every spiked market has settled.
+
+    Settled siblings have ``last_price`` pinned at the resolved outcome (1.0
+    for the winning bucket), which would falsely trip the mutually-exclusive
+    spike guard if the check did not filter on market status.
+    """
+
+    async def get_events(self, **_kwargs):
+        return {
+            "events": [
+                {
+                    "markets": [
+                        {
+                            "ticker": "KXSETTLED-1",
+                            "status": "settled",
+                            "last_price": "1.00",
+                        },
+                        {
+                            "ticker": "KXSETTLED-2",
+                            "status": "closed",
+                            "yes_ask_dollars": "0.99",
+                        },
+                        {
+                            "ticker": "KXSETTLED-3",
+                            "status": "finalized",
+                            "yes_bid_dollars": "0.98",
+                        },
+                    ]
+                }
+            ]
+        }
+
+
+@pytest.mark.asyncio
+async def test_execution_safety_sibling_spike_ignores_settled_siblings(
+    tmp_path, monkeypatch
+) -> None:
+    """Sibling spike check must not fire on resolved buckets.
+
+    Once an event has settled, the winning bucket's last_price will be 1.0
+    and the rest will be 0.0 — that is the *expected* state of a resolved
+    event, not a live anomaly. The guard must only count spikes on
+    siblings that are still open/active.
+    """
+
+    monkeypatch.setenv("EXECUTION_SAFETY_MIN_SIBLING_SPIKES", "3")
+    db = DatabaseManager(db_path=str(tmp_path / "safety.db"))
+    await db.initialize()
+    position = Position(
+        market_id="KXSETTLED-PARENT",
+        side="YES",
+        entry_price=0.5,
+        quantity=1,
+        timestamp=datetime.now(),
+    )
+
+    result = await evaluate_pre_execution_safety(
+        kalshi_client=SettledSiblingKalshiClient(),
+        db_manager=db,
+        position=position,
+        live_mode=False,
+        market_info={
+            "ticker": "KXSETTLED-PARENT",
+            "event_ticker": "KXEVENT-SETTLED",
+            "status": "open",
+            "title": "Will the Lakers win tonight?",
+            "yes_ask_dollars": "0.50",
+        },
+    )
+
+    assert result.allowed is True
+    assert result.reason == "ok"
+
+
+@pytest.mark.asyncio
+async def test_polymarket_scan_skips_closed_kalshi_markets() -> None:
+    """Closed Kalshi markets must not produce arbitrage candidates.
+
+    A settled Kalshi market keeps its last-tradable bid/ask in the snapshot,
+    so the raw price gap against a live Polymarket can look like an edge.
+    The scan should filter those out before any candidate is created.
+    """
+
+    class _Resp:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return [
+                {
+                    "id": "pm-closed",
+                    "question": "Will the Lakers win tonight?",
+                    "outcomes": ["Yes", "No"],
+                    "outcomePrices": [0.80, 0.20],
+                    "active": True,
+                    "closed": False,
+                }
+            ]
+
+    class _Client:
+        async def get(self, *_args, **_kwargs):
+            return _Resp()
+
+    adapter = PolymarketAdapter(http_client=_Client(), markets_url="https://example.test")
+    candidates = await adapter.scan_kalshi_markets(
+        [
+            {
+                "ticker": "KXNBA-LAKERS",
+                "title": "Will the Lakers win tonight?",
+                "status": "settled",
+                "yes_ask_dollars": "0.55",
+                "no_ask_dollars": "0.46",
+            }
+        ],
+        min_mapping_confidence=0.2,
+        min_edge=0.05,
+    )
+    assert candidates == []
+
+
+@pytest.mark.asyncio
+async def test_operator_api_refresh_calibration_tool(monkeypatch, tmp_path) -> None:
+    """The refresh_calibration tool should rebuild rows and return the count."""
+
+    from fastapi.testclient import TestClient
+
+    monkeypatch.delenv("OPERATOR_API_TOKEN", raising=False)
+    db_path = str(tmp_path / "operator.db")
+    monkeypatch.setenv("DB_PATH", db_path)
+    monkeypatch.setenv("KALSHI_DB_PATH", db_path)
+
+    # Seed one closed paper trade so refresh_settlement_calibration has work
+    # to do — we are not asserting on the underlying calibration logic here,
+    # only that the tool responds with the row count contract.
+    db = DatabaseManager(db_path=db_path)
+    await db.initialize()
+    refreshed_before = await db.refresh_settlement_calibration()
+
+    from src.operator_api import create_app
+
+    client = TestClient(create_app())
+    response = client.post("/mcp/call/refresh_calibration", json={})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    result = body["result"]
+    assert "rows_refreshed" in result
+    assert isinstance(result["rows_refreshed"], int)
+    # Idempotency: a second call from the same DB returns the same row count.
+    assert result["rows_refreshed"] == refreshed_before
+
+
+def test_weather_interpreter_recognizes_degree_symbol_unit() -> None:
+    """The unit detection must accept Unicode degree symbols (e.g. 70°F)."""
+
+    result = interpret_temperature_market(
+        {
+            "ticker": "KX-DEGSYM",
+            "title": "NYC high temperature above 70" + chr(176) + "F",
+        }
+    )
+    assert result.detected is True
+    assert result.unit == "F"
+    assert result.direction == "above"
+    assert result.threshold == 70

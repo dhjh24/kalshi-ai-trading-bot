@@ -124,13 +124,43 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
 
 
+_SIGNED_NUMBER_PATTERN = r"((?<![\w])-?\d{1,3}(?:\.5)?)"
+
+
 def _extract_threshold(market: Mapping[str, Any], text: str) -> Optional[float]:
     for key in ("threshold", "strike", "strike_price", "cap_strike", "floor_strike"):
         parsed = _safe_float(market.get(key))
         if parsed is not None:
             return parsed
 
-    matches = re.findall(r"(?<!\d)(\d{1,3}(?:\.5)?)(?!\d)", text)
+    directional_patterns = (
+        r"\b(?:below|under|less than|lower than|at or below|no (?:higher|greater) than|"
+        r"not (?:above|over|exceed|exceeding)|at most|max(?:imum)? of|"
+        r"do(?:es)? not exceed|cooler than|colder than)\s+"
+        + _SIGNED_NUMBER_PATTERN,
+        r"\b(?:above|over|greater than|higher than|at least|at or above|"
+        r"not (?:below|under)|no (?:lower|less) than|min(?:imum)? of|exceed|exceeds|"
+        r"exceeding|warmer than|hotter than)\s+"
+        + _SIGNED_NUMBER_PATTERN,
+        _SIGNED_NUMBER_PATTERN
+        + r"\s*(?:degrees?\s*[cf]?|deg\.?\s*[cf]?|"
+        r"(?:°)?\s*[cf]|inches|inch|in\.|mph|%)?\s*"
+        r"(?:or (?:higher|lower|above|below|warmer|cooler|colder|hotter))\b",
+    )
+    for pattern in directional_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if not match:
+            continue
+        try:
+            return float(match.group(1))
+        except (TypeError, ValueError):
+            continue
+
+    # Match optional negative sign so cold-weather contracts ("below -5F")
+    # don't fall back to picking up the next absolute integer in the text.
+    # The lookbehind also rejects `\w` so hyphens that are part of identifiers
+    # (e.g. tickers like KXHIGHNY-70) aren't read as negative signs.
+    matches = re.findall(r"(?<![\d.\w])(-?\d{1,3}(?:\.5)?)(?![\d.])", text)
     half_point_values = [float(match) for match in matches if match.endswith(".5")]
     if half_point_values:
         return half_point_values[0]
@@ -141,16 +171,19 @@ def _extract_threshold(market: Mapping[str, Any], text: str) -> Optional[float]:
 
 def _extract_range(text: str) -> Optional[tuple[float, float]]:
     patterns = (
-        r"\bbetween\s+(\d{1,3}(?:\.5)?)\s+(?:and|to|through|-)\s+(\d{1,3}(?:\.5)?)\b",
-        r"\bfrom\s+(\d{1,3}(?:\.5)?)\s+(?:to|through|-)\s+(\d{1,3}(?:\.5)?)\b",
-        r"(?<!\d)(\d{1,3}(?:\.5)?)\s*(?:-|to|through)\s*(\d{1,3}(?:\.5)?)(?!\d)",
+        r"\bbetween\s+" + _SIGNED_NUMBER_PATTERN + r"\s+(?:and|to|through|-)\s+" + _SIGNED_NUMBER_PATTERN + r"\b",
+        r"\bfrom\s+" + _SIGNED_NUMBER_PATTERN + r"\s+(?:to|through|-)\s+" + _SIGNED_NUMBER_PATTERN + r"\b",
+        r"(?<![\d.])" + _SIGNED_NUMBER_PATTERN + r"\s*(?:to|through)\s*" + _SIGNED_NUMBER_PATTERN + r"(?![\d.])",
     )
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if not match:
             continue
-        lower = float(match.group(1))
-        upper = float(match.group(2))
+        try:
+            lower = float(match.group(1))
+            upper = float(match.group(2))
+        except (TypeError, ValueError):
+            continue
         if lower > upper:
             lower, upper = upper, lower
         if lower == upper:
@@ -164,14 +197,14 @@ def _infer_direction(text: str) -> str:
     if re.search(
         r"\b(below|under|less than|lower than|at or below|no (?:higher|greater) than|"
         r"not (?:above|over|exceed|exceeding)|at most|max(?:imum)? of|"
-        r"do(?:es)? not exceed)\b",
+        r"do(?:es)? not exceed|cooler than|colder than|or (?:lower|below|colder|cooler))\b",
         normalized,
     ):
         return "below"
     if re.search(
         r"\b(above|over|greater than|higher than|at least|at or above|"
         r"not (?:below|under)|no (?:lower|less) than|min(?:imum)? of|exceed|exceeds|"
-        r"exceeding)\b",
+        r"exceeding|warmer than|hotter than|or (?:higher|above|warmer|hotter))\b",
         normalized,
     ):
         return "above"
@@ -182,7 +215,14 @@ def _infer_direction(text: str) -> str:
 
 def _infer_inclusive_endpoints(text: str) -> Optional[bool]:
     normalized = text.lower()
-    if re.search(r"\binclusive\b|\binclusively\b|\binclusive of\b|\bat or (above|below)\b", normalized):
+    # "X or higher" / "X or lower" / "at or above" all imply inclusive endpoints
+    # because the threshold value itself satisfies the bucket.
+    if re.search(
+        r"\binclusive\b|\binclusively\b|\binclusive of\b|"
+        r"\bat or (above|below)\b|"
+        r"\bor (?:higher|lower|above|below|warmer|cooler|colder|hotter)\b",
+        normalized,
+    ):
         return True
     if re.search(r"\bexclusive\b|\bexclusively\b|\bnot inclusive\b", normalized):
         return False
@@ -198,6 +238,15 @@ def _extract_temperature_kind(text: str) -> Optional[str]:
     return None
 
 
+_LEADING_CITY_PATTERN = re.compile(
+    r"^\s*([A-Z][A-Za-z]{1,3}|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s+"
+    r"(?=(?:high|low|maximum|minimum|max|min|temperature|temp|rainfall|snowfall|"
+    r"precipitation|wind|gust|humidity|heat))",
+    # Capitalization is meaningful here — IGNORECASE would let "boston high"
+    # be captured as the location group ("boston high").
+)
+
+
 def _extract_location(market: Mapping[str, Any], text: str) -> Optional[str]:
     for key in ("city", "location", "weather_location"):
         value = market.get(key)
@@ -205,6 +254,7 @@ def _extract_location(market: Mapping[str, Any], text: str) -> Optional[str]:
             return str(value).strip()
 
     title = str(market.get("title") or "")
+    # Kalshi titles often use "in X" or "for X" phrasing — preferred when present.
     match = re.search(
         r"\b(?:in|for)\s+([A-Za-z][A-Za-z .'-]{1,48}?)(?:\s+(?:on|high|low|temperature|temp|rainfall|snowfall)|[?.:,]|$)",
         title,
@@ -212,6 +262,16 @@ def _extract_location(market: Mapping[str, Any], text: str) -> Optional[str]:
     )
     if match:
         return " ".join(match.group(1).split())
+
+    # Fallback: leading city tokens like "NYC high temperature ..." or
+    # "Boston low temperature ...". The lookahead requires a metric keyword
+    # next so we don't pick up generic words. Kept conservative to avoid
+    # mistaking "Will the ..." as a location.
+    leading = _LEADING_CITY_PATTERN.match(title)
+    if leading:
+        candidate = leading.group(1).strip()
+        if candidate.lower() not in {"will", "the", "a", "an"}:
+            return " ".join(candidate.split())
     return None
 
 

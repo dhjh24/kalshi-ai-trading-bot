@@ -3,7 +3,8 @@ import { Badge, EmptyState, Panel, StatCard } from "../../components/ui";
 import {
   DashboardApiError,
   getSafety,
-  isNextDynamicServerUsageError
+  isNextDynamicServerUsageError,
+  type SafetyQuery
 } from "../../lib/api";
 import { formatMoney, formatPercent, formatTimestamp } from "../../lib/format";
 import type { CalibrationBucket, SafetyPayload } from "../../lib/types";
@@ -26,6 +27,7 @@ const EMPTY_SAFETY: SafetyPayload = {
     ece: 0,
     byStrategy: [],
     byCategory: [],
+    byModel: [],
     buckets: []
   }
 };
@@ -39,9 +41,11 @@ function summarizeError(error: unknown): string {
   return "Safety data could not be loaded.";
 }
 
-async function loadSafety(): Promise<{ safety: SafetyPayload; error: string | null }> {
+async function loadSafety(
+  query: SafetyQuery
+): Promise<{ safety: SafetyPayload; error: string | null }> {
   try {
-    return { safety: await getSafety(), error: null };
+    return { safety: await getSafety(query), error: null };
   } catch (error) {
     if (isNextDynamicServerUsageError(error)) {
       throw error;
@@ -49,6 +53,192 @@ async function loadSafety(): Promise<{ safety: SafetyPayload; error: string | nu
     console.error("Failed to load safety payload", error);
     return { safety: EMPTY_SAFETY, error: summarizeError(error) };
   }
+}
+
+const ARB_SORTS: ReadonlyArray<{
+  value: NonNullable<SafetyQuery["arbitrageSortBy"]>;
+  label: string;
+}> = [
+  { value: "net_edge", label: "Net edge" },
+  { value: "estimated_edge", label: "Gross edge" },
+  { value: "mapping_confidence", label: "Mapping" },
+  { value: "scanned_at", label: "Recency" }
+];
+
+const ARB_SIDES: ReadonlyArray<{
+  value: "" | "YES" | "NO";
+  label: string;
+}> = [
+  { value: "", label: "Both" },
+  { value: "YES", label: "YES only" },
+  { value: "NO", label: "NO only" }
+];
+
+const ARB_MIN_NET_EDGES: ReadonlyArray<{
+  value: number | null;
+  label: string;
+}> = [
+  { value: null, label: "Any net edge" },
+  { value: 0.02, label: "Net >= 2%" },
+  { value: 0.05, label: "Net >= 5%" },
+  { value: 0.1, label: "Net >= 10%" }
+];
+
+const SOURCE_STATUS_CHIPS: ReadonlyArray<{
+  value: string | null;
+  label: string;
+}> = [
+  { value: null, label: "Any status" },
+  { value: "healthy", label: "Healthy" },
+  { value: "degraded", label: "Degraded" },
+  { value: "unavailable", label: "Unavailable" }
+];
+
+const SOURCE_CATEGORY_CHIPS: ReadonlyArray<{
+  value: string;
+  label: string;
+}> = [
+  { value: "kalshi", label: "Kalshi" },
+  { value: "weather", label: "Weather" },
+  { value: "sports", label: "Sports" },
+  { value: "crypto", label: "Crypto" },
+  { value: "macro", label: "Macro" },
+  { value: "news", label: "News" },
+  { value: "cross_market", label: "Cross-Market" }
+];
+
+function parseStringParam(value: string | string[] | undefined): string | undefined {
+  if (Array.isArray(value)) {
+    return value[0];
+  }
+  return value;
+}
+
+function parseFloatParam(value: string | string[] | undefined): number | undefined {
+  const raw = parseStringParam(value);
+  if (raw === undefined || raw.trim() === "") {
+    return undefined;
+  }
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function parseStringListParam(value: string | string[] | undefined): string[] | undefined {
+  const raw = parseStringParam(value);
+  if (raw === undefined || raw.trim() === "") {
+    return undefined;
+  }
+  const items = Array.from(
+    new Set(
+      raw
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter((entry) => entry.length > 0)
+    )
+  );
+  return items.length > 0 ? items : undefined;
+}
+
+function parseSafetyQuery(
+  searchParams: Record<string, string | string[] | undefined> | undefined
+): SafetyQuery {
+  const sp = searchParams ?? {};
+  const sideRaw = parseStringParam(sp.arbitrageSide);
+  const sortRaw = parseStringParam(sp.arbitrageSortBy);
+  const sourceStatusRaw = parseStringParam(sp.sourceStatus);
+  const side = sideRaw === "YES" || sideRaw === "NO" ? sideRaw : undefined;
+  const sortBy =
+    sortRaw === "net_edge" ||
+    sortRaw === "estimated_edge" ||
+    sortRaw === "scanned_at" ||
+    sortRaw === "mapping_confidence"
+      ? sortRaw
+      : undefined;
+  const allowedSourceStatuses = new Set(["healthy", "degraded", "unavailable"]);
+  const sourceStatus =
+    sourceStatusRaw && allowedSourceStatuses.has(sourceStatusRaw.toLowerCase())
+      ? sourceStatusRaw.toLowerCase()
+      : undefined;
+  const sourceCategories = parseStringListParam(sp.sourceCategories);
+  return {
+    arbitrageSide: side,
+    arbitrageMinNetEdge: parseFloatParam(sp.arbitrageMinNetEdge),
+    arbitrageMinMappingConfidence: parseFloatParam(sp.arbitrageMinMappingConfidence),
+    arbitrageSortBy: sortBy,
+    sourceStatus,
+    sourceCategories
+  };
+}
+
+function buildHref(
+  current: SafetyQuery,
+  override: Partial<SafetyQuery> & { clear?: Array<keyof SafetyQuery> }
+): string {
+  const merged: Record<string, string> = {};
+  const { clear = [], ...patch } = override;
+  const next: SafetyQuery = { ...current, ...patch };
+  for (const key of clear) {
+    delete (next as Record<string, unknown>)[key];
+  }
+  if (next.arbitrageSide) {
+    merged.arbitrageSide = next.arbitrageSide;
+  }
+  if (typeof next.arbitrageMinNetEdge === "number") {
+    merged.arbitrageMinNetEdge = String(next.arbitrageMinNetEdge);
+  }
+  if (typeof next.arbitrageMinMappingConfidence === "number") {
+    merged.arbitrageMinMappingConfidence = String(next.arbitrageMinMappingConfidence);
+  }
+  if (next.arbitrageSortBy) {
+    merged.arbitrageSortBy = next.arbitrageSortBy;
+  }
+  if (next.sourceStatus) {
+    merged.sourceStatus = next.sourceStatus;
+  }
+  if (next.sourceCategories && next.sourceCategories.length > 0) {
+    merged.sourceCategories = next.sourceCategories.join(",");
+  }
+  const params = new URLSearchParams(merged);
+  const qs = params.toString();
+  return qs ? `/safety?${qs}` : "/safety";
+}
+
+function toggleCategory(current: string[] | undefined, value: string): string[] {
+  const set = new Set(current ?? []);
+  if (set.has(value)) {
+    set.delete(value);
+  } else {
+    set.add(value);
+  }
+  return Array.from(set);
+}
+
+function FilterChip({
+  href,
+  active,
+  label
+}: {
+  href: string;
+  active: boolean;
+  label: string;
+}) {
+  // Hard-link chips so the page stays a Server Component (no client JS just
+  // for filter state). Each click hits the route again with the new query.
+  return (
+    <Link
+      href={href}
+      prefetch={false}
+      aria-pressed={active}
+      className={[
+        "rounded-full border px-3 py-1 text-xs font-semibold transition",
+        active
+          ? "border-signal bg-signal/10 text-signal"
+          : "border-slate-200 bg-white text-slate-600 hover:border-signal hover:text-signal"
+      ].join(" ")}
+    >
+      {label}
+    </Link>
+  );
 }
 
 function percentValue(value: number | null): string {
@@ -123,7 +313,7 @@ function CalibrationBucketsChart({ buckets }: { buckets: CalibrationBucket[] }) 
             </div>
             <span className="text-right text-xs text-slate-500">
               {empty
-                ? "—"
+                ? "-"
                 : `${bucket.count} | gap ${formatPercent(bucket.absGap * 100, 1)}`}
             </span>
           </div>
@@ -133,8 +323,14 @@ function CalibrationBucketsChart({ buckets }: { buckets: CalibrationBucket[] }) 
   );
 }
 
-export default async function SafetyPage() {
-  const { safety, error } = await loadSafety();
+export default async function SafetyPage({
+  searchParams
+}: {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
+  const params = await searchParams;
+  const query = parseSafetyQuery(params);
+  const { safety, error } = await loadSafety(query);
   const sourceHealth = safety.sourceHealth ?? [];
   const arbitrage = safety.arbitrage ?? [];
   const calibration = {
@@ -145,6 +341,7 @@ export default async function SafetyPage() {
     ece: safety.calibration?.ece ?? 0,
     byStrategy: safety.calibration?.byStrategy ?? [],
     byCategory: safety.calibration?.byCategory ?? [],
+    byModel: safety.calibration?.byModel ?? [],
     buckets: safety.calibration?.buckets ?? []
   };
 
@@ -219,11 +416,56 @@ export default async function SafetyPage() {
       </div>
 
       <Panel eyebrow="Source Health" title="Latest external data snapshots">
+        <div className="mb-5 space-y-3">
+          <div className="flex flex-wrap items-center gap-2">
+            {SOURCE_STATUS_CHIPS.map((option) => {
+              const active = (query.sourceStatus ?? null) === option.value;
+              return (
+                <FilterChip
+                  key={option.value ?? "any-status"}
+                  href={
+                    option.value
+                      ? buildHref(query, { sourceStatus: option.value })
+                      : buildHref(query, { clear: ["sourceStatus"] })
+                  }
+                  active={active}
+                  label={option.label}
+                />
+              );
+            })}
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            {SOURCE_CATEGORY_CHIPS.map((option) => {
+              const selected = query.sourceCategories ?? [];
+              const active = selected.includes(option.value);
+              const next = toggleCategory(selected, option.value);
+              return (
+                <FilterChip
+                  key={option.value}
+                  href={
+                    next.length === 0
+                      ? buildHref(query, { clear: ["sourceCategories"] })
+                      : buildHref(query, { sourceCategories: next })
+                  }
+                  active={active}
+                  label={option.label}
+                />
+              );
+            })}
+          </div>
+        </div>
         {sourceHealth.length === 0 ? (
-          <EmptyState
-            title="No source-health snapshots yet"
-            body="Adapters record Kalshi, Polymarket, weather, sports, crypto, and macro checks here as they run."
-          />
+          (query.sourceStatus || (query.sourceCategories && query.sourceCategories.length > 0)) ? (
+            <EmptyState
+              title="No source snapshots match the current filters"
+              body="Loosen the status or category filters above to see all recorded adapter checks."
+            />
+          ) : (
+            <EmptyState
+              title="No source-health snapshots yet"
+              body="Adapters record Kalshi, Polymarket, weather, sports, crypto, and macro checks here as they run."
+            />
+          )
         ) : (
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
             {sourceHealth.map((item) => (
@@ -284,11 +526,58 @@ export default async function SafetyPage() {
       </Panel>
 
       <Panel eyebrow="Arbitrage Watchlist" title="Kalshi vs Polymarket alerts">
+        <div className="mb-5 space-y-3">
+          <div className="flex flex-wrap items-center gap-2">
+            {ARB_SORTS.map((option) => (
+              <FilterChip
+                key={option.value}
+                href={buildHref(query, { arbitrageSortBy: option.value })}
+                active={(query.arbitrageSortBy ?? "net_edge") === option.value}
+                label={option.label}
+              />
+            ))}
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            {ARB_SIDES.map((option) => (
+              <FilterChip
+                key={option.value || "both"}
+                href={
+                  option.value
+                    ? buildHref(query, { arbitrageSide: option.value })
+                    : buildHref(query, { clear: ["arbitrageSide"] })
+                }
+                active={(query.arbitrageSide ?? "") === option.value}
+                label={option.label}
+              />
+            ))}
+            {ARB_MIN_NET_EDGES.map((option) => (
+              <FilterChip
+                key={option.value ?? "any-net-edge"}
+                href={
+                  typeof option.value === "number"
+                    ? buildHref(query, { arbitrageMinNetEdge: option.value })
+                    : buildHref(query, { clear: ["arbitrageMinNetEdge"] })
+                }
+                active={(query.arbitrageMinNetEdge ?? null) === option.value}
+                label={option.label}
+              />
+            ))}
+          </div>
+        </div>
         {arbitrage.length === 0 ? (
-          <EmptyState
-            title="No alert-only opportunities persisted"
-            body="Run the scan-arb CLI command to populate this watchlist."
-          />
+          query.arbitrageSide ||
+          typeof query.arbitrageMinNetEdge === "number" ||
+          typeof query.arbitrageMinMappingConfidence === "number" ? (
+            <EmptyState
+              title="No arbitrage candidates match the current filters"
+              body="Loosen the side, net-edge, or mapping-confidence filters to see more candidates."
+            />
+          ) : (
+            <EmptyState
+              title="No alert-only opportunities persisted"
+              body="Run the scan-arb CLI command to populate this watchlist."
+            />
+          )
         ) : (
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-2">
             {arbitrage.map((item) => (
@@ -331,6 +620,31 @@ export default async function SafetyPage() {
           rate within that bucket. A perfectly calibrated model lines the tick up at the right edge
           of every bar.
         </p>
+      </Panel>
+
+      <Panel eyebrow="By Model" title="Calibration by LLM model">
+        {calibration.byModel.length === 0 ? (
+          <EmptyState
+            title="No model attribution yet"
+            body="Per-model calibration appears after live-trade decisions populate the model column on closed trades."
+          />
+        ) : (
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {calibration.byModel.map((row) => (
+              <div key={row.model} className="rounded-[20px] border border-slate-100 p-4">
+                <p className="font-semibold text-steel break-words">{row.model}</p>
+                <p className="mt-2 text-sm text-slate-500">
+                  {row.sampleSize} samples | win rate {percentValue(row.winRate)}
+                </p>
+                <p className="mt-1 text-sm text-slate-500">
+                  Brier{" "}
+                  {row.averageBrierScore === null ? "N/A" : row.averageBrierScore.toFixed(3)}{" "}
+                  | EV {formatMoney(row.realizedEv)}
+                </p>
+              </div>
+            ))}
+          </div>
+        )}
       </Panel>
 
       <section className="grid gap-6 lg:grid-cols-2">

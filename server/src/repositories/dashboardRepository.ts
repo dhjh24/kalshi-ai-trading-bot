@@ -2660,6 +2660,9 @@ export function listArbitrageCandidates(
     typeof optionsOrLimit === "number" ? { limit: optionsOrLimit } : optionsOrLimit;
   const limit = Math.max(1, Math.min(options.limit ?? 25, 200));
   const sortBy = options.sortBy ?? "scanned_at";
+  const needsPostFilter =
+    typeof options.minNetEdge === "number" || sortBy === "net_edge";
+  const fetchLimit = needsPostFilter ? 200 : limit;
   const orderClauses: Record<string, string> = {
     net_edge: "estimated_edge DESC, id DESC",
     estimated_edge: "estimated_edge DESC, id DESC",
@@ -2691,7 +2694,7 @@ export function listArbitrageCandidates(
           LIMIT ?
         `
       )
-      .all(...params, limit)
+      .all(...params, fetchLimit)
   );
 
   const items = rows.map((row) => {
@@ -2740,7 +2743,7 @@ export function listArbitrageCandidates(
   } else if (sortBy === "mapping_confidence") {
     filtered = filtered.slice().sort((a, b) => b.mappingConfidence - a.mappingConfidence);
   }
-  return filtered;
+  return filtered.slice(0, limit);
 }
 
 export interface ListSourceHealthOptions {
@@ -2931,6 +2934,7 @@ export function getCalibrationSummary(): CalibrationSummary {
       ece: 0,
       byStrategy: [],
       byCategory: [],
+      byModel: [],
       buckets: bucketSamples([])
     };
   }
@@ -2990,6 +2994,7 @@ export function getCalibrationSummary(): CalibrationSummary {
   );
 
   const samples = loadCalibrationSamples();
+  const modelRows = loadCalibrationByModel();
 
   return {
     sampleSize: toCount(summary?.sample_size),
@@ -3025,8 +3030,91 @@ export function getCalibrationSummary(): CalibrationSummary {
         row.win_rate === null || row.win_rate === undefined ? null : toNumber(row.win_rate, 4),
       realizedEv: toNumber(row.realized_ev, 2)
     })),
+    byModel: modelRows,
     buckets: bucketSamples(samples)
   };
+}
+
+interface CalibrationByModelRow {
+  model: string;
+  sampleSize: number;
+  averageBrierScore: number | null;
+  winRate: number | null;
+  realizedEv: number;
+}
+
+function loadCalibrationByModel(): CalibrationByModelRow[] {
+  if (!tableExists("settlement_calibration")) {
+    return [];
+  }
+  // Model attribution requires both a calibration row and a recorded
+  // live-trade decision so we can join the two on (market_id, strategy).
+  // When live_trade_decisions is missing we just return [] rather than
+  // bucketing every row under "unknown"; the dashboard will render an
+  // empty-state card explaining that no decision history was found.
+  if (!tableExists("live_trade_decisions")) {
+    return [];
+  }
+  try {
+    const rows = rowsAs<SqlRow[]>(
+      db
+        .prepare(
+          `
+            WITH latest_decision AS (
+              SELECT
+                market_ticker,
+                COALESCE(NULLIF(strategy, ''), 'unknown') AS strategy,
+                model,
+                ROW_NUMBER() OVER (
+                  PARTITION BY market_ticker, COALESCE(NULLIF(strategy, ''), 'unknown')
+                  ORDER BY COALESCE(created_at, '') DESC, id DESC
+                ) AS rn
+              FROM live_trade_decisions
+              WHERE market_ticker IS NOT NULL AND model IS NOT NULL AND model <> ''
+            ),
+            calibration_with_model AS (
+              SELECT
+                c.brier_score,
+                c.outcome,
+                COALESCE(c.realized_ev, 0) AS realized_ev,
+                COALESCE(NULLIF(d.model, ''), 'unknown') AS model
+              FROM settlement_calibration c
+              LEFT JOIN latest_decision d
+                ON d.market_ticker = c.market_id
+                AND d.strategy = COALESCE(NULLIF(c.strategy, ''), 'unknown')
+                AND d.rn = 1
+            )
+            SELECT
+              model,
+              COUNT(*) AS sample_size,
+              AVG(brier_score) AS avg_brier,
+              AVG(outcome) AS win_rate,
+              SUM(realized_ev) AS realized_ev
+            FROM calibration_with_model
+            WHERE model <> 'unknown'
+            GROUP BY model
+            ORDER BY sample_size DESC, model ASC
+            LIMIT 12
+          `
+        )
+        .all()
+    );
+    return rows.map((row) => ({
+      model: toNullableText(row.model) ?? "unknown",
+      sampleSize: toCount(row.sample_size),
+      averageBrierScore:
+        row.avg_brier === null || row.avg_brier === undefined
+          ? null
+          : toNumber(row.avg_brier, 4),
+      winRate:
+        row.win_rate === null || row.win_rate === undefined
+          ? null
+          : toNumber(row.win_rate, 4),
+      realizedEv: toNumber(row.realized_ev, 2)
+    }));
+  } catch {
+    return [];
+  }
 }
 
 function getLiveTradeDecisionOrderColumn(columns: Set<string>): string {

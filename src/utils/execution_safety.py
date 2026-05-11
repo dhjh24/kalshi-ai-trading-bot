@@ -465,6 +465,15 @@ async def evaluate_pre_execution_safety(
                 for sibling in markets:
                     if not isinstance(sibling, Mapping):
                         continue
+                    sibling_status = get_market_status(dict(sibling))
+                    # Skip siblings that have explicitly settled or closed —
+                    # their last_price reflects the settled outcome, not a
+                    # live spike, so including them would falsely trip the
+                    # mutually-exclusive guard on resolved events. Siblings
+                    # with no status field are still scanned (conservative
+                    # behavior for partial payloads from upstream APIs).
+                    if sibling_status and not is_active_market_status(sibling_status):
+                        continue
                     yes_bid, yes_ask, _, _ = get_market_prices(dict(sibling))
                     last_yes = get_last_price(dict(sibling), "YES")
                     if max(yes_bid, yes_ask, last_yes) >= spike_threshold:

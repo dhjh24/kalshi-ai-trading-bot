@@ -15,6 +15,23 @@ from src.utils.logging_setup import TradingLoggerMixin
 LLM_USAGE_RECENT_WINDOW_DAYS = 7
 
 
+def _safe_load_json(value: Any) -> Optional[Any]:
+    """Best-effort JSON decode for TEXT columns, returning None on failure."""
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass
 class Market:
     """Represents a market in the database."""
@@ -3517,6 +3534,132 @@ class DatabaseManager(TradingLoggerMixin):
             )
             await db.commit()
             return int(cursor.lastrowid)
+
+    async def list_anomaly_rejections(
+        self, *, limit: int = 25
+    ) -> List[Dict[str, Any]]:
+        """Return the most recent pre-execution rejections (newest first)."""
+        bounded_limit = max(1, min(int(limit or 0) or 25, 200))
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT id, ticker, side, reason, score, details_json, rejected_at
+                FROM anomaly_rejections
+                ORDER BY rejected_at DESC, id DESC
+                LIMIT ?
+                """,
+                (bounded_limit,),
+            )
+            rows = await cursor.fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "ticker": row["ticker"],
+                "side": row["side"],
+                "reason": row["reason"],
+                "score": float(row["score"] or 0.0),
+                "details": _safe_load_json(row["details_json"]),
+                "rejected_at": row["rejected_at"],
+            }
+            for row in rows
+        ]
+
+    async def list_arbitrage_candidates(
+        self, *, limit: int = 25
+    ) -> List[Dict[str, Any]]:
+        """Return the most recent persisted alert-only arbitrage candidates."""
+        bounded_limit = max(1, min(int(limit or 0) or 25, 200))
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT id, kalshi_ticker, polymarket_id, side, kalshi_price,
+                       polymarket_price, estimated_edge, mapping_confidence,
+                       freshness_seconds, execution_mode, payload_json,
+                       scanned_at
+                FROM arbitrage_candidates
+                ORDER BY scanned_at DESC, id DESC
+                LIMIT ?
+                """,
+                (bounded_limit,),
+            )
+            rows = await cursor.fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "kalshi_ticker": row["kalshi_ticker"],
+                "polymarket_id": row["polymarket_id"],
+                "side": row["side"],
+                "kalshi_price": float(row["kalshi_price"] or 0.0),
+                "polymarket_price": float(row["polymarket_price"] or 0.0),
+                "estimated_edge": float(row["estimated_edge"] or 0.0),
+                "mapping_confidence": float(row["mapping_confidence"] or 0.0),
+                "freshness_seconds": int(row["freshness_seconds"] or 0),
+                "execution_mode": row["execution_mode"] or "alert_only",
+                "payload": _safe_load_json(row["payload_json"]),
+                "scanned_at": row["scanned_at"],
+            }
+            for row in rows
+        ]
+
+    async def list_source_snapshots(
+        self, *, limit: int = 24
+    ) -> List[Dict[str, Any]]:
+        """Return the latest snapshot per (category, source), newest first."""
+        bounded_limit = max(1, min(int(limit or 0) or 24, 200))
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT id, category, source, status, freshness_seconds,
+                       payload_json, captured_at
+                FROM source_snapshots
+                WHERE id IN (
+                    SELECT MAX(id) FROM source_snapshots
+                    GROUP BY category, source
+                )
+                ORDER BY captured_at DESC, id DESC
+                LIMIT ?
+                """,
+                (bounded_limit,),
+            )
+            rows = await cursor.fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "category": row["category"],
+                "source": row["source"],
+                "status": row["status"],
+                "freshness_seconds": int(row["freshness_seconds"] or 0),
+                "payload": _safe_load_json(row["payload_json"]),
+                "captured_at": row["captured_at"],
+            }
+            for row in rows
+        ]
+
+    async def get_safety_metric_counts(self) -> Dict[str, int]:
+        """Return rolling 24h counts plus lifetime calibration sample count."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM anomaly_rejections "
+                "WHERE rejected_at >= datetime('now', '-1 day')"
+            )
+            (rejections_24h,) = await cursor.fetchone() or (0,)
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM arbitrage_candidates "
+                "WHERE scanned_at >= datetime('now', '-1 day')"
+            )
+            (arbitrage_24h,) = await cursor.fetchone() or (0,)
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM settlement_calibration"
+            )
+            (calibration_samples,) = await cursor.fetchone() or (0,)
+        return {
+            "rejections_24h": int(rejections_24h or 0),
+            "arbitrage_candidates_24h": int(arbitrage_24h or 0),
+            "calibration_samples": int(calibration_samples or 0),
+        }
 
     async def refresh_settlement_calibration(self) -> int:
         """

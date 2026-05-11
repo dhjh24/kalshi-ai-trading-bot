@@ -59,6 +59,24 @@ class ScanArbitrageRequest(BaseModel):
     polymarket_limit: int = Field(default=100, ge=1, le=500)
     min_edge: float = Field(default=0.03, ge=0.0, le=0.95)
     min_mapping_confidence: float = Field(default=0.28, ge=0.0, le=1.0)
+    strict: bool = Field(default=False)
+
+
+class SafetyStatusRequest(BaseModel):
+    rejection_limit: int = Field(default=20, ge=1, le=100)
+    arbitrage_limit: int = Field(default=20, ge=1, le=100)
+    source_limit: int = Field(default=24, ge=1, le=100)
+
+
+class ListArbitrageCandidatesRequest(BaseModel):
+    limit: int = Field(default=25, ge=1, le=200)
+
+
+class RefreshCalibrationRequest(BaseModel):
+    # No arguments today; the schema is left open so the tool can grow
+    # filters (e.g. by strategy or market category) without a breaking
+    # contract change for existing clients.
+    pass
 
 
 TOOLS: List[Dict[str, Any]] = [
@@ -127,7 +145,8 @@ TOOLS: List[Dict[str, Any]] = [
         "name": "scan_arbitrage",
         "description": (
             "Run an alert-only Kalshi vs Polymarket scan. Returns ranked "
-            "candidates without placing any orders."
+            "candidates without placing any orders. Set strict=true to drop "
+            "candidates that fail any spread/liquidity/staleness guard."
         ),
         "input_schema": {
             "type": "object",
@@ -141,7 +160,82 @@ TOOLS: List[Dict[str, Any]] = [
                     "maximum": 1,
                     "default": 0.28,
                 },
+                "strict": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "When true, candidates that violated a quality guard "
+                        "(stale Polymarket trade, wide Kalshi spread, thin top "
+                        "liquidity, low Polymarket volume) are dropped instead "
+                        "of being annotated with notes."
+                    ),
+                },
             },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "safety_status",
+        "description": (
+            "Return the latest execution-safety snapshot: 24h rejection counts, "
+            "recent anomaly rejections, source-health snapshots per adapter, and "
+            "the recorded arbitrage watchlist. Read-only and inexpensive."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "rejection_limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "default": 20,
+                },
+                "arbitrage_limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "default": 20,
+                },
+                "source_limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "default": 24,
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "list_arbitrage_candidates",
+        "description": (
+            "List previously persisted alert-only Kalshi vs Polymarket "
+            "candidates, newest first. Does not refetch Polymarket."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 200,
+                    "default": 25,
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "refresh_calibration",
+        "description": (
+            "Rebuild settlement-calibration rows from closed trade logs. "
+            "Returns the number of rows refreshed. Safe to run repeatedly; "
+            "the underlying job is idempotent and only refreshes the "
+            "'trade_logs' source partition."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
             "additionalProperties": False,
         },
     },
@@ -273,6 +367,38 @@ async def _explain_market(client: KalshiClient, payload: Mapping[str, Any]) -> D
     }
 
 
+async def _safety_status(
+    db: DatabaseManager, payload: Mapping[str, Any]
+) -> Dict[str, Any]:
+    request = SafetyStatusRequest(**payload)
+    rejections = await db.list_anomaly_rejections(limit=request.rejection_limit)
+    arbitrage = await db.list_arbitrage_candidates(limit=request.arbitrage_limit)
+    sources = await db.list_source_snapshots(limit=request.source_limit)
+    counts = await db.get_safety_metric_counts()
+    return {
+        "metrics": counts,
+        "rejections": rejections,
+        "arbitrage": arbitrage,
+        "source_health": sources,
+    }
+
+
+async def _list_arbitrage_candidates(
+    db: DatabaseManager, payload: Mapping[str, Any]
+) -> Dict[str, Any]:
+    request = ListArbitrageCandidatesRequest(**payload)
+    items = await db.list_arbitrage_candidates(limit=request.limit)
+    return {"candidates": items, "candidate_count": len(items)}
+
+
+async def _refresh_calibration(
+    db: DatabaseManager, payload: Mapping[str, Any]
+) -> Dict[str, Any]:
+    RefreshCalibrationRequest(**payload)
+    rows = await db.refresh_settlement_calibration()
+    return {"rows_refreshed": int(rows)}
+
+
 async def _scan_arbitrage(
     client: KalshiClient, db: DatabaseManager, payload: Mapping[str, Any]
 ) -> Dict[str, Any]:
@@ -290,6 +416,7 @@ async def _scan_arbitrage(
             limit=request.polymarket_limit,
             min_mapping_confidence=request.min_mapping_confidence,
             min_edge=request.min_edge,
+            strict=request.strict,
         )
         recorded = 0
         for candidate in candidates:
@@ -369,6 +496,18 @@ def create_app() -> FastAPI:
             if tool_name == "scan_arbitrage":
                 await db.initialize()
                 return {"ok": True, "result": await _scan_arbitrage(client, db, args)}
+            if tool_name == "safety_status":
+                await db.initialize()
+                return {"ok": True, "result": await _safety_status(db, args)}
+            if tool_name == "list_arbitrage_candidates":
+                await db.initialize()
+                return {
+                    "ok": True,
+                    "result": await _list_arbitrage_candidates(db, args),
+                }
+            if tool_name == "refresh_calibration":
+                await db.initialize()
+                return {"ok": True, "result": await _refresh_calibration(db, args)}
             if tool_name == "place_order":
                 await db.initialize()
                 request = OrderRequest(**args)

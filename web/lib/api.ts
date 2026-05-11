@@ -231,8 +231,44 @@ export async function getOverview() {
   return fetchApi<OverviewPayload>("/api/dashboard/overview");
 }
 
-export async function getSafety() {
-  return fetchApi<SafetyPayload>("/api/safety");
+export interface SafetyQuery {
+  arbitrageSide?: "YES" | "NO";
+  arbitrageMinNetEdge?: number;
+  arbitrageMinMappingConfidence?: number;
+  arbitrageSortBy?: "net_edge" | "estimated_edge" | "scanned_at" | "mapping_confidence";
+  sourceCategories?: string[];
+  sourceStatus?: string;
+}
+
+function buildSafetyQueryString(query: SafetyQuery = {}): string {
+  const params = new URLSearchParams();
+  if (query.arbitrageSide) {
+    params.set("arbitrageSide", query.arbitrageSide);
+  }
+  if (typeof query.arbitrageMinNetEdge === "number" && Number.isFinite(query.arbitrageMinNetEdge)) {
+    params.set("arbitrageMinNetEdge", String(query.arbitrageMinNetEdge));
+  }
+  if (
+    typeof query.arbitrageMinMappingConfidence === "number" &&
+    Number.isFinite(query.arbitrageMinMappingConfidence)
+  ) {
+    params.set("arbitrageMinMappingConfidence", String(query.arbitrageMinMappingConfidence));
+  }
+  if (query.arbitrageSortBy) {
+    params.set("arbitrageSortBy", query.arbitrageSortBy);
+  }
+  if (query.sourceCategories && query.sourceCategories.length > 0) {
+    params.set("sourceCategories", query.sourceCategories.join(","));
+  }
+  if (query.sourceStatus) {
+    params.set("sourceStatus", query.sourceStatus);
+  }
+  const queryString = params.toString();
+  return queryString ? `?${queryString}` : "";
+}
+
+export async function getSafety(query: SafetyQuery = {}) {
+  return fetchApi<SafetyPayload>(`/api/safety${buildSafetyQueryString(query)}`);
 }
 
 export async function getMarkets(queryString = "") {

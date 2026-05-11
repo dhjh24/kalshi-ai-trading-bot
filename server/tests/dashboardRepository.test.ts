@@ -797,6 +797,234 @@ describe("safety repository readers", () => {
       realizedEv: 3.5
     });
   });
+
+  it("applies arbitrage net-edge filters before the returned limit", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "dashboard-repository-"));
+    const databasePath = path.join(tempDir, "dashboard.sqlite");
+    const scriptPath = path.join(tempDir, "safety-arb-filter-check.mjs");
+    const repositoryUrl = pathToFileURL(
+      path.join(serverRoot, "src/repositories/dashboardRepository.ts")
+    ).href;
+    const dbUrl = pathToFileURL(path.join(serverRoot, "src/db.ts")).href;
+    tempDirs.push(tempDir);
+
+    writeFileSync(
+      scriptPath,
+      `
+        import { getDb } from ${JSON.stringify(dbUrl)};
+        import { listArbitrageCandidates } from ${JSON.stringify(repositoryUrl)};
+
+        const db = getDb();
+
+        try {
+          db.exec(\`
+            CREATE TABLE arbitrage_candidates (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              kalshi_ticker TEXT NOT NULL,
+              polymarket_id TEXT NOT NULL,
+              side TEXT NOT NULL,
+              kalshi_price REAL NOT NULL,
+              polymarket_price REAL NOT NULL,
+              estimated_edge REAL NOT NULL,
+              mapping_confidence REAL NOT NULL,
+              freshness_seconds INTEGER NOT NULL,
+              execution_mode TEXT NOT NULL,
+              payload_json TEXT,
+              scanned_at TEXT NOT NULL
+            );
+            INSERT INTO arbitrage_candidates (
+              kalshi_ticker, polymarket_id, side, kalshi_price, polymarket_price,
+              estimated_edge, mapping_confidence, freshness_seconds, execution_mode,
+              payload_json, scanned_at
+            )
+            VALUES
+              ('KXGROSS', 'pm-gross', 'YES', 0.20, 0.35, 0.15, 0.8, 5, 'alert_only', '{"net_edge":0.01}', '2999-01-02T00:00:00'),
+              ('KXNET', 'pm-net', 'YES', 0.40, 0.48, 0.08, 0.8, 5, 'alert_only', '{"net_edge":0.07}', '2999-01-01T00:00:00');
+          \`);
+
+          console.log(JSON.stringify(listArbitrageCandidates({
+            limit: 1,
+            minNetEdge: 0.05,
+            sortBy: "net_edge"
+          })));
+        } finally {
+          db.close();
+        }
+      `
+    );
+
+    const result = JSON.parse(
+      execFileSync(process.execPath, ["--import", "tsx/esm", scriptPath], {
+        cwd: serverRoot,
+        env: {
+          ...process.env,
+          DB_PATH: databasePath
+        },
+        encoding: "utf8"
+      }).trim()
+    );
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      kalshiTicker: "KXNET",
+      netEdge: 0.07
+    });
+  });
+});
+
+describe("getCalibrationSummary byModel", () => {
+  it("rolls up calibration metrics by model via live_trade_decisions join", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "dashboard-repository-"));
+    const databasePath = path.join(tempDir, "dashboard.sqlite");
+    const scriptPath = path.join(tempDir, "calibration-by-model-check.mjs");
+    const repositoryUrl = pathToFileURL(
+      path.join(serverRoot, "src/repositories/dashboardRepository.ts")
+    ).href;
+    const dbUrl = pathToFileURL(path.join(serverRoot, "src/db.ts")).href;
+    tempDirs.push(tempDir);
+
+    writeFileSync(
+      scriptPath,
+      `
+        import { getDb } from ${JSON.stringify(dbUrl)};
+        import { getCalibrationSummary } from ${JSON.stringify(repositoryUrl)};
+
+        const db = getDb();
+
+        try {
+          db.exec(\`
+            CREATE TABLE settlement_calibration (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              market_id TEXT NOT NULL,
+              strategy TEXT,
+              category TEXT,
+              predicted_probability REAL NOT NULL,
+              outcome INTEGER NOT NULL,
+              brier_score REAL NOT NULL,
+              realized_ev REAL,
+              pnl REAL,
+              source TEXT,
+              settled_at TEXT NOT NULL,
+              payload_json TEXT
+            );
+            CREATE TABLE live_trade_decisions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              created_at TEXT,
+              market_ticker TEXT,
+              strategy TEXT,
+              model TEXT,
+              payload_json TEXT
+            );
+            INSERT INTO settlement_calibration (
+              market_id, strategy, category, predicted_probability, outcome,
+              brier_score, realized_ev, pnl, source, settled_at
+            ) VALUES
+              ('K1', 'live_trade', 'Sports', 0.7, 1, 0.09, 1.5, 1.5, 'trade_logs', '2999-01-01T00:00:00'),
+              ('K1', 'live_trade', 'Sports', 0.6, 0, 0.36, -0.5, -0.5, 'trade_logs', '2999-01-02T00:00:00'),
+              ('K2', 'live_trade', 'Sports', 0.8, 1, 0.04, 2.5, 2.5, 'trade_logs', '2999-01-03T00:00:00'),
+              ('K3', 'macro_swing', 'Economics', 0.3, 0, 0.09, 0.0, 0.0, 'trade_logs', '2999-01-04T00:00:00');
+            INSERT INTO live_trade_decisions (
+              created_at, market_ticker, strategy, model, payload_json
+            ) VALUES
+              ('2999-01-01T00:00:00', 'K1', 'live_trade', 'gpt-5.1-mini', '{}'),
+              ('2999-01-02T00:00:00', 'K1', 'live_trade', 'gpt-5.1-mini', '{}'),
+              ('2999-01-03T00:00:00', 'K2', 'live_trade', 'claude-opus-4-7', '{}'),
+              ('2999-01-04T00:00:00', 'K3', 'macro_swing', 'claude-opus-4-7', '{}');
+          \`);
+
+          const summary = getCalibrationSummary();
+          console.log(JSON.stringify(summary.byModel));
+        } finally {
+          db.close();
+        }
+      `
+    );
+
+    const result = JSON.parse(
+      execFileSync(process.execPath, ["--import", "tsx/esm", scriptPath], {
+        cwd: serverRoot,
+        env: {
+          ...process.env,
+          DB_PATH: databasePath
+        },
+        encoding: "utf8"
+      }).trim()
+    );
+
+    expect(result).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          model: "gpt-5.1-mini",
+          sampleSize: 2
+        }),
+        expect.objectContaining({
+          model: "claude-opus-4-7",
+          sampleSize: 2
+        })
+      ])
+    );
+  });
+
+  it("returns empty byModel when live_trade_decisions table is missing", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "dashboard-repository-"));
+    const databasePath = path.join(tempDir, "dashboard.sqlite");
+    const scriptPath = path.join(tempDir, "calibration-by-model-empty.mjs");
+    const repositoryUrl = pathToFileURL(
+      path.join(serverRoot, "src/repositories/dashboardRepository.ts")
+    ).href;
+    const dbUrl = pathToFileURL(path.join(serverRoot, "src/db.ts")).href;
+    tempDirs.push(tempDir);
+
+    writeFileSync(
+      scriptPath,
+      `
+        import { getDb } from ${JSON.stringify(dbUrl)};
+        import { getCalibrationSummary } from ${JSON.stringify(repositoryUrl)};
+
+        const db = getDb();
+
+        try {
+          db.exec(\`
+            CREATE TABLE settlement_calibration (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              market_id TEXT NOT NULL,
+              strategy TEXT,
+              category TEXT,
+              predicted_probability REAL NOT NULL,
+              outcome INTEGER NOT NULL,
+              brier_score REAL NOT NULL,
+              realized_ev REAL,
+              pnl REAL,
+              source TEXT,
+              settled_at TEXT NOT NULL,
+              payload_json TEXT
+            );
+            INSERT INTO settlement_calibration (
+              market_id, strategy, category, predicted_probability, outcome,
+              brier_score, realized_ev, pnl, source, settled_at
+            ) VALUES
+              ('K1', 'live_trade', 'Sports', 0.7, 1, 0.09, 1.5, 1.5, 'trade_logs', '2999-01-01T00:00:00');
+          \`);
+          console.log(JSON.stringify(getCalibrationSummary().byModel));
+        } finally {
+          db.close();
+        }
+      `
+    );
+
+    const result = JSON.parse(
+      execFileSync(process.execPath, ["--import", "tsx/esm", scriptPath], {
+        cwd: serverRoot,
+        env: {
+          ...process.env,
+          DB_PATH: databasePath
+        },
+        encoding: "utf8"
+      }).trim()
+    );
+
+    expect(result).toEqual([]);
+  });
 });
 
 describe("clearPaperTradingData", () => {
