@@ -1407,6 +1407,76 @@ def cmd_weather(args: argparse.Namespace) -> None:
     asyncio.run(_run())
 
 
+def cmd_weather_scan(args: argparse.Namespace) -> None:
+    """Sweep all open weather events with the deterministic model."""
+
+    async def _run() -> None:
+        import json
+
+        from src.config.settings import settings
+        from src.jobs.weather_scan import run_weather_scan
+
+        summary = await run_weather_scan(execute=bool(getattr(args, "trade", False)))
+
+        if getattr(args, "json", False):
+            payload = {
+                "started_at": summary.started_at,
+                "series_scanned": summary.series_scanned,
+                "events_scanned": summary.events_scanned,
+                "markets_evaluated": summary.markets_evaluated,
+                "positions_opened": summary.positions_opened,
+                "errors": summary.errors,
+                "candidates": [c.to_payload() for c in summary.candidates],
+            }
+            print(json.dumps(payload, indent=2, default=str))
+            return
+
+        print("=" * 96)
+        print(
+            f"  WEATHER SCAN  ({summary.started_at})  series={len(summary.series_scanned)}"
+            f"  events={summary.events_scanned}  markets={summary.markets_evaluated}"
+        )
+        print("=" * 96)
+        if summary.errors:
+            for error in summary.errors[:8]:
+                print(f"  ! {error}")
+            print("-" * 96)
+        if not summary.candidates:
+            print("  No fee-positive candidates above the configured thresholds.")
+            print("=" * 96)
+            return
+        header = (
+            f"  {'TICKER':<30}{'SIDE':<6}{'ASK':<7}{'P(WIN)':<9}"
+            f"{'NET EDGE':<10}{'QUAL':<7}{'LEAD':<6}KELLY"
+        )
+        print(header)
+        print("-" * 96)
+        for candidate in summary.candidates[:25]:
+            print(
+                f"  {candidate.market_ticker:<30}{candidate.side:<6}"
+                f"{candidate.entry_price * 100:>4.0f}c  "
+                f"{candidate.side_win_probability:<9.3f}"
+                f"{candidate.net_edge * 100:>+7.1f}c  "
+                f"{candidate.quality:<7.2f}{candidate.lead_days:<6.1f}"
+                f"{candidate.kelly_fraction * 100:.1f}%"
+            )
+        print("-" * 96)
+        trading_active = bool(getattr(args, "trade", False)) or bool(
+            getattr(settings.weather, "scan_trade_enabled", False)
+        )
+        print(
+            f"  Positions opened this run: {summary.positions_opened}"
+            + (
+                ""
+                if trading_active
+                else "  (scan-only; use --trade or WEATHER_SCAN_TRADE_ENABLED to execute)"
+            )
+        )
+        print("=" * 96)
+
+    asyncio.run(_run())
+
+
 def cmd_scan_arb(args: argparse.Namespace) -> None:
     """Run an alert-only Kalshi vs Polymarket scan."""
 
@@ -1820,6 +1890,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--ticker", help="Single market ticker, e.g. KXHIGHNY-26JUN12-B70.5"
     )
     p_weather.set_defaults(func=cmd_weather)
+
+    # --- weather-scan ---
+    p_weather_scan = subparsers.add_parser(
+        "weather-scan",
+        help="Sweep all open weather events with the deterministic model",
+        description=(
+            "Enumerate every open Kalshi weather event (station registry x "
+            "KXHIGH/KXLOW), run the deterministic forecast model on each "
+            "bucket, rank fee-positive divergences, and optionally execute "
+            "them through the EV gate and portfolio guardrails. No LLM calls."
+        ),
+    )
+    p_weather_scan.add_argument(
+        "--trade",
+        action="store_true",
+        help=(
+            "Execute ranked candidates (paper by default; live requires "
+            "LIVE_TRADING_ENABLED and WEATHER_SCAN_LIVE)"
+        ),
+    )
+    p_weather_scan.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    p_weather_scan.set_defaults(func=cmd_weather_scan)
 
     # --- safety-status ---
     p_safety = subparsers.add_parser(

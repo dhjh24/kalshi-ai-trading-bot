@@ -43,8 +43,55 @@ ALLOCATION_TIERS = [
     (0,  0.00),   # blocked (< 30)
 ]
 
-# Minimum samples before we score (below this → default score of 0 → blocked)
+# Minimum samples before we score (below this the category is *unproven*).
 MIN_SAMPLES_FOR_SCORING = 5
+
+# Exploration default for unproven categories (no row, or fewer than
+# MIN_SAMPLES_FOR_SCORING settled trades). Without it, unknown categories
+# score 0 → blocked → never trade → never accumulate the samples that would
+# unblock them: a permanent exploration deadlock. 35 lands in the marginal
+# 2%-allocation tier, so exploration trades stay small while the category
+# earns (or loses) a real score. Clamped so a config typo can never grant
+# an unproven category more than the 5% tier.
+EXPLORATION_DEFAULT_SCORE = 35.0
+_EXPLORATION_SCORE_FLOOR = 30.0
+_EXPLORATION_SCORE_CEIL = 59.0
+
+
+def _exploration_active() -> bool:
+    """
+    True when unproven categories should receive the exploration default.
+
+    Paper/shadow runs explore by default (gathering category evidence is
+    what paper trading is for); live runs require the explicit
+    CATEGORY_EXPLORATION_LIVE opt-in so real money never rides on unproven
+    categories by accident.
+    """
+    try:
+        from src.config.settings import settings
+    except Exception:
+        return False
+    trading = getattr(settings, "trading", None)
+    if trading is None:
+        return False
+    if not bool(getattr(trading, "category_exploration_enabled", True)):
+        return False
+    if bool(getattr(trading, "live_trading_enabled", False)):
+        return bool(getattr(trading, "category_exploration_live", False))
+    return True
+
+
+def _exploration_score() -> float:
+    """Configured exploration default, clamped to the marginal tiers."""
+    try:
+        from src.config.settings import settings
+        raw = float(
+            getattr(settings.trading, "category_exploration_score", EXPLORATION_DEFAULT_SCORE)
+            or EXPLORATION_DEFAULT_SCORE
+        )
+    except Exception:
+        raw = EXPLORATION_DEFAULT_SCORE
+    return max(_EXPLORATION_SCORE_FLOOR, min(_EXPLORATION_SCORE_CEIL, raw))
 
 # Real-world data snapshot (seeded from Ryan's trading history)
 # NCAAB NO-side: 74% WR, +10% ROI — the ONLY profitable edge
@@ -196,10 +243,22 @@ class CategoryScorer:
     # ------------------------------------------------------------------
 
     async def get_score(self, category: str) -> float:
-        """Return the current score for a category (0-100). Unknown = 0."""
+        """
+        Return the current score for a category (0-100).
+
+        Categories with a proven track record return their earned score.
+        Unproven categories (no row, or fewer than MIN_SAMPLES_FOR_SCORING
+        settled trades) return the exploration default when exploration is
+        active, else 0 (blocked).
+        """
         data = await self._load(category)
         if data is None:
-            return 0.0
+            return _exploration_score() if _exploration_active() else 0.0
+        if (
+            int(data.get("total_count") or 0) < MIN_SAMPLES_FOR_SCORING
+            and _exploration_active()
+        ):
+            return max(float(data["score"]), _exploration_score())
         return data["score"]
 
     async def get_all_scores(self) -> List[Dict]:

@@ -22,10 +22,13 @@ def _extract_fair_probability(debate_result: Dict) -> Optional[float]:
     Pool the debate agents' YES-probability estimates into one fair value.
 
     The forecaster is the dedicated estimator so it carries the largest
-    weight; bull and bear act as adversarial correctors. Returns None when
-    no agent produced a usable probability (legacy single-model path).
+    weight; bull and bear act as adversarial correctors. Pooling uses
+    disagreement-aware extremization: agreeing agents earn the configured
+    extremize correction, disagreeing agents fall back to plain pooling.
+    Returns None when no agent produced a usable probability (legacy
+    single-model path).
     """
-    from src.utils.probability_engine import pool_probabilities
+    from src.utils.probability_engine import pool_probabilities_adaptive
 
     step_results = debate_result.get("step_results") or {}
     weights = {"forecaster": 0.5, "bull_researcher": 0.25, "bear_researcher": 0.25}
@@ -44,7 +47,8 @@ def _extract_fair_probability(debate_result: Dict) -> Optional[float]:
         if 0.0 < value < 1.0:
             estimates.append((value, weight))
 
-    pooled = pool_probabilities(estimates, extremize=1.0)
+    extremize = float(getattr(settings.ensemble, "extremize_factor", 1.2) or 1.2)
+    pooled = pool_probabilities_adaptive(estimates, extremize=extremize)
     return pooled.probability if pooled else None
 
 
@@ -606,7 +610,16 @@ async def make_decision_for_market(
                 )
                 ai_prob = side_win_probability(blended_yes, decision.side)
             else:
-                ai_prob = decision.confidence  # legacy single-model fallback
+                # Fail closed: without a fair probability there is no basis
+                # for edge. Anchoring to the market price yields zero edge,
+                # so the positive-edge check below rejects the trade instead
+                # of fabricating edge from the model's self-reported
+                # confidence (the historical confidence-as-probability bug).
+                ai_prob = market_prob
+                logger.info(
+                    f"No fair probability available for {market.market_id}; "
+                    "anchoring to market price (zero edge, fails closed)"
+                )
 
             # Check edge filter
             should_trade, trade_reason, edge_result = EdgeFilter.should_trade_market(

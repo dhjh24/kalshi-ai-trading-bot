@@ -53,6 +53,16 @@ MIN_CALIBRATION_SAMPLES = 30
 MIN_SHRINK_SLOPE = 0.25
 MAX_SHRINK_SLOPE = 1.0
 
+# Disagreement handling. Extremization assumes forecasters share information
+# and are individually under-confident; when member forecasts *disagree*
+# (std dev approaching DISAGREEMENT_FULL_DAMP), the spread is idiosyncratic
+# noise, so extremization is damped back toward 1.0 and the EV gate demands
+# extra net edge per contract.
+DISAGREEMENT_FULL_DAMP = 0.25      # std dev at which extremize fully damps to 1.0
+DISAGREEMENT_PAD_START = 0.05      # std dev below which no edge padding applies
+DISAGREEMENT_PAD_SCALE = 0.50      # extra edge per unit of excess disagreement
+DISAGREEMENT_PAD_CAP = 0.03       # max extra net edge demanded ($/contract)
+
 
 def clamp_probability(value: float, lo: float = _PROB_FLOOR, hi: float = _PROB_CEIL) -> float:
     """Clamp a probability into a safe open interval for log-odds math."""
@@ -132,6 +142,65 @@ def pool_probabilities(
         probability=clamp_probability(pooled),
         disagreement=math.sqrt(variance),
         num_members=len(cleaned),
+    )
+
+
+def damped_extremize(extremize: float, disagreement: Optional[float]) -> float:
+    """
+    Damp an extremization exponent toward 1.0 as member disagreement grows.
+
+    Linear damp: full ``extremize`` at zero disagreement, 1.0 (no
+    extremization) once the member std dev reaches DISAGREEMENT_FULL_DAMP.
+    """
+    try:
+        a = float(extremize)
+    except (TypeError, ValueError):
+        return 1.0
+    if disagreement is None:
+        return max(0.1, a)
+    d = max(0.0, float(disagreement))
+    damp = max(0.0, 1.0 - d / DISAGREEMENT_FULL_DAMP)
+    return max(0.1, 1.0 + (a - 1.0) * damp)
+
+
+def disagreement_edge_padding(disagreement: Optional[float]) -> float:
+    """
+    Extra net edge ($/contract) the EV gate should demand when the ensemble
+    members disagree. Zero below DISAGREEMENT_PAD_START std dev, then grows
+    at DISAGREEMENT_PAD_SCALE per unit of excess, capped at
+    DISAGREEMENT_PAD_CAP.
+    """
+    if disagreement is None:
+        return 0.0
+    try:
+        d = float(disagreement)
+    except (TypeError, ValueError):
+        return 0.0
+    excess = max(0.0, d - DISAGREEMENT_PAD_START)
+    return min(DISAGREEMENT_PAD_CAP, excess * DISAGREEMENT_PAD_SCALE)
+
+
+def pool_probabilities_adaptive(
+    estimates: Sequence[Tuple[float, float]],
+    *,
+    extremize: float = DEFAULT_EXTREMIZE,
+) -> Optional[PooledProbability]:
+    """
+    Pool estimates with disagreement-aware extremization.
+
+    Pools once without extremization to measure member disagreement, then
+    re-applies a damped extremization exponent: agreeing members earn the
+    full correction, disagreeing members converge to plain pooling.
+    """
+    base = pool_probabilities(estimates, extremize=1.0)
+    if base is None:
+        return None
+    effective = damped_extremize(extremize, base.disagreement)
+    extremized = inv_logit(logit(base.probability) * effective)
+    return PooledProbability(
+        probability=clamp_probability(extremized),
+        disagreement=base.disagreement,
+        num_members=base.num_members,
     )
 
 
@@ -322,6 +391,7 @@ def evaluate_trade_intent(
     min_net_edge: float = 0.0,
     fee_type: Optional[str] = None,
     fee_multiplier: Optional[float] = None,
+    disagreement: Optional[float] = None,
 ) -> Dict[str, object]:
     """
     Full deterministic gate for a proposed trade.
@@ -331,8 +401,13 @@ def evaluate_trade_intent(
     win probability of the requested side, then compute fee-aware EV at the
     proposed entry price.
 
+    When ``disagreement`` (std dev of the ensemble members' probabilities)
+    is provided, the gate demands extra net edge via
+    :func:`disagreement_edge_padding` — confident consensus trades clear at
+    ``min_net_edge``; contested ones must offer more.
+
     Returns a dict with the intermediate values and a final ``approved``
-    flag (net edge must exceed ``min_net_edge``).
+    flag (net edge must exceed the effective minimum).
     """
     shrunk_yes = shrink_toward_half(fair_yes_probability, calibration_slope)
 
@@ -355,7 +430,9 @@ def evaluate_trade_intent(
         fee_type=fee_type,
         fee_multiplier=fee_multiplier,
     )
-    approved = ev.net_edge > max(0.0, float(min_net_edge))
+    edge_padding = disagreement_edge_padding(disagreement)
+    effective_min_edge = max(0.0, float(min_net_edge)) + edge_padding
+    approved = ev.net_edge > effective_min_edge
     return {
         "approved": approved,
         "fair_yes_probability": clamp_probability(fair_yes_probability),
@@ -363,10 +440,18 @@ def evaluate_trade_intent(
         "blended_yes_probability": blended_yes,
         "win_probability": win_prob,
         "ev": ev,
+        "disagreement": disagreement,
+        "disagreement_edge_padding": edge_padding,
+        "effective_min_net_edge": effective_min_edge,
         "reason": (
             f"net edge {ev.net_edge * 100:.1f}c/contract "
             f"(gross {ev.gross_edge * 100:.1f}c, fees "
             f"{(ev.entry_fee_per_contract + ev.exit_fee_per_contract) * 100:.1f}c) "
-            f"{'clears' if approved else 'below'} minimum {float(min_net_edge) * 100:.1f}c"
+            f"{'clears' if approved else 'below'} minimum {effective_min_edge * 100:.1f}c"
+            + (
+                f" (incl. {edge_padding * 100:.1f}c disagreement padding)"
+                if edge_padding > 0
+                else ""
+            )
         ),
     }

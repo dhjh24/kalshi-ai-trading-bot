@@ -38,6 +38,41 @@ def _normalize_calibration_market_type(value: Any) -> str:
     return text.lower() if text else "unknown"
 
 
+def _extract_fair_side_win_probability(payload_json: Any, side: Any) -> Optional[float]:
+    """
+    Pull the pre-shrink fair YES probability out of a live-trade decision
+    payload and convert it to the win probability of the held side.
+
+    Execution rows carry it inside ``gate_snapshot``; final/specialist rows
+    carry it at the top level. Returns None when the payload is missing,
+    malformed, or holds no usable probability.
+    """
+    if not payload_json:
+        return None
+    try:
+        payload = json.loads(payload_json)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    raw = None
+    gate_snapshot = payload.get("gate_snapshot")
+    if isinstance(gate_snapshot, dict):
+        raw = gate_snapshot.get("fair_yes_probability")
+    if raw is None:
+        raw = payload.get("fair_yes_probability")
+    try:
+        fair_yes = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not (0.0 < fair_yes < 1.0):
+        return None
+    if str(side or "").upper() == "NO":
+        return 1.0 - fair_yes
+    return fair_yes
+
+
 @dataclass
 class Market:
     """Represents a market in the database."""
@@ -3829,10 +3864,15 @@ class DatabaseManager(TradingLoggerMixin):
         Rebuild settlement calibration rows from closed trade logs.
 
         For each trade we prefer (in order):
-          1. The latest matching live-trade decision confidence, treated as
+          1. The pre-shrink fair side-win probability recorded in the latest
+             matching live-trade decision payload (``fair_yes_probability``
+             at top level or inside ``gate_snapshot``, converted to the held
+             side). This is the model's raw probability claim — exactly what
+             the calibration shrink slope is meant to measure.
+          2. The latest matching live-trade decision confidence, treated as
              the held-side decision probability emitted by the strategy.
-          2. The latest matching position row's `confidence`.
-          3. The entry-price heuristic (treats fill price as the implied
+          3. The latest matching position row's `confidence`.
+          4. The entry-price heuristic (treats fill price as the implied
              probability of the held side).
 
         The chosen probability is recorded along with the source flag so the
@@ -3869,6 +3909,51 @@ class DatabaseManager(TradingLoggerMixin):
                     "market_ticker",
                     "strategy",
                     "focus_type",
+                }.issubset(decision_columns)
+                else "NULL"
+            )
+            decision_payload_expr = (
+                """
+                    (
+                        SELECT d.payload_json
+                        FROM live_trade_decisions d
+                        WHERE d.market_ticker = t.market_id
+                          AND COALESCE(NULLIF(d.strategy, ''), 'unknown') =
+                              COALESCE(NULLIF(t.strategy, ''), 'unknown')
+                          AND d.payload_json IS NOT NULL
+                          AND TRIM(d.payload_json) != ''
+                          AND LOWER(COALESCE(d.action, 'buy')) = 'buy'
+                          AND (
+                              (
+                                  LOWER(COALESCE(d.step, '')) = 'execution'
+                                  AND LOWER(COALESCE(d.status, '')) = 'executed'
+                              )
+                              OR (
+                                  LOWER(COALESCE(d.step, 'decision')) IN ('decision', 'specialist', 'final')
+                                  AND LOWER(COALESCE(d.status, 'completed')) = 'completed'
+                              )
+                          )
+                          AND (
+                              d.side IS NULL
+                              OR TRIM(d.side) = ''
+                              OR UPPER(d.side) = UPPER(t.side)
+                          )
+                        ORDER BY
+                            CASE WHEN LOWER(COALESCE(d.step, '')) = 'execution' THEN 0 ELSE 1 END,
+                            COALESCE(d.created_at, '') DESC,
+                            d.id DESC
+                        LIMIT 1
+                    )
+                """
+                if {
+                    "id",
+                    "created_at",
+                    "market_ticker",
+                    "strategy",
+                    "payload_json",
+                    "step",
+                    "status",
+                    "action",
                 }.issubset(decision_columns)
                 else "NULL"
             )
@@ -3927,7 +4012,8 @@ class DatabaseManager(TradingLoggerMixin):
                           AND p.confidence IS NOT NULL
                         ORDER BY p.timestamp DESC
                         LIMIT 1
-                    ) AS decision_confidence
+                    ) AS decision_confidence,
+                    {decision_payload_expr} AS decision_payload_json
                 FROM trade_logs t
                 LEFT JOIN markets m ON m.market_id = t.market_id
                 """
@@ -3947,10 +4033,17 @@ class DatabaseManager(TradingLoggerMixin):
                     exit_ts,
                     live_decision_confidence,
                     decision_confidence,
+                    decision_payload_json,
                 ) = row
-                predicted_source = "live_decision_confidence"
+                fair_side_win = _extract_fair_side_win_probability(
+                    decision_payload_json, side
+                )
                 predicted: Optional[float]
-                if live_decision_confidence is not None:
+                if fair_side_win is not None:
+                    predicted_source = "live_decision_fair_probability"
+                    predicted = fair_side_win
+                elif live_decision_confidence is not None:
+                    predicted_source = "live_decision_confidence"
                     predicted = max(0.0, min(1.0, float(live_decision_confidence)))
                 elif decision_confidence is not None:
                     predicted_source = "position_confidence"

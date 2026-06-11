@@ -471,6 +471,45 @@ class WeatherConfig:
         default_factory=lambda: float(os.getenv("WEATHER_REQUEST_TIMEOUT_SECONDS", "8.0"))
     )
 
+    # ------------------------------------------------------------------
+    # Weather scan job (`python cli.py weather-scan`): sweeps every open
+    # weather event with the deterministic model — no LLM calls — and
+    # surfaces/executes fee-positive divergences.
+    # ------------------------------------------------------------------
+    # Explicit series allowlist (CSV). Empty = auto-derive from the station
+    # registry (KXHIGH/KXLOW x station codes).
+    scan_series: List[str] = field(
+        default_factory=lambda: _get_csv_env_list("WEATHER_SCAN_SERIES")
+    )
+    # Net edge after fees a bucket must clear before it becomes a scan
+    # candidate. Slightly above the live-trade gate because the scanner has
+    # no LLM second opinion.
+    scan_min_net_edge: float = field(
+        default_factory=lambda: float(os.getenv("WEATHER_SCAN_MIN_NET_EDGE", "0.03"))
+    )
+    # Minimum estimate quality (0-1) for scan candidates; stricter than the
+    # pooling floor used when an LLM estimate is also present.
+    scan_min_quality: float = field(
+        default_factory=lambda: float(os.getenv("WEATHER_SCAN_MIN_QUALITY", "0.5"))
+    )
+    # Cap on events scanned per run (nearest expiries first) and on
+    # positions opened per run when trading is enabled.
+    scan_max_events: int = field(
+        default_factory=lambda: int(os.getenv("WEATHER_SCAN_MAX_EVENTS", "16"))
+    )
+    scan_max_positions: int = field(
+        default_factory=lambda: int(os.getenv("WEATHER_SCAN_MAX_POSITIONS", "5"))
+    )
+    # Execute scan candidates as paper positions when enabled. Live
+    # execution additionally requires LIVE_TRADING_ENABLED and
+    # WEATHER_SCAN_LIVE so real-money weather trading stays double opt-in.
+    scan_trade_enabled: bool = field(
+        default_factory=lambda: _get_bool_env("WEATHER_SCAN_TRADE_ENABLED", True)
+    )
+    scan_live: bool = field(
+        default_factory=lambda: _get_bool_env("WEATHER_SCAN_LIVE")
+    )
+
 
 # Trading strategy configuration — DISCIPLINED DEFAULTS (sane risk management)
 # Beast mode is still available via --beast flag, but NOT the default.
@@ -686,6 +725,34 @@ class TradingConfig:
     # EV gating (slope from realized outcomes; 1.0 = no shrink).
     calibration_shrink_enabled: bool = field(
         default_factory=lambda: _get_bool_env("CALIBRATION_SHRINK_ENABLED", True)
+    )
+
+    # Microstructure guards for the live-trade EV gate. Entries are refused
+    # when the bid-ask spread exceeds the cap (midpoint blending is
+    # unreliable across wide spreads) or when the top of book on the chosen
+    # side rests fewer contracts than the minimum (exits would pay the
+    # spread again). Set either to 0 to disable that guard.
+    live_trade_max_spread_cents: float = field(
+        default_factory=lambda: float(os.getenv("LIVE_TRADE_MAX_SPREAD_CENTS", "6"))
+    )
+    # Default matches the quick-flip depth guard (10 contracts at top of book).
+    live_trade_min_top_depth_contracts: int = field(
+        default_factory=lambda: int(os.getenv("LIVE_TRADE_MIN_TOP_DEPTH_CONTRACTS", "10"))
+    )
+
+    # Category exploration. Unproven categories (fewer than 5 settled
+    # trades) receive a small exploration score instead of a hard block so
+    # they can accumulate the evidence the category scorer needs. Always
+    # used in paper/shadow runs (unless disabled); live runs additionally
+    # require CATEGORY_EXPLORATION_LIVE.
+    category_exploration_enabled: bool = field(
+        default_factory=lambda: _get_bool_env("CATEGORY_EXPLORATION_ENABLED", True)
+    )
+    category_exploration_live: bool = field(
+        default_factory=lambda: _get_bool_env("CATEGORY_EXPLORATION_LIVE")
+    )
+    category_exploration_score: float = field(
+        default_factory=lambda: float(os.getenv("CATEGORY_EXPLORATION_SCORE", "35"))
     )
 
     # Shadow drift auto-pause (W4 follow-up). Default OFF so existing runtime

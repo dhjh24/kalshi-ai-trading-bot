@@ -8,6 +8,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ## [Unreleased]
 
 ### Added
+- `python cli.py weather-scan` + `src/jobs/weather_scan.py`: systematic deterministic weather edge scanner — sweeps every open weather event (station registry × KXHIGH/KXLOW) with the physics-ensemble model, ranks fee-positive divergences, persists them as dashboard-visible decisions, and optionally executes through the EV gate and portfolio guardrails (`WEATHER_SCAN_*` env knobs; paper by default, live double opt-in). Runs as a 30-minute background sweep inside `python cli.py run` when `WEATHER_SCAN_TRADE_ENABLED` is set
+- Disagreement-aware ensemble math in `probability_engine`: `pool_probabilities_adaptive` damps extremization toward plain pooling as member forecasts diverge, and `evaluate_trade_intent` demands extra net edge per contract on contested calls (`disagreement_edge_padding`, capped at +3c)
+- Microstructure guards on the live-trade EV gate: entries are refused when the bid-ask spread exceeds `LIVE_TRADE_MAX_SPREAD_CENTS` or the top of book rests fewer than `LIVE_TRADE_MIN_TOP_DEPTH_CONTRACTS` contracts (enforced identically in paper and live for shadow parity)
+- Maker-fee inference at the EV gate: limit prices resting inside the spread are gated at maker fees (1.75% schedule) instead of always being taxed as takers (7%) — roughly 1.3c/contract of previously-phantom cost on resting entries
+- ESPN sportsbook odds in sports research context: de-vigged implied win probabilities, spread, and over/under parsed from scoreboard competitions (`sports_context.signals.odds`) as a consensus anchor for game markets
+- Category exploration: unproven categories (<5 settled trades) receive a small exploration score (2%-allocation tier) instead of a permanent hard block, breaking the "blocked → never trades → never scored" deadlock; paper/shadow explore by default, live requires `CATEGORY_EXPLORATION_LIVE` (`CATEGORY_EXPLORATION_*` knobs)
+- Per-category calibration shrink slopes in the live-trade loop (falls back to strategy-wide, then global samples below 30 observations per bucket)
+- Settlement feedback wiring in the tracker: every closed position now updates the category scorer (win/loss + ROI) and triggers a settlement-calibration refresh — both loops previously computed scores that nothing updated or consumed automatically
+- Decision-time gate snapshots persisted with executed live-trade intents (`gate_snapshot` payload: raw fair probability, market mid, shrunk/blended probabilities, win probability, fees, spread, depth, disagreement) so calibration learns from the model's actual pre-correction claims
+- Calibration now prefers the recorded fair side-win probability over decision confidence (`live_decision_fair_probability` source) — fixing the slope being estimated on confidence but applied to probabilities
 - `src/utils/probability_engine.py` — shared math layer for all decision paths: log-odds probability pooling with extremization, market-prior blending, settlement-calibration shrinkage, fee-aware expected value, and true fractional-Kelly sizing for binary contracts
 - Deterministic fee-aware EV gate in the live-trade loop: every BUY intent must clear `LIVE_TRADE_MIN_NET_EDGE` dollars of net edge per contract after estimated Kalshi fees, computed from the calibration-shrunk, market-blended fair probability; intents below `LIVE_TRADE_MIN_CONFIDENCE` (with category multipliers) are blocked before execution
 - `fair_yes_probability` field on specialist and final live-trade schemas plus `TradingDecision`, so the model's probability estimate is carried separately from its confidence; missing estimates fail closed to the market midpoint (zero edge)
@@ -21,6 +31,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 - The main decision path no longer uses the trader's *confidence* as its *probability estimate* when computing edge — it pools the forecaster/bull/bear probabilities, blends with the market price, and requires a positive fee-adjusted edge on the chosen side
+- Closed the remaining confidence-as-probability hole: the single-model fallback in `decide.py` now anchors to the market price when no fair probability exists (zero edge, fails closed) instead of treating confidence as a win probability
+- Ensemble pooling call sites now honor `ENSEMBLE_EXTREMIZE_FACTOR` (previously hardcoded to 1.0, leaving the configured 1.2 correction dead) with disagreement damping
+- The specialist research prompt now includes `weather_context` (the deterministic model output was pooled into the EV gate but invisible to the LLM picking markets) plus an `as_of_utc` timestamp, explicit base-rate/market-prior elicitation steps, and fee guidance
 - Agents now receive the market's days-to-expiry (previously rendered as `?` in every prompt) and consistent cent-denominated prices in both decision paths
 - Replaced defunct Reuters RSS endpoints with working business, sports, and crypto feeds so the news/sentiment pipeline receives data again
 

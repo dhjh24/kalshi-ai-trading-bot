@@ -674,14 +674,20 @@ def _candidate_market_data(candidate: Dict[str, Any]) -> Dict[str, Any]:
 def _pooled_fair_yes_probability(
     debate_result: Dict[str, Any],
     candidate: Dict[str, Any],
-) -> float:
+) -> tuple[float, Optional[float]]:
     """
     Pool the specialist's fair YES probability with the debate researchers'
     probability estimates in log-odds space. The specialist saw the full
     research payload, so it carries the largest weight; bull/bear act as
     adversarial correctors.
+
+    Pooling uses disagreement-aware extremization (agreeing members earn the
+    configured extremize correction; disagreeing members fall back to plain
+    pooling). Returns ``(probability, disagreement)`` where disagreement is
+    the member std dev (None when only one usable estimate existed) so the
+    EV gate can demand extra edge on contested calls.
     """
-    from src.utils.probability_engine import pool_probabilities
+    from src.utils.probability_engine import pool_probabilities_adaptive
 
     estimates: List[tuple[float, float]] = []
     specialist_fair = _safe_float(candidate.get("fair_yes_probability"), 0.0)
@@ -697,10 +703,41 @@ def _pooled_fair_yes_probability(
         if 0.0 < probability < 1.0:
             estimates.append((probability, weight))
 
-    pooled = pool_probabilities(estimates, extremize=1.0)
+    extremize = float(getattr(settings.ensemble, "extremize_factor", 1.2) or 1.2)
+    pooled = pool_probabilities_adaptive(estimates, extremize=extremize)
     if pooled is None:
-        return _clamp(specialist_fair if specialist_fair > 0 else 0.5, lo=0.01, hi=0.99)
-    return pooled.probability
+        fallback = _clamp(specialist_fair if specialist_fair > 0 else 0.5, lo=0.01, hi=0.99)
+        return fallback, None
+    disagreement = pooled.disagreement if pooled.num_members >= 2 else None
+    return pooled.probability, disagreement
+
+
+def _top_of_book_bid_size(orderbook: Dict[str, Any], side: str) -> float:
+    """
+    Total quantity resting at the best bid for one orderbook side.
+
+    Accepts both ``{side}_dollars`` (price in dollars) and ``{side}``
+    (price in cents) level arrays, mirroring the quick-flip normalizer.
+    """
+    raw_levels = orderbook.get(f"{side.lower()}_dollars", orderbook.get(side.lower(), [])) or []
+    levels: List[tuple[float, float]] = []
+    for level in raw_levels:
+        if not isinstance(level, (list, tuple)) or len(level) < 2:
+            continue
+        try:
+            price = float(level[0])
+            size = float(level[1])
+        except (TypeError, ValueError):
+            continue
+        if price > 1.0:
+            price = price / 100.0
+        if price <= 0 or size <= 0:
+            continue
+        levels.append((price, size))
+    if not levels:
+        return 0.0
+    best_price = max(price for price, _ in levels)
+    return sum(size for price, size in levels if abs(price - best_price) < 1e-9)
 
 
 def _debate_final_payload(
@@ -722,7 +759,9 @@ def _debate_final_payload(
         execution_style = "NONE"
 
     step_results = debate_result.get("step_results") or {}
-    fair_yes_probability = _pooled_fair_yes_probability(debate_result, candidate)
+    fair_yes_probability, fair_yes_disagreement = _pooled_fair_yes_probability(
+        debate_result, candidate
+    )
     selected_candidate = {
         "event_ticker": candidate.get("event_ticker"),
         "market_ticker": candidate.get("market_ticker"),
@@ -742,6 +781,7 @@ def _debate_final_payload(
         "market_ticker": str(candidate.get("market_ticker") or ""),
         "side": side,
         "fair_yes_probability": fair_yes_probability,
+        "fair_yes_disagreement": fair_yes_disagreement,
         "confidence": _clamp(_safe_float(debate_result.get("confidence"), candidate.get("confidence")), lo=0.0, hi=1.0),
         "edge_pct": _safe_float(candidate.get("edge_pct"), 0.0),
         "position_size_pct": _clamp(
@@ -911,26 +951,34 @@ class LiveTradeDecisionLoop:
             logger=self.logger
         )
         self._refresh_notify_tasks: set[asyncio.Task] = set()
-        # Cached settlement-calibration reliability slope (slope, expires_at).
-        self._calibration_slope_cache: Optional[tuple[float, float]] = None
+        # Cached settlement-calibration reliability slopes keyed by market
+        # type ("" = global): key -> (slope, expires_at).
+        self._calibration_slope_cache: Dict[str, tuple[float, float]] = {}
         # Deterministic weather-model probabilities harvested from the
         # specialist research payloads: market_ticker -> probability entry
         # (+ "cached_at" epoch seconds). Consumed by the EV gate.
         self._weather_model_probs: Dict[str, Dict[str, Any]] = {}
 
-    async def _get_calibration_slope(self) -> float:
+    async def _get_calibration_slope(self, market_type: Optional[str] = None) -> float:
         """
         Reliability slope from realized live-trade settlements, cached for
         30 minutes. 1.0 means no shrink (perfectly calibrated or not enough
         data); lower values shrink model probabilities toward 0.5 before the
         EV gate, so an overconfident strategy automatically trades less.
+
+        When ``market_type`` is provided and that category has accumulated
+        enough settled samples, the category-specific slope is used —
+        categories where the models are systematically overconfident (e.g.
+        economics) shrink harder than ones where they are sharp.
         """
         if not bool(getattr(settings.trading, "calibration_shrink_enabled", True)):
             return 1.0
 
+        cache_key = (market_type or "").strip().lower()
         now = datetime.now(timezone.utc).timestamp()
-        if self._calibration_slope_cache is not None:
-            slope, expires_at = self._calibration_slope_cache
+        cached = self._calibration_slope_cache.get(cache_key)
+        if cached is not None:
+            slope, expires_at = cached
             if expires_at > now:
                 return slope
 
@@ -949,16 +997,26 @@ class LiveTradeDecisionLoop:
                 self.logger.debug(
                     "Settlement calibration refresh skipped", error=str(refresh_exc)
                 )
-            samples = await self.db_manager.get_calibration_samples(
-                strategy="live_trade", limit=500
-            )
+            samples: List[tuple[float, int]] = []
+            if cache_key:
+                samples = await self.db_manager.get_calibration_samples(
+                    strategy="live_trade", market_type=cache_key, limit=500
+                )
+                if len(samples) < MIN_CALIBRATION_SAMPLES:
+                    samples = await self.db_manager.get_calibration_samples(
+                        market_type=cache_key, limit=500
+                    )
+            if len(samples) < MIN_CALIBRATION_SAMPLES:
+                samples = await self.db_manager.get_calibration_samples(
+                    strategy="live_trade", limit=500
+                )
             if len(samples) < MIN_CALIBRATION_SAMPLES:
                 samples = await self.db_manager.get_calibration_samples(limit=500)
             slope = calibration_shrink_slope(samples)
         except Exception as exc:
             self.logger.debug("Calibration slope lookup failed", error=str(exc))
 
-        self._calibration_slope_cache = (slope, now + 1800.0)
+        self._calibration_slope_cache[cache_key] = (slope, now + 1800.0)
         return slope
 
     def _harvest_weather_model_probabilities(self, payload: Dict[str, Any]) -> None:
@@ -1919,6 +1977,100 @@ class LiveTradeDecisionLoop:
                         quality=quality,
                     )
 
+        # ------------------------------------------------------------------
+        # Microstructure guard: refuse entries into wide or empty books.
+        # A wide spread makes the midpoint blend unreliable (the "market
+        # probability" is a guess between distant quotes), and a thin top
+        # of book means the eventual exit pays the spread all over again.
+        # ------------------------------------------------------------------
+        yes_bid = _safe_float(selected_market.get("yes_bid"), 0.0)
+        yes_ask = _safe_float(selected_market.get("yes_ask"), 0.0)
+        spread_cents: Optional[float] = None
+        raw_spread = _safe_float(selected_market.get("yes_spread"), -1.0)
+        if raw_spread >= 0:
+            spread_cents = raw_spread * 100.0 if raw_spread <= 1.0 else float(raw_spread)
+        elif 0 < yes_bid <= yes_ask:
+            spread_cents = (yes_ask - yes_bid) * 100.0
+        max_spread_cents = float(
+            getattr(settings.trading, "live_trade_max_spread_cents", 6.0) or 0.0
+        )
+        if max_spread_cents > 0 and spread_cents is not None and spread_cents > max_spread_cents:
+            await self._record_execution_status(
+                run_id=run_id,
+                final_intent=final_intent,
+                status="blocked",
+                summary=(
+                    f"Bid-ask spread {spread_cents:.0f}c exceeds the "
+                    f"{max_spread_cents:.0f}c microstructure cap."
+                ),
+                error="spread_too_wide",
+                quantity=quantity,
+                payload={"spread_cents": spread_cents, "max_spread_cents": max_spread_cents},
+            )
+            return False
+
+        min_top_depth = int(
+            getattr(settings.trading, "live_trade_min_top_depth_contracts", 10) or 0
+        )
+        top_depth_contracts: Optional[float] = None
+        if min_top_depth > 0:
+            # Depth is enforced identically in paper and live (shadow parity);
+            # a failed orderbook *fetch* skips the check in both modes — the
+            # spread guard and EV gate still bound the damage, and blocking on
+            # telemetry hiccups would make paper/live decisions diverge.
+            try:
+                orderbook_response = await self.kalshi_client.get_orderbook(
+                    market_ticker, depth=5
+                )
+                orderbook = (
+                    orderbook_response.get(
+                        "orderbook_fp", orderbook_response.get("orderbook", {})
+                    )
+                    or {}
+                )
+                top_depth_contracts = _top_of_book_bid_size(orderbook, intent_side)
+            except Exception as exc:
+                self.logger.warning(
+                    "Orderbook depth check unavailable; spread guard and EV gate still apply",
+                    market_ticker=market_ticker,
+                    error=str(exc),
+                )
+            if top_depth_contracts is not None and top_depth_contracts < min_top_depth:
+                await self._record_execution_status(
+                    run_id=run_id,
+                    final_intent=final_intent,
+                    status="blocked",
+                    summary=(
+                        f"Top-of-book size {top_depth_contracts:.0f} contracts is below "
+                        f"the {min_top_depth} minimum for {intent_side} entries."
+                    ),
+                    error="orderbook_too_thin",
+                    quantity=quantity,
+                    payload={
+                        "top_depth_contracts": top_depth_contracts,
+                        "min_top_depth_contracts": min_top_depth,
+                    },
+                )
+                return False
+
+        # A limit priced inside the spread rests on the book and earns maker
+        # fee treatment (1.75% vs 7%); the EV gate should not tax a resting
+        # order with taker fees it will never pay.
+        side_ask = (
+            yes_ask
+            if intent_side == "YES"
+            else _safe_float(selected_market.get("no_ask"), 0.0)
+        )
+        expects_maker_entry = bool(side_ask > 0 and limit_price < side_ask - 1e-9)
+
+        raw_disagreement = final_intent.get("fair_yes_disagreement")
+        try:
+            intent_disagreement = (
+                float(raw_disagreement) if raw_disagreement is not None else None
+            )
+        except (TypeError, ValueError):
+            intent_disagreement = None
+
         gate = evaluate_trade_intent(
             fair_yes_probability=fair_yes_for_gate,
             side=intent_side,
@@ -1927,13 +2079,33 @@ class LiveTradeDecisionLoop:
             model_blend_weight=float(
                 getattr(settings.ensemble, "market_blend_model_weight", 0.65) or 0.65
             ),
-            calibration_slope=await self._get_calibration_slope(),
-            maker=False,
+            calibration_slope=await self._get_calibration_slope(
+                market_type=str(selected_event.get("category") or "") or None
+            ),
+            maker=expects_maker_entry,
             include_exit_fee=is_quick_flip_intent,
             min_net_edge=float(
                 getattr(settings.trading, "live_trade_min_net_edge", 0.02) or 0.0
             ),
+            disagreement=intent_disagreement,
         )
+        gate_snapshot = {
+            "fair_yes_probability": gate["fair_yes_probability"],
+            "market_yes_midpoint": market_yes_mid,
+            "shrunk_yes_probability": gate["shrunk_yes_probability"],
+            "blended_yes_probability": gate["blended_yes_probability"],
+            "win_probability": gate["win_probability"],
+            "net_edge": gate["ev"].net_edge,
+            "gross_edge": gate["ev"].gross_edge,
+            "fees_per_contract": gate["ev"].entry_fee_per_contract
+            + gate["ev"].exit_fee_per_contract,
+            "expects_maker_entry": expects_maker_entry,
+            "spread_cents": spread_cents,
+            "top_depth_contracts": top_depth_contracts,
+            "disagreement": intent_disagreement,
+            "disagreement_edge_padding": gate["disagreement_edge_padding"],
+            "weather_model": weather_pooled_from,
+        }
         if not gate["approved"]:
             await self._record_execution_status(
                 run_id=run_id,
@@ -1944,16 +2116,8 @@ class LiveTradeDecisionLoop:
                 quantity=quantity,
                 payload={
                     "fair_yes_probability": gate["fair_yes_probability"],
-                    "shrunk_yes_probability": gate["shrunk_yes_probability"],
-                    "blended_yes_probability": gate["blended_yes_probability"],
-                    "win_probability": gate["win_probability"],
-                    "market_yes_midpoint": market_yes_mid,
                     "entry_price": limit_price,
-                    "net_edge": gate["ev"].net_edge,
-                    "gross_edge": gate["ev"].gross_edge,
-                    "fees_per_contract": gate["ev"].entry_fee_per_contract
-                    + gate["ev"].exit_fee_per_contract,
-                    "weather_model": weather_pooled_from,
+                    **gate_snapshot,
                 },
             )
             return False
@@ -2004,7 +2168,10 @@ class LiveTradeDecisionLoop:
                 ),
                 error=quick_flip_result.get("error"),
                 quantity=quick_flip_result.get("quantity", quantity),
-                payload=quick_flip_result.get("payload"),
+                payload={
+                    **(quick_flip_result.get("payload") or {}),
+                    "gate_snapshot": gate_snapshot,
+                },
             )
             return bool(quick_flip_result.get("executed"))
 
@@ -2090,6 +2257,7 @@ class LiveTradeDecisionLoop:
                     "contracts_cost": position.contracts_cost,
                     "stop_loss_price": position.stop_loss_price,
                     "take_profit_price": position.take_profit_price,
+                    "gate_snapshot": gate_snapshot,
                 },
             )
             return True

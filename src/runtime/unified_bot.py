@@ -219,6 +219,14 @@ class UnifiedTradingBot:
                 asyncio.create_task(self._run_position_tracking(db_manager, kalshi_client)),
                 asyncio.create_task(self._run_performance_evaluation(db_manager))
             ]
+            if bool(getattr(settings.weather, "enabled", True)) and bool(
+                getattr(settings.weather, "scan_trade_enabled", False)
+            ):
+                self.background_tasks.append(
+                    asyncio.create_task(
+                        self._run_weather_scan(db_manager, kalshi_client)
+                    )
+                )
 
             # Setup shutdown handler
             def signal_handler():
@@ -384,6 +392,34 @@ class UnifiedTradingBot:
             except Exception as e:
                 self.logger.error(f"Error in performance evaluation: {e}")
                 await asyncio.sleep(300)
+
+    async def _run_weather_scan(self, db_manager: DatabaseManager, kalshi_client: KalshiClient):
+        """
+        Background task: deterministic weather edge scanner.
+
+        Forecasts move on model-run cadence (hours), not seconds, so a
+        30-minute sweep is plenty. No LLM calls — this loop costs nothing
+        but a handful of HTTP requests per cycle.
+        """
+        from src.jobs.weather_scan import run_weather_scan
+
+        while not self.shutdown_event.is_set():
+            try:
+                summary = await run_weather_scan(
+                    db_manager=db_manager,
+                    kalshi_client=kalshi_client,
+                    execute=True,
+                )
+                self.logger.info(
+                    "Weather scan cycle complete",
+                    events=summary.events_scanned,
+                    candidates=len(summary.candidates),
+                    positions_opened=summary.positions_opened,
+                )
+                await asyncio.sleep(1800)  # 30 minutes between sweeps
+            except Exception as e:
+                self.logger.error(f"Error in weather scan: {e}")
+                await asyncio.sleep(600)
 
     async def run(self):
         """Main entry point for the Unified Trading Bot."""

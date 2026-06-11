@@ -371,6 +371,87 @@ class SportsAdapter(TradingLoggerMixin):
         return "-"
 
     @staticmethod
+    def _moneyline_to_probability(moneyline: Any) -> Optional[float]:
+        """American moneyline → implied win probability (vig included)."""
+        try:
+            ml = float(moneyline)
+        except (TypeError, ValueError):
+            return None
+        if ml == 0:
+            return None
+        if ml < 0:
+            return -ml / (-ml + 100.0)
+        return 100.0 / (ml + 100.0)
+
+    @staticmethod
+    def _extract_team_moneyline(team_odds: Any) -> Optional[float]:
+        """Pull a moneyline from ESPN's homeTeamOdds/awayTeamOdds blocks."""
+        if not isinstance(team_odds, Mapping):
+            return None
+        for source in (team_odds, team_odds.get("current"), team_odds.get("open")):
+            if not isinstance(source, Mapping):
+                continue
+            raw = source.get("moneyLine", source.get("moneyline"))
+            if raw is None and isinstance(source.get("moneyLine"), Mapping):
+                raw = source["moneyLine"].get("american")
+            try:
+                if raw is not None:
+                    return float(raw)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @classmethod
+    def _extract_odds(cls, competition: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Normalize the first sportsbook odds entry on an ESPN competition.
+
+        Moneylines are converted to implied win probabilities and de-vigged
+        (normalized to sum to 1) so downstream prompts get a clean
+        market-consensus anchor rather than raw juiced prices.
+        """
+        odds_entries = competition.get("odds") or []
+        if not isinstance(odds_entries, list) or not odds_entries:
+            return None
+        entry = odds_entries[0]
+        if not isinstance(entry, Mapping):
+            return None
+
+        provider = entry.get("provider")
+        provider_name = (
+            str(provider.get("name") or "") if isinstance(provider, Mapping) else ""
+        )
+        home_ml = cls._extract_team_moneyline(entry.get("homeTeamOdds"))
+        away_ml = cls._extract_team_moneyline(entry.get("awayTeamOdds"))
+        home_prob = cls._moneyline_to_probability(home_ml)
+        away_prob = cls._moneyline_to_probability(away_ml)
+        if home_prob is not None and away_prob is not None:
+            total = home_prob + away_prob
+            if total > 0:
+                home_prob = round(home_prob / total, 4)
+                away_prob = round(away_prob / total, 4)
+
+        def _maybe_float(value: Any) -> Optional[float]:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        odds: Dict[str, Any] = {
+            "provider": provider_name or None,
+            "details": str(entry.get("details") or "") or None,
+            "spread": _maybe_float(entry.get("spread")),
+            "over_under": _maybe_float(entry.get("overUnder")),
+            "home_moneyline": home_ml,
+            "away_moneyline": away_ml,
+            "home_implied_win_probability": home_prob,
+            "away_implied_win_probability": away_prob,
+        }
+        if not any(value is not None for key, value in odds.items() if key != "provider"):
+            return None
+        return odds
+
+    @staticmethod
     def _extract_signals(
         league: str,
         teams: List[Dict[str, Any]],
@@ -414,6 +495,13 @@ class SportsAdapter(TradingLoggerMixin):
             "possession_team_id": competition.get("possession"),
             "down_distance_text": competition.get("shortDownDistanceText"),
         })
+
+        # Sportsbook consensus (when ESPN carries it): de-vigged implied win
+        # probabilities are the strongest available anchor for game-winner
+        # markets — sharper than any single-model estimate.
+        odds = SportsAdapter._extract_odds(competition)
+        if odds is not None:
+            signals["odds"] = odds
         return signals
 
 

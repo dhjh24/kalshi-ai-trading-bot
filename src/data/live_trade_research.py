@@ -1500,6 +1500,7 @@ class LiveTradeResearchService(TradingLoggerMixin):
         event = dict(research_payload["event"])
         event["markets"] = event["markets"][:MAX_EVENT_MARKETS_FOR_PROMPT]
         compact_payload = {
+            "as_of_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "event": event,
             "microstructure": research_payload.get("microstructure", {}),
             "news": research_payload.get("news", {}),
@@ -1508,15 +1509,37 @@ class LiveTradeResearchService(TradingLoggerMixin):
             "bitcoin_context": research_payload.get("bitcoin_context"),
             "crypto_context": research_payload.get("crypto_context"),
             "macro_context": research_payload.get("macro_context"),
+            "weather_context": research_payload.get("weather_context"),
         }
 
         return (
             "Analyze this Kalshi live-trade event and identify the best tradable "
             "opportunities.\n\n"
-            "Rules:\n"
+            "How to estimate probabilities (in this order):\n"
+            "1. Start from the market YES midpoint as your prior — it aggregates "
+            "many informed traders and is usually close to fair.\n"
+            "2. State the base rate for this kind of event before weighing "
+            "today's specifics.\n"
+            "3. Move off the prior only for concrete, current evidence in the "
+            "research payload (scores, sportsbook odds, model output, news). "
+            "Deviations under ~5 points are noise, not edge.\n"
+            "4. When sports_context.signals.odds carries implied win "
+            "probabilities, treat them as the sharp consensus; stray from them "
+            "only with in-game evidence the books may lag.\n"
+            "5. When weather_context carries deterministic model probabilities, "
+            "anchor to them — they come from physics ensembles, not narratives.\n"
+            "6. Calibration discipline: of markets you mark 70%, about 70% "
+            "should resolve YES. If you cannot defend the number, move toward "
+            "the market prior.\n\n"
+            "Trading rules:\n"
             "- Estimate a fair YES probability for any market you discuss.\n"
-            "- Compare it to the current market YES midpoint.\n"
-            "- Prefer liquid markets with evidence-backed edge.\n"
+            "- Use as_of_utc and each market's close time: the question is what "
+            "happens before expiry, not eventually.\n"
+            "- Kalshi taker fees are ~0.07 x P x (1-P) per contract (~1.75c at "
+            "mid prices; an early exit pays them again). Gross edges under ~3c "
+            "rarely survive fees — SKIP them.\n"
+            "- Prefer liquid markets with evidence-backed edge; wide spreads and "
+            "thin books are rejected downstream anyway.\n"
             "- If edge is weak or evidence is stale, use WATCH or SKIP.\n"
             "- Keep recommendations realistic and note the biggest risk flags.\n"
             "- Return JSON only.\n\n"

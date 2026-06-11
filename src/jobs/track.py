@@ -38,6 +38,46 @@ def _position_was_maker_entry(position: Position) -> bool:
     return (position.strategy or "").strip().lower() == "market_making"
 
 
+async def _record_category_outcome(
+    position: Position, net_pnl: float, db_path: Optional[str] = None
+) -> None:
+    """
+    Feed a settled position back into the category scorer.
+
+    This is the half of the category feedback loop that was missing: scores
+    were seeded once from historical data and then never updated, so the
+    allocation tiers could not learn from live results. Best-effort — a
+    scorer failure must never block exit bookkeeping.
+    """
+    try:
+        from src.strategies.category_scorer import CategoryScorer, infer_category
+
+        category = infer_category(position.market_id, position.rationale or "")
+        cost_basis = (
+            position.contracts_cost
+            if (position.contracts_cost or 0) > 0
+            else position.entry_price * position.quantity
+        )
+        roi = (net_pnl / cost_basis) if cost_basis > 0 else 0.0
+        scorer = CategoryScorer(db_path) if db_path else CategoryScorer()
+        await scorer.initialize()
+        await scorer.update_score(category, trade_won=net_pnl > 0, roi=roi)
+    except Exception as exc:  # pragma: no cover - defensive
+        get_trading_logger("position_tracker").debug(
+            "Category outcome update skipped", error=str(exc)
+        )
+
+
+async def _refresh_settlement_calibration(db_manager: DatabaseManager) -> None:
+    """Rebuild calibration rows after settlements so the shrink loop stays fresh."""
+    try:
+        await db_manager.refresh_settlement_calibration()
+    except Exception as exc:  # pragma: no cover - defensive
+        get_trading_logger("position_tracker").debug(
+            "Settlement calibration refresh skipped", error=str(exc)
+        )
+
+
 async def _resolve_market_fee_metadata(
     *,
     kalshi_client: KalshiClient,
@@ -391,6 +431,11 @@ async def run_tracking(
                         await db_manager.update_position_status(position.id, "closed")
 
                         exits_executed += 1
+                        await _record_category_outcome(
+                            position,
+                            float(pnl_details["net_pnl"]),
+                            db_path=getattr(db_manager, "db_path", None),
+                        )
                         logger.info(
                             "Position for market %s closed via %s. PnL: $%.2f",
                             position.market_id,
@@ -419,6 +464,11 @@ async def run_tracking(
                         )
 
                         exits_executed += 1
+                        await _record_category_outcome(
+                            position,
+                            float(exit_result["net_pnl"]),
+                            db_path=getattr(db_manager, "db_path", None),
+                        )
                         logger.info(
                             "Paper position for market %s closed via %s. Net PnL: $%.2f, fees: $%.2f",
                             position.market_id,
@@ -448,6 +498,9 @@ async def run_tracking(
             total_paper_exits,
             exits_executed,
         )
+
+        if exits_executed > 0 or total_paper_exits > 0:
+            await _refresh_settlement_calibration(db_manager)
 
         await _evaluate_shadow_drift_auto_pause(db_manager, logger)
 
