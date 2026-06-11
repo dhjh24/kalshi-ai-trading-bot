@@ -7,7 +7,7 @@ import json
 import os
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
-from typing import Any, Optional, List, Dict
+from typing import Any, Optional, List, Dict, Tuple
 
 from src.utils.logging_setup import TradingLoggerMixin
 
@@ -30,6 +30,12 @@ def _safe_load_json(value: Any) -> Optional[Any]:
         return json.loads(text)
     except (TypeError, ValueError):
         return None
+
+
+def _normalize_calibration_market_type(value: Any) -> str:
+    """Normalize calibration market-focus labels for stable dashboard grouping."""
+    text = str(value or "").strip()
+    return text.lower() if text else "unknown"
 
 
 @dataclass
@@ -830,6 +836,7 @@ class DatabaseManager(TradingLoggerMixin):
                 market_id TEXT NOT NULL,
                 strategy TEXT,
                 category TEXT,
+                market_type TEXT,
                 predicted_probability REAL NOT NULL,
                 outcome INTEGER NOT NULL,
                 brier_score REAL NOT NULL,
@@ -844,6 +851,13 @@ class DatabaseManager(TradingLoggerMixin):
             "CREATE INDEX IF NOT EXISTS idx_settlement_calibration_settled_at "
             "ON settlement_calibration(settled_at DESC)"
         )
+        cursor = await db.execute("PRAGMA table_info(settlement_calibration)")
+        calibration_info = await cursor.fetchall()
+        calibration_columns = {col[1] for col in calibration_info}
+        if calibration_info and "market_type" not in calibration_columns:
+            await db.execute("ALTER TABLE settlement_calibration ADD COLUMN market_type TEXT")
+            self.logger.info("Added market_type column to settlement_calibration table")
+        await self._backfill_settlement_calibration_market_types(db)
 
     async def _migrate_simulated_orders_resting_uniqueness(
         self, db: aiosqlite.Connection
@@ -3566,27 +3580,65 @@ class DatabaseManager(TradingLoggerMixin):
         ]
 
     async def list_arbitrage_candidates(
-        self, *, limit: int = 25
+        self,
+        *,
+        limit: int = 25,
+        side: Optional[str] = None,
+        min_net_edge: Optional[float] = None,
+        min_mapping_confidence: Optional[float] = None,
+        sort_by: str = "scanned_at",
     ) -> List[Dict[str, Any]]:
-        """Return the most recent persisted alert-only arbitrage candidates."""
+        """Return persisted alert-only arbitrage candidates with safe filters."""
         bounded_limit = max(1, min(int(limit or 0) or 25, 200))
+        normalized_side = str(side or "").strip().upper()
+        if normalized_side not in {"YES", "NO"}:
+            normalized_side = ""
+        sort_order = {
+            "scanned_at": "scanned_at DESC, estimated_edge DESC, id DESC",
+            "estimated_edge": "estimated_edge DESC, id DESC",
+            "mapping_confidence": "mapping_confidence DESC, id DESC",
+            # net_edge is stored in payload_json, so SQL fetches a wider window
+            # and the Python post-pass sorts on the parsed value.
+            "net_edge": "estimated_edge DESC, id DESC",
+        }.get(str(sort_by or "scanned_at"), "scanned_at DESC, estimated_edge DESC, id DESC")
+        needs_post_filter = min_net_edge is not None or sort_by == "net_edge"
+        fetch_limit = 200 if needs_post_filter else bounded_limit
+        where: list[str] = []
+        params: list[Any] = []
+        if normalized_side:
+            where.append("side = ?")
+            params.append(normalized_side)
+        if min_mapping_confidence is not None:
+            where.append("mapping_confidence >= ?")
+            params.append(float(min_mapping_confidence))
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                """
+                f"""
                 SELECT id, kalshi_ticker, polymarket_id, side, kalshi_price,
                        polymarket_price, estimated_edge, mapping_confidence,
                        freshness_seconds, execution_mode, payload_json,
                        scanned_at
                 FROM arbitrage_candidates
-                ORDER BY scanned_at DESC, id DESC
+                {where_sql}
+                ORDER BY {sort_order}
                 LIMIT ?
                 """,
-                (bounded_limit,),
+                (*params, fetch_limit),
             )
             rows = await cursor.fetchall()
-        return [
-            {
+        items: List[Dict[str, Any]] = []
+        for row in rows:
+            payload = _safe_load_json(row["payload_json"])
+
+            def _payload_float(key: str) -> float:
+                try:
+                    return float(payload.get(key) or 0.0) if isinstance(payload, dict) else 0.0
+                except (TypeError, ValueError):
+                    return 0.0
+
+            item = {
                 "id": int(row["id"]),
                 "kalshi_ticker": row["kalshi_ticker"],
                 "polymarket_id": row["polymarket_id"],
@@ -3594,14 +3646,27 @@ class DatabaseManager(TradingLoggerMixin):
                 "kalshi_price": float(row["kalshi_price"] or 0.0),
                 "polymarket_price": float(row["polymarket_price"] or 0.0),
                 "estimated_edge": float(row["estimated_edge"] or 0.0),
+                "net_edge": _payload_float("net_edge"),
+                "fees_estimated": _payload_float("fees_estimated"),
+                "kalshi_spread": _payload_float("kalshi_spread"),
+                "kalshi_top_liquidity": _payload_float("kalshi_top_liquidity"),
+                "polymarket_volume_usd": _payload_float("polymarket_volume_usd"),
+                "polymarket_liquidity_usd": _payload_float("polymarket_liquidity_usd"),
+                "notes": payload.get("notes") if isinstance(payload, dict) else None,
                 "mapping_confidence": float(row["mapping_confidence"] or 0.0),
                 "freshness_seconds": int(row["freshness_seconds"] or 0),
                 "execution_mode": row["execution_mode"] or "alert_only",
-                "payload": _safe_load_json(row["payload_json"]),
+                "payload": payload,
                 "scanned_at": row["scanned_at"],
             }
-            for row in rows
-        ]
+            items.append(item)
+        if min_net_edge is not None:
+            items = [item for item in items if item["net_edge"] >= float(min_net_edge)]
+        if sort_by == "net_edge":
+            items.sort(key=lambda item: (item["net_edge"], item["mapping_confidence"]), reverse=True)
+        elif sort_by == "mapping_confidence":
+            items.sort(key=lambda item: item["mapping_confidence"], reverse=True)
+        return items[:bounded_limit]
 
     async def list_source_snapshots(
         self, *, limit: int = 24
@@ -3655,20 +3720,119 @@ class DatabaseManager(TradingLoggerMixin):
                 "SELECT COUNT(*) FROM settlement_calibration"
             )
             (calibration_samples,) = await cursor.fetchone() or (0,)
-        return {
-            "rejections_24h": int(rejections_24h or 0),
-            "arbitrage_candidates_24h": int(arbitrage_24h or 0),
-            "calibration_samples": int(calibration_samples or 0),
-        }
+            return {
+                "rejections_24h": int(rejections_24h or 0),
+                "arbitrage_candidates_24h": int(arbitrage_24h or 0),
+                "calibration_samples": int(calibration_samples or 0),
+            }
+
+    async def _backfill_settlement_calibration_market_types(
+        self, db: aiosqlite.Connection
+    ) -> int:
+        """Fill blank calibration market types from decisions, then market metadata."""
+
+        cursor = await db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settlement_calibration'"
+        )
+        if await cursor.fetchone() is None:
+            return 0
+
+        cursor = await db.execute("PRAGMA table_info(settlement_calibration)")
+        calibration_columns = {col[1] for col in await cursor.fetchall()}
+        if "market_type" not in calibration_columns:
+            return 0
+
+        cursor = await db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'live_trade_decisions'"
+        )
+        has_decisions = await cursor.fetchone() is not None
+        decision_columns: set[str] = set()
+        if has_decisions:
+            cursor = await db.execute("PRAGMA table_info(live_trade_decisions)")
+            decision_columns = {col[1] for col in await cursor.fetchall()}
+
+        decision_focus_expr = (
+            """
+                (
+                    SELECT LOWER(TRIM(d.focus_type))
+                    FROM live_trade_decisions d
+                    WHERE d.market_ticker = settlement_calibration.market_id
+                      AND COALESCE(NULLIF(d.strategy, ''), 'unknown') =
+                          COALESCE(NULLIF(settlement_calibration.strategy, ''), 'unknown')
+                      AND d.focus_type IS NOT NULL
+                      AND TRIM(d.focus_type) != ''
+                    ORDER BY COALESCE(d.created_at, '') DESC, d.id DESC
+                    LIMIT 1
+                )
+            """
+            if {
+                "id",
+                "created_at",
+                "market_ticker",
+                "strategy",
+                "focus_type",
+            }.issubset(decision_columns)
+            else "NULL"
+        )
+
+        cursor = await db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'markets'"
+        )
+        has_markets = await cursor.fetchone() is not None
+        market_columns: set[str] = set()
+        if has_markets:
+            cursor = await db.execute("PRAGMA table_info(markets)")
+            market_columns = {col[1] for col in await cursor.fetchall()}
+
+        market_category_expr = (
+            """
+                (
+                    SELECT LOWER(TRIM(m.category))
+                    FROM markets m
+                    WHERE m.market_id = settlement_calibration.market_id
+                      AND m.category IS NOT NULL
+                      AND TRIM(m.category) != ''
+                    LIMIT 1
+                )
+            """
+            if {"market_id", "category"}.issubset(market_columns)
+            else "NULL"
+        )
+        own_category_expr = (
+            "LOWER(NULLIF(TRIM(category), ''))"
+            if "category" in calibration_columns
+            else "NULL"
+        )
+
+        cursor = await db.execute(
+            f"""
+            UPDATE settlement_calibration
+            SET market_type = COALESCE(
+                {decision_focus_expr},
+                {market_category_expr},
+                {own_category_expr},
+                'unknown'
+            )
+            WHERE market_type IS NULL OR TRIM(market_type) = ''
+            """
+        )
+        backfilled = max(int(cursor.rowcount or 0), 0)
+        if backfilled:
+            self.logger.info(
+                "Backfilled settlement_calibration market_type values",
+                rows=backfilled,
+            )
+        return backfilled
 
     async def refresh_settlement_calibration(self) -> int:
         """
         Rebuild settlement calibration rows from closed trade logs.
 
         For each trade we prefer (in order):
-          1. The latest matching position row's `confidence`, treated as the
-             held-side decision probability emitted by the strategy.
-          2. The entry-price heuristic (treats fill price as the implied
+          1. The latest matching live-trade decision confidence, treated as
+             the held-side decision probability emitted by the strategy.
+          2. The latest matching position row's `confidence`.
+          3. The entry-price heuristic (treats fill price as the implied
              probability of the held side).
 
         The chosen probability is recorded along with the source flag so the
@@ -3678,16 +3842,83 @@ class DatabaseManager(TradingLoggerMixin):
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("DELETE FROM settlement_calibration WHERE source = 'trade_logs'")
             cursor = await db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'live_trade_decisions'"
+            )
+            has_decisions = await cursor.fetchone() is not None
+            decision_columns: set[str] = set()
+            if has_decisions:
+                cursor = await db.execute("PRAGMA table_info(live_trade_decisions)")
+                decision_columns = {col[1] for col in await cursor.fetchall()}
+            decision_focus_expr = (
                 """
+                    (
+                        SELECT LOWER(TRIM(d.focus_type))
+                        FROM live_trade_decisions d
+                        WHERE d.market_ticker = t.market_id
+                          AND COALESCE(NULLIF(d.strategy, ''), 'unknown') =
+                              COALESCE(NULLIF(t.strategy, ''), 'unknown')
+                          AND d.focus_type IS NOT NULL
+                          AND TRIM(d.focus_type) != ''
+                        ORDER BY COALESCE(d.created_at, '') DESC, d.id DESC
+                        LIMIT 1
+                    )
+                """
+                if {
+                    "id",
+                    "created_at",
+                    "market_ticker",
+                    "strategy",
+                    "focus_type",
+                }.issubset(decision_columns)
+                else "NULL"
+            )
+            decision_confidence_expr = (
+                """
+                    (
+                        SELECT d.confidence
+                        FROM live_trade_decisions d
+                        WHERE d.market_ticker = t.market_id
+                          AND COALESCE(NULLIF(d.strategy, ''), 'unknown') =
+                              COALESCE(NULLIF(t.strategy, ''), 'unknown')
+                          AND d.confidence IS NOT NULL
+                          AND LOWER(COALESCE(d.step, 'decision')) IN ('decision', 'specialist', 'final')
+                          AND LOWER(COALESCE(d.status, 'completed')) = 'completed'
+                          AND LOWER(COALESCE(d.action, 'buy')) = 'buy'
+                          AND (
+                              d.side IS NULL
+                              OR TRIM(d.side) = ''
+                              OR UPPER(d.side) = UPPER(t.side)
+                          )
+                        ORDER BY COALESCE(d.created_at, '') DESC, d.id DESC
+                        LIMIT 1
+                    )
+                """
+                if {
+                    "id",
+                    "created_at",
+                    "market_ticker",
+                    "strategy",
+                    "confidence",
+                    "side",
+                    "step",
+                    "status",
+                    "action",
+                }.issubset(decision_columns)
+                else "NULL"
+            )
+            cursor = await db.execute(
+                f"""
                 SELECT
                     t.market_id,
                     t.strategy,
                     m.category,
+                    COALESCE({decision_focus_expr}, LOWER(NULLIF(TRIM(m.category), '')), 'unknown') AS market_type,
                     t.side,
                     t.entry_price,
                     t.exit_price,
                     t.pnl,
                     t.exit_timestamp,
+                    {decision_confidence_expr} AS live_decision_confidence,
                     (
                         SELECT p.confidence
                         FROM positions p
@@ -3708,16 +3939,21 @@ class DatabaseManager(TradingLoggerMixin):
                     market_id,
                     strategy,
                     category,
+                    market_type,
                     side,
                     entry_price,
                     exit_price,
                     pnl,
                     exit_ts,
+                    live_decision_confidence,
                     decision_confidence,
                 ) = row
-                predicted_source = "decision_confidence"
+                predicted_source = "live_decision_confidence"
                 predicted: Optional[float]
-                if decision_confidence is not None:
+                if live_decision_confidence is not None:
+                    predicted = max(0.0, min(1.0, float(live_decision_confidence)))
+                elif decision_confidence is not None:
+                    predicted_source = "position_confidence"
                     predicted = max(0.0, min(1.0, float(decision_confidence)))
                 else:
                     predicted_source = "entry_price_heuristic"
@@ -3730,15 +3966,16 @@ class DatabaseManager(TradingLoggerMixin):
                 await db.execute(
                     """
                     INSERT INTO settlement_calibration (
-                        market_id, strategy, category, predicted_probability,
+                        market_id, strategy, category, market_type, predicted_probability,
                         outcome, brier_score, realized_ev, pnl, source, settled_at,
                         payload_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'trade_logs', ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'trade_logs', ?, ?)
                     """,
                     (
                         market_id,
                         strategy,
                         category,
+                        _normalize_calibration_market_type(market_type),
                         predicted,
                         outcome,
                         brier,
@@ -3750,6 +3987,7 @@ class DatabaseManager(TradingLoggerMixin):
                                 "side": side,
                                 "entry_price": entry_price,
                                 "predicted_source": predicted_source,
+                                "live_decision_confidence": live_decision_confidence,
                                 "decision_confidence": decision_confidence,
                             },
                             sort_keys=True,
@@ -3757,8 +3995,54 @@ class DatabaseManager(TradingLoggerMixin):
                     ),
                 )
                 inserted += 1
+            await self._backfill_settlement_calibration_market_types(db)
             await db.commit()
             return inserted
+
+    async def get_calibration_samples(
+        self,
+        *,
+        strategy: Optional[str] = None,
+        market_type: Optional[str] = None,
+        limit: int = 500,
+    ) -> List[Tuple[float, int]]:
+        """
+        Return recent ``(predicted_probability, outcome)`` pairs from the
+        settlement calibration table, newest first.
+
+        Used by the probability engine to estimate a reliability slope so
+        persistently overconfident strategies are automatically shrunk
+        toward the market prior before EV gating.
+        """
+        query = (
+            "SELECT predicted_probability, outcome FROM settlement_calibration "
+            "WHERE predicted_probability IS NOT NULL AND outcome IS NOT NULL"
+        )
+        params: List[Any] = []
+        if strategy:
+            query += " AND COALESCE(NULLIF(strategy, ''), 'unknown') = ?"
+            params.append(strategy)
+        if market_type:
+            query += " AND COALESCE(NULLIF(market_type, ''), 'unknown') = ?"
+            params.append(market_type)
+        query += " ORDER BY settled_at DESC, id DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(query, params)
+                rows = await cursor.fetchall()
+        except aiosqlite.Error as exc:
+            self.logger.warning(f"Failed to load calibration samples: {exc}")
+            return []
+
+        samples: List[Tuple[float, int]] = []
+        for predicted, outcome in rows:
+            try:
+                samples.append((float(predicted), int(outcome)))
+            except (TypeError, ValueError):
+                continue
+        return samples
 
     async def get_performance_by_strategy(self) -> Dict[str, Dict]:
         """

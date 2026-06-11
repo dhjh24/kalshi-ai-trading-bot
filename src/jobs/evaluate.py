@@ -5,10 +5,10 @@ Enhanced evaluation system with cost monitoring and trading performance analysis
 import asyncio
 import aiosqlite
 import os
-import pickle
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
+from src.clients.shared_types import load_daily_tracker_pickle
 from src.utils.database import DatabaseManager
 from src.config.settings import settings
 from src.utils.logging_setup import get_trading_logger
@@ -26,7 +26,7 @@ def _read_xai_tracker_from_pickle() -> Optional[dict]:
     try:
         if os.path.exists(usage_file):
             with open(usage_file, "rb") as f:
-                tracker = pickle.load(f)
+                tracker = load_daily_tracker_pickle(f)
             today = datetime.now().strftime("%Y-%m-%d")
             if getattr(tracker, "date", None) == today:
                 return {

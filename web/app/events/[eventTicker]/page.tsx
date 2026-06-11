@@ -21,6 +21,8 @@ export default async function EventDetailPage({
     notFound();
   }
 
+  const eventWeather = detail.eventWeather ?? null;
+
   return (
     <div className="space-y-6">
       <Panel eyebrow="Event Detail" title={detail.event.title}>
@@ -71,6 +73,41 @@ export default async function EventDetailPage({
               color="#f59e0b"
             />
             <CandlestickChart title="BTC candlesticks" candles={detail.crypto.candles} />
+          </div>
+        </Panel>
+      ) : null}
+
+      {eventWeather && eventWeather.buckets.length > 0 ? (
+        <Panel
+          eyebrow="Weather Buckets"
+          title={eventWeather.eventTitle || "Mutually exclusive contracts"}
+        >
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+            {eventWeather.buckets.map((bucket) => (
+              <div key={bucket.ticker} className="rounded-lg border border-slate-100 p-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <Link href={`/markets/${bucket.ticker}`} className="font-semibold text-steel hover:text-signal">
+                      {bucket.ticker}
+                    </Link>
+                    <p className="mt-1 text-sm text-slate-500">
+                      {bucket.bucketLabel || bucket.title || "Unmapped bucket"}
+                    </p>
+                  </div>
+                  <Badge tone={bucket.canTrade ? "positive" : "warning"}>
+                    {bucket.canTrade ? "Mapped" : "Review"}
+                  </Badge>
+                </div>
+                <p className="mt-3 text-sm font-semibold text-steel">
+                  YES {Math.round((bucket.yesPrice || 0) * 100)} cents
+                </p>
+                {!bucket.canTrade ? (
+                  <p className="mt-2 text-xs text-amber-700">
+                    Blocked: {bucket.blockReason || "ambiguous wording"}
+                  </p>
+                ) : null}
+              </div>
+            ))}
           </div>
         </Panel>
       ) : null}

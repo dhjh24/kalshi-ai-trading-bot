@@ -25,6 +25,10 @@ class TradingDecision:
     confidence: float
     limit_price: Optional[int] = None
     reasoning: Optional[str] = None
+    # Estimated TRUE probability that the market resolves YES (0-1), pooled
+    # from the agents' forecasts. Distinct from `confidence`, which is the
+    # model's certainty in its own decision. None on legacy single-model paths.
+    fair_yes_probability: Optional[float] = None
 
 
 @dataclass
@@ -40,18 +44,28 @@ class DailyUsageTracker:
 
 
 class LegacyPickleUnpickler(pickle.Unpickler):
-    """Unpickler that rewrites legacy ``src.clients.xai_client`` references.
+    """Restricted unpickler for the local daily-usage tracker.
 
     Pickled :class:`DailyUsageTracker` snapshots written before the W11(c)
     cleanup carry ``__module__ == "src.clients.xai_client"``. After that
     module is deleted those snapshots would fail to unpickle; this remap
     keeps the on-disk format readable without resurrecting the dead module.
+
+    The file lives under ``logs/`` and is not a network protocol, but it is
+    still mutable local state. Restrict globals to the tracker shape instead
+    of allowing a crafted pickle to import arbitrary callables.
     """
 
     def find_class(self, module: str, name: str):  # type: ignore[override]
-        if module == "src.clients.xai_client":
+        if module == "src.clients.xai_client" and name == "DailyUsageTracker":
             module = "src.clients.shared_types"
-        return super().find_class(module, name)
+
+        if module == "src.clients.shared_types" and name == "DailyUsageTracker":
+            return DailyUsageTracker
+        if module == "datetime" and name == "datetime":
+            return datetime
+
+        raise pickle.UnpicklingError(f"Unsupported class in daily usage tracker: {module}.{name}")
 
 
 def load_daily_tracker_pickle(fh) -> Any:

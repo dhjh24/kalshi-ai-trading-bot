@@ -22,6 +22,11 @@ from src.agents.bear_researcher import BearResearcher
 from src.agents.risk_manager_agent import RiskManagerAgent
 from src.config.settings import settings
 from src.utils.logging_setup import get_trading_logger
+from src.utils.probability_engine import (
+    blend_with_market,
+    clamp_probability,
+    pool_probabilities,
+)
 
 logger = get_trading_logger("ensemble")
 
@@ -183,9 +188,20 @@ class EnsembleRunner:
             }
 
         # ------------------------------------------------------------------
-        # Weighted average (confidence-adjusted weights)
+        # Weighted log-odds pooling (confidence-adjusted weights) blended
+        # with the market-implied probability as a prior.
         # ------------------------------------------------------------------
         weighted_prob, raw_confidence, disagreement = self._aggregate(probabilities)
+        model_probability = weighted_prob
+        market_probability = self._market_yes_probability(market_data)
+        if market_probability is not None:
+            weighted_prob = blend_with_market(
+                model_probability,
+                market_probability,
+                model_weight=getattr(
+                    settings.ensemble, "market_blend_model_weight", 0.65
+                ),
+            )
 
         # If disagreement is high, discount confidence
         if disagreement > self.disagreement_threshold:
@@ -223,6 +239,10 @@ class EnsembleRunner:
 
         return {
             "probability": round(weighted_prob, 4),
+            "model_probability": round(model_probability, 4),
+            "market_probability": (
+                round(market_probability, 4) if market_probability is not None else None
+            ),
             "confidence": round(adjusted_confidence, 4),
             "disagreement": round(disagreement, 4),
             "model_results": model_results,
@@ -290,41 +310,59 @@ class EnsembleRunner:
         self, probabilities: List[Tuple[str, float, float]]
     ) -> Tuple[float, float, float]:
         """
-        Compute weighted average probability, aggregate confidence, and
-        disagreement (standard deviation).
+        Pool probabilities in log-odds space with confidence-adjusted weights,
+        and report aggregate confidence plus disagreement (std deviation).
 
-        Weights are base weight * agent confidence so that more confident
-        agents contribute more.
+        Log-odds pooling with mild extremization replaces the previous
+        arithmetic mean, which systematically pulled estimates toward 0.5.
+        The news analyst's sentiment-derived pseudo-probability is weighted by
+        its distance from 0.5 so a neutral news read no longer dilutes the
+        real forecasts.
         """
-        import math
-
-        total_weight = 0.0
-        weighted_sum = 0.0
+        entries: List[Tuple[float, float]] = []
         confidence_sum = 0.0
 
         for role, prob, conf in probabilities:
             base_w = self.weights.get(role, 0.1)
             adjusted_w = base_w * max(conf, 0.1)  # Floor conf at 0.1 to avoid zero
-            weighted_sum += prob * adjusted_w
+            if role == "news_analyst":
+                # Sentiment-derived probability is a tilt, not a forecast:
+                # neutral news (prob ~0.5) carries no information.
+                signal_strength = min(1.0, abs(prob - 0.5) * 4.0)
+                adjusted_w *= signal_strength
+            entries.append((prob, adjusted_w))
             confidence_sum += conf * base_w
-            total_weight += adjusted_w
 
-        if total_weight == 0:
+        pooled = pool_probabilities(
+            entries,
+            extremize=getattr(settings.ensemble, "extremize_factor", 1.2),
+        )
+        if pooled is None:
             return 0.5, 0.0, 1.0
-
-        avg_prob = weighted_sum / total_weight
 
         # Normalise confidence by total base weight
         total_base = sum(self.weights.get(r, 0.1) for r, _, _ in probabilities)
         avg_conf = confidence_sum / total_base if total_base > 0 else 0.5
 
-        # Standard deviation of probabilities (unweighted for simplicity)
-        probs = [p for _, p, _ in probabilities]
-        mean = sum(probs) / len(probs)
-        variance = sum((p - mean) ** 2 for p in probs) / len(probs)
-        std_dev = math.sqrt(variance)
+        return pooled.probability, avg_conf, pooled.disagreement
 
-        return avg_prob, avg_conf, std_dev
+    @staticmethod
+    def _market_yes_probability(market_data: dict) -> Optional[float]:
+        """Extract the market-implied YES probability from market data."""
+        raw = market_data.get("yes_price")
+        if raw is None:
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if value <= 0:
+            return None
+        if value > 1.0:  # cents-denominated
+            value /= 100.0
+        if not (0.0 < value < 1.0):
+            return None
+        return clamp_probability(value)
 
     # ------------------------------------------------------------------
     # Calibration tracking

@@ -29,33 +29,35 @@ export default async function MarketDetailPage({
   return (
     <div className="space-y-6">
       <Panel eyebrow="Market Detail" title={detail.market.live?.title || detail.market.db?.title || ticker}>
-        <div className="flex flex-wrap items-start justify-between gap-4">
-          <div className="space-y-3">
+        <div className="flex min-w-0 flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <div className="min-w-0 space-y-3 lg:flex-1">
             <div className="flex flex-wrap gap-2">
               <Badge tone="neutral">{detail.focusType}</Badge>
               {detail.market.db?.category ? <Badge tone="neutral">{detail.market.db.category}</Badge> : null}
               {detail.event?.event_ticker ? <Badge tone="positive">{detail.event.event_ticker}</Badge> : null}
             </div>
-            <p className="max-w-3xl text-slate-600">
+            <p className="max-w-3xl break-words text-slate-600">
               {detail.market.live?.rulesPrimary || "No market rules loaded for this contract yet."}
             </p>
             <p className="text-sm text-slate-500">
               Last updated {formatTimestamp(detail.market.db?.last_updated || detail.market.live?.expirationTime || null)}
             </p>
-            <p className="max-w-3xl text-sm leading-6 text-slate-500">
+            <p className="max-w-3xl break-words text-sm leading-6 text-slate-500">
               Use this page to inspect order book depth, related contracts, and
               sibling opportunities before requesting manual analysis. The
               analysis result below is stored in SQLite and surfaced across
               related market and event views.
             </p>
           </div>
-          <QueryProvider>
-            <AnalysisButton
-              targetType="market"
-              targetId={ticker}
-              initialRecord={detail.latestAnalysis}
-            />
-          </QueryProvider>
+          <div className="min-w-0 lg:flex-none">
+            <QueryProvider>
+              <AnalysisButton
+                targetType="market"
+                targetId={ticker}
+                initialRecord={detail.latestAnalysis}
+              />
+            </QueryProvider>
+          </div>
         </div>
       </Panel>
 

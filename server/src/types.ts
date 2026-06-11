@@ -888,6 +888,7 @@ export interface CalibrationSummary {
     strategy: string;
     sampleSize: number;
     averageBrierScore: number | null;
+    ece: number;
     winRate: number | null;
     realizedEv: number;
   }>;
@@ -895,6 +896,7 @@ export interface CalibrationSummary {
     category: string;
     sampleSize: number;
     averageBrierScore: number | null;
+    ece: number;
     winRate: number | null;
     realizedEv: number;
   }>;
@@ -902,6 +904,15 @@ export interface CalibrationSummary {
     model: string;
     sampleSize: number;
     averageBrierScore: number | null;
+    ece: number;
+    winRate: number | null;
+    realizedEv: number;
+  }>;
+  byMarketType: Array<{
+    marketType: string;
+    sampleSize: number;
+    averageBrierScore: number | null;
+    ece: number;
     winRate: number | null;
     realizedEv: number;
   }>;

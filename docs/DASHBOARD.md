@@ -115,6 +115,7 @@ This keeps the dashboard fast and predictable while still exposing richer AI rev
 - `DASHBOARD_BRIDGE_PORT` - change the Python bridge port from `8101`
 - `DASHBOARD_WEB_PORT` - change the Next.js web port from `3000`
 - `DASHBOARD_SERVER_PORT` - change the Fastify port from `4000`
+- `DASHBOARD_API_TOKEN` - optional bearer token required for dashboard writes when the API receives non-loopback socket-peer requests; loopback means `127.0.0.0/8`, `::1`, or IPv4-mapped `127.0.0.0/8`
 - `ANALYSIS_BRIDGE_URL` - point the API at a different analysis bridge
 - `DASHBOARD_REFRESH_MS` - adjust server-side refresh caching
 - `DASHBOARD_NEWS_REFRESH_MS`, `DASHBOARD_SPORTS_REFRESH_MS`, `DASHBOARD_CRYPTO_REFRESH_MS` - tune adapter cache TTLs

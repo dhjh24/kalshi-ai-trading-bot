@@ -1,4 +1,7 @@
+import { createHash, timingSafeEqual } from "node:crypto";
+import { isIP } from "node:net";
 import Fastify from "fastify";
+import type { FastifyReply, FastifyRequest } from "fastify";
 import cors from "@fastify/cors";
 import { z } from "zod";
 import { serverConfig } from "./config.js";
@@ -25,6 +28,86 @@ import { buildDashboardOrigins } from "./corsOrigins.js";
 
 const streamTopicSchema = z.enum(["markets", "btc", "scores", "analysis", "live-trade-decisions"]);
 const dashboardOrigins = buildDashboardOrigins();
+
+function tokenDigest(value: string): Buffer {
+  return createHash("sha256").update(value, "utf8").digest();
+}
+
+function timingSafeTokenEqual(presentedToken: string, expectedToken: string): boolean {
+  return timingSafeEqual(tokenDigest(presentedToken), tokenDigest(expectedToken));
+}
+
+function getHeaderValue(value: string | string[] | undefined): string {
+  if (Array.isArray(value)) {
+    return value[0] ?? "";
+  }
+  return typeof value === "string" ? value : "";
+}
+
+function getPresentedDashboardToken(request: FastifyRequest): string {
+  const bearer = getHeaderValue(request.headers.authorization).match(/^Bearer\s+(.+)$/i);
+  if (bearer?.[1]) {
+    return bearer[1].trim();
+  }
+  return getHeaderValue(request.headers["x-dashboard-token"]).trim();
+}
+
+function normalizeRemoteIpAddress(value: string | undefined): string | null {
+  const candidate = (value || "").trim().toLowerCase().replace(/%.+$/, "");
+  if (!candidate) {
+    return null;
+  }
+
+  if (candidate.startsWith("::ffff:")) {
+    const mappedAddress = candidate.slice("::ffff:".length);
+    return isIP(mappedAddress) === 4 ? mappedAddress : null;
+  }
+
+  return isIP(candidate) ? candidate : null;
+}
+
+function isLoopbackIpAddress(value: string | undefined): boolean {
+  const address = normalizeRemoteIpAddress(value);
+  if (!address) {
+    return false;
+  }
+
+  if (address === "::1") {
+    return true;
+  }
+
+  return isIP(address) === 4 && address.split(".")[0] === "127";
+}
+
+function isLoopbackRequest(request: FastifyRequest): boolean {
+  return isLoopbackIpAddress(request.raw.socket.remoteAddress);
+}
+
+function enforceDashboardMutationAuth(request: FastifyRequest, reply: FastifyReply): boolean {
+  if (isLoopbackRequest(request)) {
+    return true;
+  }
+
+  const expectedToken = (process.env.DASHBOARD_API_TOKEN || "").trim();
+  if (expectedToken) {
+    const presentedToken = getPresentedDashboardToken(request);
+    if (presentedToken && timingSafeTokenEqual(presentedToken, expectedToken)) {
+      return true;
+    }
+
+    reply.code(401);
+    void reply.send({ ok: false, error: "missing_or_invalid_dashboard_token" });
+    return false;
+  }
+
+  reply.code(403);
+  void reply.send({
+    ok: false,
+    error: "remote_dashboard_mutation_denied",
+    message: "Set DASHBOARD_API_TOKEN to allow non-loopback dashboard mutations."
+  });
+  return false;
+}
 
 export async function buildServer() {
   const app = Fastify({
@@ -105,6 +188,10 @@ export async function buildServer() {
   });
   app.get("/api/quick-flip", async () => getQuickFlipPayload());
   app.put("/api/quick-flip/config", async (request, reply) => {
+    if (!enforceDashboardMutationAuth(request, reply)) {
+      return;
+    }
+
     const payload = updateQuickFlipConfigPayload(request.body);
     if (!payload.ok) {
       reply.code(
@@ -118,6 +205,10 @@ export async function buildServer() {
     return payload;
   });
   app.post("/api/paper-trading/reset", async (request, reply) => {
+    if (!enforceDashboardMutationAuth(request, reply)) {
+      return;
+    }
+
     z
       .object({
         confirmation: z.literal("CLEAR PAPER")
@@ -133,6 +224,10 @@ export async function buildServer() {
     return payload;
   });
   app.post("/api/dashboard/reset", async (request, reply) => {
+    if (!enforceDashboardMutationAuth(request, reply)) {
+      return;
+    }
+
     z
       .object({
         confirmation: z.literal("CLEAR ALL")
@@ -172,12 +267,11 @@ export async function buildServer() {
     notes: z.string().trim().max(2000).nullable().optional(),
     source: z.string().trim().min(1).max(120).nullable().optional()
   });
-  const submitLiveTradeDecisionFeedback = async (request: {
-    params: unknown;
-    body: unknown;
-  }, reply: {
-    code: (statusCode: number) => void;
-  }) => {
+  const submitLiveTradeDecisionFeedback = async (request: FastifyRequest, reply: FastifyReply) => {
+    if (!enforceDashboardMutationAuth(request, reply)) {
+      return;
+    }
+
     const params = z.object({ decisionId: z.string().min(1) }).parse(request.params);
     const body = liveTradeDecisionFeedbackBodySchema.parse(request.body);
     const payload = submitLiveTradeDecisionFeedbackPayload(params.decisionId, body);
@@ -225,7 +319,7 @@ export async function buildServer() {
       : typeof headerValue === "string"
         ? headerValue
         : "";
-    if (!presentedToken || presentedToken !== expectedToken) {
+    if (!presentedToken || !timingSafeTokenEqual(presentedToken, expectedToken)) {
       reply.code(401);
       return { ok: false, error: "unauthorized" };
     }
@@ -275,6 +369,10 @@ export async function buildServer() {
   });
 
   app.post("/api/analysis/markets/:ticker", async (request, reply) => {
+    if (!enforceDashboardMutationAuth(request, reply)) {
+      return;
+    }
+
     const params = z.object({ ticker: z.string().min(1) }).parse(request.params);
     const body = z
       .object({
@@ -288,6 +386,10 @@ export async function buildServer() {
   });
 
   app.post("/api/analysis/events/:eventTicker", async (request, reply) => {
+    if (!enforceDashboardMutationAuth(request, reply)) {
+      return;
+    }
+
     const params = z.object({ eventTicker: z.string().min(1) }).parse(request.params);
     const body = z
       .object({

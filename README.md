@@ -438,6 +438,17 @@ Provider request behavior:
 - JSON-critical calls use strict `response_format` schemas and provider parameter checks.
 - Optional attribution headers come from `OPENROUTER_HTTP_REFERER` and `OPENROUTER_TITLE`.
 
+### Probability Engine & EV Gating
+
+Every decision path shares `src/utils/probability_engine.py`:
+
+- **Log-odds pooling with extremization** — agent probabilities are pooled in log-odds space (`ENSEMBLE_EXTREMIZE_FACTOR`, default 1.2) instead of arithmetic averaging, which under-extremizes.
+- **Market-prior blending** — the pooled model probability is blended with the market price in log-odds space (`MARKET_BLEND_MODEL_WEIGHT`, default 0.65 on the model). Marginal claims stay near the market and stop clearing the fee band.
+- **Calibration shrinkage** — realized settlement outcomes produce a reliability slope that shrinks model probabilities toward 0.5 when the strategy has been overconfident (`CALIBRATION_SHRINK_ENABLED`, default true).
+- **Fee-aware EV gate** — the live-trade loop blocks any BUY whose blended fair probability does not clear the entry price plus estimated Kalshi fees (`0.07 × P × (1−P)` per contract, taker) by at least `LIVE_TRADE_MIN_NET_EDGE` (default $0.02/contract). Quick-flip intents also price in the exit fee. A confidence floor (`LIVE_TRADE_MIN_CONFIDENCE`, default 0.55, scaled by category multipliers) applies first.
+- **True Kelly sizing** — `f* = (p − c) / (1 − c)` scaled by `kelly_fraction` and capped at `max_single_position`.
+- **Cross-market prior** — live-trade research payloads include matched Polymarket prices for the same question (`CROSS_MARKET_CONTEXT_ENABLED`, default true) so specialists anchor on an independent market.
+
 > **💸 Controlling AI spend**
 >
 > The bot checks daily spend limits **before every AI API call**. Once the limit is reached, all AI calls are skipped until the next calendar day.

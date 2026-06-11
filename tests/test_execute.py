@@ -2,7 +2,7 @@ import os
 import pytest
 from typing import Any, Dict
 from unittest.mock import AsyncMock
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from src.jobs.execute import (
     execute_position,
@@ -481,6 +481,183 @@ async def test_execute_position_live_mode_blocks_quote_movement(monkeypatch):
 
         assert result is False
         mock_kalshi_client.place_order.assert_not_called()
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+async def test_execute_position_paper_mode_refreshes_stale_exchange_health(monkeypatch):
+    monkeypatch.setenv("EXECUTION_SAFETY_EXCHANGE_STALE_SECONDS", "1")
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+    await db_manager.record_source_snapshot(
+        category="kalshi",
+        source="kalshi.public-api",
+        status="healthy",
+        freshness_seconds=0,
+        payload={"phase": "old_health_probe"},
+    )
+
+    import aiosqlite
+
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.execute(
+            "UPDATE source_snapshots SET captured_at = ? WHERE source = ?",
+            (
+                (datetime.now() - timedelta(minutes=5)).isoformat(),
+                "kalshi.public-api",
+            ),
+        )
+        await conn.commit()
+
+    test_position = Position(
+        market_id="PAPER-STALE-HEALTH-RECOVER",
+        side="YES",
+        entry_price=0.27,
+        quantity=4,
+        timestamp=datetime.now(),
+        rationale="Recovered paper exchange health",
+        confidence=0.70,
+        live=False,
+    )
+    test_position.id = await db_manager.add_position(test_position)
+
+    mock_kalshi_client = AsyncMock()
+    mock_kalshi_client.get_market.return_value = {
+        "market": {
+            "ticker": "PAPER-STALE-HEALTH-RECOVER",
+            "status": "open",
+            "yes_bid_dollars": 0.25,
+            "yes_ask_dollars": 0.27,
+            "no_bid_dollars": 0.73,
+            "no_ask_dollars": 0.75,
+        }
+    }
+    mock_kalshi_client.get_orderbook.return_value = {}
+
+    try:
+        result = await execute_position(
+            position=test_position,
+            live_mode=False,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+        )
+
+        assert result is True
+        latest = await db_manager.get_latest_source_snapshot(
+            category="kalshi",
+            source="kalshi.public-api",
+        )
+        assert latest is not None
+        assert latest["status"] == "healthy"
+        assert "pre_execution_entry_quote" in latest["payload_json"]
+    finally:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+
+async def test_execute_position_live_mode_refreshes_stale_exchange_health(monkeypatch):
+    monkeypatch.setenv("EXECUTION_SAFETY_EXCHANGE_STALE_SECONDS", "1")
+    db_path = TEST_DB
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    db_manager = DatabaseManager(db_path=db_path)
+    await db_manager.initialize()
+    await db_manager.record_source_snapshot(
+        category="kalshi",
+        source="kalshi.public-api",
+        status="healthy",
+        freshness_seconds=0,
+        payload={"phase": "old_health_probe"},
+    )
+
+    import aiosqlite
+
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.execute(
+            "UPDATE source_snapshots SET captured_at = ? WHERE source = ?",
+            (
+                (datetime.now() - timedelta(minutes=5)).isoformat(),
+                "kalshi.public-api",
+            ),
+        )
+        await conn.commit()
+
+    test_position = Position(
+        market_id="LIVE-STALE-HEALTH-RECOVER",
+        side="YES",
+        entry_price=0.60,
+        quantity=10,
+        timestamp=datetime.now(),
+        rationale="Recovered live exchange health",
+        confidence=0.80,
+        live=False,
+    )
+    position_id = await db_manager.add_position(test_position)
+    test_position.id = position_id
+
+    from unittest.mock import Mock
+    mock_kalshi_client = Mock()
+    mock_kalshi_client.get_market = AsyncMock(
+        return_value={
+            "market": {
+                "ticker": "LIVE-STALE-HEALTH-RECOVER",
+                "status": "open",
+                "yes_bid_dollars": 0.58,
+                "yes_ask_dollars": 0.60,
+                "yes_ask_size_fp": "20.00",
+                "no_bid_dollars": 0.40,
+                "no_ask_dollars": 0.42,
+            }
+        }
+    )
+    mock_kalshi_client.place_order = AsyncMock(
+        return_value={
+            "order": {
+                "order_id": "stale-health-live-order",
+                "status": "filled",
+                "fill_count_fp": "10.00",
+                "yes_price_dollars": "0.6000",
+            }
+        }
+    )
+    mock_kalshi_client.get_fills = AsyncMock(
+        return_value={
+            "fills": [
+                {
+                    "ticker": "LIVE-STALE-HEALTH-RECOVER",
+                    "order_id": "stale-health-live-order",
+                    "client_order_id": "ignored",
+                    "count_fp": "10.00",
+                    "yes_price_dollars": "0.6000",
+                    "purchased_side": "yes",
+                }
+            ]
+        }
+    )
+
+    try:
+        result = await execute_position(
+            position=test_position,
+            live_mode=True,
+            db_manager=db_manager,
+            kalshi_client=mock_kalshi_client,
+        )
+
+        assert result is True
+        mock_kalshi_client.place_order.assert_called_once()
+        latest = await db_manager.get_latest_source_snapshot(
+            category="kalshi",
+            source="kalshi.public-api",
+        )
+        assert latest is not None
+        assert latest["status"] == "healthy"
+        assert "pre_execution_entry_quote" in latest["payload_json"]
     finally:
         if os.path.exists(db_path):
             os.remove(db_path)

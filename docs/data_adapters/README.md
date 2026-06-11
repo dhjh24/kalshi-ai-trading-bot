@@ -56,6 +56,8 @@ HTTP client and folds their payloads into event research bundles:
 
 - sports events call `SportsAdapter.fetch_context(...)`
 - bitcoin / crypto events call both `fetch_bitcoin_context(...)` and `CryptoAdapter.fetch_context(...)`
+- weather events call `WeatherAdapter.fetch_context(...)` (deterministic
+  forecast-model bucket probabilities — see `weather.md`)
 - economics and general events call `MacroAdapter.fetch_context(...)`
 
 The Node dashboard consumes those enriched research payloads through the
@@ -80,8 +82,11 @@ hydration.
   futures funding rate.
 - `src/data/macro_adapter.py` — Trading Economics free RSS calendar +
   Kalshi description scraping.
-- `src/data/weather_adapter.py` — Kalshi temperature-bucket interpreter for
-  UI/API threshold confusion and settlement-source notes.
+- `src/data/weather_adapter.py` — contract interpreter **plus** the full
+  forecast model: Open-Meteo ensemble + NWS point forecast/observations →
+  deterministic P(bucket) per market (see `weather.md`). Companion modules:
+  `src/data/weather_client.py`, `src/data/weather_stations.py`,
+  `src/utils/weather_probability.py`.
 - `src/data/polymarket_adapter.py` — alert-only Polymarket normalization and
   Kalshi mapping for cross-market watchlists.
 

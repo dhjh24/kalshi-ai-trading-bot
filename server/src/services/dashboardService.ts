@@ -257,6 +257,12 @@ function detectUnit(text: string, fallback: string): string {
   if (/\b(mph|miles per hour)\b/i.test(text)) {
     return "mph";
   }
+  if (/(?:\bdegrees?\s*c\b|\u00b0\s*c\b|\u00c2\u00b0\s*c\b)/i.test(text)) {
+    return "C";
+  }
+  if (/(?:\bdegrees?\s*f\b|\u00b0\s*f\b|\u00c2\u00b0\s*f\b)/i.test(text)) {
+    return "F";
+  }
   if (/\b(degrees?\s*c|°\s*c)\b/i.test(text)) {
     return "C";
   }
@@ -268,14 +274,14 @@ function detectUnit(text: string, fallback: string): string {
 
 function detectDirection(normalized: string): string {
   if (
-    /\b(below|under|less than|lower than|at or below|no (?:higher|greater) than|not (?:above|over|exceed|exceeding)|at most|max(?:imum)? of|do(?:es)? not exceed)\b/.test(
+    /\b(below|under|less than|lower than|at or below|no (?:higher|greater) than|not (?:above|over|exceed|exceeding)|at most|max(?:imum)? of|do(?:es)? not exceed|cooler than|colder than|or (?:lower|below|cooler|colder))\b/.test(
       normalized
     )
   ) {
     return "below";
   }
   if (
-    /\b(above|over|greater than|higher than|at least|at or above|not (?:below|under)|no (?:lower|less) than|min(?:imum)? of|exceed|exceeds|exceeding)\b/.test(
+    /\b(above|over|greater than|higher than|at least|at or above|not (?:below|under)|no (?:lower|less) than|min(?:imum)? of|exceed|exceeds|exceeding|warmer than|hotter than|or (?:higher|above|warmer|hotter))\b/.test(
       normalized
     )
   ) {
@@ -288,13 +294,80 @@ function detectDirection(normalized: string): string {
 }
 
 function detectInclusive(normalized: string): boolean | null {
-  if (/\binclusive\b|\binclusively\b|\bat or (above|below)\b/.test(normalized)) {
+  if (
+    /\binclusive\b|\binclusively\b|\bat or (above|below)\b|\bor (?:higher|lower|above|below|warmer|cooler|colder|hotter)\b/.test(
+      normalized
+    )
+  ) {
     return true;
   }
   if (/\bexclusive\b|\bexclusively\b|\bnot inclusive\b/.test(normalized)) {
     return false;
   }
   return null;
+}
+
+const SIGNED_WEATHER_NUMBER = "((?<![\\w])-?\\d{1,3}(?:\\.\\d{1,2})?)";
+
+function parseWeatherRange(text: string): { lower: number; upper: number } | null {
+  const patterns = [
+    new RegExp(
+      `\\b(?:between|from)\\s+${SIGNED_WEATHER_NUMBER}\\s+(?:and|to|through|-)\\s+${SIGNED_WEATHER_NUMBER}\\b`,
+      "i"
+    ),
+    new RegExp(
+      `(?<![\\d.])${SIGNED_WEATHER_NUMBER}\\s*(?:to|through)\\s*${SIGNED_WEATHER_NUMBER}(?![\\d.])`,
+      "i"
+    ),
+    new RegExp(
+      `(?<![\\d.])${SIGNED_WEATHER_NUMBER}\\s*-\\s*${SIGNED_WEATHER_NUMBER}(?![\\d.])`,
+      "i"
+    )
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (!match) {
+      continue;
+    }
+    const lower = Number(match[1]);
+    const upper = Number(match[2]);
+    if (!Number.isFinite(lower) || !Number.isFinite(upper) || lower === upper) {
+      continue;
+    }
+    return { lower: Math.min(lower, upper), upper: Math.max(lower, upper) };
+  }
+  return null;
+}
+
+function parseWeatherThreshold(text: string): number | null {
+  const directionalPatterns = [
+    new RegExp(
+      `\\b(?:below|under|less than|lower than|at or below|no (?:higher|greater) than|not (?:above|over|exceed|exceeding)|at most|max(?:imum)? of|do(?:es)? not exceed|cooler than|colder than)\\s+${SIGNED_WEATHER_NUMBER}`,
+      "i"
+    ),
+    new RegExp(
+      `\\b(?:above|over|greater than|higher than|at least|at or above|not (?:below|under)|no (?:lower|less) than|min(?:imum)? of|exceed|exceeds|exceeding|warmer than|hotter than)\\s+${SIGNED_WEATHER_NUMBER}`,
+      "i"
+    ),
+    new RegExp(
+      `${SIGNED_WEATHER_NUMBER}\\s*(?:degrees?\\s*[cf]?|deg\\.?\\s*[cf]?|(?:°)?\\s*[cf]|inches|inch|in\\.|mph|%)?\\s*(?:or (?:higher|lower|above|below|warmer|cooler|colder|hotter))\\b`,
+      "i"
+    )
+  ];
+  for (const pattern of directionalPatterns) {
+    const match = text.match(pattern);
+    if (!match) {
+      continue;
+    }
+    const threshold = Number(match[1]);
+    if (Number.isFinite(threshold)) {
+      return threshold;
+    }
+  }
+
+  const generic = text.match(/(?<![\d.\w])(-?\d{1,3}(?:\.\d{1,2})?)(?![\d.])/);
+  const threshold = generic ? Number(generic[1]) : Number.NaN;
+  return Number.isFinite(threshold) ? threshold : null;
 }
 
 function interpretWeatherContract(market: Record<string, unknown> | null): WeatherContractInterpretation {
@@ -333,24 +406,8 @@ function interpretWeatherContract(market: Record<string, unknown> | null): Weath
     };
   }
 
-  const rangeMatch = text.match(
-    /\b(?:between|from)\s+(\d{1,3}(?:\.5)?)\s+(?:and|to|through|-)\s+(\d{1,3}(?:\.5)?)\b|(?<!\d)(\d{1,3}(?:\.5)?)\s*(?:-|to|through)\s*(\d{1,3}(?:\.5)?)(?!\d)/i
-  );
-  const rangeLower = rangeMatch ? Number(rangeMatch[1] ?? rangeMatch[3]) : null;
-  const rangeUpper = rangeMatch ? Number(rangeMatch[2] ?? rangeMatch[4]) : null;
-  const parsedRange =
-    rangeLower !== null &&
-    rangeUpper !== null &&
-    Number.isFinite(rangeLower) &&
-    Number.isFinite(rangeUpper) &&
-    rangeLower !== rangeUpper
-      ? {
-          lower: Math.min(rangeLower, rangeUpper),
-          upper: Math.max(rangeLower, rangeUpper)
-        }
-      : null;
-  const thresholdMatch = text.match(/(?<!\d)(\d{1,3}(?:\.5)?)(?!\d)/);
-  const threshold = thresholdMatch ? Number(thresholdMatch[1]) : null;
+  const parsedRange = parseWeatherRange(text);
+  const threshold = parseWeatherThreshold(text);
   const settlementSource = /asos/i.test(text)
     ? "ASOS station report"
     : /nws|national weather service/i.test(text)
@@ -520,9 +577,24 @@ function interpretEventWeatherBuckets(
   }
 
   buckets.sort((a, b) => {
-    const aLower = a.lowerBound ?? a.threshold ?? Number.POSITIVE_INFINITY;
-    const bLower = b.lowerBound ?? b.threshold ?? Number.POSITIVE_INFINITY;
-    return aLower - bLower;
+    const sortKey = (bucket: WeatherEventBucket): [number, number] => {
+      if (bucket.lowerBound === null && typeof bucket.upperBound === "number") {
+        return [bucket.upperBound, 0];
+      }
+      if (typeof bucket.lowerBound === "number" && typeof bucket.upperBound === "number") {
+        return [bucket.lowerBound, 1];
+      }
+      if (typeof bucket.lowerBound === "number") {
+        return [bucket.lowerBound, 2];
+      }
+      if (typeof bucket.threshold === "number") {
+        return [bucket.threshold, 3];
+      }
+      return [Number.POSITIVE_INFINITY, 4];
+    };
+    const [aValue, aPriority] = sortKey(a);
+    const [bValue, bPriority] = sortKey(b);
+    return aValue - bValue || aPriority - bPriority;
   });
 
   return {
@@ -1394,6 +1466,11 @@ export async function getEventDetailPayload(eventTicker: string) {
     markets: event.markets.map((market) => normalizeMarketSnapshot(market)),
     sports: sportsContext,
     crypto: btcSnapshot,
+    eventWeather: interpretEventWeatherBuckets({
+      event_ticker: event.event_ticker,
+      title: event.title,
+      markets: event.markets as Array<Record<string, unknown>>
+    }),
     news,
     latestAnalysis: mapLatestAnalysis(latestAnalysis)
   };

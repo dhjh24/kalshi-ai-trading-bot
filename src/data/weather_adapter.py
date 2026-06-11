@@ -13,7 +13,12 @@ import re
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Mapping, Optional
+
+from src.utils.logging_setup import TradingLoggerMixin
+
+if TYPE_CHECKING:  # pragma: no cover - import for type hints only
+    from src.data.weather_client import WeatherDataClient
 
 
 WEATHER_KEYWORDS = (
@@ -34,9 +39,35 @@ WEATHER_KEYWORDS = (
 )
 
 
+_DEGREE_SIGN = "\N{DEGREE SIGN}"
+_MOJIBAKE_DEGREE_SIGN = "\u00c2\N{DEGREE SIGN}"
+
+
 WEATHER_UNIT_PATTERNS = (
     (re.compile(r"\b(inches|inch|in\.|\")\b", re.IGNORECASE), "inches"),
     (re.compile(r"\b(mph|miles per hour)\b", re.IGNORECASE), "mph"),
+    (
+        re.compile(
+            r"\bdegrees?\s*c\b|"
+            + re.escape(_DEGREE_SIGN)
+            + r"\s*c\b|"
+            + re.escape(_MOJIBAKE_DEGREE_SIGN)
+            + r"\s*c\b",
+            re.IGNORECASE,
+        ),
+        "C",
+    ),
+    (
+        re.compile(
+            r"\bdegrees?\s*f\b|"
+            + re.escape(_DEGREE_SIGN)
+            + r"\s*f\b|"
+            + re.escape(_MOJIBAKE_DEGREE_SIGN)
+            + r"\s*f\b",
+            re.IGNORECASE,
+        ),
+        "F",
+    ),
     (re.compile(r"\b(degrees?\s*c|°\s*c)\b", re.IGNORECASE), "C"),
     (re.compile(r"\b(degrees?\s*f|°\s*f)\b", re.IGNORECASE), "F"),
 )
@@ -124,7 +155,7 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
 
 
-_SIGNED_NUMBER_PATTERN = r"((?<![\w])-?\d{1,3}(?:\.5)?)"
+_SIGNED_NUMBER_PATTERN = r"((?<![\w])-?\d{1,3}(?:\.\d{1,2})?)"
 
 
 def _extract_threshold(market: Mapping[str, Any], text: str) -> Optional[float]:
@@ -160,7 +191,7 @@ def _extract_threshold(market: Mapping[str, Any], text: str) -> Optional[float]:
     # don't fall back to picking up the next absolute integer in the text.
     # The lookbehind also rejects `\w` so hyphens that are part of identifiers
     # (e.g. tickers like KXHIGHNY-70) aren't read as negative signs.
-    matches = re.findall(r"(?<![\d.\w])(-?\d{1,3}(?:\.5)?)(?![\d.])", text)
+    matches = re.findall(r"(?<![\d.\w])(-?\d{1,3}(?:\.\d{1,2})?)(?![\d.])", text)
     half_point_values = [float(match) for match in matches if match.endswith(".5")]
     if half_point_values:
         return half_point_values[0]
@@ -173,7 +204,7 @@ def _extract_range(text: str) -> Optional[tuple[float, float]]:
     patterns = (
         r"\bbetween\s+" + _SIGNED_NUMBER_PATTERN + r"\s+(?:and|to|through|-)\s+" + _SIGNED_NUMBER_PATTERN + r"\b",
         r"\bfrom\s+" + _SIGNED_NUMBER_PATTERN + r"\s+(?:to|through|-)\s+" + _SIGNED_NUMBER_PATTERN + r"\b",
-        r"(?<![\d.])" + _SIGNED_NUMBER_PATTERN + r"\s*(?:to|through)\s*" + _SIGNED_NUMBER_PATTERN + r"(?![\d.])",
+        r"(?<![\d.])" + _SIGNED_NUMBER_PATTERN + r"\s*(?:-|to|through)\s*" + _SIGNED_NUMBER_PATTERN + r"(?![\d.])",
     )
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
@@ -224,7 +255,11 @@ def _infer_inclusive_endpoints(text: str) -> Optional[bool]:
         normalized,
     ):
         return True
-    if re.search(r"\bexclusive\b|\bexclusively\b|\bnot inclusive\b", normalized):
+    if re.search(
+        r"\bexclusive\b|\bexclusively\b|\bnot inclusive\b|"
+        r"\bstrictly\s+(?:greater|more|higher|above|over|less|lower|below|under)\s+than\b",
+        normalized,
+    ):
         return False
     return None
 
@@ -247,6 +282,46 @@ _LEADING_CITY_PATTERN = re.compile(
 )
 
 
+_MONTH_WORDS = {
+    "jan",
+    "january",
+    "feb",
+    "february",
+    "mar",
+    "march",
+    "apr",
+    "april",
+    "may",
+    "jun",
+    "june",
+    "jul",
+    "july",
+    "aug",
+    "august",
+    "sep",
+    "sept",
+    "september",
+    "oct",
+    "october",
+    "nov",
+    "november",
+    "dec",
+    "december",
+}
+
+
+def _clean_location_candidate(candidate: str) -> Optional[str]:
+    cleaned = " ".join(candidate.strip(" .,:;?").split())
+    if not cleaned:
+        return None
+    lowered = cleaned.lower()
+    if lowered in {"will", "the", "a", "an"} or lowered in _MONTH_WORDS:
+        return None
+    if re.fullmatch(r"(?:20\d{2}|\d{1,2}|\d{1,2},?\s*20\d{2})", cleaned):
+        return None
+    return cleaned
+
+
 def _extract_location(market: Mapping[str, Any], text: str) -> Optional[str]:
     for key in ("city", "location", "weather_location"):
         value = market.get(key)
@@ -255,13 +330,36 @@ def _extract_location(market: Mapping[str, Any], text: str) -> Optional[str]:
 
     title = str(market.get("title") or "")
     # Kalshi titles often use "in X" or "for X" phrasing — preferred when present.
-    match = re.search(
-        r"\b(?:in|for)\s+([A-Za-z][A-Za-z .'-]{1,48}?)(?:\s+(?:on|high|low|temperature|temp|rainfall|snowfall)|[?.:,]|$)",
+    month_pattern = (
+        r"Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+        r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t|tember)?|Oct(?:ober)?|"
+        r"Nov(?:ember)?|Dec(?:ember)?"
+    )
+    location_pattern = re.compile(
+        r"\b(?:in|for)\s+([A-Za-z][A-Za-z .'-]{1,48}?)(?="
+        r"\s+(?:on|high|low|temperature|temp|rainfall|snowfall|precipitation|"
+        r"wind|gust|humidity|heat)|"
+        r"\s+in\s+(?:" + month_pattern + r"|20\d{2})\b|"
+        r"\s+(?:" + month_pattern + r"|20\d{2})\b|"
+        r"[?.:,]|$)",
+        re.IGNORECASE,
+    )
+    for source_text in (title, text):
+        match = location_pattern.search(source_text)
+        if match:
+            cleaned = _clean_location_candidate(match.group(1))
+            if cleaned:
+                return cleaned
+
+    will_have = re.search(
+        r"^\s*Will\s+([A-Za-z][A-Za-z .'-]{1,48}?)\s+have\s+",
         title,
         re.IGNORECASE,
     )
-    if match:
-        return " ".join(match.group(1).split())
+    if will_have:
+        cleaned = _clean_location_candidate(will_have.group(1))
+        if cleaned:
+            return cleaned
 
     # Fallback: leading city tokens like "NYC high temperature ..." or
     # "Boston low temperature ...". The lookahead requires a metric keyword
@@ -269,9 +367,9 @@ def _extract_location(market: Mapping[str, Any], text: str) -> Optional[str]:
     # mistaking "Will the ..." as a location.
     leading = _LEADING_CITY_PATTERN.match(title)
     if leading:
-        candidate = leading.group(1).strip()
-        if candidate.lower() not in {"will", "the", "a", "an"}:
-            return " ".join(candidate.split())
+        cleaned = _clean_location_candidate(leading.group(1))
+        if cleaned:
+            return cleaned
     return None
 
 
@@ -304,6 +402,14 @@ def _extract_event_date(market: Mapping[str, Any], text: str) -> Optional[str]:
     )
     if month_match:
         return " ".join(month_match.group(1).replace(".", "").split())
+
+    month_year_match = re.search(
+        r"\b((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?(?:\s+20\d{2})?)\b",
+        text,
+        re.IGNORECASE,
+    )
+    if month_year_match:
+        return " ".join(month_year_match.group(1).replace(".", "").split())
     return None
 
 
@@ -348,6 +454,43 @@ def interpret_temperature_market(market: Mapping[str, Any]) -> WeatherContractIn
     threshold = _extract_threshold(market, text)
     parsed_range = _extract_range(text)
     direction = _infer_direction(text)
+
+    # Kalshi's structured strike fields are authoritative when present —
+    # regexes over title/subtitle text mis-pair thresholds with inclusivity
+    # (a "<88" market subtitled "87° or below" reads as inclusive-88 from
+    # text, which overlaps the neighbouring 88-89 bucket). strike_type
+    # semantics: "less"/"greater" are strict; "_or_equal" variants include
+    # the strike; "between" includes both endpoints.
+    strike_type = str(market.get("strike_type") or "").strip().lower()
+    floor_strike = _safe_float(market.get("floor_strike"))
+    cap_strike = _safe_float(market.get("cap_strike"))
+    strike_derived = False
+    if strike_type == "between" and floor_strike is not None and cap_strike is not None:
+        parsed_range = (
+            (floor_strike, cap_strike)
+            if floor_strike <= cap_strike
+            else (cap_strike, floor_strike)
+        )
+        direction = "bucket"
+        inclusive = True
+        strike_derived = True
+    elif strike_type in {"less", "less_or_equal"} and (
+        cap_strike is not None or threshold is not None
+    ):
+        threshold = cap_strike if cap_strike is not None else threshold
+        parsed_range = None
+        direction = "below"
+        inclusive = strike_type == "less_or_equal"
+        strike_derived = True
+    elif strike_type in {"greater", "greater_or_equal"} and (
+        floor_strike is not None or threshold is not None
+    ):
+        threshold = floor_strike if floor_strike is not None else threshold
+        parsed_range = None
+        direction = "above"
+        inclusive = strike_type == "greater_or_equal"
+        strike_derived = True
+
     source = _settlement_source(text)
     location = _extract_location(market, text)
     station = _extract_station(market, text)
@@ -441,6 +584,13 @@ def interpret_temperature_market(market: Mapping[str, Any]) -> WeatherContractIn
         notes = "Weather threshold parsed, but the contract direction was not explicit."
         block_reason = "weather_bucket_ambiguous"
 
+    if strike_derived:
+        confidence = max(confidence, 0.92)
+        notes = (
+            f"{notes} Bounds taken from Kalshi strike fields "
+            f"(strike_type={strike_type})."
+        )
+
     return WeatherContractInterpretation(
         ticker=ticker,
         detected=True,
@@ -533,21 +683,445 @@ def interpret_event_weather_buckets(
     }
 
 
-class WeatherAdapter:
-    """Uniform live-trade adapter wrapper for weather interpretation."""
+class WeatherAdapter(TradingLoggerMixin):
+    """
+    Full weather data adapter: contract interpretation + live forecast data
+    + deterministic per-bucket model probabilities.
 
-    async def fetch_context(self, market: Mapping[str, Any]) -> Dict[str, Any]:
+    Accepts either a single Kalshi market mapping or an event snapshot with a
+    ``markets`` list (one ensemble fetch then covers every sibling bucket).
+    Follows the uniform adapter contract used by sports/crypto/macro.
+    """
+
+    SOURCE = "open-meteo.ensemble+nws.forecast"
+
+    def __init__(
+        self,
+        *,
+        http_client: Optional[Any] = None,
+        data_client: Optional["WeatherDataClient"] = None,
+        config: Optional[Any] = None,
+    ) -> None:
+        from src.config.settings import settings as _settings
+        from src.data.weather_client import WeatherDataClient
+
+        self.config = config if config is not None else _settings.weather
+        self._owns_data_client = data_client is None
+        self.data_client = data_client or WeatherDataClient(
+            http_client=http_client,
+            timeout_seconds=float(
+                getattr(self.config, "request_timeout_seconds", 8.0) or 8.0
+            ),
+            ensemble_models=tuple(
+                getattr(self.config, "ensemble_models", None)
+                or ("gfs_seamless", "ecmwf_ifs025")
+            ),
+        )
+
+    async def aclose(self) -> None:
+        if self._owns_data_client:
+            await self.data_client.aclose()
+
+    # ------------------------------------------------------------------
+    # Public adapter surface
+    # ------------------------------------------------------------------
+    async def fetch_context(self, payload: Mapping[str, Any]) -> Dict[str, Any]:
         start = time.monotonic()
-        interpretation = interpret_temperature_market(market)
+        try:
+            signals, error = await self._build_signals(payload)
+        except Exception as exc:  # never break the research pipeline
+            self.logger.warning("Weather adapter failed", error=str(exc))
+            signals, error = {"model_status": "adapter_error"}, f"adapter_error:{exc.__class__.__name__}"
         return {
             "category": "weather",
             "timestamp_utc": _iso_utc(),
-            "signals": interpretation.to_dict(),
+            "signals": signals,
             "freshness_seconds": int(time.monotonic() - start),
-            "source": "kalshi.weather-contract-interpreter",
-            "error": interpretation.block_reason,
+            "source": self.SOURCE,
+            "error": error,
         }
+
+    # ------------------------------------------------------------------
+    # Orchestration
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _extract_markets(payload: Mapping[str, Any]) -> list:
+        markets = payload.get("markets")
+        if isinstance(markets, (list, tuple)) and markets:
+            return [m for m in markets if isinstance(m, Mapping)]
+        return [payload]
+
+    async def _build_signals(
+        self, payload: Mapping[str, Any]
+    ) -> tuple:
+        import asyncio
+
+        from src.data.weather_stations import (
+            resolve_station,
+            resolve_target_period,
+            series_metric,
+            station_local_today,
+        )
+
+        markets = self._extract_markets(payload)
+        interpreted = []
+        for market in markets:
+            interpretation = interpret_temperature_market(market)
+            if interpretation.detected:
+                interpreted.append((market, interpretation))
+
+        if not interpreted:
+            return {"model_status": "not_weather"}, "not_weather_event"
+
+        first_market, first_interp = interpreted[0]
+        event_ticker = str(payload.get("event_ticker") or "")
+        anchor_ticker = event_ticker or first_interp.ticker
+
+        station = resolve_station(
+            ticker=anchor_ticker,
+            location=first_interp.location or "",
+            station_hint=first_interp.station or "",
+        )
+        if station is None and first_interp.location and bool(
+            getattr(self.config, "allow_geocode_fallback", True)
+        ):
+            station = await self.data_client.geocode_city(first_interp.location)
+
+        period = resolve_target_period(
+            ticker=anchor_ticker, event_date_text=first_interp.event_date or ""
+        )
+        if period is None:
+            for market, interp in interpreted[1:]:
+                period = resolve_target_period(
+                    ticker=interp.ticker, event_date_text=interp.event_date or ""
+                )
+                if period is not None:
+                    break
+
+        metric = first_interp.metric
+        kind = first_interp.temperature_kind or ""
+        series_hint = series_metric(anchor_ticker)
+        if series_hint == "temperature_low":
+            kind = kind or "low"
+        kind = kind or "high"
+
+        base_signals: Dict[str, Any] = {
+            "event_ticker": event_ticker,
+            "metric": metric,
+            "temperature_kind": kind if metric == "temperature" else None,
+            "station": station.to_dict() if station is not None else None,
+            "target_period": period.to_dict() if period is not None else None,
+            "interpretations": {
+                interp.ticker: interp.to_dict() for _market, interp in interpreted
+            },
+        }
+
+        if station is None:
+            base_signals["model_status"] = "station_unresolved"
+            return base_signals, "weather_station_unresolved"
+        if period is None:
+            base_signals["model_status"] = "target_period_unknown"
+            return base_signals, "weather_target_period_unknown"
+
+        today_local = station_local_today(station)
+        lead_days = (period.start - today_local).days
+        base_signals["lead_days"] = lead_days
+        base_signals["station_local_today"] = today_local.isoformat()
+
+        if period.end < today_local:
+            base_signals["model_status"] = "event_date_passed"
+            return base_signals, None
+
+        # Forecast context is useful for every metric, even ones without a
+        # deterministic bucket model (wind, humidity).
+        overview_task = asyncio.create_task(
+            self.data_client.fetch_forecast_overview(
+                station, forecast_days=min(16, max(2, lead_days + 2))
+            )
+        )
+        nws_task = asyncio.create_task(self.data_client.fetch_nws_point_forecast(station))
+        overview = await overview_task
+        nws = await nws_task
+
+        target_iso = period.start.isoformat()
+        base_signals["forecast"] = {
+            "open_meteo_daily": (overview.get("daily") or {}).get(target_iso),
+            "nws_daily": (nws.get("daily") or {}).get(target_iso),
+            "current_temperature_f": overview.get("current_temperature_f"),
+            "current_time_local": overview.get("current_time"),
+        }
+
+        if metric == "temperature" and period.kind == "day":
+            probabilities, status = await self._temperature_probabilities(
+                station=station,
+                period=period,
+                interpreted=interpreted,
+                kind=kind,
+                lead_days=lead_days,
+                nws_daily=(nws.get("daily") or {}).get(target_iso) or {},
+                base_signals=base_signals,
+            )
+        elif metric in {"rainfall", "snowfall"}:
+            probabilities, status = await self._precip_probabilities(
+                station=station,
+                period=period,
+                interpreted=interpreted,
+                metric=metric,
+                today_local=today_local,
+            )
+        else:
+            probabilities, status = {}, "context_only"
+
+        base_signals["market_probabilities"] = probabilities
+        base_signals["model_status"] = status
+        return base_signals, None
+
+    # ------------------------------------------------------------------
+    # Temperature (daily high/low) model
+    # ------------------------------------------------------------------
+    async def _temperature_probabilities(
+        self,
+        *,
+        station: Any,
+        period: Any,
+        interpreted: list,
+        kind: str,
+        lead_days: int,
+        nws_daily: Mapping[str, Any],
+        base_signals: Dict[str, Any],
+    ) -> tuple:
+        import asyncio
+        from datetime import datetime as _dt, timezone as _tz
+
+        from src.data.weather_stations import station_tzinfo
+        from src.utils.weather_probability import estimate_bucket_probability
+
+        cfg = self.config
+        intraday = lead_days == 0
+        now_local = _dt.now(_tz.utc).astimezone(station_tzinfo(station))
+
+        ensemble_task = asyncio.create_task(
+            self.data_client.fetch_ensemble_daily_temperature(
+                station,
+                period.start,
+                kind=kind,
+                after_local_hour=now_local.hour if intraday else None,
+            )
+        )
+        running_task = (
+            asyncio.create_task(
+                self.data_client.fetch_running_extremes(station, period.start)
+            )
+            if intraday
+            else None
+        )
+        ensemble = await ensemble_task
+        running = await running_task if running_task is not None else None
+
+        members = list(ensemble.get("members") or [])
+        method = "ensemble"
+        if not members:
+            members = await self.data_client.climatology_temperature_members(
+                station,
+                period.start,
+                kind=kind,
+                years=int(getattr(cfg, "climatology_years", 10) or 10),
+            )
+            method = "climatology"
+        if not members:
+            return {}, "no_forecast_data"
+
+        running_value = None
+        obs_margin = float(getattr(cfg, "running_obs_margin_f", 1.5) or 1.5)
+        if intraday and isinstance(running, Mapping):
+            running_value = (
+                running.get("running_min_f")
+                if kind == "low"
+                else running.get("running_max_f")
+            )
+            if running_value is not None and not bool(running.get("nws_station_used")):
+                # Grid analysis only — hedge harder before claiming certainty.
+                obs_margin = max(obs_margin, 2.5)
+            base_signals["forecast"]["running_max_f"] = running.get("running_max_f")
+            base_signals["forecast"]["running_min_f"] = running.get("running_min_f")
+            base_signals["forecast"]["running_through_local"] = running.get("through_local")
+
+        nws_anchor = nws_daily.get("low_f") if kind == "low" else nws_daily.get("high_f")
+        sigma_extra = (
+            0.0
+            if getattr(station, "verified", True)
+            else float(getattr(cfg, "unverified_station_extra_sigma_f", 1.5) or 1.5)
+        )
+
+        base_signals["forecast"]["ensemble_member_count"] = len(members)
+        base_signals["forecast"]["ensemble_models"] = ensemble.get("models")
+        base_signals["forecast"]["forecast_method"] = method
+
+        probabilities: Dict[str, Any] = {}
+        for market, interp in interpreted:
+            estimate = estimate_bucket_probability(
+                members=members,
+                metric=interp.metric,
+                lower=interp.lower_bound,
+                upper=interp.upper_bound,
+                direction=interp.direction,
+                inclusive=interp.inclusive_endpoints,
+                lead_days=float(lead_days),
+                sigma_base=float(getattr(cfg, "sigma_base_f", 1.6) or 1.6),
+                sigma_per_day=float(getattr(cfg, "sigma_per_day_f", 0.5) or 0.5),
+                sigma_floor=float(getattr(cfg, "sigma_floor_f", 1.2) or 1.2),
+                sigma_extra=sigma_extra,
+                nws_anchor=nws_anchor,
+                nws_weight=float(getattr(cfg, "nws_blend_weight", 0.35) or 0.0),
+                running_value=running_value,
+                running_kind=kind,
+                running_obs_margin=obs_margin,
+                method=method,
+                station_verified=bool(getattr(station, "verified", True)),
+            )
+            if estimate is None:
+                continue
+            probabilities[interp.ticker] = self._probability_entry(
+                market=market, interp=interp, estimate=estimate
+            )
+        return probabilities, "ok" if probabilities else "no_buckets_modeled"
+
+    # ------------------------------------------------------------------
+    # Precipitation (daily or month-total) model
+    # ------------------------------------------------------------------
+    async def _precip_probabilities(
+        self,
+        *,
+        station: Any,
+        period: Any,
+        interpreted: list,
+        metric: str,
+        today_local: Any,
+    ) -> tuple:
+        from datetime import date as _date, timedelta as _timedelta
+
+        from src.utils.weather_probability import (
+            combine_observed_forecast_tail,
+            estimate_bucket_probability,
+        )
+
+        cfg = self.config
+        variable = "snowfall" if metric == "snowfall" else "precipitation"
+        daily_key = "snowfall_in" if metric == "snowfall" else "precip_in"
+        sigma = float(
+            getattr(cfg, "snow_sigma_in", 0.3)
+            if metric == "snowfall"
+            else getattr(cfg, "rain_sigma_in", 0.08)
+        ) or (0.3 if metric == "snowfall" else 0.08)
+
+        observed_total = 0.0
+        if period.start <= today_local:
+            observed = await self.data_client.fetch_observed_precip_total(
+                station,
+                period.start,
+                min(today_local - _timedelta(days=1), period.end),
+                variable=daily_key,
+            )
+            observed_total = float(observed.get("total_in") or 0.0)
+
+        forecast_start = max(period.start, today_local)
+        forecast_members: list = []
+        covered_through = None
+        if forecast_start <= period.end:
+            ens = await self.data_client.fetch_ensemble_precip_window(
+                station, forecast_start, period.end, variable=variable
+            )
+            forecast_members = list(ens.get("members") or [])
+            covered = ens.get("covered_through")
+            if covered:
+                try:
+                    covered_through = _date.fromisoformat(str(covered))
+                except ValueError:
+                    covered_through = None
+
+        method = "ensemble" if forecast_members else "climatology"
+        tail_totals: list = []
+        tail_start = (
+            (covered_through + _timedelta(days=1)) if covered_through else forecast_start
+        )
+        if tail_start <= period.end:
+            tail_totals = await self.data_client.climatology_window_totals(
+                station,
+                tail_start,
+                period.end,
+                variable=daily_key,
+                years=int(getattr(cfg, "climatology_years", 10) or 10),
+            )
+            if not forecast_members and not tail_totals:
+                return {}, "no_forecast_data"
+
+        totals = combine_observed_forecast_tail(
+            observed_total=observed_total,
+            forecast_member_totals=forecast_members or [0.0],
+            tail_climatology_totals=tail_totals or [0.0],
+        )
+        lead_to_resolution = max(0, (period.end - today_local).days)
+
+        probabilities: Dict[str, Any] = {}
+        for market, interp in interpreted:
+            estimate = estimate_bucket_probability(
+                members=totals,
+                metric=interp.metric,
+                lower=interp.lower_bound,
+                upper=interp.upper_bound,
+                direction=interp.direction,
+                inclusive=interp.inclusive_endpoints,
+                lead_days=float(lead_to_resolution),
+                sigma_base=sigma,
+                sigma_per_day=0.0,
+                sigma_floor=sigma,
+                sigma_extra=0.0,
+                nws_anchor=None,
+                nws_weight=0.0,
+                method=method,
+                station_verified=bool(getattr(station, "verified", True)),
+            )
+            if estimate is None:
+                continue
+            entry = self._probability_entry(market=market, interp=interp, estimate=estimate)
+            entry["observed_total_in"] = round(observed_total, 3)
+            entry["tail_years_used"] = len(tail_totals)
+            probabilities[interp.ticker] = entry
+        return probabilities, "ok" if probabilities else "no_buckets_modeled"
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _probability_entry(
+        *, market: Mapping[str, Any], interp: WeatherContractInterpretation, estimate: Any
+    ) -> Dict[str, Any]:
+        # Snapshot fields are already in dollars; raw Kalshi payloads carry
+        # integer cents (last_price=55 means $0.55), so divide those by 100.
+        yes_price = _safe_float(
+            market.get("yes_midpoint")
+            or market.get("last_yes_price")
+            or market.get("yes_ask_dollars")
+            or market.get("yes_bid_dollars")
+        )
+        if yes_price is None:
+            cents = _safe_float(market.get("last_price") or market.get("yes_ask"))
+            if cents is not None:
+                yes_price = cents / 100.0 if cents > 1.0 else cents
+        entry = {
+            "model_yes_probability": estimate.probability,
+            "quality": estimate.quality,
+            "method": estimate.method,
+            "bucket_label": interp.bucket_label,
+            "can_trade": interp.can_trade,
+            "interpretation_confidence": interp.confidence,
+            "market_yes_price": yes_price,
+            "diagnostics": estimate.to_dict(),
+        }
+        return entry
 
 
 async def fetch_context(market: Mapping[str, Any]) -> Dict[str, Any]:
-    return await WeatherAdapter().fetch_context(market)
+    adapter = WeatherAdapter()
+    try:
+        return await adapter.fetch_context(market)
+    finally:
+        await adapter.aclose()

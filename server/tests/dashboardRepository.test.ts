@@ -697,6 +697,7 @@ describe("safety repository readers", () => {
               market_id TEXT NOT NULL,
               strategy TEXT,
               category TEXT,
+              market_type TEXT,
               predicted_probability REAL NOT NULL,
               outcome INTEGER NOT NULL,
               brier_score REAL NOT NULL,
@@ -724,10 +725,10 @@ describe("safety repository readers", () => {
             )
             VALUES ('KXTEST', 'pm-1', 'YES', 0.42, 0.52, 0.1, 0.8, 2, 'alert_only', '{"foo":"bar"}', '2999-01-01T00:00:00');
             INSERT INTO settlement_calibration (
-              market_id, strategy, category, predicted_probability, outcome,
+              market_id, strategy, category, market_type, predicted_probability, outcome,
               brier_score, realized_ev, pnl, source, settled_at
             )
-            VALUES ('KXTEST', 'live_trade', 'Sports', 0.7, 1, 0.09, 3.5, 3.5, 'trade_logs', '2999-01-01T00:00:00');
+            VALUES ('KXTEST', 'live_trade', 'Sports', 'sports', 0.7, 1, 0.09, 3.5, 3.5, 'trade_logs', '2999-01-01T00:00:00');
             INSERT INTO source_snapshots (
               category, source, status, freshness_seconds, payload_json, captured_at
             )
@@ -794,7 +795,20 @@ describe("safety repository readers", () => {
       sampleSize: 1,
       averageBrierScore: 0.09,
       winRate: 1,
-      realizedEv: 3.5
+      realizedEv: 3.5,
+      byMarketType: [
+        expect.objectContaining({
+          marketType: "sports",
+          sampleSize: 1,
+          ece: 0.3
+        })
+      ],
+      byStrategy: [
+        expect.objectContaining({
+          strategy: "live_trade",
+          ece: 0.3
+        })
+      ]
     });
   });
 
@@ -869,6 +883,149 @@ describe("safety repository readers", () => {
       kalshiTicker: "KXNET",
       netEdge: 0.07
     });
+  });
+
+  it("populates market-type calibration from category when legacy rows are blank", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "dashboard-repository-"));
+    const databasePath = path.join(tempDir, "dashboard.sqlite");
+    const scriptPath = path.join(tempDir, "calibration-market-type-fallback.mjs");
+    const repositoryUrl = pathToFileURL(
+      path.join(serverRoot, "src/repositories/dashboardRepository.ts")
+    ).href;
+    const dbUrl = pathToFileURL(path.join(serverRoot, "src/db.ts")).href;
+    tempDirs.push(tempDir);
+
+    writeFileSync(
+      scriptPath,
+      `
+        import { getDb } from ${JSON.stringify(dbUrl)};
+        import { getCalibrationSummary } from ${JSON.stringify(repositoryUrl)};
+
+        const db = getDb();
+
+        try {
+          db.exec(\`
+            CREATE TABLE settlement_calibration (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              market_id TEXT NOT NULL,
+              strategy TEXT,
+              category TEXT,
+              market_type TEXT,
+              predicted_probability REAL NOT NULL,
+              outcome INTEGER NOT NULL,
+              brier_score REAL NOT NULL,
+              realized_ev REAL,
+              pnl REAL,
+              source TEXT,
+              settled_at TEXT NOT NULL,
+              payload_json TEXT
+            );
+            INSERT INTO settlement_calibration (
+              market_id, strategy, category, market_type, predicted_probability,
+              outcome, brier_score, realized_ev, pnl, source, settled_at
+            ) VALUES
+              ('KXWEATHER', 'live_trade', 'Weather', NULL, 0.8, 1, 0.04, 2.0, 2.0, 'legacy', '2999-01-01T00:00:00'),
+              ('KXWEATHER2', 'live_trade', 'Weather', '', 0.3, 0, 0.09, -1.0, -1.0, 'legacy', '2999-01-02T00:00:00');
+          \`);
+
+          console.log(JSON.stringify(getCalibrationSummary().byMarketType));
+        } finally {
+          db.close();
+        }
+      `
+    );
+
+    const result = JSON.parse(
+      execFileSync(process.execPath, ["--import", "tsx/esm", scriptPath], {
+        cwd: serverRoot,
+        env: {
+          ...process.env,
+          DB_PATH: databasePath
+        },
+        encoding: "utf8"
+      }).trim()
+    );
+
+    expect(result).toEqual([
+      expect.objectContaining({
+        marketType: "Weather",
+        sampleSize: 2,
+        ece: 0.25
+      })
+    ]);
+  });
+
+  it("filters source-health snapshots by latest current status only", () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "dashboard-repository-"));
+    const databasePath = path.join(tempDir, "dashboard.sqlite");
+    const scriptPath = path.join(tempDir, "source-health-current-filter-check.mjs");
+    const repositoryUrl = pathToFileURL(
+      path.join(serverRoot, "src/repositories/dashboardRepository.ts")
+    ).href;
+    const dbUrl = pathToFileURL(path.join(serverRoot, "src/db.ts")).href;
+    tempDirs.push(tempDir);
+
+    writeFileSync(
+      scriptPath,
+      `
+        import { getDb } from ${JSON.stringify(dbUrl)};
+        import { listSourceHealthSnapshots } from ${JSON.stringify(repositoryUrl)};
+
+        const db = getDb();
+
+        try {
+          db.exec(\`
+            CREATE TABLE source_snapshots (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              category TEXT NOT NULL,
+              source TEXT NOT NULL,
+              status TEXT NOT NULL,
+              freshness_seconds INTEGER NOT NULL,
+              payload_json TEXT,
+              captured_at TEXT NOT NULL
+            );
+            INSERT INTO source_snapshots (
+              category, source, status, freshness_seconds, payload_json, captured_at
+            )
+            VALUES
+              ('kalshi', 'kalshi.public-api', 'healthy', 2, '{"seq":1}', '2999-01-01T00:00:00'),
+              ('kalshi', 'kalshi.public-api', 'unavailable', 60, '{"seq":2}', '2999-01-01T01:00:00'),
+              ('sports', 'espn.scoreboard', 'healthy', 3, '{"seq":3}', '2999-01-01T00:30:00');
+          \`);
+
+          console.log(JSON.stringify({
+            healthy: listSourceHealthSnapshots({ limit: 10, status: "healthy" }),
+            unavailable: listSourceHealthSnapshots({ limit: 10, status: "unavailable" }),
+            kalshiHealthy: listSourceHealthSnapshots({
+              limit: 10,
+              categories: ["Kalshi"],
+              status: "healthy"
+            })
+          }));
+        } finally {
+          db.close();
+        }
+      `
+    );
+
+    const result = JSON.parse(
+      execFileSync(process.execPath, ["--import", "tsx/esm", scriptPath], {
+        cwd: serverRoot,
+        env: {
+          ...process.env,
+          DB_PATH: databasePath
+        },
+        encoding: "utf8"
+      }).trim()
+    );
+
+    expect(result.healthy.map((item: { source: string }) => item.source)).toEqual([
+      "espn.scoreboard"
+    ]);
+    expect(result.unavailable.map((item: { source: string }) => item.source)).toEqual([
+      "kalshi.public-api"
+    ]);
+    expect(result.kalshiHealthy).toEqual([]);
   });
 });
 

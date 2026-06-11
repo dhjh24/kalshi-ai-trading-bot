@@ -28,6 +28,7 @@ const EMPTY_SAFETY: SafetyPayload = {
     byStrategy: [],
     byCategory: [],
     byModel: [],
+    byMarketType: [],
     buckets: []
   }
 };
@@ -245,6 +246,10 @@ function percentValue(value: number | null): string {
   return value === null ? "N/A" : formatPercent(value * 100, 1);
 }
 
+function eceValue(value: number | undefined): string {
+  return typeof value === "number" && Number.isFinite(value) ? value.toFixed(3) : "0.000";
+}
+
 function sourceStatusTone(status: string): "positive" | "warning" | "negative" | "neutral" {
   const normalized = status.trim().toLowerCase();
   if (["ok", "healthy", "available", "fresh", "success"].includes(normalized)) {
@@ -342,6 +347,7 @@ export default async function SafetyPage({
     byStrategy: safety.calibration?.byStrategy ?? [],
     byCategory: safety.calibration?.byCategory ?? [],
     byModel: safety.calibration?.byModel ?? [],
+    byMarketType: safety.calibration?.byMarketType ?? [],
     buckets: safety.calibration?.buckets ?? []
   };
 
@@ -639,7 +645,7 @@ export default async function SafetyPage({
                 <p className="mt-1 text-sm text-slate-500">
                   Brier{" "}
                   {row.averageBrierScore === null ? "N/A" : row.averageBrierScore.toFixed(3)}{" "}
-                  | EV {formatMoney(row.realizedEv)}
+                  | ECE {eceValue(row.ece)} | EV {formatMoney(row.realizedEv)}
                 </p>
               </div>
             ))}
@@ -665,7 +671,7 @@ export default async function SafetyPage({
                   <p className="mt-1 text-sm text-slate-500">
                     Brier{" "}
                     {row.averageBrierScore === null ? "N/A" : row.averageBrierScore.toFixed(3)}{" "}
-                    | EV {formatMoney(row.realizedEv)}
+                    | ECE {eceValue(row.ece)} | EV {formatMoney(row.realizedEv)}
                   </p>
                 </div>
               ))}
@@ -689,7 +695,7 @@ export default async function SafetyPage({
                   <p className="mt-1 text-sm text-slate-500">
                     Brier{" "}
                     {row.averageBrierScore === null ? "N/A" : row.averageBrierScore.toFixed(3)}{" "}
-                    | EV {formatMoney(row.realizedEv)}
+                    | ECE {eceValue(row.ece)} | EV {formatMoney(row.realizedEv)}
                   </p>
                 </div>
               ))}
@@ -697,6 +703,31 @@ export default async function SafetyPage({
           )}
         </Panel>
       </section>
+
+      <Panel eyebrow="By Market Type" title="Calibration by market focus">
+        {calibration.byMarketType.length === 0 ? (
+          <EmptyState
+            title="No market-type rollups yet"
+            body="Market-type calibration appears after refreshed rows include focus metadata or market categories."
+          />
+        ) : (
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            {calibration.byMarketType.map((row) => (
+              <div key={row.marketType} className="rounded-[20px] border border-slate-100 p-4">
+                <p className="font-semibold text-steel break-words">{row.marketType}</p>
+                <p className="mt-2 text-sm text-slate-500">
+                  {row.sampleSize} samples | win rate {percentValue(row.winRate)}
+                </p>
+                <p className="mt-1 text-sm text-slate-500">
+                  Brier{" "}
+                  {row.averageBrierScore === null ? "N/A" : row.averageBrierScore.toFixed(3)}{" "}
+                  | ECE {eceValue(row.ece)} | EV {formatMoney(row.realizedEv)}
+                </p>
+              </div>
+            ))}
+          </div>
+        )}
+      </Panel>
     </div>
   );
 }

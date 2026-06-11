@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -24,6 +25,7 @@ from src.data.crypto_adapter import CryptoAdapter
 from src.data.macro_adapter import MacroAdapter
 from src.data.news_aggregator import NewsAggregator
 from src.data.sports_adapter import SportsAdapter
+from src.data.weather_adapter import WeatherAdapter
 from src.utils.kalshi_normalization import (
     get_last_price,
     get_market_expiration_ts,
@@ -137,6 +139,15 @@ GENERAL_SEARCH_DOMAINS = [
     "reuters.com",
     "apnews.com",
 ]
+WEATHER_SEARCH_DOMAINS = [
+    "weather.gov",
+    "noaa.gov",
+    "open-meteo.com",
+    "weather.com",
+    "accuweather.com",
+    "wunderground.com",
+    "kalshi.com",
+]
 LIVE_CRYPTO_SERIES_TICKERS = (
     "KXBTCD",
     "KXETHD",
@@ -235,6 +246,7 @@ class LiveTradeResearchService(TradingLoggerMixin):
         sports_adapter: Optional[SportsAdapter] = None,
         crypto_adapter: Optional[CryptoAdapter] = None,
         macro_adapter: Optional[MacroAdapter] = None,
+        weather_adapter: Optional[WeatherAdapter] = None,
     ) -> None:
         self.kalshi_client = kalshi_client or KalshiClient()
         self.model_router = model_router
@@ -250,12 +262,16 @@ class LiveTradeResearchService(TradingLoggerMixin):
         self.sports_adapter = sports_adapter or SportsAdapter(http_client=self.http_client)
         self.crypto_adapter = crypto_adapter or CryptoAdapter(http_client=self.http_client)
         self.macro_adapter = macro_adapter or MacroAdapter(http_client=self.http_client)
+        self.weather_adapter = weather_adapter or WeatherAdapter(http_client=self.http_client)
         self._owns_sports_adapter = sports_adapter is None
         self._owns_crypto_adapter = crypto_adapter is None
         self._owns_macro_adapter = macro_adapter is None
+        self._owns_weather_adapter = weather_adapter is None
         self._team_directory_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._team_schedule_cache: Dict[str, Dict[str, Any]] = {}
         self._scoreboard_cache: Dict[str, Dict[str, Any]] = {}
+        # Cross-market (Polymarket) price snapshot cache: (expires_at, markets).
+        self._cross_market_cache: Optional[Tuple[float, List[Dict[str, Any]]]] = None
 
     async def close(self) -> None:
         """Close owned clients."""
@@ -272,6 +288,8 @@ class LiveTradeResearchService(TradingLoggerMixin):
             close_tasks.append(self.crypto_adapter.aclose())
         if self._owns_macro_adapter:
             close_tasks.append(self.macro_adapter.aclose())
+        if self._owns_weather_adapter:
+            close_tasks.append(self.weather_adapter.aclose())
 
         if close_tasks:
             await asyncio.gather(*close_tasks, return_exceptions=True)
@@ -638,6 +656,7 @@ class LiveTradeResearchService(TradingLoggerMixin):
             self._load_market_microstructure(event.get("markets", []))
         )
         news_task = asyncio.create_task(self._load_news_context(event["title"]))
+        cross_market_task = asyncio.create_task(self._load_cross_market_context(event))
 
         focus_type = str(event.get("focus_type") or "general").lower()
         sports_task: Optional[asyncio.Task] = None
@@ -650,26 +669,133 @@ class LiveTradeResearchService(TradingLoggerMixin):
             bitcoin_task = asyncio.create_task(self.fetch_bitcoin_context())
             crypto_task = asyncio.create_task(self.crypto_adapter.fetch_context(event))
 
+        weather_task: Optional[asyncio.Task] = None
+        if focus_type == "weather":
+            weather_task = asyncio.create_task(self.weather_adapter.fetch_context(event))
+
         macro_task: Optional[asyncio.Task] = None
-        if focus_type not in {"sports", "bitcoin", "crypto"}:
+        if focus_type not in {"sports", "bitcoin", "crypto", "weather"}:
             macro_task = asyncio.create_task(self.macro_adapter.fetch_context(event))
 
         microstructure = await microstructure_task
         news_context = await news_task
+        cross_market_context = await cross_market_task
         sports_context = await sports_task if sports_task else None
         bitcoin_context = await bitcoin_task if bitcoin_task else None
         crypto_context = await crypto_task if crypto_task else None
         macro_context = await macro_task if macro_task else None
+        weather_context = await weather_task if weather_task else None
 
         return {
             "event": event,
             "microstructure": microstructure,
             "news": news_context,
+            "cross_market_context": cross_market_context,
             "sports_context": sports_context,
             "bitcoin_context": bitcoin_context,
             "crypto_context": crypto_context,
             "macro_context": macro_context,
+            "weather_context": weather_context,
         }
+
+    async def _load_cross_market_context(
+        self, event: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Match the event's markets against Polymarket prices.
+
+        An independent prediction market pricing the same question is a strong
+        external prior: agreement shrinks claimed edge, sharp divergence is a
+        real signal. Failures and misses return None so the research payload
+        never blocks on the cross-market fetch.
+        """
+        if os.getenv("CROSS_MARKET_CONTEXT_ENABLED", "true").strip().lower() in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }:
+            return None
+        try:
+            from src.data.polymarket_adapter import mapping_confidence
+
+            snapshot = await self._fetch_polymarket_snapshot()
+            if not snapshot:
+                return None
+
+            matches: List[Dict[str, Any]] = []
+            for market in (event.get("markets") or [])[:5]:
+                market_title = str(market.get("title") or "").strip()
+                event_title = str(event.get("title") or "").strip()
+                query = market_title or event_title
+                if not query:
+                    continue
+                best: Optional[Dict[str, Any]] = None
+                best_confidence = 0.0
+                for candidate in snapshot:
+                    confidence = mapping_confidence(query, str(candidate.get("question", "")))
+                    if market_title and market_title != event_title:
+                        # Mix in the event title so series markets (e.g. team
+                        # moneylines) still match the parent question.
+                        confidence = max(
+                            confidence,
+                            mapping_confidence(
+                                f"{event_title} {market_title}",
+                                str(candidate.get("question", "")),
+                            ),
+                        )
+                    if confidence > best_confidence:
+                        best_confidence = confidence
+                        best = candidate
+                if best is not None and best_confidence >= 0.35:
+                    matches.append(
+                        {
+                            "kalshi_ticker": market.get("ticker"),
+                            "kalshi_yes_midpoint": market.get("yes_midpoint"),
+                            "polymarket_question": best.get("question"),
+                            "polymarket_yes_price": best.get("yes_price"),
+                            "polymarket_no_price": best.get("no_price"),
+                            "polymarket_volume_usd": best.get("volume_usd"),
+                            "mapping_confidence": round(best_confidence, 3),
+                        }
+                    )
+
+            if not matches:
+                return None
+            return {
+                "source": "polymarket.gamma",
+                "match_count": len(matches),
+                "matches": matches,
+                "note": (
+                    "Independent market prices for the same question. Agreement "
+                    "with Kalshi means little edge; sharp divergence is signal."
+                ),
+            }
+        except Exception as exc:
+            self.logger.debug(f"Cross-market context unavailable: {exc}")
+            return None
+
+    async def _fetch_polymarket_snapshot(self) -> List[Dict[str, Any]]:
+        """Fetch and cache active Polymarket markets for ~5 minutes."""
+        now = datetime.now(timezone.utc).timestamp()
+        if self._cross_market_cache is not None:
+            expires_at, markets = self._cross_market_cache
+            if expires_at > now:
+                return markets
+
+        from src.data.polymarket_adapter import PolymarketAdapter
+
+        adapter = PolymarketAdapter(http_client=self.http_client)
+        payload = await adapter.fetch_markets(limit=250)
+        markets = list(payload.get("signals", {}).get("markets", []))
+        # Drop illiquid matches early; thin Polymarket books are noise.
+        markets = [
+            market
+            for market in markets
+            if _safe_float(market.get("volume_usd"), 0.0) >= 500.0
+        ]
+        self._cross_market_cache = (now + 300.0, markets)
+        return markets
 
     async def analyze_event(
         self,
@@ -1036,6 +1162,14 @@ class LiveTradeResearchService(TradingLoggerMixin):
             raw_blob,
         ):
             return "crypto"
+        if re.search(
+            r"\bkx(?:high|low|maxtemp|mintemp|rain|precip|snow)",
+            raw_blob,
+        ) or re.search(
+            r"\b(temperature|high temp|low temp|rainfall|snowfall|precipitation|heat index)\b",
+            title_blob,
+        ) or category in {"Climate and Weather", "Weather", "Climate"}:
+            return "weather"
         if category == "Sports":
             return "sports"
         return "general"
@@ -1369,6 +1503,7 @@ class LiveTradeResearchService(TradingLoggerMixin):
             "event": event,
             "microstructure": research_payload.get("microstructure", {}),
             "news": research_payload.get("news", {}),
+            "cross_market_context": research_payload.get("cross_market_context"),
             "sports_context": research_payload.get("sports_context"),
             "bitcoin_context": research_payload.get("bitcoin_context"),
             "crypto_context": research_payload.get("crypto_context"),
@@ -1394,6 +1529,8 @@ class LiveTradeResearchService(TradingLoggerMixin):
             return SPORTS_SEARCH_DOMAINS
         if event.get("focus_type") in {"bitcoin", "crypto"}:
             return BITCOIN_SEARCH_DOMAINS
+        if event.get("focus_type") == "weather":
+            return WEATHER_SEARCH_DOMAINS
         return GENERAL_SEARCH_DOMAINS
 
     @staticmethod

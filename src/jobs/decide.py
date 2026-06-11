@@ -17,6 +17,66 @@ from src.clients.kalshi_client import KalshiClient
 from src.clients.model_router import ModelRouter
 
 
+def _extract_fair_probability(debate_result: Dict) -> Optional[float]:
+    """
+    Pool the debate agents' YES-probability estimates into one fair value.
+
+    The forecaster is the dedicated estimator so it carries the largest
+    weight; bull and bear act as adversarial correctors. Returns None when
+    no agent produced a usable probability (legacy single-model path).
+    """
+    from src.utils.probability_engine import pool_probabilities
+
+    step_results = debate_result.get("step_results") or {}
+    weights = {"forecaster": 0.5, "bull_researcher": 0.25, "bear_researcher": 0.25}
+    estimates = []
+    for role, weight in weights.items():
+        result = step_results.get(role) or {}
+        if "error" in result:
+            continue
+        probability = result.get("probability")
+        if probability is None:
+            continue
+        try:
+            value = float(probability)
+        except (TypeError, ValueError):
+            continue
+        if 0.0 < value < 1.0:
+            estimates.append((value, weight))
+
+    pooled = pool_probabilities(estimates, extremize=1.0)
+    return pooled.probability if pooled else None
+
+
+def _calculate_kelly_quantity(
+    balance: float,
+    entry_price: float,
+    win_probability: float,
+) -> int:
+    """Fractional-Kelly contract count for a binary market entry."""
+    from src.utils.probability_engine import kelly_fraction
+
+    if entry_price <= 0 or balance <= 0:
+        return 0
+    fraction = kelly_fraction(
+        win_probability=win_probability,
+        entry_price=entry_price,
+        multiplier=float(getattr(settings.trading, "kelly_fraction", 0.25) or 0.25),
+        cap=float(getattr(settings.trading, "max_single_position", 0.03) or 0.03),
+    )
+    investment = balance * fraction
+    quantity = int(investment // entry_price)
+    get_trading_logger("decision_engine").info(
+        "Calculated Kelly position size.",
+        win_probability=round(win_probability, 4),
+        entry_price=entry_price,
+        bankroll_fraction=round(fraction, 5),
+        investment_amount=round(investment, 2),
+        quantity=quantity,
+    )
+    return quantity
+
+
 def _calculate_dynamic_quantity(
     balance: float,
     market_price: float,
@@ -402,6 +462,7 @@ async def make_decision_for_market(
             "ticker": market.market_id, "title": market.title, "rules": rules,
             "yes_price": market.yes_price, "no_price": market.no_price,
             "volume": market.volume, "expiration_ts": market.expiration_ts,
+            "days_to_expiry": round(get_time_to_expiry_days(market), 2),
         }
 
         # COST OPTIMIZATION: Skip expensive news search for low-volume markets
@@ -480,6 +541,9 @@ async def make_decision_for_market(
                 )
                 # Attach reasoning for rationale
                 decision.reasoning = ensemble_result.get("reasoning", "Multi-agent ensemble decision")
+                # Attach the pooled fair YES probability so the edge filter
+                # compares probability-vs-price instead of confidence-vs-price.
+                decision.fair_yes_probability = _extract_fair_probability(ensemble_result)
                 estimated_decision_cost = 0.10  # Ensemble uses multiple models
                 total_analysis_cost += estimated_decision_cost
             else:
@@ -517,14 +581,33 @@ async def make_decision_for_market(
 
         if decision.action == "BUY" and decision.confidence >= settings.trading.min_confidence_to_trade:
             price = market.yes_price if decision.side == "YES" else market.no_price
-            
-            # Apply Grok4 edge filtering - 10% minimum edge requirement
+
+            # Fee-aware edge filtering on probability-vs-price
             from src.utils.edge_filter import EdgeFilter
-            
-            # Calculate market probabilities and AI confidence
+            from src.utils.probability_engine import (
+                blend_with_market,
+                side_win_probability,
+            )
+
             market_prob = market.yes_price if decision.side == "YES" else market.no_price
-            ai_prob = decision.confidence
-            
+
+            # Use the agents' pooled fair probability when available. The
+            # decision's *confidence* is certainty about the trade, not the
+            # probability the side wins — conflating them fabricated edge.
+            fair_yes = getattr(decision, "fair_yes_probability", None)
+            if fair_yes is not None:
+                market_yes_prob = max(0.01, min(0.99, float(market.yes_price)))
+                blended_yes = blend_with_market(
+                    fair_yes,
+                    market_yes_prob,
+                    model_weight=float(
+                        getattr(settings.ensemble, "market_blend_model_weight", 0.65) or 0.65
+                    ),
+                )
+                ai_prob = side_win_probability(blended_yes, decision.side)
+            else:
+                ai_prob = decision.confidence  # legacy single-model fallback
+
             # Check edge filter
             should_trade, trade_reason, edge_result = EdgeFilter.should_trade_market(
                 ai_probability=ai_prob,
@@ -538,21 +621,35 @@ async def make_decision_for_market(
                 }
             )
             
+            # The filter measures |edge|; the decision side must also be the
+            # underpriced one (positive edge), otherwise we would buy an
+            # overpriced contract whenever the models disagree with the LLM side.
+            if should_trade and edge_result.edge_magnitude <= 0:
+                should_trade = False
+                trade_reason = (
+                    f"Estimated win probability {ai_prob:.2f} does not exceed the "
+                    f"{decision.side} price {market_prob:.2f} — no positive edge"
+                )
+
             if not should_trade:
                 logger.info(f"❌ EDGE FILTER REJECTED: {market.market_id} - {trade_reason}")
                 await db_manager.record_market_analysis(
                     market.market_id, "EDGE_FILTERED", decision.confidence, total_analysis_cost, trade_reason
                 )
                 return None
-                
+
             logger.info(f"✅ EDGE FILTER APPROVED: {market.market_id} - {trade_reason}")
-            
+
             # Check position limits before calculating quantity
             from src.utils.position_limits import check_can_add_position
-            
-            # Calculate initial position size
-            confidence_delta = decision.confidence - price
-            initial_quantity = _calculate_dynamic_quantity(available_balance, price, confidence_delta)
+
+            # Calculate initial position size: true fractional Kelly when a
+            # fair probability is available, legacy confidence scaling otherwise.
+            if fair_yes is not None and getattr(settings.trading, "use_kelly_criterion", True):
+                initial_quantity = _calculate_kelly_quantity(available_balance, price, ai_prob)
+            else:
+                confidence_delta = decision.confidence - price
+                initial_quantity = _calculate_dynamic_quantity(available_balance, price, confidence_delta)
             initial_position_value = initial_quantity * price
             
             # Check if position can be added within limits and adjust if needed

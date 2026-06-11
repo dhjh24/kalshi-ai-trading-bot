@@ -15,6 +15,8 @@ from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
 import math
 
+from src.utils.trade_pricing import estimate_kalshi_fee
+
 
 @dataclass
 class EdgeFilterResult:
@@ -25,6 +27,8 @@ class EdgeFilterResult:
     side: str  # "YES" or "NO"
     reason: str
     confidence_adjusted_edge: float
+    fee_per_contract: float = 0.0
+    net_edge_after_fees: float = 0.0
 
 
 class EdgeFilter:
@@ -47,41 +51,53 @@ class EdgeFilter:
     # UPDATED: More permissive quality filters
     MIN_VOLUME_FOR_HIGH_EDGE = 500     # DECREASED: Lower volume requirement (was 2000, now 500)
     MIN_SPREAD_QUALITY = 0.03          # INCREASED: Allow wider spreads (was 0.02, now 0.03)
-    
+
+    # Minimum edge remaining after estimated Kalshi fees. The raw edge tiers
+    # above ignore fees; at mid prices taker fees are ~1.75c/contract, so a
+    # "4% edge" can be mostly fees. Net edge must clear this floor too.
+    MIN_NET_EDGE_AFTER_FEES = 0.01     # 1c/contract after fees
+
     @classmethod
     def calculate_edge(
         cls,
         ai_probability: float,
         market_probability: float,
-        confidence: Optional[float] = None
+        confidence: Optional[float] = None,
+        *,
+        maker: bool = False,
+        include_exit_fee: bool = False,
     ) -> EdgeFilterResult:
         """
         Calculate edge and determine if it meets filtering criteria.
-        
+
         Args:
             ai_probability: AI predicted probability (0.0 to 1.0)
             market_probability: Current market price/probability (0.0 to 1.0)
             confidence: AI confidence level (0.0 to 1.0)
-            
+            maker: Whether the entry is expected to rest as a maker order
+                   (lower fee schedule).
+            include_exit_fee: Whether a pre-settlement exit fee should also be
+                   priced in (scalp-style strategies).
+
         Returns:
             EdgeFilterResult with filtering decision and details
         """
-        
+
         # Validate inputs
         ai_probability = max(0.01, min(0.99, ai_probability))
         market_probability = max(0.01, min(0.99, market_probability))
         confidence = confidence or 0.7
-        
+
         # Calculate raw edge (probability difference)
         edge_magnitude = ai_probability - market_probability
         edge_percentage = abs(edge_magnitude)
-        
+
         # Determine position side based on edge direction
         if edge_magnitude > 0:
             side = "YES"  # AI thinks YES is underpriced
         else:
             side = "NO"   # AI thinks NO is underpriced (YES is overpriced)
-        
+
         # Confidence-adjusted edge thresholds
         if confidence >= 0.8:
             required_edge = cls.HIGH_CONFIDENCE_EDGE     # 8% for high confidence
@@ -89,14 +105,24 @@ class EdgeFilter:
             required_edge = cls.MEDIUM_CONFIDENCE_EDGE   # 10% for medium confidence
         else:
             required_edge = cls.LOW_CONFIDENCE_EDGE      # 15% for low confidence
-        
+
         # Calculate confidence-adjusted edge
         confidence_adjusted_edge = edge_percentage * confidence
-        
+
+        # Fee-aware net edge. Kalshi fees are 0.07 * P * (1-P) per contract
+        # for takers (P symmetric, so the entry price of either side yields
+        # the same fee). Buying the flipped side costs ~(1 - market_probability)
+        # which has an identical fee under the quadratic schedule.
+        fee_per_contract = estimate_kalshi_fee(market_probability, 1, maker=maker)
+        if include_exit_fee:
+            fee_per_contract += estimate_kalshi_fee(market_probability, 1, maker=maker)
+        net_edge_after_fees = edge_percentage - fee_per_contract
+
         # Check if edge meets requirements (use > instead of >= to avoid floating point precision issues)
         passes_basic_edge = edge_percentage > (required_edge - 0.001)  # Allow tiny tolerance for floating point
         passes_confidence = confidence >= cls.MIN_CONFIDENCE_FOR_TRADE
-        
+        passes_net_edge = net_edge_after_fees > (cls.MIN_NET_EDGE_AFTER_FEES + 1e-9)
+
         # Generate filtering decision and reason
         if not passes_confidence:
             passes_filter = False
@@ -104,17 +130,28 @@ class EdgeFilter:
         elif not passes_basic_edge:
             passes_filter = False
             reason = f"Edge {edge_percentage:.1%} below required {required_edge:.1%} for confidence {confidence:.1%}"
+        elif not passes_net_edge:
+            passes_filter = False
+            reason = (
+                f"Net edge {net_edge_after_fees:.1%} after ~{fee_per_contract:.1%} fees "
+                f"below minimum {cls.MIN_NET_EDGE_AFTER_FEES:.1%}"
+            )
         else:
             passes_filter = True
-            reason = f"Meets requirements: {edge_percentage:.1%} edge, {confidence:.1%} confidence"
-        
+            reason = (
+                f"Meets requirements: {edge_percentage:.1%} edge "
+                f"({net_edge_after_fees:.1%} net of fees), {confidence:.1%} confidence"
+            )
+
         return EdgeFilterResult(
             passes_filter=passes_filter,
             edge_magnitude=edge_magnitude,
             edge_percentage=edge_percentage,
             side=side,
             reason=reason,
-            confidence_adjusted_edge=confidence_adjusted_edge
+            confidence_adjusted_edge=confidence_adjusted_edge,
+            fee_per_contract=fee_per_contract,
+            net_edge_after_fees=net_edge_after_fees,
         )
     
     @classmethod

@@ -228,3 +228,14 @@ def test_legacy_pickle_unpickler_remaps_xai_client_module():
     again = LegacyPickleUnpickler(io.BytesIO(payload)).load()
     assert isinstance(again, DailyUsageTracker)
     assert again.request_count == 7
+
+
+def test_daily_tracker_pickle_rejects_unexpected_globals():
+    class UnexpectedGlobal:
+        def __reduce__(self):
+            return eval, ("1 + 1",)
+
+    payload = pickle.dumps(UnexpectedGlobal())
+
+    with pytest.raises(pickle.UnpicklingError):
+        load_daily_tracker_pickle(io.BytesIO(payload))

@@ -1222,6 +1222,7 @@ def cmd_mcp(args: argparse.Namespace) -> None:
     port = getattr(args, "port", 8765)
     print("Starting localhost operator API")
     print(f"  URL: http://{host}:{port}")
+    print("  Transport: HTTP JSON-RPC at POST /mcp/jsonrpc")
     print("  Tools: GET /mcp/tools and POST /mcp/call/{tool_name}")
     print("  Live order calls require OPERATOR_API_ALLOW_LIVE_ORDERS=true")
     uvicorn.run("src.operator_api:app", host=host, port=port, log_level="info")
@@ -1264,6 +1265,148 @@ def cmd_explain_market(args: argparse.Namespace) -> None:
     asyncio.run(_explain())
 
 
+def cmd_weather(args: argparse.Namespace) -> None:
+    """Deterministic forecast probabilities + edge for a Kalshi weather event."""
+
+    async def _run() -> None:
+        from src.clients.kalshi_client import KalshiClient
+        from src.config.settings import settings
+        from src.data.weather_adapter import WeatherAdapter
+        from src.utils.kalshi_normalization import get_market_prices
+        from src.utils.probability_engine import fee_aware_ev, kelly_fraction
+
+        client = KalshiClient()
+        adapter = WeatherAdapter()
+        try:
+            if args.ticker:
+                response = await client.get_market(args.ticker)
+                market = response.get("market", response) if isinstance(response, dict) else {}
+                markets = [market] if market else []
+                event_ticker = str(market.get("event_ticker") or args.ticker)
+            else:
+                response = await client.get_markets(event_ticker=args.event, limit=100)
+                markets = list(response.get("markets") or [])
+                event_ticker = args.event
+
+            if not markets:
+                print(f"No markets found for {args.ticker or args.event}.")
+                return
+
+            context = await adapter.fetch_context(
+                {"event_ticker": event_ticker, "markets": markets}
+            )
+            signals = context.get("signals") or {}
+            station = signals.get("station") or {}
+            period = signals.get("target_period") or {}
+            forecast = signals.get("forecast") or {}
+            probabilities = signals.get("market_probabilities") or {}
+
+            print("=" * 88)
+            print(f"  WEATHER MODEL: {event_ticker}")
+            print("=" * 88)
+            print(f"  Station:      {station.get('name') or 'UNRESOLVED'}"
+                  + ("" if station.get("verified", True) else "  (geocoded — not the settlement station!)"))
+            print(f"  Period:       {period.get('kind') or '?'} {period.get('start') or '?'}"
+                  f"  (lead {signals.get('lead_days', '?')} days)")
+            nws_daily = forecast.get("nws_daily") or {}
+            om_daily = forecast.get("open_meteo_daily") or {}
+            print(f"  NWS forecast: high {nws_daily.get('high_f', '—')}F / low {nws_daily.get('low_f', '—')}F"
+                  f"   Open-Meteo: high {om_daily.get('high_f', '—')}F / low {om_daily.get('low_f', '—')}F")
+            if forecast.get("running_max_f") is not None:
+                print(f"  Running obs:  max {forecast.get('running_max_f'):.1f}F"
+                      f" / min {forecast.get('running_min_f'):.1f}F"
+                      f" (through {forecast.get('running_through_local')})")
+            print(f"  Members:      {forecast.get('ensemble_member_count', 0)}"
+                  f"  method={forecast.get('forecast_method') or signals.get('model_status')}")
+            if context.get("error"):
+                print(f"  Adapter error: {context['error']}")
+            print("-" * 88)
+
+            if not probabilities:
+                print(f"  No bucket probabilities ({signals.get('model_status')}).")
+                print("=" * 88)
+                return
+
+            min_edge = float(getattr(settings.trading, "live_trade_min_net_edge", 0.02) or 0.02)
+            kelly_multiplier = float(getattr(settings.trading, "kelly_fraction", 0.25) or 0.25)
+            kelly_cap = float(getattr(settings.trading, "max_single_position", 0.03) or 0.03)
+
+            header = (
+                f"  {'TICKER':<32}{'BUCKET':<26}{'ASK Y/N':<14}"
+                f"{'P(YES)':<9}{'EDGE':<16}ACTION"
+            )
+            print(header)
+            print("-" * 88)
+
+            by_ticker = {str(m.get("ticker") or ""): m for m in markets}
+            for ticker, entry in sorted(probabilities.items()):
+                market = by_ticker.get(ticker, {})
+                yes_bid, yes_ask, no_bid, no_ask = get_market_prices(market)
+                p_yes = float(entry.get("model_yes_probability") or 0.5)
+
+                yes_edge = no_edge = None
+                if yes_ask and 0 < yes_ask < 1:
+                    yes_edge = fee_aware_ev(
+                        win_probability=p_yes, entry_price=yes_ask, side="YES"
+                    ).net_edge
+                if no_ask and 0 < no_ask < 1:
+                    no_edge = fee_aware_ev(
+                        win_probability=1.0 - p_yes, entry_price=no_ask, side="NO"
+                    ).net_edge
+
+                action = "PASS"
+                size_note = ""
+                if yes_edge is not None and yes_edge > min_edge and (no_edge or -1) <= yes_edge:
+                    action = "BUY YES"
+                    kelly = kelly_fraction(
+                        win_probability=p_yes,
+                        entry_price=yes_ask,
+                        multiplier=kelly_multiplier,
+                        cap=kelly_cap,
+                    )
+                    size_note = f" ({kelly * 100:.1f}% bankroll)"
+                elif no_edge is not None and no_edge > min_edge:
+                    action = "BUY NO"
+                    kelly = kelly_fraction(
+                        win_probability=1.0 - p_yes,
+                        entry_price=no_ask,
+                        multiplier=kelly_multiplier,
+                        cap=kelly_cap,
+                    )
+                    size_note = f" ({kelly * 100:.1f}% bankroll)"
+
+                edge_text = (
+                    f"Y{(yes_edge if yes_edge is not None else 0) * 100:+.1f}c"
+                    f"/N{(no_edge if no_edge is not None else 0) * 100:+.1f}c"
+                )
+                ask_text = (
+                    f"{yes_ask:.2f}/{no_ask:.2f}"
+                    if yes_ask and no_ask
+                    else "—"
+                )
+                quality = float(entry.get("quality") or 0.0)
+                print(
+                    f"  {ticker:<32}{str(entry.get('bucket_label') or '')[:24]:<26}"
+                    f"{ask_text:<14}{p_yes:<9.3f}{edge_text:<16}{action}{size_note}"
+                )
+                if not entry.get("can_trade", True):
+                    print(f"  {'':<32}^ interpreter blocked: confidence {entry.get('interpretation_confidence')}")
+                if quality < 0.5:
+                    print(f"  {'':<32}^ low model quality ({quality:.2f}, {entry.get('method')})")
+            print("-" * 88)
+            print(
+                f"  Edges are net of Kalshi taker fees; minimum tradable edge is "
+                f"{min_edge * 100:.1f}c/contract. Kelly sizes use {kelly_multiplier:.2f}x "
+                f"fractional Kelly capped at {kelly_cap * 100:.0f}%."
+            )
+            print("=" * 88)
+        finally:
+            await adapter.aclose()
+            await client.close()
+
+    asyncio.run(_run())
+
+
 def cmd_scan_arb(args: argparse.Namespace) -> None:
     """Run an alert-only Kalshi vs Polymarket scan."""
 
@@ -1279,19 +1422,47 @@ def cmd_scan_arb(args: argparse.Namespace) -> None:
             await db.initialize()
             response = await client.get_markets(limit=args.kalshi_limit, status="open")
             markets = response.get("markets", []) if isinstance(response, dict) else []
-            candidates = await adapter.scan_kalshi_markets(
-                markets,
-                limit=args.polymarket_limit,
-                min_mapping_confidence=args.min_confidence,
-                min_edge=args.min_edge,
-                strict=getattr(args, "strict", False),
+            try:
+                candidates = await adapter.scan_kalshi_markets(
+                    markets,
+                    limit=args.polymarket_limit,
+                    min_mapping_confidence=args.min_confidence,
+                    min_edge=args.min_edge,
+                    strict=getattr(args, "strict", False),
+                )
+            except Exception as exc:
+                await db.record_source_snapshot(
+                    category="cross_market",
+                    source="polymarket.gamma",
+                    status="unavailable",
+                    freshness_seconds=1,
+                    payload={"phase": "cli_scan_arb", "error": str(exc)},
+                )
+                raise
+            polymarket_payload = getattr(adapter, "last_fetch_payload", None)
+            polymarket_markets = (
+                polymarket_payload.get("signals", {}).get("markets", [])
+                if isinstance(polymarket_payload, dict)
+                else []
             )
             await db.record_source_snapshot(
                 category="cross_market",
                 source="polymarket.gamma",
                 status="healthy",
-                freshness_seconds=max((c.freshness_seconds for c in candidates), default=0),
-                payload={"candidate_count": len(candidates)},
+                freshness_seconds=(
+                    int(polymarket_payload.get("freshness_seconds") or 0)
+                    if isinstance(polymarket_payload, dict)
+                    else max((c.freshness_seconds for c in candidates), default=0)
+                ),
+                payload={
+                    "phase": "cli_scan_arb",
+                    "candidate_count": len(candidates),
+                    "polymarket_market_count": (
+                        len(polymarket_markets)
+                        if isinstance(polymarket_markets, list)
+                        else 0
+                    ),
+                },
             )
             for candidate in candidates[: args.limit]:
                 await db.record_arbitrage_candidate(candidate.to_dict())
@@ -1630,6 +1801,25 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_arb.set_defaults(func=cmd_scan_arb)
+
+    # --- weather ---
+    p_weather = subparsers.add_parser(
+        "weather",
+        help="Forecast-model probabilities and edge for a Kalshi weather event",
+        description=(
+            "Fetch a weather event's bucket markets, run the deterministic "
+            "ensemble-forecast probability model (Open-Meteo + NWS), and print "
+            "model P(YES) vs market price with fee-adjusted edge and Kelly size."
+        ),
+    )
+    weather_target = p_weather.add_mutually_exclusive_group(required=True)
+    weather_target.add_argument(
+        "--event", help="Kalshi event ticker, e.g. KXHIGHNY-26JUN12"
+    )
+    weather_target.add_argument(
+        "--ticker", help="Single market ticker, e.g. KXHIGHNY-26JUN12-B70.5"
+    )
+    p_weather.set_defaults(func=cmd_weather)
 
     # --- safety-status ---
     p_safety = subparsers.add_parser(

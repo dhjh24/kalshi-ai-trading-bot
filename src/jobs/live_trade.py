@@ -78,6 +78,7 @@ SPECIALIST_SCHEMA: Dict[str, Any] = {
         "action": {"type": "string", "enum": ["TRADE", "WATCH", "SKIP"]},
         "market_ticker": {"type": "string"},
         "side": {"type": "string", "enum": ["YES", "NO"]},
+        "fair_yes_probability": {"type": "number"},
         "confidence": {"type": "number"},
         "edge_pct": {"type": "number"},
         "position_size_pct": {"type": "number"},
@@ -95,6 +96,7 @@ SPECIALIST_SCHEMA: Dict[str, Any] = {
         "action",
         "market_ticker",
         "side",
+        "fair_yes_probability",
         "confidence",
         "edge_pct",
         "position_size_pct",
@@ -115,6 +117,7 @@ FINAL_SCHEMA: Dict[str, Any] = {
         "event_ticker": {"type": "string"},
         "market_ticker": {"type": "string"},
         "side": {"type": "string", "enum": ["YES", "NO"]},
+        "fair_yes_probability": {"type": "number"},
         "confidence": {"type": "number"},
         "edge_pct": {"type": "number"},
         "position_size_pct": {"type": "number"},
@@ -132,6 +135,7 @@ FINAL_SCHEMA: Dict[str, Any] = {
         "event_ticker",
         "market_ticker",
         "side",
+        "fair_yes_probability",
         "confidence",
         "edge_pct",
         "position_size_pct",
@@ -456,10 +460,12 @@ def _trim_research_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "event": trimmed_event,
         "news": trimmed_news,
         "microstructure": payload.get("microstructure") or {},
+        "cross_market_context": payload.get("cross_market_context"),
         "sports_context": payload.get("sports_context"),
         "bitcoin_context": payload.get("bitcoin_context"),
         "crypto_context": payload.get("crypto_context"),
         "macro_context": payload.get("macro_context"),
+        "weather_context": payload.get("weather_context"),
     }
 
 
@@ -488,11 +494,22 @@ def _normalize_specialist_payload(
     execution_style = str((payload or {}).get("execution_style", "NONE")).upper()
     if execution_style not in {"QUICK_FLIP", "LIVE_TRADE", "NONE"}:
         execution_style = "NONE"
+    # Fail-closed fair value: when the model omits its probability estimate,
+    # fall back to the market midpoint, which yields zero edge at the EV gate.
+    market_midpoint = _clamp(
+        _safe_float((chosen_market or {}).get("yes_midpoint"), 0.5), lo=0.01, hi=0.99
+    )
+    fair_yes_probability = _clamp(
+        _safe_float((payload or {}).get("fair_yes_probability"), market_midpoint),
+        lo=0.01,
+        hi=0.99,
+    )
     normalized = {
         "summary": str((payload or {}).get("summary", "") or ""),
         "action": action,
         "market_ticker": market_ticker,
         "side": side,
+        "fair_yes_probability": fair_yes_probability,
         "confidence": _clamp(_safe_float((payload or {}).get("confidence"), 0.0), lo=0.0, hi=1.0),
         "edge_pct": _safe_float((payload or {}).get("edge_pct"), 0.0),
         "position_size_pct": _clamp(_safe_float((payload or {}).get("position_size_pct"), 1.0), lo=0.0, hi=100.0),
@@ -528,6 +545,7 @@ def _normalize_final_payload(
                 "event_ticker": "",
                 "market_ticker": "",
                 "side": "YES",
+                "fair_yes_probability": 0.5,
                 "confidence": 0.0,
                 "edge_pct": 0.0,
                 "position_size_pct": 0.0,
@@ -542,6 +560,9 @@ def _normalize_final_payload(
             "event_ticker": best.get("event_ticker", ""),
             "market_ticker": best.get("market_ticker", ""),
             "side": best.get("side", "YES"),
+            "fair_yes_probability": _clamp(
+                _safe_float(best.get("fair_yes_probability"), 0.5), lo=0.01, hi=0.99
+            ),
             "confidence": _clamp(_safe_float(best.get("confidence"), 0.0), lo=0.0, hi=1.0),
             "edge_pct": _safe_float(best.get("edge_pct"), 0.0),
             "position_size_pct": _clamp(_safe_float(best.get("position_size_pct"), 1.0), lo=0.0, hi=100.0),
@@ -566,6 +587,9 @@ def _normalize_final_payload(
         "event_ticker": str(payload.get("event_ticker", "") or ""),
         "market_ticker": str(payload.get("market_ticker", "") or ""),
         "side": side,
+        "fair_yes_probability": _clamp(
+            _safe_float(payload.get("fair_yes_probability"), 0.5), lo=0.01, hi=0.99
+        ),
         "confidence": _clamp(_safe_float(payload.get("confidence"), 0.0), lo=0.0, hi=1.0),
         "edge_pct": _safe_float(payload.get("edge_pct"), 0.0),
         "position_size_pct": _clamp(_safe_float(payload.get("position_size_pct"), 0.0), lo=0.0, hi=100.0),
@@ -612,13 +636,20 @@ def _candidate_market_data(candidate: Dict[str, Any]) -> Dict[str, Any]:
         no_probability = _clamp(1.0 - limit_price, lo=0.01, hi=0.99)
 
     risk_flags = [str(item) for item in (candidate.get("risk_flags") or []) if str(item).strip()]
+    fair_yes = _safe_float(candidate.get("fair_yes_probability"), 0.0)
+    entry_fee_estimate = 0.07 * limit_price * (1.0 - limit_price)
     summary_lines = [
         "Entry-only live-trade loop candidate. Emit BUY with side YES or NO, or SKIP. Do not emit SELL.",
         f"Focus type: {candidate.get('focus_type') or 'general'}",
         f"Execution style: {candidate.get('execution_style') or 'NONE'}",
         f"Target hold minutes: {max(_safe_int(candidate.get('hold_minutes'), 0), 0)}",
+        f"Specialist fair YES probability: {fair_yes:.2f}" if fair_yes > 0 else "Specialist fair YES probability: not provided",
         f"Specialist edge estimate: {_safe_float(candidate.get('edge_pct'), 0.0):.4f}",
         f"Specialist confidence: {_safe_float(candidate.get('confidence'), 0.0):.2f}",
+        (
+            f"Estimated Kalshi taker fee at entry: ~{entry_fee_estimate * 100:.1f}c/contract. "
+            "Your edge must clearly exceed fees; if it does not, SKIP."
+        ),
     ]
     if risk_flags:
         summary_lines.append(f"Risk flags: {', '.join(risk_flags[:5])}")
@@ -640,6 +671,38 @@ def _candidate_market_data(candidate: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _pooled_fair_yes_probability(
+    debate_result: Dict[str, Any],
+    candidate: Dict[str, Any],
+) -> float:
+    """
+    Pool the specialist's fair YES probability with the debate researchers'
+    probability estimates in log-odds space. The specialist saw the full
+    research payload, so it carries the largest weight; bull/bear act as
+    adversarial correctors.
+    """
+    from src.utils.probability_engine import pool_probabilities
+
+    estimates: List[tuple[float, float]] = []
+    specialist_fair = _safe_float(candidate.get("fair_yes_probability"), 0.0)
+    if 0.0 < specialist_fair < 1.0:
+        estimates.append((specialist_fair, 0.5))
+
+    step_results = debate_result.get("step_results") or {}
+    for role, weight in (("bull_researcher", 0.25), ("bear_researcher", 0.25)):
+        result = step_results.get(role) or {}
+        if "error" in result:
+            continue
+        probability = _safe_float(result.get("probability"), -1.0)
+        if 0.0 < probability < 1.0:
+            estimates.append((probability, weight))
+
+    pooled = pool_probabilities(estimates, extremize=1.0)
+    if pooled is None:
+        return _clamp(specialist_fair if specialist_fair > 0 else 0.5, lo=0.01, hi=0.99)
+    return pooled.probability
+
+
 def _debate_final_payload(
     debate_result: Dict[str, Any],
     *,
@@ -659,6 +722,7 @@ def _debate_final_payload(
         execution_style = "NONE"
 
     step_results = debate_result.get("step_results") or {}
+    fair_yes_probability = _pooled_fair_yes_probability(debate_result, candidate)
     selected_candidate = {
         "event_ticker": candidate.get("event_ticker"),
         "market_ticker": candidate.get("market_ticker"),
@@ -677,6 +741,7 @@ def _debate_final_payload(
         "event_ticker": str(candidate.get("event_ticker") or ""),
         "market_ticker": str(candidate.get("market_ticker") or ""),
         "side": side,
+        "fair_yes_probability": fair_yes_probability,
         "confidence": _clamp(_safe_float(debate_result.get("confidence"), candidate.get("confidence")), lo=0.0, hi=1.0),
         "edge_pct": _safe_float(candidate.get("edge_pct"), 0.0),
         "position_size_pct": _clamp(
@@ -846,6 +911,90 @@ class LiveTradeDecisionLoop:
             logger=self.logger
         )
         self._refresh_notify_tasks: set[asyncio.Task] = set()
+        # Cached settlement-calibration reliability slope (slope, expires_at).
+        self._calibration_slope_cache: Optional[tuple[float, float]] = None
+        # Deterministic weather-model probabilities harvested from the
+        # specialist research payloads: market_ticker -> probability entry
+        # (+ "cached_at" epoch seconds). Consumed by the EV gate.
+        self._weather_model_probs: Dict[str, Dict[str, Any]] = {}
+
+    async def _get_calibration_slope(self) -> float:
+        """
+        Reliability slope from realized live-trade settlements, cached for
+        30 minutes. 1.0 means no shrink (perfectly calibrated or not enough
+        data); lower values shrink model probabilities toward 0.5 before the
+        EV gate, so an overconfident strategy automatically trades less.
+        """
+        if not bool(getattr(settings.trading, "calibration_shrink_enabled", True)):
+            return 1.0
+
+        now = datetime.now(timezone.utc).timestamp()
+        if self._calibration_slope_cache is not None:
+            slope, expires_at = self._calibration_slope_cache
+            if expires_at > now:
+                return slope
+
+        from src.utils.probability_engine import (
+            MIN_CALIBRATION_SAMPLES,
+            calibration_shrink_slope,
+        )
+
+        slope = 1.0
+        try:
+            # Rebuild calibration rows from closed trades so the feedback loop
+            # runs autonomously (the CLI/operator refresh is manual-only).
+            try:
+                await self.db_manager.refresh_settlement_calibration()
+            except Exception as refresh_exc:
+                self.logger.debug(
+                    "Settlement calibration refresh skipped", error=str(refresh_exc)
+                )
+            samples = await self.db_manager.get_calibration_samples(
+                strategy="live_trade", limit=500
+            )
+            if len(samples) < MIN_CALIBRATION_SAMPLES:
+                samples = await self.db_manager.get_calibration_samples(limit=500)
+            slope = calibration_shrink_slope(samples)
+        except Exception as exc:
+            self.logger.debug("Calibration slope lookup failed", error=str(exc))
+
+        self._calibration_slope_cache = (slope, now + 1800.0)
+        return slope
+
+    def _harvest_weather_model_probabilities(self, payload: Dict[str, Any]) -> None:
+        """
+        Pull deterministic per-bucket weather probabilities out of a research
+        payload so the EV gate can pool them with the LLM estimate later in
+        the same run (and shortly after — entries expire in 30 minutes).
+        """
+        try:
+            weather_context = payload.get("weather_context") or {}
+            signals = weather_context.get("signals") or {}
+            probabilities = signals.get("market_probabilities") or {}
+            if not isinstance(probabilities, dict):
+                return
+            now = datetime.now(timezone.utc).timestamp()
+            for ticker, entry in probabilities.items():
+                if not isinstance(entry, dict):
+                    continue
+                model_prob = _safe_float(entry.get("model_yes_probability"), -1.0)
+                if not (0.0 <= model_prob <= 1.0):
+                    continue
+                self._weather_model_probs[str(ticker)] = {**entry, "cached_at": now}
+        except Exception as exc:  # telemetry only — never break the loop
+            self.logger.debug("Weather probability harvest failed", error=str(exc))
+
+    def _weather_model_entry(
+        self, market_ticker: str, *, max_age_seconds: float = 1800.0
+    ) -> Optional[Dict[str, Any]]:
+        """Fresh deterministic weather estimate for a ticker, if we have one."""
+        entry = self._weather_model_probs.get(str(market_ticker or ""))
+        if not entry:
+            return None
+        cached_at = _safe_float(entry.get("cached_at"), 0.0)
+        if datetime.now(timezone.utc).timestamp() - cached_at > max_age_seconds:
+            return None
+        return entry
 
     def _resolve_runtime_mode(self) -> str:
         if bool(getattr(settings.trading, "live_trading_enabled", False)):
@@ -1275,15 +1424,35 @@ class LiveTradeDecisionLoop:
                 error=str(exc),
             )
 
+        self._harvest_weather_model_probabilities(payload)
+
         focus_type = str(event.get("focus_type") or "general").lower()
         specialist_label = {
             "sports": "sports specialist",
             "bitcoin": "crypto specialist",
             "crypto": "crypto specialist",
+            "weather": "weather specialist",
         }.get(focus_type, "macro specialist")
+        weather_prompt_line = ""
+        if focus_type == "weather":
+            weather_prompt_line = (
+                "The weather_context contains deterministic ensemble-forecast bucket "
+                "probabilities (model_yes_probability per ticker) computed from "
+                "GFS/ECMWF ensemble members recentered toward the official NWS point "
+                "forecast. Anchor your fair_yes_probability on them — deviate only "
+                "with concrete evidence the model missed (e.g. a frontal timing shift "
+                "in the latest discussion), and say why.\n"
+            )
         prompt = (
             f"You are the {specialist_label} for a short-dated prediction-market bot.\n"
             f"Review the event packet and decide whether there is an actionable {_resolve_quick_flip_runtime_label()} trade right now.\n"
+            "Estimate fair_yes_probability — your TRUE probability that the market resolves YES — "
+            "independent of the current price, anchored in the evidence in the packet.\n"
+            f"{weather_prompt_line}"
+            "The market price is usually close to fair: if your estimate is within ~5 cents of the "
+            "midpoint, there is no edge — use WATCH or SKIP.\n"
+            "Kalshi taker fees are about 0.07 x P x (1-P) per contract (~1.75c at mid prices); "
+            "your edge must clearly exceed fees after entry at the ask.\n"
             "Trade only when liquidity, catalyst, and edge are all present. Use QUICK_FLIP only for sub-30-minute holds.\n"
             "Return only JSON.\n\n"
             f"Event packet:\n{json.dumps(_trim_research_payload(payload), default=str)}"
@@ -1639,6 +1808,164 @@ class LiveTradeDecisionLoop:
                 quantity=quantity,
             )
             return False
+        # ------------------------------------------------------------------
+        # Deterministic fee-aware EV gate. The LLM's BUY is a proposal, not
+        # an order: its fair probability is calibration-shrunk, blended with
+        # the live market price, and the trade must clear a minimum net edge
+        # per contract after estimated Kalshi fees.
+        # ------------------------------------------------------------------
+        from src.utils.probability_engine import evaluate_trade_intent
+
+        intent_side = str(final_intent.get("side") or "YES").upper()
+        intent_confidence = _safe_float(final_intent.get("confidence"), 0.0)
+        category_label = str(selected_event.get("category") or "default").lower()
+        category_multipliers = dict(
+            getattr(settings.trading, "category_confidence_adjustments", {}) or {}
+        )
+        confidence_multiplier = float(
+            category_multipliers.get(category_label, category_multipliers.get("default", 1.0))
+        )
+        min_confidence = (
+            float(getattr(settings.trading, "live_trade_min_confidence", 0.55) or 0.55)
+            * confidence_multiplier
+        )
+        if intent_confidence < min_confidence:
+            await self._record_execution_status(
+                run_id=run_id,
+                final_intent=final_intent,
+                status="blocked",
+                summary=(
+                    f"Confidence {intent_confidence:.2f} below the {category_label} "
+                    f"minimum {min_confidence:.2f}."
+                ),
+                error="confidence_below_minimum",
+                quantity=quantity,
+            )
+            return False
+
+        market_yes_mid = _clamp(
+            _safe_float(selected_market.get("yes_midpoint"), 0.5), lo=0.01, hi=0.99
+        )
+        fair_yes_for_gate = _safe_float(
+            final_intent.get("fair_yes_probability"), market_yes_mid
+        )
+
+        # ------------------------------------------------------------------
+        # Weather override: when a fresh deterministic ensemble-forecast
+        # probability exists for this market, it dominates the LLM estimate
+        # (log-odds pooling, weight scaled by estimate quality), and entries
+        # beyond the configured forecast horizon are refused outright.
+        # ------------------------------------------------------------------
+        weather_entry = self._weather_model_entry(market_ticker)
+        weather_pooled_from: Optional[Dict[str, Any]] = None
+        if weather_entry is not None and bool(getattr(settings.weather, "enabled", True)):
+            diagnostics = weather_entry.get("diagnostics") or {}
+            lead_days = _safe_float(diagnostics.get("lead_days"), 0.0)
+            max_lead = float(getattr(settings.weather, "max_lead_days", 6) or 6)
+            if lead_days > max_lead:
+                await self._record_execution_status(
+                    run_id=run_id,
+                    final_intent=final_intent,
+                    status="blocked",
+                    summary=(
+                        f"Weather contract resolves {lead_days:.0f} days out — beyond "
+                        f"the {max_lead:.0f}-day forecast-skill horizon."
+                    ),
+                    error="weather_lead_too_far",
+                    quantity=quantity,
+                )
+                return False
+
+            model_prob = _clamp(
+                _safe_float(weather_entry.get("model_yes_probability"), 0.5),
+                lo=0.01,
+                hi=0.99,
+            )
+            quality = _clamp(_safe_float(weather_entry.get("quality"), 0.0), lo=0.0, hi=1.0)
+            min_quality = float(
+                getattr(settings.weather, "min_quality_to_pool", 0.35) or 0.35
+            )
+            if quality >= min_quality:
+                from src.utils.probability_engine import pool_probabilities
+
+                pool_weight = _clamp(
+                    float(getattr(settings.weather, "model_pool_weight", 0.75) or 0.75)
+                    * quality,
+                    lo=0.0,
+                    hi=0.95,
+                )
+                pooled = pool_probabilities(
+                    [
+                        (fair_yes_for_gate, 1.0 - pool_weight),
+                        (model_prob, pool_weight),
+                    ],
+                    extremize=1.0,
+                )
+                if pooled is not None:
+                    weather_pooled_from = {
+                        "llm_fair_yes_probability": fair_yes_for_gate,
+                        "weather_model_yes_probability": model_prob,
+                        "weather_model_quality": quality,
+                        "weather_model_method": weather_entry.get("method"),
+                        "pool_weight": pool_weight,
+                    }
+                    fair_yes_for_gate = pooled.probability
+                    self.logger.info(
+                        "Pooled deterministic weather probability into EV gate",
+                        market_ticker=market_ticker,
+                        llm_fair=weather_pooled_from["llm_fair_yes_probability"],
+                        weather_model=model_prob,
+                        pooled=fair_yes_for_gate,
+                        quality=quality,
+                    )
+
+        gate = evaluate_trade_intent(
+            fair_yes_probability=fair_yes_for_gate,
+            side=intent_side,
+            entry_price=limit_price,
+            market_yes_probability=market_yes_mid,
+            model_blend_weight=float(
+                getattr(settings.ensemble, "market_blend_model_weight", 0.65) or 0.65
+            ),
+            calibration_slope=await self._get_calibration_slope(),
+            maker=False,
+            include_exit_fee=is_quick_flip_intent,
+            min_net_edge=float(
+                getattr(settings.trading, "live_trade_min_net_edge", 0.02) or 0.0
+            ),
+        )
+        if not gate["approved"]:
+            await self._record_execution_status(
+                run_id=run_id,
+                final_intent=final_intent,
+                status="blocked",
+                summary=f"EV gate blocked the trade: {gate['reason']}.",
+                error="ev_gate_blocked",
+                quantity=quantity,
+                payload={
+                    "fair_yes_probability": gate["fair_yes_probability"],
+                    "shrunk_yes_probability": gate["shrunk_yes_probability"],
+                    "blended_yes_probability": gate["blended_yes_probability"],
+                    "win_probability": gate["win_probability"],
+                    "market_yes_midpoint": market_yes_mid,
+                    "entry_price": limit_price,
+                    "net_edge": gate["ev"].net_edge,
+                    "gross_edge": gate["ev"].gross_edge,
+                    "fees_per_contract": gate["ev"].entry_fee_per_contract
+                    + gate["ev"].exit_fee_per_contract,
+                    "weather_model": weather_pooled_from,
+                },
+            )
+            return False
+        self.logger.info(
+            "EV gate approved live-trade intent",
+            market_ticker=market_ticker,
+            side=intent_side,
+            entry_price=limit_price,
+            blended_yes_probability=gate["blended_yes_probability"],
+            net_edge=gate["ev"].net_edge,
+        )
+
         guardrail_strategy = "quick_flip" if is_short_quick_flip else "live_trade"
         allowed, reason = await self._passes_guardrails(
             market=market_record,

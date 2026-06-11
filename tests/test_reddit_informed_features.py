@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -13,8 +15,35 @@ from src.utils.calibration_metrics import (
     expected_calibration_error,
     probability_buckets,
 )
-from src.utils.database import DatabaseManager, MarketSnapshot, Position
+from src.utils.database import (
+    DatabaseManager,
+    LiveTradeDecision,
+    MarketSnapshot,
+    Position,
+    TradeLog,
+)
 from src.utils.execution_safety import evaluate_pre_execution_safety
+
+
+WEATHER_FIXTURES_PATH = Path(__file__).parent / "fixtures" / "kalshi_weather_contracts.json"
+
+
+def _load_weather_fixtures() -> list[dict]:
+    return json.loads(WEATHER_FIXTURES_PATH.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    _load_weather_fixtures(),
+    ids=lambda item: item["name"],
+)
+def test_weather_interpreter_real_world_kalshi_fixtures(fixture: dict) -> None:
+    result = interpret_temperature_market(fixture["market"])
+    expected = fixture["expect"]
+
+    for field, value in expected.items():
+        actual = result.can_trade if field == "can_trade" else getattr(result, field)
+        assert actual == value, f"{fixture['name']} ({fixture['source_url']}) {field}"
 
 
 def test_weather_interpreter_explains_half_degree_bucket() -> None:
@@ -391,6 +420,37 @@ def test_weather_interpreter_event_buckets_sorted_by_lower_bound() -> None:
     assert payload["event_ticker"] == "KXNYHIGH"
 
 
+def test_weather_interpreter_parses_compact_hyphen_range_bucket() -> None:
+    result = interpret_temperature_market(
+        {
+            "ticker": "KXHIGHNY-RANGE",
+            "title": "NYC high temperature 60-69F",
+        }
+    )
+
+    assert result.detected is True
+    assert result.direction == "bucket"
+    assert result.lower_bound == 60
+    assert result.upper_bound == 69
+    assert result.bucket_label == "temperature between 60-69F"
+    assert result.can_trade is True
+
+
+def test_weather_interpreter_parses_non_half_decimal_threshold() -> None:
+    result = interpret_temperature_market(
+        {
+            "ticker": "KXRAINNY-025",
+            "title": "NYC rainfall above 0.25 inches",
+        }
+    )
+
+    assert result.detected is True
+    assert result.metric == "rainfall"
+    assert result.threshold == 0.25
+    assert result.lower_bound == 0.25
+    assert result.bucket_label == "rainfall above 0.25inches"
+
+
 def test_calibration_metrics_basic_ece_and_buckets() -> None:
     samples = [
         (0.05, 0),
@@ -411,6 +471,216 @@ def test_calibration_metrics_basic_ece_and_buckets() -> None:
 def test_calibration_metrics_handles_empty_samples() -> None:
     assert expected_calibration_error([]) == 0.0
     assert probability_buckets([])[0].count == 0
+
+
+@pytest.mark.asyncio
+async def test_refresh_settlement_calibration_records_decision_market_type(
+    tmp_path,
+) -> None:
+    import aiosqlite
+
+    db = DatabaseManager(db_path=str(tmp_path / "calibration.db"))
+    await db.initialize()
+    now = datetime.now(timezone.utc)
+    await db.add_live_trade_decision(
+        LiveTradeDecision(
+            created_at=now,
+            run_id="run-calibration",
+            step="decision",
+            strategy="live_trade",
+            event_ticker="KXSPORTSEVT",
+            market_ticker="KXSPORTS",
+            title="Will the Lakers win?",
+            focus_type="sports",
+            model="gpt-test",
+            action="buy",
+            side="YES",
+            confidence=0.72,
+        )
+    )
+    await db.add_trade_log(
+        TradeLog(
+            market_id="KXSPORTS",
+            side="YES",
+            entry_price=0.61,
+            exit_price=1.0,
+            quantity=1,
+            pnl=0.39,
+            entry_timestamp=now,
+            exit_timestamp=now,
+            rationale="closed for calibration",
+            strategy="live_trade",
+        )
+    )
+
+    refreshed = await db.refresh_settlement_calibration()
+
+    assert refreshed == 1
+    async with aiosqlite.connect(db.db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT market_type, predicted_probability FROM settlement_calibration"
+        )
+        row = await cursor.fetchone()
+    assert row is not None
+    assert row["market_type"] == "sports"
+    assert row["predicted_probability"] == pytest.approx(0.72)
+
+
+@pytest.mark.asyncio
+async def test_refresh_settlement_calibration_prefers_live_decision_confidence(
+    tmp_path,
+) -> None:
+    import aiosqlite
+    import json
+
+    db = DatabaseManager(db_path=str(tmp_path / "calibration.db"))
+    await db.initialize()
+    now = datetime.now(timezone.utc)
+    await db.add_live_trade_decision(
+        LiveTradeDecision(
+            created_at=now,
+            run_id="run-calibration",
+            step="final",
+            strategy="live_trade",
+            market_ticker="KXDECISION",
+            focus_type="weather",
+            model="gpt-test",
+            action="buy",
+            side="YES",
+            confidence=0.83,
+        )
+    )
+    await db.add_live_trade_decision(
+        LiveTradeDecision(
+            created_at=now + timedelta(seconds=30),
+            run_id="run-calibration",
+            step="execution",
+            strategy="live_trade",
+            market_ticker="KXDECISION",
+            focus_type="weather",
+            action="buy",
+            side="YES",
+            confidence=0.21,
+            status="completed",
+        )
+    )
+    await db.add_position(
+        Position(
+            market_id="KXDECISION",
+            side="YES",
+            entry_price=0.52,
+            quantity=1,
+            timestamp=now,
+            rationale="older position confidence",
+            strategy="live_trade",
+            confidence=0.64,
+        )
+    )
+    await db.add_trade_log(
+        TradeLog(
+            market_id="KXDECISION",
+            side="YES",
+            entry_price=0.52,
+            exit_price=1.0,
+            quantity=1,
+            pnl=0.48,
+            entry_timestamp=now,
+            exit_timestamp=now,
+            rationale="closed for calibration",
+            strategy="live_trade",
+        )
+    )
+
+    refreshed = await db.refresh_settlement_calibration()
+
+    assert refreshed == 1
+    async with aiosqlite.connect(db.db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT predicted_probability, payload_json FROM settlement_calibration"
+        )
+        row = await cursor.fetchone()
+    assert row is not None
+    payload = json.loads(row["payload_json"])
+    assert row["predicted_probability"] == pytest.approx(0.83)
+    assert payload["predicted_source"] == "live_decision_confidence"
+    assert payload["decision_confidence"] == pytest.approx(0.64)
+
+
+@pytest.mark.asyncio
+async def test_refresh_settlement_calibration_backfills_legacy_market_types(
+    tmp_path,
+) -> None:
+    import aiosqlite
+
+    db = DatabaseManager(db_path=str(tmp_path / "calibration.db"))
+    await db.initialize()
+    now = datetime.now(timezone.utc)
+    await db.add_live_trade_decision(
+        LiveTradeDecision(
+            created_at=now,
+            run_id="run-calibration",
+            step="decision",
+            strategy="live_trade",
+            market_ticker="KXFOCUS",
+            focus_type="Sports",
+            model="gpt-test",
+            action="buy",
+            side="YES",
+            confidence=0.72,
+        )
+    )
+    async with aiosqlite.connect(db.db_path) as conn:
+        await conn.execute(
+            """
+            INSERT INTO markets (
+                market_id, title, yes_price, no_price, volume, expiration_ts,
+                category, status, last_updated
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "KXCATEGORY",
+                "Will CPI print above expectations?",
+                0.45,
+                0.55,
+                100,
+                int(now.timestamp()) + 3600,
+                "Economics",
+                "open",
+                now.isoformat(),
+            ),
+        )
+        await conn.execute(
+            """
+            INSERT INTO settlement_calibration (
+                market_id, strategy, category, market_type, predicted_probability,
+                outcome, brier_score, realized_ev, pnl, source, settled_at
+            ) VALUES
+              ('KXFOCUS', 'live_trade', NULL, NULL, 0.72, 1, 0.0784, 1.0, 1.0, 'legacy', ?),
+              ('KXCATEGORY', 'macro_swing', NULL, '', 0.45, 0, 0.2025, -1.0, -1.0, 'legacy', ?)
+            """,
+            (now.isoformat(), now.isoformat()),
+        )
+        await conn.commit()
+
+    refreshed = await db.refresh_settlement_calibration()
+
+    assert refreshed == 0
+    async with aiosqlite.connect(db.db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            """
+            SELECT market_id, market_type
+            FROM settlement_calibration
+            ORDER BY market_id
+            """
+        )
+        rows = await cursor.fetchall()
+    assert {row["market_id"]: row["market_type"] for row in rows} == {
+        "KXCATEGORY": "economics",
+        "KXFOCUS": "sports",
+    }
 
 
 def test_polymarket_normalizer_extracts_volume_and_liquidity() -> None:
@@ -606,6 +876,7 @@ async def test_operator_api_rejects_remote_without_token(monkeypatch) -> None:
     # Health is open even without token.
     health = client.get("/health")
     assert health.status_code == 200
+    assert health.json()["transport"] == "http-jsonrpc"
     # Tools require loopback or a token; the TestClient looks like loopback.
     tools = client.get("/mcp/tools")
     assert tools.status_code == 200
@@ -646,6 +917,179 @@ async def test_operator_api_returns_structured_error_for_unknown_tool(monkeypatc
     body = response.json()
     assert body.get("error") == "unknown_tool"
     assert "availableTools" in body.get("details", {})
+
+
+@pytest.mark.asyncio
+async def test_operator_api_returns_structured_error_for_invalid_http_payload(
+    monkeypatch,
+) -> None:
+    from fastapi.testclient import TestClient
+
+    monkeypatch.delenv("OPERATOR_API_TOKEN", raising=False)
+    from src.operator_api import create_app
+
+    client = TestClient(create_app())
+    response = client.post("/mcp/call/safety_status", json=["not", "an", "object"])
+
+    assert response.status_code == 422
+    body = response.json()
+    assert body["error"] == "invalid_request"
+    assert body["message"] == "Request payload failed validation."
+    assert "errors" in body.get("details", {})
+
+
+@pytest.mark.asyncio
+async def test_operator_api_jsonrpc_lists_mcp_tools(monkeypatch) -> None:
+    from fastapi.testclient import TestClient
+
+    monkeypatch.delenv("OPERATOR_API_TOKEN", raising=False)
+    from src.operator_api import create_app
+
+    client = TestClient(create_app())
+    response = client.post(
+        "/mcp/jsonrpc",
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["jsonrpc"] == "2.0"
+    assert body["id"] == 1
+    tools = body["result"]["tools"]
+    assert any(tool["name"] == "safety_status" for tool in tools)
+    assert all("inputSchema" in tool for tool in tools)
+
+
+@pytest.mark.asyncio
+async def test_operator_api_jsonrpc_calls_tool_with_structured_content(
+    monkeypatch, tmp_path
+) -> None:
+    from fastapi.testclient import TestClient
+
+    monkeypatch.delenv("OPERATOR_API_TOKEN", raising=False)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "operator.db"))
+    monkeypatch.setenv("KALSHI_DB_PATH", str(tmp_path / "operator.db"))
+
+    db = DatabaseManager(db_path=str(tmp_path / "operator.db"))
+    await db.initialize()
+    await db.record_anomaly_rejection(
+        ticker="KXRPC",
+        side="YES",
+        reason="quote_move_exceeds_guard",
+        score=0.8,
+        details={"previous_ask": 0.4, "current_ask": 0.6},
+    )
+
+    from src.operator_api import create_app
+
+    client = TestClient(create_app())
+    response = client.post(
+        "/mcp/jsonrpc",
+        json={
+            "jsonrpc": "2.0",
+            "id": "call-1",
+            "method": "tools/call",
+            "params": {
+                "name": "safety_status",
+                "arguments": {
+                    "rejection_limit": 5,
+                    "arbitrage_limit": 5,
+                    "source_limit": 5,
+                },
+            },
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == "call-1"
+    result = body["result"]
+    assert result["isError"] is False
+    assert result["content"][0]["type"] == "text"
+    assert any(
+        item["ticker"] == "KXRPC"
+        for item in result["structuredContent"]["rejections"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_operator_api_jsonrpc_returns_protocol_error_for_bad_tool_args(
+    monkeypatch,
+) -> None:
+    from fastapi.testclient import TestClient
+
+    monkeypatch.delenv("OPERATOR_API_TOKEN", raising=False)
+    from src.operator_api import create_app
+
+    client = TestClient(create_app())
+    response = client.post(
+        "/mcp/jsonrpc",
+        json={
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "safety_status", "arguments": {"rejection_limit": 0}},
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == 2
+    assert body["error"]["code"] == -32602
+    assert body["error"]["message"] == "Tool arguments failed validation."
+
+
+@pytest.mark.asyncio
+async def test_operator_api_jsonrpc_rejects_non_object_params(monkeypatch) -> None:
+    from fastapi.testclient import TestClient
+
+    monkeypatch.delenv("OPERATOR_API_TOKEN", raising=False)
+    from src.operator_api import create_app
+
+    client = TestClient(create_app())
+    response = client.post(
+        "/mcp/jsonrpc",
+        json={
+            "jsonrpc": "2.0",
+            "id": "bad-params",
+            "method": "tools/call",
+            "params": ["safety_status"],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == "bad-params"
+    assert body["error"]["code"] == -32602
+    assert body["error"]["message"] == "tools/call params must be an object."
+
+
+@pytest.mark.asyncio
+async def test_operator_api_jsonrpc_batch_and_notifications(monkeypatch) -> None:
+    from fastapi.testclient import TestClient
+
+    monkeypatch.delenv("OPERATOR_API_TOKEN", raising=False)
+    from src.operator_api import create_app
+
+    client = TestClient(create_app())
+    response = client.post(
+        "/mcp/jsonrpc",
+        json=[
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": "ping-1", "method": "ping"},
+            {"jsonrpc": "2.0", "id": "tools-1", "method": "tools/list"},
+        ],
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [item["id"] for item in body] == ["ping-1", "tools-1"]
+    assert body[0]["result"] == {}
+    assert any(tool["name"] == "scan_arbitrage" for tool in body[1]["result"]["tools"])
+
+    notification = client.post(
+        "/mcp/jsonrpc",
+        json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+    )
+    assert notification.status_code == 204
+    assert notification.content == b""
 
 
 # ---------------------------------------------------------------------------
@@ -928,6 +1372,244 @@ async def test_operator_api_list_arbitrage_candidates_tool(monkeypatch, tmp_path
     assert any(item["kalshi_ticker"] == "KXARB" for item in result["candidates"])
 
 
+@pytest.mark.asyncio
+async def test_operator_api_list_arbitrage_candidates_filters_and_sorts(
+    monkeypatch, tmp_path
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from src.data.polymarket_adapter import ArbitrageCandidate
+
+    db_path = str(tmp_path / "operator.db")
+    monkeypatch.delenv("OPERATOR_API_TOKEN", raising=False)
+    monkeypatch.setenv("DB_PATH", db_path)
+    monkeypatch.setenv("KALSHI_DB_PATH", db_path)
+
+    db = DatabaseManager(db_path=db_path)
+    await db.initialize()
+    for candidate in [
+        ArbitrageCandidate(
+            kalshi_ticker="KXARB-LOW",
+            polymarket_id="pm-low",
+            kalshi_title="Low edge",
+            polymarket_question="Low edge",
+            side="YES",
+            kalshi_price=0.40,
+            polymarket_price=0.48,
+            estimated_edge=0.08,
+            mapping_confidence=0.90,
+            freshness_seconds=2,
+            net_edge=0.02,
+        ),
+        ArbitrageCandidate(
+            kalshi_ticker="KXARB-NO",
+            polymarket_id="pm-no",
+            kalshi_title="No side",
+            polymarket_question="No side",
+            side="NO",
+            kalshi_price=0.30,
+            polymarket_price=0.45,
+            estimated_edge=0.15,
+            mapping_confidence=0.92,
+            freshness_seconds=2,
+            net_edge=0.12,
+        ),
+        ArbitrageCandidate(
+            kalshi_ticker="KXARB-HIGH",
+            polymarket_id="pm-high",
+            kalshi_title="High edge",
+            polymarket_question="High edge",
+            side="YES",
+            kalshi_price=0.35,
+            polymarket_price=0.55,
+            estimated_edge=0.20,
+            mapping_confidence=0.75,
+            freshness_seconds=2,
+            net_edge=0.14,
+        ),
+    ]:
+        await db.record_arbitrage_candidate(candidate.to_dict())
+
+    from src.operator_api import create_app
+
+    client = TestClient(create_app())
+    response = client.post(
+        "/mcp/call/list_arbitrage_candidates",
+        json={
+            "limit": 10,
+            "side": "YES",
+            "min_net_edge": 0.05,
+            "min_mapping_confidence": 0.7,
+            "sort_by": "net_edge",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    candidates = body["result"]["candidates"]
+    assert [item["kalshi_ticker"] for item in candidates] == ["KXARB-HIGH"]
+    assert candidates[0]["net_edge"] == pytest.approx(0.14)
+
+
+@pytest.mark.asyncio
+async def test_operator_api_rejects_unexpected_tool_arguments(monkeypatch) -> None:
+    from fastapi.testclient import TestClient
+
+    monkeypatch.delenv("OPERATOR_API_TOKEN", raising=False)
+    from src.operator_api import create_app
+
+    client = TestClient(create_app())
+    response = client.post(
+        "/mcp/call/list_arbitrage_candidates",
+        json={"limit": 5, "execute": True},
+    )
+
+    assert response.status_code == 422
+    body = response.json()
+    assert body["error"] == "invalid_arguments"
+    assert any(
+        error.get("type") == "extra_forbidden"
+        for error in body.get("details", {}).get("errors", [])
+    )
+
+
+@pytest.mark.asyncio
+async def test_operator_api_scan_arbitrage_records_source_health(
+    monkeypatch, tmp_path
+) -> None:
+    from fastapi.testclient import TestClient
+
+    from src.data.polymarket_adapter import ArbitrageCandidate
+
+    db_path = str(tmp_path / "operator.db")
+    monkeypatch.delenv("OPERATOR_API_TOKEN", raising=False)
+    monkeypatch.setenv("DB_PATH", db_path)
+    monkeypatch.setenv("KALSHI_DB_PATH", db_path)
+
+    class _FakeKalshiClient:
+        async def get_markets(self, **_kwargs):
+            return {
+                "markets": [
+                    {
+                        "ticker": "KXARB-OP",
+                        "title": "Will the Lakers win tonight?",
+                        "yes_ask_dollars": "0.55",
+                        "no_ask_dollars": "0.47",
+                    }
+                ]
+            }
+
+        async def close(self):
+            return None
+
+    class _FakeAdapter:
+        def __init__(self):
+            self.last_fetch_payload = {
+                "category": "cross_market",
+                "source": "polymarket.gamma",
+                "freshness_seconds": 2,
+                "signals": {"markets": [{"market_id": "pm-op"}]},
+                "error": None,
+            }
+
+        async def scan_kalshi_markets(self, *_args, **_kwargs):
+            return [
+                ArbitrageCandidate(
+                    kalshi_ticker="KXARB-OP",
+                    polymarket_id="pm-op",
+                    kalshi_title="Will the Lakers win tonight?",
+                    polymarket_question="Will the Lakers win tonight?",
+                    side="YES",
+                    kalshi_price=0.55,
+                    polymarket_price=0.70,
+                    estimated_edge=0.15,
+                    mapping_confidence=0.8,
+                    freshness_seconds=2,
+                    net_edge=0.10,
+                )
+            ]
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr("src.operator_api.KalshiClient", _FakeKalshiClient)
+    monkeypatch.setattr("src.data.polymarket_adapter.PolymarketAdapter", _FakeAdapter)
+
+    from src.operator_api import create_app
+
+    client = TestClient(create_app())
+    response = client.post("/mcp/call/scan_arbitrage", json={"min_edge": 0.01})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["result"]["candidate_count"] == 1
+
+    db = DatabaseManager(db_path=db_path)
+    await db.initialize()
+    sources = await db.list_source_snapshots(limit=10)
+    by_source = {item["source"]: item for item in sources}
+
+    assert by_source["kalshi.public-api"]["status"] == "healthy"
+    assert by_source["kalshi.public-api"]["payload"]["market_count"] == 1
+    assert by_source["polymarket.gamma"]["status"] == "healthy"
+    assert by_source["polymarket.gamma"]["payload"]["candidate_count"] == 1
+    assert by_source["polymarket.gamma"]["payload"]["polymarket_market_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_operator_api_scan_arbitrage_records_polymarket_failure(
+    monkeypatch, tmp_path
+) -> None:
+    from fastapi.testclient import TestClient
+
+    db_path = str(tmp_path / "operator.db")
+    monkeypatch.delenv("OPERATOR_API_TOKEN", raising=False)
+    monkeypatch.setenv("DB_PATH", db_path)
+    monkeypatch.setenv("KALSHI_DB_PATH", db_path)
+
+    class _FakeKalshiClient:
+        async def get_markets(self, **_kwargs):
+            return {
+                "markets": [
+                    {
+                        "ticker": "KXARB-FAIL",
+                        "title": "Will the Lakers win tonight?",
+                    }
+                ]
+            }
+
+        async def close(self):
+            return None
+
+    class _FailingAdapter:
+        last_fetch_payload = None
+
+        async def scan_kalshi_markets(self, *_args, **_kwargs):
+            raise RuntimeError("polymarket down")
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr("src.operator_api.KalshiClient", _FakeKalshiClient)
+    monkeypatch.setattr("src.data.polymarket_adapter.PolymarketAdapter", _FailingAdapter)
+
+    from src.operator_api import create_app
+
+    client = TestClient(create_app())
+    response = client.post("/mcp/call/scan_arbitrage", json={"min_edge": 0.01})
+    assert response.status_code == 500
+    assert response.json()["error"] == "tool_execution_failed"
+
+    db = DatabaseManager(db_path=db_path)
+    await db.initialize()
+    sources = await db.list_source_snapshots(limit=10)
+    by_source = {item["source"]: item for item in sources}
+
+    assert by_source["kalshi.public-api"]["status"] == "healthy"
+    assert by_source["polymarket.gamma"]["status"] == "unavailable"
+    assert "polymarket down" in by_source["polymarket.gamma"]["payload"]["error"]
+
+
 # ---------------------------------------------------------------------------
 # Source-health helper tests
 # ---------------------------------------------------------------------------
@@ -1020,6 +1702,30 @@ def test_derive_source_snapshot_uses_fallback_for_news_payload() -> None:
     assert snapshot.summary["article_count"] == 2
 
 
+def test_derive_source_snapshot_marks_bare_bitcoin_payload_healthy() -> None:
+    from src.utils.source_health import derive_source_snapshot
+
+    snapshot = derive_source_snapshot(
+        {
+            "asset": "bitcoin",
+            "price_usd": 101234.5,
+            "change_24h_pct": 1.25,
+            "chart_points": [
+                {"timestamp": "2026-05-11T12:00:00Z", "price_usd": 101234.5}
+            ],
+            "error": None,
+        },
+        fallback_category="crypto",
+        fallback_source="coingecko.simple-price",
+    )
+
+    assert snapshot is not None
+    assert snapshot.category == "crypto"
+    assert snapshot.source == "coingecko.simple-price"
+    assert snapshot.status == "healthy"
+    assert snapshot.summary["has_signals"] is True
+
+
 def test_iter_research_payload_snapshots_yields_one_per_adapter() -> None:
     from src.utils.source_health import iter_research_payload_snapshots
 
@@ -1059,6 +1765,7 @@ def test_iter_research_payload_snapshots_yields_one_per_adapter() -> None:
     assert "fred.series" in sources
     assert "rss-aggregator" in sources
     assert statuses["espn.scoreboard"] == "healthy"
+    assert statuses["coingecko.simple-price"] == "healthy"
     assert statuses["fred.series"] == "unavailable"
     assert statuses["rss-aggregator"] == "healthy"
 
@@ -1478,3 +2185,14 @@ def test_weather_interpreter_recognizes_degree_symbol_unit() -> None:
     assert result.unit == "F"
     assert result.direction == "above"
     assert result.threshold == 70
+
+    celsius = interpret_temperature_market(
+        {
+            "ticker": "KX-DEGSYM-C",
+            "title": "Toronto high temperature above 21" + chr(176) + "C",
+        }
+    )
+    assert celsius.detected is True
+    assert celsius.unit == "C"
+    assert celsius.direction == "above"
+    assert celsius.threshold == 21

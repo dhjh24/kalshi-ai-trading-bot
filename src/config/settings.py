@@ -262,6 +262,16 @@ class EnsembleConfig:
     debate_enabled: bool = True
     calibration_tracking: bool = True
     max_ensemble_cost: float = 0.50  # Max cost per ensemble decision
+    # Log-odds pooling extremization exponent (1.0 = plain pooling). Mild
+    # extremization corrects the under-confidence of averaged forecasts.
+    extremize_factor: float = field(
+        default_factory=lambda: float(os.getenv("ENSEMBLE_EXTREMIZE_FACTOR", "1.2"))
+    )
+    # Weight on the pooled model probability when blending with the market
+    # price in log-odds space; the remainder anchors to the market prior.
+    market_blend_model_weight: float = field(
+        default_factory=lambda: float(os.getenv("MARKET_BLEND_MODEL_WEIGHT", "0.65"))
+    )
 
     @staticmethod
     def _normalize_role(role: str) -> str:
@@ -329,20 +339,137 @@ class EnsembleConfig:
         }
 
 
+def _get_rss_feeds() -> List[str]:
+    """Return RSS feeds from the RSS_FEEDS env var or working defaults.
+
+    The old Reuters endpoints (feeds.reuters.com) were discontinued and
+    silently returned nothing, starving the sentiment pipeline. Defaults now
+    cover general/business news plus sports and crypto, matching the live
+    trading focus categories.
+    """
+    override = _get_csv_env_list("RSS_FEEDS")
+    if override:
+        return override
+    return [
+        "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml",
+        "https://feeds.bbci.co.uk/news/business/rss.xml",
+        "https://feeds.bbci.co.uk/news/world/rss.xml",
+        "https://feeds.npr.org/1001/rss.xml",
+        "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+        "https://finance.yahoo.com/news/rssindex",
+        "https://www.espn.com/espn/rss/news",
+        "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    ]
+
+
 @dataclass
 class SentimentConfig:
     """News and sentiment analysis configuration."""
     enabled: bool = True
-    rss_feeds: List[str] = field(default_factory=lambda: [
-        "https://feeds.reuters.com/reuters/topNews",
-        "https://feeds.reuters.com/reuters/businessNews",
-        "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml",
-        "https://feeds.bbci.co.uk/news/business/rss.xml",
-    ])
+    rss_feeds: List[str] = field(default_factory=_get_rss_feeds)
     sentiment_model: str = field(default_factory=_get_default_sentiment_model)
     cache_ttl_minutes: int = 30
     max_articles_per_source: int = 10
     relevance_threshold: float = 0.3
+
+
+@dataclass
+class WeatherConfig:
+    """
+    Weather forecast model configuration.
+
+    The weather pipeline (``src/data/weather_client.py`` +
+    ``src/utils/weather_probability.py`` + ``src/data/weather_adapter.py``)
+    turns free Open-Meteo ensemble forecasts and the official NWS point
+    forecast into a deterministic P(bucket) for Kalshi temperature and
+    precipitation contracts. These knobs control that model and how strongly
+    its probability overrides the LLM estimate at the EV gate.
+    """
+    enabled: bool = field(default_factory=lambda: _get_bool_env("WEATHER_TRADING_ENABLED", True))
+
+    # Open-Meteo ensemble models to pool (comma-separated env override).
+    # gfs_seamless = 31 members, ecmwf_ifs025 = 51 members.
+    ensemble_models: List[str] = field(
+        default_factory=lambda: _get_csv_env_list("WEATHER_ENSEMBLE_MODELS")
+        or ["gfs_seamless", "ecmwf_ifs025"]
+    )
+
+    # Weight of the deterministic weather-model probability when pooled with
+    # the LLM fair probability before the EV gate (log-odds pooling). The
+    # effective weight is scaled by the estimate's quality score.
+    model_pool_weight: float = field(
+        default_factory=lambda: float(os.getenv("WEATHER_MODEL_POOL_WEIGHT", "0.75"))
+    )
+
+    # Do not allow live weather entries further out than this many days —
+    # ensemble skill degrades and the fee-adjusted edge is usually noise.
+    max_lead_days: int = field(
+        default_factory=lambda: int(os.getenv("WEATHER_MAX_LEAD_DAYS", "6"))
+    )
+
+    # Gaussian-kernel bandwidth model (deg F): sigma = max(floor, base +
+    # per_day * lead_days), with `unverified_extra` added in quadrature when
+    # the settlement station had to be geocoded instead of matched.
+    sigma_floor_f: float = field(
+        default_factory=lambda: float(os.getenv("WEATHER_SIGMA_FLOOR_F", "1.2"))
+    )
+    sigma_base_f: float = field(
+        default_factory=lambda: float(os.getenv("WEATHER_SIGMA_BASE_F", "1.6"))
+    )
+    sigma_per_day_f: float = field(
+        default_factory=lambda: float(os.getenv("WEATHER_SIGMA_PER_DAY_F", "0.5"))
+    )
+    unverified_station_extra_sigma_f: float = field(
+        default_factory=lambda: float(os.getenv("WEATHER_UNVERIFIED_EXTRA_SIGMA_F", "1.5"))
+    )
+
+    # Kernel bandwidth for precipitation totals (inches).
+    rain_sigma_in: float = field(
+        default_factory=lambda: float(os.getenv("WEATHER_RAIN_SIGMA_IN", "0.08"))
+    )
+    snow_sigma_in: float = field(
+        default_factory=lambda: float(os.getenv("WEATHER_SNOW_SIGMA_IN", "0.3"))
+    )
+
+    # Weight used to recenter the ensemble toward the official NWS point
+    # forecast (settlement is an NWS product). 0 disables recentering.
+    nws_blend_weight: float = field(
+        default_factory=lambda: float(os.getenv("WEATHER_NWS_BLEND_WEIGHT", "0.35"))
+    )
+
+    # Margin (deg F) the observed running max/min must clear a bucket
+    # boundary by before the model emits a hard 0/1 on same-day contracts.
+    running_obs_margin_f: float = field(
+        default_factory=lambda: float(os.getenv("WEATHER_RUNNING_OBS_MARGIN_F", "1.5"))
+    )
+
+    # Climatology fallback depth.
+    climatology_years: int = field(
+        default_factory=lambda: int(os.getenv("WEATHER_CLIMATOLOGY_YEARS", "10"))
+    )
+
+    # Minimum ensemble members before an estimate is allowed to override
+    # the LLM at full strength (quality is scaled down below this).
+    min_ensemble_members: int = field(
+        default_factory=lambda: int(os.getenv("WEATHER_MIN_ENSEMBLE_MEMBERS", "8"))
+    )
+
+    # Minimum quality score (0-1) an estimate needs before it is pooled
+    # into the live-trade EV gate at all.
+    min_quality_to_pool: float = field(
+        default_factory=lambda: float(os.getenv("WEATHER_MIN_QUALITY_TO_POOL", "0.35"))
+    )
+
+    # Allow geocoding fallback for cities outside the curated registry.
+    allow_geocode_fallback: bool = field(
+        default_factory=lambda: _get_bool_env("WEATHER_ALLOW_GEOCODE_FALLBACK", True)
+    )
+
+    # HTTP behaviour for the weather data client (ensemble payloads are
+    # bigger than the 3s sports/crypto budget allows).
+    request_timeout_seconds: float = field(
+        default_factory=lambda: float(os.getenv("WEATHER_REQUEST_TIMEOUT_SECONDS", "8.0"))
+    )
 
 
 # Trading strategy configuration — DISCIPLINED DEFAULTS (sane risk management)
@@ -545,6 +672,22 @@ class TradingConfig:
         default_factory=lambda: int(os.getenv("LIVE_TRADE_MAX_TRADES_PER_HOUR", "20"))
     )
 
+    # Deterministic fee-aware EV gate for the live-trade loop. The final
+    # intent's fair probability is calibration-shrunk, blended with the live
+    # market price, and the trade must clear this many dollars of net edge
+    # per contract after estimated fees before execution is allowed.
+    live_trade_min_net_edge: float = field(
+        default_factory=lambda: float(os.getenv("LIVE_TRADE_MIN_NET_EDGE", "0.02"))
+    )
+    live_trade_min_confidence: float = field(
+        default_factory=lambda: float(os.getenv("LIVE_TRADE_MIN_CONFIDENCE", "0.55"))
+    )
+    # Apply settlement-calibration shrinkage to model probabilities before
+    # EV gating (slope from realized outcomes; 1.0 = no shrink).
+    calibration_shrink_enabled: bool = field(
+        default_factory=lambda: _get_bool_env("CALIBRATION_SHRINK_ENABLED", True)
+    )
+
     # Shadow drift auto-pause (W4 follow-up). Default OFF so existing runtime
     # behavior is preserved unless explicitly opted in via env.
     shadow_drift_auto_pause_enabled: bool = field(
@@ -685,6 +828,7 @@ class Settings:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     ensemble: EnsembleConfig = field(default_factory=EnsembleConfig)
     sentiment: SentimentConfig = field(default_factory=SentimentConfig)
+    weather: WeatherConfig = field(default_factory=WeatherConfig)
 
     def validate(self) -> bool:
         """Validate configuration settings."""
@@ -820,6 +964,34 @@ class Settings:
 
         if self.trading.live_wagering_max_hours_to_expiry <= 0:
             raise ValueError("live_wagering_max_hours_to_expiry must be positive")
+
+        if not (0.0 <= self.weather.model_pool_weight <= 1.0):
+            raise ValueError("WEATHER_MODEL_POOL_WEIGHT must be between 0 and 1")
+
+        if not (0.0 <= self.weather.min_quality_to_pool <= 1.0):
+            raise ValueError("WEATHER_MIN_QUALITY_TO_POOL must be between 0 and 1")
+
+        if self.weather.max_lead_days < 0:
+            raise ValueError("WEATHER_MAX_LEAD_DAYS must be non-negative")
+
+        if not (0.0 <= self.weather.nws_blend_weight <= 1.0):
+            raise ValueError("WEATHER_NWS_BLEND_WEIGHT must be between 0 and 1")
+
+        for sigma_name in (
+            "sigma_floor_f",
+            "sigma_base_f",
+            "sigma_per_day_f",
+            "rain_sigma_in",
+            "snow_sigma_in",
+        ):
+            if getattr(self.weather, sigma_name) < 0:
+                raise ValueError(f"weather.{sigma_name} must be non-negative")
+
+        if self.weather.climatology_years < 1:
+            raise ValueError("WEATHER_CLIMATOLOGY_YEARS must be at least 1")
+
+        if not self.weather.ensemble_models:
+            raise ValueError("WEATHER_ENSEMBLE_MODELS must list at least one model")
 
         required_roles = {
             "news_analyst",

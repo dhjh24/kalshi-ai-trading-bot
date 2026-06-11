@@ -91,6 +91,14 @@ def _classify_status(payload: Mapping[str, Any]) -> str:
             "connection",
             "unauthorized",
             "forbidden",
+            "httpstatus",
+            "http status",
+            "network",
+            "ssl",
+            "dns",
+            "rate limit",
+            "429",
+            "4xx",
             "5xx",
             "unavailable",
             "down",
@@ -116,6 +124,24 @@ def _classify_status(payload: Mapping[str, Any]) -> str:
         article_count_int = 0
     if article_count_int > 0 or (isinstance(articles, list) and len(articles) > 0):
         return "healthy"
+
+    # Compatibility payloads such as ``fetch_bitcoin_context`` predate the
+    # uniform adapter contract and expose useful fields directly instead of
+    # under ``signals``. Treat any populated data field as healthy so the
+    # safety dashboard does not show fresh crypto context as "empty".
+    metadata_keys = {
+        "category",
+        "source",
+        "timestamp_utc",
+        "freshness_seconds",
+        "signals",
+        "error",
+    }
+    content_keys = [key for key in payload.keys() if key not in metadata_keys]
+    for key in content_keys:
+        value = payload.get(key)
+        if value not in (None, "", [], {}):
+            return "healthy"
 
     return "empty"
 
@@ -158,8 +184,21 @@ def derive_source_snapshot(
         article_count_int = None
 
     has_signals = bool(signals) if signals is not None else False
+    has_direct_payload = any(
+        payload.get(key) not in (None, "", [], {})
+        for key in payload.keys()
+        if key
+        not in {
+            "category",
+            "source",
+            "timestamp_utc",
+            "freshness_seconds",
+            "signals",
+            "error",
+        }
+    )
     summary: Dict[str, Any] = {
-        "has_signals": has_signals,
+        "has_signals": has_signals or has_direct_payload,
         "error": str(error) if error else None,
     }
     if article_count_int is not None:

@@ -493,6 +493,32 @@ async def _get_current_executable_entry_quote(
     return _validate_executable_price(ticker=ticker, side=side, price=ask_dollars), ask_size, market
 
 
+async def _record_pre_execution_kalshi_health(
+    *,
+    db_manager: DatabaseManager,
+    ticker: str,
+    market_info: Dict[str, Any],
+) -> None:
+    """Persist a fresh Kalshi source-health row after a successful entry quote fetch."""
+    recorder = getattr(db_manager, "record_source_snapshot", None)
+    if not callable(recorder):
+        return
+    try:
+        await recorder(
+            category="kalshi",
+            source="kalshi.public-api",
+            status="healthy",
+            freshness_seconds=0,
+            payload={
+                "ticker": ticker,
+                "phase": "pre_execution_entry_quote",
+                "status": get_market_status(market_info),
+            },
+        )
+    except Exception:
+        return
+
+
 def _normalize_book_levels(
     orderbook: Dict[str, Any], side: str, *, ascending: bool
 ) -> list[tuple[float, float]]:
@@ -1233,6 +1259,11 @@ async def execute_position(
                 ticker=position.market_id,
                 side=position.side,
             )
+            await _record_pre_execution_kalshi_health(
+                db_manager=db_manager,
+                ticker=position.market_id,
+                market_info=market_info,
+            )
         except Exception as exc:
             if paper_market_info:
                 top_of_book_price = position.entry_price
@@ -1419,6 +1450,11 @@ async def execute_position(
                 kalshi_client=kalshi_client,
                 ticker=position.market_id,
                 side=position.side,
+            )
+            await _record_pre_execution_kalshi_health(
+                db_manager=db_manager,
+                ticker=position.market_id,
+                market_info=market_info,
             )
         except Exception as exc:
             safety = await evaluate_pre_execution_safety(

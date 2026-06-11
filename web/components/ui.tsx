@@ -139,7 +139,9 @@ export function Panel({
           {eyebrow ? (
             <p className="text-xs uppercase tracking-[0.35em] text-slate-400">{eyebrow}</p>
           ) : null}
-          {title ? <h2 className="mt-2 text-xl font-semibold text-steel">{title}</h2> : null}
+          {title ? (
+            <h2 className="mt-2 break-words text-xl font-semibold text-steel">{title}</h2>
+          ) : null}
         </div>
       )}
       {children}

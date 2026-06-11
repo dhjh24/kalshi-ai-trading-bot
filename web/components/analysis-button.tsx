@@ -78,7 +78,7 @@ export function AnalysisButton({
       : "Request Analysis";
 
   return (
-    <div className="flex flex-col items-end gap-3">
+    <div className="flex flex-col items-start gap-3 sm:items-end">
       <LlmTokenBadge>LLM call (tokenized)</LlmTokenBadge>
       <label
         htmlFor={inputId}
@@ -91,6 +91,8 @@ export function AnalysisButton({
           onChange={(event) => setUseWebResearch(event.target.checked)}
           disabled={mutation.isPending || liveRecord?.status === "pending"}
           className="h-4 w-4 rounded border-slate-300 text-signal focus:ring-signal"
+          style={{ caretColor: "transparent" }}
+          suppressHydrationWarning
         />
         <span>Use web research</span>
       </label>

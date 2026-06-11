@@ -302,11 +302,22 @@ class BaseAgent(ABC):
     # Formatting helpers
     # ------------------------------------------------------------------
     @staticmethod
+    def _format_price_cents(value) -> str:
+        """Normalise a price that may be dollars (0-1) or cents (1-99) to cents."""
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return "?"
+        if 0 < numeric <= 1.0:
+            numeric *= 100.0
+        return f"{numeric:.0f}"
+
+    @staticmethod
     def format_market_summary(market_data: dict) -> str:
         """Return a concise human-readable market summary for prompts."""
         title = market_data.get("title", "Unknown Market")
-        yes_price = market_data.get("yes_price", "?")
-        no_price = market_data.get("no_price", "?")
+        yes_price = BaseAgent._format_price_cents(market_data.get("yes_price"))
+        no_price = BaseAgent._format_price_cents(market_data.get("no_price"))
         volume = market_data.get("volume", 0)
         days = market_data.get("days_to_expiry", "?")
         rules = market_data.get("rules", "")

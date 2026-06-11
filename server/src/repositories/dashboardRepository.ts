@@ -2770,27 +2770,27 @@ export function listSourceHealthSnapshots(
   const params: Array<string | number> = [];
   if (categories.length > 0) {
     const placeholders = categories.map(() => "?").join(", ");
-    where.push(`category IN (${placeholders})`);
-    params.push(...categories);
+    where.push(`LOWER(s.category) IN (${placeholders})`);
+    params.push(...categories.map((entry) => entry.toLowerCase()));
   }
   if (options.status) {
-    where.push("LOWER(status) = LOWER(?)");
+    where.push("LOWER(s.status) = LOWER(?)");
     params.push(options.status);
   }
-  const whereSql = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+  const currentFilterSql = where.length > 0 ? `AND ${where.join(" AND ")}` : "";
 
   const rows = rowsAs<SqlRow[]>(
     db
       .prepare(
         `
-          SELECT *
-          FROM source_snapshots
-          WHERE id IN (
+          SELECT s.*
+          FROM source_snapshots s
+          WHERE s.id IN (
             SELECT MAX(id)
             FROM source_snapshots
-            ${whereSql}
             GROUP BY category, source
           )
+          ${currentFilterSql}
           ORDER BY captured_at DESC, id DESC
           LIMIT ?
         `
@@ -2849,13 +2849,42 @@ interface CalibrationSample {
   outcome: number;
 }
 
+interface CalibrationRollupRow {
+  sample_size?: number;
+  avg_brier?: number | null;
+  win_rate?: number | null;
+  realized_ev?: number | null;
+}
+
+interface CalibrationGroupMetrics {
+  sampleSize: number;
+  averageBrierScore: number | null;
+  ece: number;
+  winRate: number | null;
+  realizedEv: number;
+}
+
 const CALIBRATION_BUCKET_COUNT = 10;
 
-function loadCalibrationSamples(filter?: { strategy?: string }): CalibrationSample[] {
-  const where = filter?.strategy
-    ? "WHERE COALESCE(NULLIF(strategy, ''), 'unknown') = ?"
-    : "";
-  const params = filter?.strategy ? [filter.strategy] : [];
+function calibrationMarketTypeExpression(alias = ""): string {
+  const prefix = alias ? `${alias}.` : "";
+  if (columnExists("settlement_calibration", "market_type")) {
+    return `COALESCE(NULLIF(${prefix}market_type, ''), NULLIF(${prefix}category, ''), 'unknown')`;
+  }
+  return `COALESCE(NULLIF(${prefix}category, ''), 'unknown')`;
+}
+
+function loadCalibrationSamples(filter?: {
+  column: "strategy" | "category" | "market_type";
+  value: string;
+}): CalibrationSample[] {
+  const columnExpressions = {
+    strategy: "COALESCE(NULLIF(strategy, ''), 'unknown')",
+    category: "COALESCE(NULLIF(category, ''), 'uncategorized')",
+    market_type: calibrationMarketTypeExpression()
+  } satisfies Record<NonNullable<typeof filter>["column"], string>;
+  const where = filter ? `WHERE ${columnExpressions[filter.column]} = ?` : "";
+  const params = filter ? [filter.value] : [];
   const rows = rowsAs<SqlRow[]>(
     db
       .prepare(
@@ -2924,6 +2953,23 @@ function expectedCalibrationError(samples: CalibrationSample[]): number {
   return Number(weighted.toFixed(4));
 }
 
+function mapCalibrationGroupMetrics(
+  row: CalibrationRollupRow,
+  samples: CalibrationSample[]
+): CalibrationGroupMetrics {
+  return {
+    sampleSize: toCount(row.sample_size),
+    averageBrierScore:
+      row.avg_brier === null || row.avg_brier === undefined
+        ? null
+        : toNumber(row.avg_brier, 4),
+    ece: expectedCalibrationError(samples),
+    winRate:
+      row.win_rate === null || row.win_rate === undefined ? null : toNumber(row.win_rate, 4),
+    realizedEv: toNumber(row.realized_ev, 2)
+  };
+}
+
 export function getCalibrationSummary(): CalibrationSummary {
   if (!tableExists("settlement_calibration")) {
     return {
@@ -2935,6 +2981,7 @@ export function getCalibrationSummary(): CalibrationSummary {
       byStrategy: [],
       byCategory: [],
       byModel: [],
+      byMarketType: [],
       buckets: bucketSamples([])
     };
   }
@@ -2993,6 +3040,24 @@ export function getCalibrationSummary(): CalibrationSummary {
     ).all()
   );
 
+  const marketTypeExpression = calibrationMarketTypeExpression();
+  const marketTypeRows = rowsAs<SqlRow[]>(
+    db.prepare(
+      `
+        SELECT
+          ${marketTypeExpression} AS market_type,
+          COUNT(*) AS sample_size,
+          AVG(brier_score) AS avg_brier,
+          AVG(outcome) AS win_rate,
+          SUM(COALESCE(realized_ev, 0)) AS realized_ev
+        FROM settlement_calibration
+        GROUP BY ${marketTypeExpression}
+        ORDER BY sample_size DESC, market_type ASC
+        LIMIT 12
+      `
+    ).all()
+  );
+
   const samples = loadCalibrationSamples();
   const modelRows = loadCalibrationByModel();
 
@@ -3010,27 +3075,35 @@ export function getCalibrationSummary(): CalibrationSummary {
     ece: expectedCalibrationError(samples),
     byStrategy: strategyRows.map((row) => ({
       strategy: toNullableText(row.strategy) ?? "unknown",
-      sampleSize: toCount(row.sample_size),
-      averageBrierScore:
-        row.avg_brier === null || row.avg_brier === undefined
-          ? null
-          : toNumber(row.avg_brier, 4),
-      winRate:
-        row.win_rate === null || row.win_rate === undefined ? null : toNumber(row.win_rate, 4),
-      realizedEv: toNumber(row.realized_ev, 2)
+      ...mapCalibrationGroupMetrics(
+        row,
+        loadCalibrationSamples({
+          column: "strategy",
+          value: toNullableText(row.strategy) ?? "unknown"
+        })
+      )
     })),
     byCategory: categoryRows.map((row) => ({
       category: toNullableText(row.category) ?? "uncategorized",
-      sampleSize: toCount(row.sample_size),
-      averageBrierScore:
-        row.avg_brier === null || row.avg_brier === undefined
-          ? null
-          : toNumber(row.avg_brier, 4),
-      winRate:
-        row.win_rate === null || row.win_rate === undefined ? null : toNumber(row.win_rate, 4),
-      realizedEv: toNumber(row.realized_ev, 2)
+      ...mapCalibrationGroupMetrics(
+        row,
+        loadCalibrationSamples({
+          column: "category",
+          value: toNullableText(row.category) ?? "uncategorized"
+        })
+      )
     })),
     byModel: modelRows,
+    byMarketType: marketTypeRows.map((row) => ({
+      marketType: toNullableText(row.market_type) ?? "unknown",
+      ...mapCalibrationGroupMetrics(
+        row,
+        loadCalibrationSamples({
+          column: "market_type",
+          value: toNullableText(row.market_type) ?? "unknown"
+        })
+      )
+    })),
     buckets: bucketSamples(samples)
   };
 }
@@ -3039,8 +3112,59 @@ interface CalibrationByModelRow {
   model: string;
   sampleSize: number;
   averageBrierScore: number | null;
+  ece: number;
   winRate: number | null;
   realizedEv: number;
+}
+
+function loadCalibrationSamplesForModel(model: string): CalibrationSample[] {
+  if (!tableExists("settlement_calibration") || !tableExists("live_trade_decisions")) {
+    return [];
+  }
+  try {
+    const rows = rowsAs<SqlRow[]>(
+      db
+        .prepare(
+          `
+            WITH latest_decision AS (
+              SELECT
+                market_ticker,
+                COALESCE(NULLIF(strategy, ''), 'unknown') AS strategy,
+                model,
+                ROW_NUMBER() OVER (
+                  PARTITION BY market_ticker, COALESCE(NULLIF(strategy, ''), 'unknown')
+                  ORDER BY COALESCE(created_at, '') DESC, id DESC
+                ) AS rn
+              FROM live_trade_decisions
+              WHERE market_ticker IS NOT NULL AND model IS NOT NULL AND model <> ''
+            )
+            SELECT
+              c.predicted_probability AS predicted_probability,
+              c.outcome AS outcome
+            FROM settlement_calibration c
+            JOIN latest_decision d
+              ON d.market_ticker = c.market_id
+              AND d.strategy = COALESCE(NULLIF(c.strategy, ''), 'unknown')
+              AND d.rn = 1
+            WHERE d.model = ?
+          `
+        )
+        .all(model)
+    );
+    return rows
+      .map((row) => ({
+        predicted: Number(row.predicted_probability ?? 0),
+        outcome: Number(row.outcome ?? 0)
+      }))
+      .filter(
+        (sample) =>
+          Number.isFinite(sample.predicted) &&
+          sample.predicted >= 0 &&
+          sample.predicted <= 1
+      );
+  } catch {
+    return [];
+  }
 }
 
 function loadCalibrationByModel(): CalibrationByModelRow[] {
@@ -3101,16 +3225,10 @@ function loadCalibrationByModel(): CalibrationByModelRow[] {
     );
     return rows.map((row) => ({
       model: toNullableText(row.model) ?? "unknown",
-      sampleSize: toCount(row.sample_size),
-      averageBrierScore:
-        row.avg_brier === null || row.avg_brier === undefined
-          ? null
-          : toNumber(row.avg_brier, 4),
-      winRate:
-        row.win_rate === null || row.win_rate === undefined
-          ? null
-          : toNumber(row.win_rate, 4),
-      realizedEv: toNumber(row.realized_ev, 2)
+      ...mapCalibrationGroupMetrics(
+        row,
+        loadCalibrationSamplesForModel(toNullableText(row.model) ?? "unknown")
+      )
     }));
   } catch {
     return [];

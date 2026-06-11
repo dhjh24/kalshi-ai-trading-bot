@@ -1,11 +1,13 @@
-# Operator API (HTTP Tool Protocol)
+# Operator API (HTTP + JSON-RPC MCP Tool Protocol)
 
 The operator API is a localhost-first FastAPI service that exposes a small
-set of MCP-style tool endpoints for AI agents and human operators. It is
-intentionally **not** a full JSON-RPC MCP server; instead it speaks a
-minimal, well-documented HTTP protocol that any MCP-style client can wrap
-with a few lines of glue code, and that ordinary `curl`/`httpx` callers can
-use directly.
+set of MCP-style tool endpoints for AI agents and human operators. Ordinary
+`curl`/`httpx` callers can use the simple HTTP routes directly; MCP-style
+clients can use the JSON-RPC endpoint at `/mcp/jsonrpc`, which supports the
+core `initialize`, `ping`, `tools/list`, and `tools/call` methods.
+
+The supported MCP transport is HTTP JSON-RPC. There is intentionally no
+stdio server entry point unless a concrete client integration requires one.
 
 This document is the canonical description of the protocol. See
 `src/operator_api.py` for the implementation and `tests/test_reddit_informed_features.py`
@@ -26,6 +28,11 @@ curl http://127.0.0.1:8765/mcp/tools
 curl -X POST http://127.0.0.1:8765/mcp/call/get_market \
   -H 'Content-Type: application/json' \
   -d '{"ticker":"KXNBA-LAKERS"}'
+
+# MCP-style JSON-RPC tool discovery.
+curl -X POST http://127.0.0.1:8765/mcp/jsonrpc \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 
 # Health check (always unauthenticated).
 curl http://127.0.0.1:8765/health
@@ -48,6 +55,7 @@ Errors return a structured envelope (see [Error envelope](#error-envelope)).
 | GET    | `/health`                 | none     | Liveness + auth-mode probe               |
 | GET    | `/mcp/tools`              | required | List available tools and JSON schemas    |
 | POST   | `/mcp/call/{tool_name}`   | required | Invoke a tool with a JSON object body    |
+| POST   | `/mcp/jsonrpc`            | required | MCP-style JSON-RPC transport             |
 
 All authenticated endpoints accept either a loopback caller (when no token
 is configured) or a bearer token (when one is). See [Authentication](#authentication).
@@ -60,6 +68,7 @@ Returns:
 {
   "ok": true,
   "service": "operator-api",
+  "transport": "http-jsonrpc",
   "liveOrdersAllowed": false,
   "authMode": "loopback_only" | "token",
   "loopbackCaller": true
@@ -104,12 +113,71 @@ Tools available today:
 | `explain_market`             | Run the weather/contract interpreter for a market and return a structured explanation. |
 | `scan_arbitrage`             | Run an alert-only Kalshi vs Polymarket scan and persist candidates. `strict=true` drops quality-failing candidates instead of annotating them. |
 | `safety_status`              | Return the latest execution-safety snapshot (rejections, source health, arbitrage).    |
-| `list_arbitrage_candidates`  | Return the persisted alert-only arbitrage watchlist (does not refetch Polymarket).     |
+| `list_arbitrage_candidates`  | Return the persisted alert-only arbitrage watchlist (does not refetch Polymarket). Supports `side`, `min_net_edge`, `min_mapping_confidence`, and `sort_by` filters. |
 | `refresh_calibration`        | Rebuild settlement-calibration rows from closed trade logs. Returns rows refreshed.    |
 | `place_order`                | Create a paper order; live orders require an additional env flag.                      |
 
 Run `GET /mcp/tools` for the authoritative input schemas; they are checked
 into source via `TOOLS` in `src/operator_api.py`.
+
+Tool schemas reject unknown fields. This is intentional: operator calls should
+fail closed instead of silently ignoring a misspelled risk or filter flag.
+
+### `POST /mcp/jsonrpc`
+
+The JSON-RPC endpoint accepts JSON-RPC 2.0 objects and returns JSON-RPC 2.0
+responses. It shares the same auth, validation, live-order gating, and tool
+dispatcher as `/mcp/call/{tool_name}`.
+
+Batch requests are accepted. Notifications, including
+`notifications/initialized`, intentionally produce no JSON response; if a
+batch contains only notifications the endpoint returns `204 No Content`.
+
+Supported methods:
+
+| Method                        | Purpose                                                            |
+| ----------------------------- | ------------------------------------------------------------------ |
+| `initialize`                  | Return protocol version, server info, and tool capability summary. |
+| `notifications/initialized`   | Acknowledge MCP client initialization notifications.               |
+| `ping`                        | Return an empty success payload.                                   |
+| `tools/list`                  | Return tool descriptors with MCP-style `inputSchema` keys.         |
+| `tools/call`                  | Invoke a tool using `params.name` and `params.arguments`.           |
+
+Example tool call:
+
+```bash
+curl -X POST http://127.0.0.1:8765/mcp/jsonrpc \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": "safety-1",
+    "method": "tools/call",
+    "params": {
+      "name": "safety_status",
+      "arguments": { "rejection_limit": 10, "arbitrage_limit": 10, "source_limit": 20 }
+    }
+  }'
+```
+
+Successful `tools/call` responses include both MCP-style text content and a
+machine-readable `structuredContent` payload:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "safety-1",
+  "result": {
+    "content": [{ "type": "text", "text": "{...}" }],
+    "structuredContent": { "...": "tool-specific payload" },
+    "isError": false
+  }
+}
+```
+
+JSON-RPC protocol errors use standard codes such as `-32600` (invalid
+request), `-32601` (unknown method), and `-32602` (invalid params). Tool
+execution failures use `-32000` with structured `data.status`, `data.error`,
+and optional `data.details`.
 
 ---
 
@@ -199,9 +267,9 @@ back to the `error`/`message` pair when not.
 
 ---
 
-## Why HTTP and not JSON-RPC over stdio?
+## Why HTTP and not stdio?
 
-A few reasons we picked HTTP for V1:
+A few reasons the operator transport remains HTTP-hosted:
 
 1. **Operability.** A localhost HTTP service is debuggable from any
    browser, `curl`, or `httpx` REPL; no MCP runtime required. We can
@@ -209,15 +277,15 @@ A few reasons we picked HTTP for V1:
 2. **Symmetric auth.** Bearer tokens and loopback gating compose naturally
    with HTTP intermediaries. The same protocol works whether the client is
    a Python script, an LLM tool-call wrapper, or a manual curl.
-3. **MCP compatibility is cheap.** An MCP shim can wrap each tool as a
-   single `tools/call` method that POSTs to `/mcp/call/{name}`; the
-   `input_schema` on `/mcp/tools` is already JSON-Schema-style, so MCP
-   `tools/list` translates 1:1.
+3. **MCP compatibility is direct.** `/mcp/jsonrpc` now exposes MCP-style
+   `tools/list` and `tools/call` without duplicating the underlying tool
+   handlers.
 
-If a future operator deployment needs true JSON-RPC over stdio, the
-recommended path is to wrap this HTTP API rather than re-implement tool
-handlers. The auth, validation, and error-envelope contracts stay
-identical and only the transport changes.
+If a future operator deployment has a named client that cannot speak HTTP
+JSON-RPC and truly needs JSON-RPC over stdio, add a thin stdio wrapper around
+this API rather than re-implementing tool handlers. The auth, validation, and
+error-envelope contracts should stay identical and only the transport should
+change.
 
 ---
 

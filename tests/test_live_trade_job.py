@@ -95,26 +95,28 @@ def _debate_response_bundle(
     trader_confidence: float = 0.76,
     trader_position_size_pct: float = 2.0,
     trader_reasoning: str = "Consensus favors a disciplined entry.",
+    bull_probability: float = 0.78,
+    bear_probability: float = 0.46,
 ):
-    bull_response = """
-    {
-      "probability": 0.78,
-      "probability_floor": 0.66,
+    bull_response = f"""
+    {{
+      "probability": {bull_probability},
+      "probability_floor": {max(bull_probability - 0.12, 0.01)},
       "confidence": 0.74,
       "key_arguments": ["live catalyst", "tight spread"],
       "catalysts": ["game state"],
       "reasoning": "Bull case supports an actionable short-dated entry."
-    }
+    }}
     """
-    bear_response = """
-    {
-      "probability": 0.46,
-      "probability_ceiling": 0.58,
+    bear_response = f"""
+    {{
+      "probability": {bear_probability},
+      "probability_ceiling": {min(bear_probability + 0.12, 0.99)},
       "confidence": 0.63,
       "key_arguments": ["variance risk"],
       "risk_factors": ["late swing"],
       "reasoning": "Bear case is real but not decisive."
-    }
+    }}
     """
     risk_response = """
     {
@@ -1335,6 +1337,7 @@ async def test_live_trade_loop_voids_position_when_generic_execution_fails(monke
             "event_ticker": "KXFAIL-EVT",
             "market_ticker": "KXFAIL-EVT-M1",
             "side": "YES",
+            "fair_yes_probability": 0.75,
             "confidence": 0.75,
             "edge_pct": 0.08,
             "position_size_pct": 2.0,
@@ -2121,6 +2124,7 @@ async def test_live_trade_loop_maps_debate_sell_signal_into_no_side_entry(monkey
       "action": "TRADE",
       "market_ticker": "KXSPORTS-NO-M1",
       "side": "NO",
+      "fair_yes_probability": 0.18,
       "confidence": 0.77,
       "edge_pct": 0.08,
       "position_size_pct": 2.0,
@@ -2151,6 +2155,8 @@ async def test_live_trade_loop_maps_debate_sell_signal_into_no_side_entry(monkey
                     trader_limit_price=61,
                     trader_confidence=0.77,
                     trader_reasoning="Debate agrees the NO side is the tradeable stance.",
+                    bull_probability=0.30,
+                    bear_probability=0.12,
                 ),
             ]
         ),

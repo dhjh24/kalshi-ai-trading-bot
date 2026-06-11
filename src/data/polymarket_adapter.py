@@ -304,6 +304,7 @@ class PolymarketAdapter:
             "POLYMARKET_MARKETS_URL",
             DEFAULT_POLYMARKET_MARKETS_URL,
         )
+        self.last_fetch_payload: Optional[Dict[str, Any]] = None
 
     async def aclose(self) -> None:
         if self._owns_client:
@@ -326,7 +327,7 @@ class PolymarketAdapter:
             for normalized in [normalize_polymarket_market(item)]
             if normalized is not None and normalized.active and not normalized.closed
         ]
-        return {
+        payload = {
             "category": "cross_market",
             "timestamp_utc": _iso_utc(),
             "signals": {"markets": [asdict(market) for market in markets]},
@@ -334,6 +335,8 @@ class PolymarketAdapter:
             "source": "polymarket.gamma",
             "error": None,
         }
+        self.last_fetch_payload = payload
+        return payload
 
     async def scan_kalshi_markets(
         self,
