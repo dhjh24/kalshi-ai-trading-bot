@@ -57,6 +57,19 @@ class EdgeFilter:
     # "4% edge" can be mostly fees. Net edge must clear this floor too.
     MIN_NET_EDGE_AFTER_FEES = 0.01     # 1c/contract after fees
 
+    # Statistical reinforcement (2026-06). Markets priced near 50c are where
+    # outcomes are most coin-flip-like AND where the quadratic fee schedule
+    # peaks, so model edge claims there need extra proof. The penalty is
+    # waived when the category has a strong realized track record, and an
+    # additional penalty applies in categories with a weak one — pushing
+    # capital toward statistically reinforced areas and away from chance.
+    COIN_FLIP_ZONE_LOW = 0.40
+    COIN_FLIP_ZONE_HIGH = 0.60
+    COIN_FLIP_ZONE_PENALTY = 0.02      # extra required edge inside the zone
+    STRONG_CATEGORY_SCORE = 70         # waives the coin-flip penalty
+    WEAK_CATEGORY_SCORE = 40           # adds extra required edge
+    WEAK_CATEGORY_PENALTY = 0.02
+
     @classmethod
     def calculate_edge(
         cls,
@@ -66,6 +79,8 @@ class EdgeFilter:
         *,
         maker: bool = False,
         include_exit_fee: bool = False,
+        category_score: Optional[float] = None,
+        extra_required_edge: float = 0.0,
     ) -> EdgeFilterResult:
         """
         Calculate edge and determine if it meets filtering criteria.
@@ -78,6 +93,11 @@ class EdgeFilter:
                    (lower fee schedule).
             include_exit_fee: Whether a pre-settlement exit fee should also be
                    priced in (scalp-style strategies).
+            category_score: Optional 0-100 category performance score from
+                   the CategoryScorer. Strong categories waive the coin-flip
+                   penalty; weak ones must show extra edge.
+            extra_required_edge: Additional required edge (e.g. ensemble
+                   disagreement padding from the probability engine).
 
         Returns:
             EdgeFilterResult with filtering decision and details
@@ -100,11 +120,27 @@ class EdgeFilter:
 
         # Confidence-adjusted edge thresholds
         if confidence >= 0.8:
-            required_edge = cls.HIGH_CONFIDENCE_EDGE     # 8% for high confidence
+            required_edge = cls.HIGH_CONFIDENCE_EDGE     # 3% for high confidence
         elif confidence >= 0.6:
-            required_edge = cls.MEDIUM_CONFIDENCE_EDGE   # 10% for medium confidence
+            required_edge = cls.MEDIUM_CONFIDENCE_EDGE   # 5% for medium confidence
         else:
-            required_edge = cls.LOW_CONFIDENCE_EDGE      # 15% for low confidence
+            required_edge = cls.LOW_CONFIDENCE_EDGE      # 8% for low confidence
+
+        # Coin-flip-zone penalty: near-50c markets are the most random and
+        # the most fee-expensive; demand extra edge there unless the category
+        # has a statistically strong realized record.
+        in_coin_flip_zone = cls.COIN_FLIP_ZONE_LOW <= market_probability <= cls.COIN_FLIP_ZONE_HIGH
+        strong_category = category_score is not None and category_score >= cls.STRONG_CATEGORY_SCORE
+        if in_coin_flip_zone and not strong_category:
+            required_edge += cls.COIN_FLIP_ZONE_PENALTY
+
+        # Weak-category penalty: realized losses in this category mean model
+        # claims get less benefit of the doubt.
+        if category_score is not None and category_score < cls.WEAK_CATEGORY_SCORE:
+            required_edge += cls.WEAK_CATEGORY_PENALTY
+
+        # Caller-supplied padding (e.g. ensemble disagreement).
+        required_edge += max(0.0, float(extra_required_edge or 0.0))
 
         # Calculate confidence-adjusted edge
         confidence_adjusted_edge = edge_percentage * confidence
@@ -202,23 +238,34 @@ class EdgeFilter:
         ai_probability: float,
         market_probability: float,
         confidence: float,
-        additional_filters: Optional[Dict[str, Any]] = None
+        additional_filters: Optional[Dict[str, Any]] = None,
+        *,
+        category_score: Optional[float] = None,
+        extra_required_edge: float = 0.0,
     ) -> tuple[bool, str, EdgeFilterResult]:
         """
         Comprehensive trading decision based on edge filtering.
-        
+
         Args:
             ai_probability: AI predicted probability
-            market_probability: Market price/probability  
+            market_probability: Market price/probability
             confidence: AI confidence level
             additional_filters: Optional additional filtering criteria
-            
+            category_score: Optional 0-100 category performance score
+            extra_required_edge: Additional required edge (disagreement padding)
+
         Returns:
             (should_trade, reason, edge_result)
         """
-        
+
         # Calculate edge
-        edge_result = cls.calculate_edge(ai_probability, market_probability, confidence)
+        edge_result = cls.calculate_edge(
+            ai_probability,
+            market_probability,
+            confidence,
+            category_score=category_score,
+            extra_required_edge=extra_required_edge,
+        )
         
         # Basic edge filter
         if not edge_result.passes_filter:

@@ -112,6 +112,26 @@ KNOWN_DATA = {
 }
 
 
+def wilson_lower_bound(successes: float, trials: int, z: float = 1.96) -> float:
+    """
+    Wilson score interval lower bound for a binomial proportion.
+
+    A statistically honest win rate: 3 wins out of 4 trades is NOT a 75%
+    edge — the 95% Wilson lower bound is ~30%. Using the lower bound instead
+    of the raw rate stops small lucky samples from inflating category scores
+    while converging to the true rate as evidence accumulates.
+    """
+    n = max(0, int(trials))
+    if n == 0:
+        return 0.0
+    p_hat = max(0.0, min(1.0, float(successes) / n))
+    z2 = z * z
+    denominator = 1.0 + z2 / n
+    centre = p_hat + z2 / (2.0 * n)
+    margin = z * math.sqrt((p_hat * (1.0 - p_hat) + z2 / (4.0 * n)) / n)
+    return max(0.0, (centre - margin) / denominator)
+
+
 def _compute_score(
     win_rate: float,
     avg_roi: float,
@@ -136,8 +156,11 @@ def _compute_score(
     # +1 = strong up, -1 = strong down
     trend_score = max(0.0, min(100.0, (recent_trend + 1.0) / 2.0 * 100))
 
-    # Win rate score: 50% → 50pts, 70% → 85pts, 100% → 100pts
-    winrate_score = max(0.0, min(100.0, win_rate * 100))
+    # Win rate score uses the Wilson 95% lower bound rather than the raw
+    # rate, so a lucky 3-for-4 streak can't masquerade as a 75% edge. With
+    # large samples the bound converges to the raw win rate.
+    robust_win_rate = wilson_lower_bound(win_rate * sample_size, sample_size)
+    winrate_score = max(0.0, min(100.0, robust_win_rate * 100))
 
     total = (
         roi_score * W_ROI

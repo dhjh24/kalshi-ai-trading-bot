@@ -1730,3 +1730,105 @@ async def test_evaluate_price_opportunity_works_without_ai_via_heuristic():
     assert opportunity is not None
     assert "Heuristic" in opportunity.movement_indicator
     assert opportunity.expected_profit > 0
+
+
+@pytest.mark.asyncio
+async def test_evaluate_price_opportunity_rejects_book_stacked_against_entry():
+    """Heavy opposing depth vs thin supporting depth fails the imbalance gate."""
+    strategy = QuickFlipScalpingStrategy(
+        db_manager=object(),
+        kalshi_client=object(),
+        xai_client=object(),
+        config=QuickFlipConfig(
+            capital_per_trade=5.0,
+            max_position_size=25,
+            confidence_threshold=0.6,
+            min_net_profit_per_trade=0.10,
+            min_net_roi=0.03,
+            min_bid_ask_size_ratio=0.5,
+        ),
+    )
+    strategy._analyze_market_movement = AsyncMock(
+        return_value={"target_price": 0.20, "confidence": 0.95, "reason": "small bounce"}
+    )
+    strategy._get_recent_trade_stats = AsyncMock(
+        return_value={
+            "trade_count": 10.0,
+            "recent_max_price": 0.22,
+            "recent_min_price": 0.18,
+            "recent_last_price": 0.20,
+        }
+    )
+
+    market_info = {
+        "yes_bid_dollars": "0.18",
+        "yes_ask_dollars": "0.19",
+        "no_bid_dollars": "0.81",
+        "no_ask_dollars": "0.82",
+        "volume_fp": "5000.00",
+    }
+    # Supporting YES depth 20 vs opposing NO depth 100: ratio 0.2 < 0.5.
+    orderbook = {
+        "yes_dollars": [["0.18", "20.00"]],
+        "no_dollars": [["0.81", "100.00"]],
+    }
+
+    opportunity = await strategy._evaluate_price_opportunity(
+        _build_market(),
+        market_info,
+        orderbook,
+        "YES",
+        hours_to_expiry=2.0,
+        market_volume=5000,
+    )
+    assert opportunity is None
+
+
+@pytest.mark.asyncio
+async def test_evaluate_price_opportunity_imbalance_gate_can_be_disabled():
+    strategy = QuickFlipScalpingStrategy(
+        db_manager=object(),
+        kalshi_client=object(),
+        xai_client=object(),
+        config=QuickFlipConfig(
+            capital_per_trade=5.0,
+            max_position_size=25,
+            confidence_threshold=0.6,
+            min_net_profit_per_trade=0.10,
+            min_net_roi=0.03,
+            min_bid_ask_size_ratio=0.0,
+        ),
+    )
+    strategy._analyze_market_movement = AsyncMock(
+        return_value={"target_price": 0.20, "confidence": 0.95, "reason": "small bounce"}
+    )
+    strategy._get_recent_trade_stats = AsyncMock(
+        return_value={
+            "trade_count": 10.0,
+            "recent_max_price": 0.22,
+            "recent_min_price": 0.18,
+            "recent_last_price": 0.20,
+        }
+    )
+
+    market_info = {
+        "yes_bid_dollars": "0.18",
+        "yes_ask_dollars": "0.19",
+        "no_bid_dollars": "0.81",
+        "no_ask_dollars": "0.82",
+        "volume_fp": "5000.00",
+    }
+    orderbook = {
+        "yes_dollars": [["0.18", "20.00"]],
+        "no_dollars": [["0.81", "100.00"]],
+    }
+
+    opportunity = await strategy._evaluate_price_opportunity(
+        _build_market(),
+        market_info,
+        orderbook,
+        "YES",
+        hours_to_expiry=2.0,
+        market_volume=5000,
+    )
+    assert opportunity is not None

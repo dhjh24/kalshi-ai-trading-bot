@@ -122,6 +122,18 @@ async def should_exit_position(
             exit_price = current_price
         return True, "market_resolution", exit_price
 
+    # Heal exit levels persisted by the old inverted NO-side calculator so
+    # legacy positions don't keep stopping out winners / "taking profit" on
+    # losers. Levels are mirrored back around the entry price.
+    if position.stop_loss_price or position.take_profit_price:
+        from src.utils.stop_loss_calculator import StopLossCalculator as _SLC
+
+        fixed_stop, fixed_tp = _SLC.normalize_exit_levels(
+            position.entry_price, position.stop_loss_price, position.take_profit_price
+        )
+        position.stop_loss_price = fixed_stop
+        position.take_profit_price = fixed_tp
+
     if position.stop_loss_price:
         from src.utils.stop_loss_calculator import StopLossCalculator
 
@@ -142,12 +154,21 @@ async def should_exit_position(
             return True, f"stop_loss_triggered_pnl_{expected_pnl:.2f}", current_price
 
     if position.take_profit_price:
-        if position.side == "YES":
-            take_profit_triggered = current_price >= position.take_profit_price
-        else:
-            take_profit_triggered = current_price <= position.take_profit_price
-
-        if take_profit_triggered:
+        # Side-symmetric: current_price is in the held side's price space, so
+        # profit is always the price rising above the target.
+        if current_price >= position.take_profit_price:
+            # Fee-avoidance: a near-certain winner is worth more held to
+            # settlement (fee-free, pays $1) than sold early (exit fee plus
+            # spread for a few cents of protection). The stop-loss still
+            # guards against a genuine reversal.
+            hold_threshold = float(
+                getattr(settings.trading, "hold_winners_to_settlement_price", 0.95) or 0.95
+            )
+            if (
+                bool(getattr(settings.trading, "hold_winners_to_settlement", True))
+                and current_price >= hold_threshold
+            ):
+                return False, "", current_price
             return True, "take_profit", current_price
 
     if position.max_hold_hours:
@@ -252,6 +273,7 @@ async def run_tracking(
                 ev_gate_enabled=settings.trading.quick_flip_ev_gate_enabled,
                 ev_confidence_margin=settings.trading.quick_flip_ev_confidence_margin,
                 max_last_trade_age_seconds=settings.trading.quick_flip_max_last_trade_age_seconds,
+                min_bid_ask_size_ratio=settings.trading.quick_flip_min_bid_ask_size_ratio,
             ),
         )
         logger.info(

@@ -282,6 +282,7 @@ def _build_quick_flip_config(*, hold_minutes: int) -> QuickFlipConfig:
         ev_gate_enabled=settings.trading.quick_flip_ev_gate_enabled,
         ev_confidence_margin=settings.trading.quick_flip_ev_confidence_margin,
         max_last_trade_age_seconds=settings.trading.quick_flip_max_last_trade_age_seconds,
+        min_bid_ask_size_ratio=settings.trading.quick_flip_min_bid_ask_size_ratio,
     )
 
 

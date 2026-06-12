@@ -1855,6 +1855,20 @@ async def place_profit_taking_orders(
                 )
 
                 if profit_pct >= profit_threshold:
+                    # Near-certain winners are worth more held to settlement
+                    # (fee-free $1 payout) than sold early minus fee + spread.
+                    hold_threshold = float(
+                        getattr(settings.trading, "hold_winners_to_settlement_price", 0.95) or 0.95
+                    )
+                    if (
+                        bool(getattr(settings.trading, "hold_winners_to_settlement", True))
+                        and current_price >= hold_threshold
+                    ):
+                        logger.info(
+                            f"HOLDING TO SETTLEMENT: {position.market_id} at ${current_price:.2f} "
+                            f"(>= ${hold_threshold:.2f}) — skipping early profit-taking to avoid exit fees"
+                        )
+                        continue
                     logger.info(
                         f"PROFIT TARGET HIT: {position.market_id} - {profit_pct:.1%} profit (${unrealized_pnl:.2f})"
                     )

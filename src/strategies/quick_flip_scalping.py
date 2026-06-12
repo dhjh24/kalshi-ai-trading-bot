@@ -118,6 +118,10 @@ class QuickFlipConfig:
     # Reject candidates whose latest public trade is older than this — the
     # momentum heuristics are meaningless on a stale tape. 0 disables.
     max_last_trade_age_seconds: int = 900
+    # Momentum confirmation from book imbalance: resting depth supporting the
+    # entry side must be at least this fraction of the opposing side's depth
+    # (on Kalshi the opposing side's bids ARE the asks above us). 0 disables.
+    min_bid_ask_size_ratio: float = 0.5
 
 
 class QuickFlipScalpingStrategy:
@@ -1343,6 +1347,18 @@ class QuickFlipScalpingStrategy:
         best_bid_size = self._get_best_bid_size(orderbook, side)
         if best_bid_size < self.config.min_orderbook_depth_contracts:
             return None
+
+        # Book-imbalance momentum gate: buying a continuation into a book
+        # whose opposing depth dwarfs the supporting depth is statistically
+        # a fade, not a flip. Opposing-side bids are the asks above us.
+        if self.config.min_bid_ask_size_ratio > 0:
+            opposing_side = "no" if side.lower() == "yes" else "yes"
+            opposing_size = self._get_best_bid_size(orderbook, opposing_side)
+            if (
+                opposing_size > 0
+                and best_bid_size < opposing_size * self.config.min_bid_ask_size_ratio
+            ):
+                return None
 
         quantity = min(
             self.config.max_position_size,

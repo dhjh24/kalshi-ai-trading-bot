@@ -29,6 +29,9 @@ class TradingDecision:
     # from the agents' forecasts. Distinct from `confidence`, which is the
     # model's certainty in its own decision. None on legacy single-model paths.
     fair_yes_probability: Optional[float] = None
+    # Std dev of the ensemble members' probability estimates. High values
+    # mean a contested forecast; the edge gate demands extra net edge.
+    ensemble_disagreement: Optional[float] = None
 
 
 @dataclass

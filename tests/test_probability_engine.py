@@ -252,13 +252,24 @@ class TestEdgeFilterFeeAwareness:
         from src.utils.edge_filter import EdgeFilter
 
         # 4% raw edge at mid prices passes the legacy tier check for high
-        # confidence (3%) but only ~2% survives the ~2c taker fee.
+        # confidence (3%) but only ~2% survives the ~2c taker fee — and the
+        # coin-flip-zone penalty (2026-06) demands 5% there unless the
+        # category has a strong realized record.
         result = EdgeFilter.calculate_edge(0.54, 0.50, confidence=0.85)
         assert result.fee_per_contract == pytest.approx(0.02)
         assert result.net_edge_after_fees == pytest.approx(0.02)
-        assert result.passes_filter is True
+        assert result.passes_filter is False
 
-        marginal = EdgeFilter.calculate_edge(0.53, 0.50, confidence=0.85)
+        strong_category = EdgeFilter.calculate_edge(
+            0.54, 0.50, confidence=0.85, category_score=75.0
+        )
+        assert strong_category.passes_filter is True
+
+        # Waive the zone penalty via a strong category so the fee gate is
+        # the rejection path being exercised.
+        marginal = EdgeFilter.calculate_edge(
+            0.53, 0.50, confidence=0.85, category_score=75.0
+        )
         assert marginal.net_edge_after_fees == pytest.approx(0.01)
         assert marginal.passes_filter is False
         assert "fees" in marginal.reason

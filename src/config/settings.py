@@ -799,6 +799,37 @@ class TradingConfig:
         default_factory=lambda: int(os.getenv("RESULT_BACKFILL_MAX_TICKERS_PER_RUN", "400"))
     )
 
+    # Quick-flip momentum confirmation: require the resting bid depth to be
+    # at least this fraction of the resting ask depth at top of book before
+    # entering. A book stacked with sellers above and no buyers below is a
+    # bad place to buy a momentum continuation. 0 disables the guard.
+    quick_flip_min_bid_ask_size_ratio: float = field(
+        default_factory=lambda: float(os.getenv("QUICK_FLIP_MIN_BID_ASK_SIZE_RATIO", "0.5"))
+    )
+
+    # Fee-avoidance: hold near-certain winners to settlement (fee-free $1
+    # payout) instead of selling early and paying an exit fee plus spread.
+    # Stop-losses still apply, so a genuine reversal is still cut.
+    hold_winners_to_settlement: bool = field(
+        default_factory=lambda: _get_bool_env("HOLD_WINNERS_TO_SETTLEMENT", True)
+    )
+    hold_winners_to_settlement_price: float = field(
+        default_factory=lambda: float(os.getenv("HOLD_WINNERS_TO_SETTLEMENT_PRICE", "0.95"))
+    )
+
+    # ML meta-model: a statistical model (numpy logistic regression, or a
+    # random forest when scikit-learn is installed and enough settlements
+    # exist) trained on realized settlement outcomes. Its probability is
+    # blended with the LLM ensemble's in log-odds space; the blend weight
+    # ramps with training-set size and is capped below so the LLM signal is
+    # never fully overridden.
+    ml_meta_model_enabled: bool = field(
+        default_factory=lambda: _get_bool_env("ML_META_MODEL_ENABLED", True)
+    )
+    ml_meta_model_max_blend_weight: float = field(
+        default_factory=lambda: float(os.getenv("ML_META_MODEL_MAX_BLEND_WEIGHT", "0.35"))
+    )
+
     # Category exploration. Unproven categories (fewer than 5 settled
     # trades) receive a small exploration score instead of a hard block so
     # they can accumulate the evidence the category scorer needs. Always
