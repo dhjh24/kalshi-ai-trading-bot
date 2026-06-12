@@ -1477,6 +1477,80 @@ def cmd_weather_scan(args: argparse.Namespace) -> None:
     asyncio.run(_run())
 
 
+def cmd_backfill_results(args: argparse.Namespace) -> None:
+    """Backfill settlement results for snapshotted markets."""
+
+    async def _run() -> None:
+        from src.jobs.settlement_backfill import run_settlement_backfill
+
+        summary = await run_settlement_backfill(
+            max_tickers=getattr(args, "limit", None),
+            force_fit=bool(getattr(args, "fit", False)),
+        )
+        print("=" * 72)
+        print(f"  SETTLEMENT BACKFILL  ({summary.started_at})")
+        print("=" * 72)
+        print(f"  Tickers checked : {summary.tickers_checked}")
+        print(f"  Settled         : {summary.settled}")
+        print(f"  Voided          : {summary.voided}")
+        print(f"  Still pending   : {summary.pending}")
+        print(f"  Missing at API  : {summary.missing}")
+        print(f"  Model refit     : {'yes' if summary.model_refit else 'no'}")
+        print(f"  Active segments : {summary.models_active}")
+        for error in summary.errors[:8]:
+            print(f"  ! {error}")
+        print("=" * 72)
+
+    asyncio.run(_run())
+
+
+def cmd_fit_market_prior(args: argparse.Namespace) -> None:
+    """Refit the market-prior calibration from labelled snapshots."""
+
+    async def _run() -> None:
+        from src.jobs.settlement_backfill import refresh_market_prior_models
+        from src.utils.database import DatabaseManager
+        from src.utils.market_prior import invalidate_market_prior_cache
+
+        db = DatabaseManager()
+        await db.initialize()
+        active = await refresh_market_prior_models(db)
+        invalidate_market_prior_cache()
+        rows = await db.get_market_prior_models()
+        print("=" * 88)
+        print("  MARKET-PRIOR CALIBRATION FIT")
+        print("=" * 88)
+        if not rows:
+            print("  No labelled snapshot samples yet — run `python cli.py backfill-results` first.")
+            print("=" * 88)
+            return
+        header = (
+            f"  {'SEGMENT':<10}{'A':>8}{'B':>8}{'N_TRAIN':>10}{'N_HOLD':>9}"
+            f"{'BRIER(MODEL)':>14}{'BRIER(MID)':>12}{'ACTIVE':>8}"
+        )
+        print(header)
+        print("-" * 88)
+        for row in rows:
+            hb_model = row.get("holdout_brier_model")
+            hb_ident = row.get("holdout_brier_identity")
+            print(
+                f"  {str(row['segment']):<10}{float(row['intercept']):>8.3f}"
+                f"{float(row['slope']):>8.3f}{int(row['n_train']):>10}"
+                f"{int(row['n_holdout']):>9}"
+                f"{(f'{hb_model:.5f}' if hb_model is not None else 'n/a'):>14}"
+                f"{(f'{hb_ident:.5f}' if hb_ident is not None else 'n/a'):>12}"
+                f"{('yes' if row.get('active') else 'no'):>8}"
+            )
+        print("-" * 88)
+        print(
+            f"  Active segments: {active}. The EV gates use active segments only; "
+            "raw mid is used otherwise."
+        )
+        print("=" * 88)
+
+    asyncio.run(_run())
+
+
 def cmd_scan_arb(args: argparse.Namespace) -> None:
     """Run an alert-only Kalshi vs Polymarket scan."""
 
@@ -1931,6 +2005,38 @@ def build_parser() -> argparse.ArgumentParser:
         description="Refresh the settlement_calibration table using stored trade outcomes.",
     )
     p_calib.set_defaults(func=cmd_refresh_calibration)
+
+    # --- backfill-results ---
+    p_backfill = subparsers.add_parser(
+        "backfill-results",
+        help="Fetch final YES/NO results for expired snapshotted markets",
+        description=(
+            "Batched Kalshi lookups that label the market_snapshots archive "
+            "with settlement outcomes — the training data for the "
+            "market-prior calibration. Run repeatedly to work through the "
+            "backlog; the unified runtime also runs this hourly."
+        ),
+    )
+    p_backfill.add_argument(
+        "--limit", type=int, default=None, help="Max tickers to check this run"
+    )
+    p_backfill.add_argument(
+        "--fit", action="store_true", help="Force a market-prior refit afterwards"
+    )
+    p_backfill.set_defaults(func=cmd_backfill_results)
+
+    # --- fit-market-prior ---
+    p_fit_prior = subparsers.add_parser(
+        "fit-market-prior",
+        help="Refit the market-prior calibration from labelled snapshots",
+        description=(
+            "Fits per-horizon Platt scalers mapping market mid price to "
+            "realized settlement probability (favorite-longshot correction). "
+            "Segments activate only when they beat the raw mid on a "
+            "ticker-level holdout."
+        ),
+    )
+    p_fit_prior.set_defaults(func=cmd_fit_market_prior)
 
     return parser
 

@@ -6,7 +6,7 @@ import aiosqlite
 import json
 import os
 from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, List, Dict, Tuple
 
 from src.utils.logging_setup import TradingLoggerMixin
@@ -36,6 +36,28 @@ def _normalize_calibration_market_type(value: Any) -> str:
     """Normalize calibration market-focus labels for stable dashboard grouping."""
     text = str(value or "").strip()
     return text.lower() if text else "unknown"
+
+
+def normalize_market_type(value: Any) -> str:
+    """
+    Public alias of the calibration market-type normalizer.
+
+    Jobs that look up per-category skill weights or persist decision rows
+    must use the same label normalization the settlement rebuild uses, or
+    category-level observations silently fragment across spellings.
+    """
+    return _normalize_calibration_market_type(value)
+
+
+def _nan_to_none(value: Any) -> Optional[float]:
+    """Convert NaN/invalid numerics to None for clean NULL storage."""
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if numeric != numeric:  # NaN
+        return None
+    return numeric
 
 
 def _extract_fair_side_win_probability(payload_json: Any, side: Any) -> Optional[float]:
@@ -71,6 +93,53 @@ def _extract_fair_side_win_probability(payload_json: Any, side: Any) -> Optional
     if str(side or "").upper() == "NO":
         return 1.0 - fair_yes
     return fair_yes
+
+
+def _extract_member_probabilities(payload_json: Any) -> List[Dict[str, Any]]:
+    """
+    Pull per-ensemble-member fair YES probabilities out of a live-trade
+    decision payload (``gate_snapshot.member_probabilities`` on execution
+    rows, ``member_probabilities`` at top level otherwise).
+
+    Returns a list of ``{role, model, yes_probability}`` dicts; malformed
+    entries are skipped silently.
+    """
+    if not payload_json:
+        return []
+    try:
+        payload = json.loads(payload_json)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    members = None
+    gate_snapshot = payload.get("gate_snapshot")
+    if isinstance(gate_snapshot, dict):
+        members = gate_snapshot.get("member_probabilities")
+    if members is None:
+        members = payload.get("member_probabilities")
+    if not isinstance(members, list):
+        return []
+
+    extracted: List[Dict[str, Any]] = []
+    for entry in members:
+        if not isinstance(entry, dict):
+            continue
+        role = str(entry.get("role") or "").strip().lower()
+        try:
+            probability = float(entry.get("probability"))
+        except (TypeError, ValueError):
+            continue
+        if not role or not (0.0 < probability < 1.0):
+            continue
+        extracted.append(
+            {
+                "role": role,
+                "model": entry.get("model"),
+                "yes_probability": probability,
+            }
+        )
+    return extracted
 
 
 @dataclass
@@ -1560,6 +1629,72 @@ class DatabaseManager(TradingLoggerMixin):
             )
         """)
 
+        # Settlement results for markets the snapshot collector observed.
+        # Written by the settlement-backfill job; labels the historical
+        # snapshot archive so the market-prior calibration can train on it.
+        # status: 'settled' (result is yes/no), 'void' (settled without a
+        # binary result), 'pending' (expired but not yet resolved at the
+        # API), 'missing' (the API no longer returns the ticker).
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS market_outcomes (
+                ticker TEXT PRIMARY KEY,
+                result TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                close_ts INTEGER,
+                category TEXT,
+                checked_at TEXT NOT NULL
+            )
+        """)
+
+        # Fitted market-prior calibration coefficients (Platt scaling per
+        # time-to-expiry segment). Replaced wholesale on each refit; the EV
+        # gates only consume rows with active=1.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS market_prior_models (
+                segment TEXT PRIMARY KEY,
+                intercept REAL NOT NULL,
+                slope REAL NOT NULL,
+                n_train INTEGER NOT NULL,
+                n_holdout INTEGER NOT NULL,
+                train_brier_model REAL,
+                train_brier_identity REAL,
+                holdout_brier_model REAL,
+                holdout_brier_identity REAL,
+                active INTEGER NOT NULL DEFAULT 0,
+                fitted_at TEXT NOT NULL
+            )
+        """)
+
+        # Per-ensemble-member realized accuracy. Rebuilt alongside
+        # settlement_calibration from executed decisions' member
+        # probabilities; feeds skill-weighted pooling. market_type mirrors
+        # settlement_calibration's normalized focus label so multipliers can
+        # be computed per category with a global fallback.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS model_skill_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                role TEXT NOT NULL,
+                model TEXT,
+                market_id TEXT NOT NULL,
+                strategy TEXT,
+                side TEXT,
+                market_type TEXT,
+                predicted_probability REAL NOT NULL,
+                outcome INTEGER NOT NULL,
+                brier_score REAL NOT NULL,
+                source TEXT NOT NULL DEFAULT 'trade_logs',
+                settled_at TEXT
+            )
+        """)
+        cursor = await db.execute("PRAGMA table_info(model_skill_observations)")
+        skill_info = await cursor.fetchall()
+        skill_columns = {col[1] for col in skill_info}
+        if skill_info and "market_type" not in skill_columns:
+            await db.execute(
+                "ALTER TABLE model_skill_observations ADD COLUMN market_type TEXT"
+            )
+            self.logger.info("Added market_type column to model_skill_observations table")
+
         # Create indices for performance
         await db.execute("CREATE INDEX IF NOT EXISTS idx_market_analyses_market_id ON market_analyses(market_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_market_analyses_timestamp ON market_analyses(analysis_timestamp)")
@@ -1599,6 +1734,18 @@ class DatabaseManager(TradingLoggerMixin):
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_shadow_orders_market "
             "ON shadow_orders(market_id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_market_outcomes_status "
+            "ON market_outcomes(status, checked_at)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_model_skill_role "
+            "ON model_skill_observations(role, settled_at DESC)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_model_skill_role_market_type "
+            "ON model_skill_observations(role, market_type)"
         )
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_market_snapshots_ts "
@@ -3881,6 +4028,12 @@ class DatabaseManager(TradingLoggerMixin):
         """
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("DELETE FROM settlement_calibration WHERE source = 'trade_logs'")
+            try:
+                await db.execute(
+                    "DELETE FROM model_skill_observations WHERE source = 'trade_logs'"
+                )
+            except aiosqlite.Error:
+                pass  # legacy DB without the table; created on next initialize()
             cursor = await db.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'live_trade_decisions'"
             )
@@ -4056,6 +4209,7 @@ class DatabaseManager(TradingLoggerMixin):
                 outcome = 1 if float(exit_price or 0.0) >= 0.99 else 0
                 brier = (predicted - outcome) ** 2
                 realized_ev = float(pnl or 0.0)
+                normalized_market_type = _normalize_calibration_market_type(market_type)
                 await db.execute(
                     """
                     INSERT INTO settlement_calibration (
@@ -4068,7 +4222,7 @@ class DatabaseManager(TradingLoggerMixin):
                         market_id,
                         strategy,
                         category,
-                        _normalize_calibration_market_type(market_type),
+                        normalized_market_type,
                         predicted,
                         outcome,
                         brier,
@@ -4088,6 +4242,41 @@ class DatabaseManager(TradingLoggerMixin):
                     ),
                 )
                 inserted += 1
+                # Per-ensemble-member skill observations. Executed decisions
+                # persist each debate member's fair YES probability; score
+                # every member against the realized outcome so pooling can
+                # weight roles by demonstrated accuracy.
+                for member in _extract_member_probabilities(decision_payload_json):
+                    member_yes = member["yes_probability"]
+                    member_side_win = (
+                        member_yes
+                        if str(side).upper() == "YES"
+                        else max(0.0, min(1.0, 1.0 - member_yes))
+                    )
+                    try:
+                        await db.execute(
+                            """
+                            INSERT INTO model_skill_observations (
+                                role, model, market_id, strategy, side,
+                                market_type, predicted_probability, outcome,
+                                brier_score, source, settled_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'trade_logs', ?)
+                            """,
+                            (
+                                member["role"],
+                                member.get("model"),
+                                market_id,
+                                strategy,
+                                side,
+                                normalized_market_type,
+                                member_side_win,
+                                outcome,
+                                (member_side_win - outcome) ** 2,
+                                exit_ts,
+                            ),
+                        )
+                    except aiosqlite.Error:
+                        pass  # legacy DB without the table
             await self._backfill_settlement_calibration_market_types(db)
             await db.commit()
             return inserted
@@ -4136,6 +4325,278 @@ class DatabaseManager(TradingLoggerMixin):
             except (TypeError, ValueError):
                 continue
         return samples
+
+    # ------------------------------------------------------------------
+    # Settlement-result backfill + market-prior calibration support
+    # ------------------------------------------------------------------
+
+    async def get_pending_result_tickers(self, *, limit: int = 400) -> List[str]:
+        """
+        Tickers whose markets have expired but whose final result has not
+        been recorded yet.
+
+        Two sources, in priority order:
+        1. ``markets`` rows past expiration (cheap, covers tracked markets).
+        2. Snapshot tickers absent from ``markets`` entirely — old markets
+           the collector observed but whose registry rows were lost or
+           pruned; the API decides whether they settled.
+
+        ``pending`` outcomes are re-checked after six hours;
+        ``settled``/``void``/``missing`` are final.
+        """
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        recheck_cutoff = (
+            datetime.now(timezone.utc) - timedelta(hours=6)
+        ).isoformat()
+        limit = max(1, int(limit))
+        tickers: List[str] = []
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(
+                    """
+                    SELECT m.market_id
+                    FROM markets m
+                    LEFT JOIN market_outcomes o ON o.ticker = m.market_id
+                    WHERE m.expiration_ts IS NOT NULL
+                      AND m.expiration_ts > 0
+                      AND m.expiration_ts < ?
+                      AND (
+                          o.ticker IS NULL
+                          OR (o.status = 'pending' AND o.checked_at < ?)
+                      )
+                    ORDER BY m.expiration_ts DESC
+                    LIMIT ?
+                    """,
+                    (now_ts - 900, recheck_cutoff, limit),
+                )
+                rows = await cursor.fetchall()
+                tickers = [str(row[0]) for row in rows if row and row[0]]
+
+                remaining = limit - len(tickers)
+                if remaining > 0:
+                    cursor = await db.execute(
+                        """
+                        SELECT DISTINCT s.ticker
+                        FROM market_snapshots s
+                        LEFT JOIN markets m ON m.market_id = s.ticker
+                        LEFT JOIN market_outcomes o ON o.ticker = s.ticker
+                        WHERE m.market_id IS NULL
+                          AND (
+                              o.ticker IS NULL
+                              OR (o.status = 'pending' AND o.checked_at < ?)
+                          )
+                        LIMIT ?
+                        """,
+                        (recheck_cutoff, remaining),
+                    )
+                    rows = await cursor.fetchall()
+                    tickers.extend(str(row[0]) for row in rows if row and row[0])
+        except aiosqlite.Error as exc:
+            self.logger.warning(f"Failed to list pending result tickers: {exc}")
+            return tickers
+        return tickers
+
+    async def upsert_market_outcomes(self, outcomes: List[Dict[str, Any]]) -> int:
+        """
+        Upsert settlement outcomes and label the snapshot archive.
+
+        Each entry: ``{ticker, result, status, close_ts, category}``.
+        For freshly settled tickers, every historical snapshot row for that
+        ticker gets its ``market_result`` column filled — that column is the
+        training label for the market-prior calibration and the replay
+        harness.
+        """
+        if not outcomes:
+            return 0
+        checked_at = datetime.now(timezone.utc).isoformat()
+        settled: List[Tuple[str, str]] = []
+        written = 0
+        async with aiosqlite.connect(self.db_path) as db:
+            for entry in outcomes:
+                ticker = str(entry.get("ticker") or "").strip()
+                if not ticker:
+                    continue
+                result = (entry.get("result") or None)
+                status = str(entry.get("status") or "pending")
+                await db.execute(
+                    """
+                    INSERT INTO market_outcomes (ticker, result, status, close_ts, category, checked_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(ticker) DO UPDATE SET
+                        result = excluded.result,
+                        status = excluded.status,
+                        close_ts = COALESCE(excluded.close_ts, market_outcomes.close_ts),
+                        category = COALESCE(excluded.category, market_outcomes.category),
+                        checked_at = excluded.checked_at
+                    """,
+                    (
+                        ticker,
+                        str(result).lower() if result else None,
+                        status,
+                        entry.get("close_ts"),
+                        entry.get("category"),
+                        checked_at,
+                    ),
+                )
+                written += 1
+                if status == "settled" and result and str(result).lower() in ("yes", "no"):
+                    settled.append((str(result).upper(), ticker))
+            if settled:
+                await db.executemany(
+                    """
+                    UPDATE market_snapshots
+                    SET market_result = ?
+                    WHERE ticker = ? AND market_result IS NULL
+                    """,
+                    settled,
+                )
+            await db.commit()
+        return written
+
+    async def count_settled_outcomes(self) -> int:
+        """Number of tickers with a recorded binary settlement result."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(
+                    "SELECT COUNT(*) FROM market_outcomes "
+                    "WHERE status = 'settled' AND result IN ('yes', 'no')"
+                )
+                row = await cursor.fetchone()
+                return int(row[0] or 0) if row else 0
+        except aiosqlite.Error:
+            return 0
+
+    async def sample_settled_snapshot_rows(
+        self, *, bucket_seconds: int = 21600, max_spread: float = 0.10
+    ) -> List[Tuple[str, float, float, float]]:
+        """
+        Build the market-prior training set from labelled snapshots.
+
+        Returns ``(ticker, yes_mid, hours_to_expiry, outcome)`` tuples with
+        at most one snapshot per market per ``bucket_seconds`` window (the
+        max-id row in each bucket), so serially-correlated snapshots of the
+        same book don't swamp the fit. Rows with crossed/empty books or
+        spreads wider than ``max_spread`` are excluded — their mids are not
+        meaningful prices.
+        """
+        query = """
+            SELECT
+                s.ticker,
+                MAX(s.id) AS picked_id,
+                (s.yes_bid + s.yes_ask) / 2.0 AS yes_mid,
+                s.yes_ask - s.yes_bid AS spread,
+                CAST(strftime('%s', s.timestamp) AS INTEGER) AS snap_ts,
+                o.result AS result,
+                COALESCE(o.close_ts, m.expiration_ts) AS close_ts
+            FROM market_snapshots s
+            JOIN market_outcomes o
+                ON o.ticker = s.ticker
+                AND o.status = 'settled'
+                AND o.result IN ('yes', 'no')
+            LEFT JOIN markets m ON m.market_id = s.ticker
+            WHERE s.yes_bid > 0
+              AND s.yes_ask > 0
+              AND s.yes_ask >= s.yes_bid
+            GROUP BY s.ticker, CAST(strftime('%s', s.timestamp) AS INTEGER) / ?
+        """
+        samples: List[Tuple[str, float, float, float]] = []
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(query, (max(60, int(bucket_seconds)),))
+                rows = await cursor.fetchall()
+        except aiosqlite.Error as exc:
+            self.logger.warning(f"Failed to sample settled snapshots: {exc}")
+            return []
+        for ticker, _picked_id, yes_mid, spread, snap_ts, result, close_ts in rows:
+            try:
+                mid = float(yes_mid)
+                spread_f = float(spread)
+                snap = int(snap_ts)
+                close = int(close_ts) if close_ts is not None else None
+            except (TypeError, ValueError):
+                continue
+            if spread_f > max_spread or close is None or close <= snap:
+                continue
+            hours_to_expiry = (close - snap) / 3600.0
+            outcome = 1.0 if str(result).lower() == "yes" else 0.0
+            samples.append((str(ticker), mid, hours_to_expiry, outcome))
+        return samples
+
+    async def replace_market_prior_models(self, models: List[Dict[str, Any]]) -> int:
+        """Replace all fitted market-prior coefficients (idempotent refit)."""
+        fitted_at = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("DELETE FROM market_prior_models")
+            for row in models:
+                await db.execute(
+                    """
+                    INSERT INTO market_prior_models (
+                        segment, intercept, slope, n_train, n_holdout,
+                        train_brier_model, train_brier_identity,
+                        holdout_brier_model, holdout_brier_identity,
+                        active, fitted_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(row["segment"]),
+                        float(row["intercept"]),
+                        float(row["slope"]),
+                        int(row["n_train"]),
+                        int(row["n_holdout"]),
+                        _nan_to_none(row.get("train_brier_model")),
+                        _nan_to_none(row.get("train_brier_identity")),
+                        _nan_to_none(row.get("holdout_brier_model")),
+                        _nan_to_none(row.get("holdout_brier_identity")),
+                        1 if row.get("active") else 0,
+                        fitted_at,
+                    ),
+                )
+            await db.commit()
+        return len(models)
+
+    async def get_market_prior_models(self) -> List[Dict[str, Any]]:
+        """All fitted market-prior coefficient rows (active and inactive)."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute("SELECT * FROM market_prior_models")
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+        except aiosqlite.Error:
+            return []
+
+    async def get_model_skill_summary(
+        self, *, market_type: Optional[str] = None
+    ) -> Dict[str, Tuple[int, float]]:
+        """
+        Per-role realized accuracy: role -> (sample_count, mean_brier).
+
+        With ``market_type`` (normalized via :func:`normalize_market_type`),
+        only observations from that category count — feeding the per-category
+        skill multipliers. Without it, the global summary is returned.
+        """
+        query = (
+            "SELECT role, COUNT(*) AS n, AVG(brier_score) AS avg_brier "
+            "FROM model_skill_observations"
+        )
+        params: Tuple[Any, ...] = ()
+        if market_type is not None:
+            query += " WHERE market_type = ?"
+            params = (_normalize_calibration_market_type(market_type),)
+        query += " GROUP BY role"
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(query, params)
+                rows = await cursor.fetchall()
+        except aiosqlite.Error:
+            return {}
+        summary: Dict[str, Tuple[int, float]] = {}
+        for role, n, avg_brier in rows:
+            try:
+                summary[str(role)] = (int(n), float(avg_brier))
+            except (TypeError, ValueError):
+                continue
+        return summary
 
     async def get_performance_by_strategy(self) -> Dict[str, Dict]:
         """

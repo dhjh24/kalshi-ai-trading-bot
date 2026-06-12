@@ -227,6 +227,12 @@ class UnifiedTradingBot:
                         self._run_weather_scan(db_manager, kalshi_client)
                     )
                 )
+            if bool(getattr(settings.trading, "result_backfill_enabled", True)):
+                self.background_tasks.append(
+                    asyncio.create_task(
+                        self._run_settlement_backfill(db_manager, kalshi_client)
+                    )
+                )
 
             # Setup shutdown handler
             def signal_handler():
@@ -419,6 +425,44 @@ class UnifiedTradingBot:
                 await asyncio.sleep(1800)  # 30 minutes between sweeps
             except Exception as e:
                 self.logger.error(f"Error in weather scan: {e}")
+                await asyncio.sleep(600)
+
+    async def _run_settlement_backfill(self, db_manager: DatabaseManager, kalshi_client: KalshiClient):
+        """
+        Background task: settlement-result backfill + market-prior refit.
+
+        Labels the snapshot archive with final YES/NO outcomes (cheap,
+        batched market lookups — no LLM cost) and refits the market-prior
+        calibration once enough labelled data accumulates. This is the
+        learning loop that turns six million collected order books into a
+        statistical edge.
+        """
+        from src.jobs.settlement_backfill import run_settlement_backfill
+
+        interval_seconds = max(
+            300,
+            int(
+                getattr(settings.trading, "result_backfill_interval_minutes", 60) or 60
+            )
+            * 60,
+        )
+        while not self.shutdown_event.is_set():
+            try:
+                summary = await run_settlement_backfill(
+                    db_manager=db_manager,
+                    kalshi_client=kalshi_client,
+                )
+                self.logger.info(
+                    "Settlement backfill cycle complete",
+                    tickers_checked=summary.tickers_checked,
+                    settled=summary.settled,
+                    pending=summary.pending,
+                    model_refit=summary.model_refit,
+                    models_active=summary.models_active,
+                )
+                await asyncio.sleep(interval_seconds)
+            except Exception as e:
+                self.logger.error(f"Error in settlement backfill: {e}")
                 await asyncio.sleep(600)
 
     async def run(self):

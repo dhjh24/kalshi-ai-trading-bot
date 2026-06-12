@@ -249,6 +249,9 @@ async def run_tracking(
                 maker_entry_reprice_seconds=settings.trading.quick_flip_maker_entry_reprice_seconds,
                 dynamic_exit_reprice_seconds=settings.trading.quick_flip_dynamic_exit_reprice_seconds,
                 stop_loss_pct=settings.trading.quick_flip_stop_loss_pct,
+                ev_gate_enabled=settings.trading.quick_flip_ev_gate_enabled,
+                ev_confidence_margin=settings.trading.quick_flip_ev_confidence_margin,
+                max_last_trade_age_seconds=settings.trading.quick_flip_max_last_trade_age_seconds,
             ),
         )
         logger.info(

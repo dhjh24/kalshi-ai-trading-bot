@@ -34,6 +34,42 @@ logger = get_trading_logger("ensemble")
 _CALIBRATION_FILE = Path("logs/ensemble_calibration.json")
 
 
+def extract_role_probability(role: str, result: dict) -> Optional[float]:
+    """
+    Extract a YES probability from an agent result, by role convention.
+
+    - forecaster, bull, bear: ``probability`` key directly.
+    - news_analyst: derive from sentiment x relevance, centred on 0.5
+      (a tilt, not a forecast — neutral news maps to exactly 0.5).
+    - risk_manager and anything else: ``probability`` key when present.
+
+    Shared by the ensemble aggregator and by the jobs that persist each
+    debate member's probability claim for settlement-time skill scoring.
+    Returns None when the result holds no usable probability.
+    """
+    if not isinstance(result, dict) or "error" in result:
+        return None
+
+    if role == "news_analyst":
+        sentiment = result.get("sentiment")
+        relevance = result.get("relevance", 0.5)
+        if sentiment is None:
+            return None
+        try:
+            prob = 0.5 + (float(sentiment) * float(relevance) * 0.5)
+        except (TypeError, ValueError):
+            return None
+        return max(0.0, min(1.0, prob))
+
+    val = result.get("probability")
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
 class EnsembleRunner:
     """
     Orchestrates a multi-model probability ensemble.
@@ -57,6 +93,7 @@ class EnsembleRunner:
         weights: Optional[Dict[str, float]] = None,
         min_models: Optional[int] = None,
         disagreement_threshold: Optional[float] = None,
+        skill_multipliers: Optional[Dict[str, float]] = None,
     ):
         """
         Args:
@@ -69,6 +106,12 @@ class EnsembleRunner:
             disagreement_threshold: Std-dev above this triggers a low-confidence
                         flag. Defaults to
                         ``settings.ensemble.disagreement_threshold``.
+            skill_multipliers: Optional role -> multiplier map from realized
+                        settlement accuracy (see
+                        ``probability_engine.category_skill_weight_multipliers``).
+                        Scales the configured base weights so demonstrated
+                        skill earns influence; missing roles default to 1.0,
+                        failing open to the static config weights.
         """
         self.agents: Dict[str, BaseAgent] = agents or self._default_agents()
         self.weights = weights or settings.ensemble.get_role_weights()
@@ -78,6 +121,7 @@ class EnsembleRunner:
             if disagreement_threshold is not None
             else settings.ensemble.disagreement_threshold
         )
+        self.skill_multipliers: Dict[str, float] = dict(skill_multipliers or {})
 
     # ------------------------------------------------------------------
     # Public API
@@ -275,36 +319,14 @@ class EnsembleRunner:
         """
         Extract a YES probability from an agent result.
 
-        Different agents store probability differently:
-        - forecaster, bull, bear: ``probability`` key directly.
-        - news_analyst: derive from sentiment + relevance heuristic.
-        - risk_manager: does not provide a probability per se; skip.
+        Delegates to :func:`extract_role_probability`; the ensemble keeps the
+        legacy leniency of treating a news result without a sentiment score
+        as neutral (0.5) so it still counts toward consensus, whereas the
+        strict module function skips it for skill scoring.
         """
-        if role in ("forecaster", "bull_researcher", "bear_researcher"):
-            val = result.get("probability")
-            if val is not None:
-                return float(val)
-
-        if role == "news_analyst":
-            # Convert sentiment (-1..1) into a probability adjustment centred on 0.5
-            sentiment = result.get("sentiment", 0.0)
-            relevance = result.get("relevance", 0.5)
-            # Scale: sentiment * relevance gives -1..1 adjustment, map to 0..1
-            prob = 0.5 + (sentiment * relevance * 0.5)
-            return max(0.0, min(1.0, prob))
-
-        if role == "risk_manager":
-            # Risk manager may optionally include a probability; if not, skip
-            val = result.get("probability")
-            if val is not None:
-                return float(val)
-            return None
-
-        # Fallback: look for a "probability" key
-        val = result.get("probability")
-        if val is not None:
-            return float(val)
-        return None
+        if role == "news_analyst" and "error" not in result and "sentiment" not in result:
+            result = {**result, "sentiment": 0.0}
+        return extract_role_probability(role, result)
 
     def _aggregate(
         self, probabilities: List[Tuple[str, float, float]]
@@ -318,12 +340,21 @@ class EnsembleRunner:
         The news analyst's sentiment-derived pseudo-probability is weighted by
         its distance from 0.5 so a neutral news read no longer dilutes the
         real forecasts.
+
+        Each role's configured base weight is scaled by its realized-skill
+        multiplier (``self.skill_multipliers``, missing roles get 1.0) so the
+        static config weights adapt to demonstrated per-category accuracy.
         """
         entries: List[Tuple[float, float]] = []
         confidence_sum = 0.0
 
+        def _base_weight(role: str) -> float:
+            return self.weights.get(role, 0.1) * float(
+                self.skill_multipliers.get(role, 1.0)
+            )
+
         for role, prob, conf in probabilities:
-            base_w = self.weights.get(role, 0.1)
+            base_w = _base_weight(role)
             adjusted_w = base_w * max(conf, 0.1)  # Floor conf at 0.1 to avoid zero
             if role == "news_analyst":
                 # Sentiment-derived probability is a tilt, not a forecast:
@@ -340,8 +371,8 @@ class EnsembleRunner:
         if pooled is None:
             return 0.5, 0.0, 1.0
 
-        # Normalise confidence by total base weight
-        total_base = sum(self.weights.get(r, 0.1) for r, _, _ in probabilities)
+        # Normalise confidence by total (skill-scaled) base weight
+        total_base = sum(_base_weight(r) for r, _, _ in probabilities)
         avg_conf = confidence_sum / total_base if total_base > 0 else 0.5
 
         return pooled.probability, avg_conf, pooled.disagreement

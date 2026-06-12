@@ -312,6 +312,25 @@ async def _execute_candidate(
             )
             return False
 
+    # Market-prior calibration (same correction the live-trade gate applies):
+    # blend against the calibrated settlement probability of this mid, not
+    # the raw mid, when a validated model exists. Identity otherwise.
+    market_yes_prior = market_yes_mid
+    if market_yes_mid is not None and bool(
+        getattr(settings.trading, "market_prior_calibration_enabled", True)
+    ):
+        try:
+            from src.utils.market_prior import adjusted_market_yes_probability
+
+            market_yes_prior, _segment = await adjusted_market_yes_probability(
+                db_manager,
+                market_yes_mid,
+                max(candidate.lead_days, 0.0) * 24.0,
+            )
+        except Exception as exc:
+            logger.debug("Market-prior adjustment unavailable", error=str(exc))
+            market_yes_prior = market_yes_mid
+
     blend_weight = max(
         0.5,
         min(
@@ -324,7 +343,7 @@ async def _execute_candidate(
         fair_yes_probability=candidate.model_yes_probability,
         side=candidate.side,
         entry_price=candidate.entry_price,
-        market_yes_probability=market_yes_mid,
+        market_yes_probability=market_yes_prior,
         model_blend_weight=blend_weight,
         calibration_slope=1.0,
         maker=False,

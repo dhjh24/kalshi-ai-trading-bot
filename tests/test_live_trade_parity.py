@@ -6,6 +6,7 @@ final-synth chain is replayed under paper, shadow, and live runtimes.
 """
 
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -101,6 +102,10 @@ def _specialist_payload(market_ticker: str, *, execution_style: str, hold_minute
             "action": "TRADE",
             "market_ticker": market_ticker,
             "side": "YES",
+            # Explicit fair probability, members in agreement: parity
+            # fixtures model a clean approved trade (contested members now
+            # genuinely raise the EV bar via disagreement padding).
+            "fair_yes_probability": 0.74,
             "confidence": 0.78,
             "edge_pct": 0.07,
             "position_size_pct": 2.0,
@@ -127,8 +132,8 @@ def _debate_responses(*, limit_cents: int = 41) -> list[str]:
         ),
         json.dumps(
             {
-                "probability": 0.46,
-                "probability_ceiling": 0.58,
+                "probability": 0.68,
+                "probability_ceiling": 0.74,
                 "confidence": 0.63,
                 "key_arguments": ["variance risk"],
                 "risk_factors": ["late swing"],
@@ -274,13 +279,32 @@ async def _run_parity_cycle(
     }
 
 
+# Step headers in the debate transcript interpolate wall-clock timings
+# ("(agent=trader, model=..., 0.01s)"), which jitter between otherwise
+# identical runs. The parity contract covers the logical decision, never
+# timing, so signatures normalize them away.
+_TRANSCRIPT_TIMING = re.compile(r", (?:\d+(?:\.\d+)?|\?)s\)")
+
+
+def _strip_volatile(value):
+    if isinstance(value, dict):
+        return {
+            key: _strip_volatile(item)
+            for key, item in value.items()
+            if key not in {"elapsed_seconds", "_elapsed_seconds"}
+        }
+    if isinstance(value, list):
+        return [_strip_volatile(item) for item in value]
+    if isinstance(value, str):
+        return _TRANSCRIPT_TIMING.sub(", <elapsed>s)", value)
+    return value
+
+
 def _final_signature(payload_json: str | None) -> dict:
     payload = json.loads(payload_json) if payload_json else {}
     if not isinstance(payload, dict):
         return {}
-    stable = dict(payload)
-    stable.pop("elapsed_seconds", None)
-    return stable
+    return _strip_volatile(payload)
 
 
 @pytest.mark.asyncio

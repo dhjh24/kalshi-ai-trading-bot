@@ -701,6 +701,22 @@ class TradingConfig:
     quick_flip_stop_loss_pct: float = field(
         default_factory=lambda: float(os.getenv("QUICK_FLIP_STOP_LOSS_PCT", "0.08"))
     )
+    # Quick-flip statistical gates. The EV gate converts each candidate's
+    # reward (net profit at target) and risk (stop-loss distance plus taker
+    # exit fees) into the minimum win probability that makes the scalp
+    # positive expected value, and requires the movement confidence to clear
+    # it (plus an optional margin). The freshness guard rejects candidates
+    # whose most recent public trade is older than the configured age —
+    # momentum heuristics on a stale tape are noise.
+    quick_flip_ev_gate_enabled: bool = field(
+        default_factory=lambda: _get_bool_env("QUICK_FLIP_EV_GATE_ENABLED", True)
+    )
+    quick_flip_ev_confidence_margin: float = field(
+        default_factory=lambda: float(os.getenv("QUICK_FLIP_EV_CONFIDENCE_MARGIN", "0.0"))
+    )
+    quick_flip_max_last_trade_age_seconds: int = field(
+        default_factory=lambda: int(os.getenv("QUICK_FLIP_MAX_LAST_TRADE_AGE_SECONDS", "900"))
+    )
     live_trade_daily_loss_budget_pct: float = field(
         default_factory=lambda: float(os.getenv("LIVE_TRADE_DAILY_LOSS_BUDGET_PCT", "0.05"))
     )
@@ -738,6 +754,49 @@ class TradingConfig:
     # Default matches the quick-flip depth guard (10 contracts at top of book).
     live_trade_min_top_depth_contracts: int = field(
         default_factory=lambda: int(os.getenv("LIVE_TRADE_MIN_TOP_DEPTH_CONTRACTS", "10"))
+    )
+
+    # Kelly sizing cap for the standard live-trade execution path. The LLM's
+    # requested position_size_pct is clamped to the fractional-Kelly bankroll
+    # fraction implied by the EV gate's blended win probability, so position
+    # size can never exceed what the measured edge statistically supports.
+    live_trade_kelly_sizing_enabled: bool = field(
+        default_factory=lambda: _get_bool_env("LIVE_TRADE_KELLY_SIZING_ENABLED", True)
+    )
+    live_trade_kelly_multiplier: float = field(
+        default_factory=lambda: float(os.getenv("LIVE_TRADE_KELLY_MULTIPLIER", "0.25"))
+    )
+
+    # Market-prior calibration. When fitted models exist (trained on settled
+    # market snapshots via `python cli.py fit-market-prior`), the EV gate's
+    # market anchor uses the calibrated probability instead of the raw mid,
+    # correcting systematic price biases (favorite-longshot). Fails closed to
+    # the raw mid whenever no validated model is available.
+    market_prior_calibration_enabled: bool = field(
+        default_factory=lambda: _get_bool_env("MARKET_PRIOR_CALIBRATION_ENABLED", True)
+    )
+
+    # Per-role ensemble skill weighting. Each debate member's probability is
+    # persisted with executed decisions; at settlement the realized Brier
+    # score per role accumulates (tagged with the market's category), and
+    # pooling weights are scaled by inverse relative Brier — per category
+    # when a role has enough settled observations there, shrunk toward its
+    # global multiplier otherwise, and toward 1.0 until any evidence exists.
+    model_skill_weighting_enabled: bool = field(
+        default_factory=lambda: _get_bool_env("MODEL_SKILL_WEIGHTING_ENABLED", True)
+    )
+
+    # Settlement-result backfill. Periodically fetches final YES/NO results
+    # for expired markets the snapshot collector observed, labelling the
+    # historical dataset the market-prior calibration trains on.
+    result_backfill_enabled: bool = field(
+        default_factory=lambda: _get_bool_env("RESULT_BACKFILL_ENABLED", True)
+    )
+    result_backfill_interval_minutes: int = field(
+        default_factory=lambda: int(os.getenv("RESULT_BACKFILL_INTERVAL_MINUTES", "60"))
+    )
+    result_backfill_max_tickers_per_run: int = field(
+        default_factory=lambda: int(os.getenv("RESULT_BACKFILL_MAX_TICKERS_PER_RUN", "400"))
     )
 
     # Category exploration. Unproven categories (fewer than 5 settled

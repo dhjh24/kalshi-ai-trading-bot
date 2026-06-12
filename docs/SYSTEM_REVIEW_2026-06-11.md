@@ -132,3 +132,141 @@ weather pipeline was blocked by its own category scorer.
 - Live smoke test: `python cli.py weather-scan` ran against production Kalshi +
   forecast APIs — 7 series, 14 events, 84 markets, 25 candidates, 4 paper
   positions opened through the full gate/guardrail chain.
+
+---
+
+# Second pass (same day): statistical reinforcement + real ML
+
+A follow-up review asked: where is decision-making still rule-of-thumb instead
+of statistics, and would "actual ML models" (random forest, k-means, …) beat
+the current math + LLM stack?
+
+## 8. The ML answer
+
+The repo's biggest untapped statistical asset was the snapshot archive:
+6.65M order-book snapshots across 16,342 markets — with **zero settlement
+labels** (ingest only ever sees open markets, so `market_result` was NULL
+everywhere). Without labels there is nothing for any model to learn from.
+What shipped:
+
+1. **Settlement backfill** (`src/jobs/settlement_backfill.py`,
+   `python cli.py backfill-results`, hourly in the runtime via
+   `RESULT_BACKFILL_*`): batched Kalshi lookups label every expired
+   snapshotted market in `market_outcomes` and stamp
+   `market_snapshots.market_result`. First production run: 133 settled
+   outcomes recorded; the remaining ~24k tracked markets label themselves as
+   they expire.
+2. **Market-prior calibration** (`src/utils/market_prior.py`,
+   `python cli.py fit-market-prior`): per-time-to-expiry-segment Platt
+   scaling `P(YES) = sigmoid(a + b·logit(mid))` fit by penalized IRLS
+   (numpy), regularized toward the identity, trained on the labelled
+   snapshots with **ticker-level holdout** (correlated snapshots of one
+   market never straddle the split, and a holdout-ticker floor stops
+   activation on binomial noise). A segment's coefficients are only used by
+   the gates when they beat the raw mid on holdout Brier; otherwise every
+   caller falls back to the raw mid. This is the favorite-longshot
+   correction — the standard, monotonic, few-parameter calibration tool.
+   Wired into the live-trade gate, the weather scanner, and the
+   high-confidence path as the EV gate's market anchor
+   (`MARKET_PRIOR_CALIBRATION_ENABLED`).
+3. **Per-model skill weighting**: every executed decision now persists each
+   debate member's fair probability (`member_probabilities` in the gate
+   snapshot); settlement scoring writes per-role Brier rows
+   (`model_skill_observations`), and pooling weights are scaled by shrunk
+   inverse relative Brier (`skill_weight_multipliers`,
+   `MODEL_SKILL_WEIGHTING_ENABLED`). Members that prove accurate earn
+   influence; persistently wrong ones lose it — automatically.
+
+On random forests / k-means specifically: k-means is unsupervised and adds
+nothing the category scorer doesn't already do; a random forest needs the
+same labels this pass created and offers little over regularized logistic
+calibration at current sample sizes (hundreds–thousands of settled markets),
+while giving up monotonicity and interpretability. The Platt layer is the
+right first supervised model; richer feature models (volume, momentum,
+order-book imbalance) can replace the inner fit later without touching any
+caller.
+
+## 9. Defects found and fixed in the second pass
+
+1. **Disagreement padding was dead in production** — `_normalize_final_payload`
+   dropped `fair_yes_disagreement`, so the EV gate always saw `None` and the
+   +3c contested-call padding (built that morning) never engaged. Fixed via
+   the normalization passthrough; parity fixtures were re-specified as
+   genuinely uncontested trades.
+2. **Quick flip traded on negative expectancy** — a 0.6-confidence candidate
+   with an 8% stop and a ~2-tick target is EV-negative after fees (the stop
+   risk dwarfs the reward). New EV gate computes the break-even win
+   probability of each candidate's exact reward/risk profile (taker stop
+   exit priced in) and requires the movement confidence to clear it
+   (`QUICK_FLIP_EV_GATE_ENABLED`).
+3. **Quick flip trusted stale tapes** — momentum heuristics ran on prints up
+   to an hour old. Candidates whose newest trade is older than
+   `QUICK_FLIP_MAX_LAST_TRADE_AGE_SECONDS` (default 900) are rejected before
+   any AI spend.
+4. **Live-trade sizing ignored Kelly** — the standard path funded the LLM's
+   requested `position_size_pct` as-is. The funded size is now capped by the
+   fractional-Kelly fraction implied by the gate's blended win probability
+   (`LIVE_TRADE_KELLY_SIZING_ENABLED`, mode-blind for parity).
+5. **The high-confidence near-expiry bypass had no math** — it bought 90c+
+   favorites on confidence alone. It now passes the deterministic EV gate
+   (calibration shrink + prior-adjusted market blend + fee-aware net edge).
+6. **Production DB corruption** — `trading_system.db` had freelist damage and
+   two corrupted snapshot indexes (cause of intermittent "database disk
+   image is malformed" on writes/scans). Fixed in place: backup →
+   VACUUM → REINDEX; `PRAGMA integrity_check` now returns `ok`. Backup
+   retained at `trading_system.backup-20260611-pre-vacuum.db`.
+
+## 10. Second-pass verification
+
+- Full suite: **578 passed, 8 skipped** (new:
+  `tests/test_market_prior_and_skill.py`, 24 tests — Platt recovery on
+  synthetic favorite-longshot bias, activation/fail-closed rules, holdout
+  determinism, skill-weight shrinkage, DB round-trips, backfill job with a
+  stub client, quick-flip EV/freshness gates, member persistence).
+- Live smoke: `python cli.py backfill-results` labelled 133 settled markets
+  through the production API; `python cli.py fit-market-prior` fit 268
+  samples and correctly **refused to activate** (insufficient holdout) — the
+  gates keep using the raw mid until the model demonstrably beats it.
+
+---
+
+# Third pass (same day, evening): per-category adaptive ensemble weights
+
+Global skill multipliers treat a role's accuracy as uniform across market
+types. It isn't — a role can be sharp on weather and mediocre on politics.
+This pass slices the skill loop per category and widens what gets scored.
+
+## 11. What shipped
+
+1. **Per-category skill observations** — `model_skill_observations` gained a
+   `market_type` column (normalized the same way as `settlement_calibration`
+   via `normalize_market_type`); `get_model_skill_summary(market_type=...)`
+   slices per category.
+2. **Hierarchical shrinkage** — `category_skill_weight_multipliers(global,
+   category)` shrinks a category's multiplier toward the role's *global*
+   multiplier rather than toward 1.0 (the `priors=` parameter on
+   `skill_weight_multipliers`), so thin category samples inherit the role's
+   proven global skill instead of eroding it toward "average". A category
+   pass additionally requires ≥2 eligible roles: a single-role category's
+   raw relative multiplier is identically 1.0 — pure noise.
+3. **Per-focus caching** — live_trade caches weights per `focus_type`;
+   decide.py keeps a module-level cache keyed the same way.
+4. **Observer scoring** — debate roles that emit a probability but are not
+   pooled (risk_manager in live_trade; news_analyst tilt + risk_manager in
+   decide.py) are appended to `member_probabilities` with `weight: 0,
+   pooled: false`: settlement scoring sees them, the pooled probability is
+   untouched (parity-safe). The trader is never scored — its confidence is
+   certainty about the action, not a probability.
+5. **decide.py BUY intents persist** a `live_trade_decisions` row
+   (strategy `directional_trading`, step `decision`) carrying
+   `fair_yes_probability` + `member_probabilities`, so settlement scoring
+   covers the full 6-role debate; previously only live_trade's
+   specialist/bull/bear ever accrued skill history.
+   `extract_role_probability` in `agents/ensemble.py` is the shared
+   extraction used by both pipelines.
+
+## 12. Third-pass verification
+
+- Full suite: **586 passed, 8 skipped** (8 new tests: category slicing,
+  hierarchical shrinkage toward global priors, ≥2-role eligibility,
+  observer-row conventions, decide.py decision-row persistence).

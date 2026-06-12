@@ -4,10 +4,12 @@ Supports both single-model (legacy) and multi-agent ensemble decision modes.
 """
 
 import asyncio
+import json
 import time
 import numpy as np
 from typing import Optional, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
+from uuid import uuid4
 
 from src.utils.database import DatabaseManager, Market, Position
 from src.config.settings import settings
@@ -17,23 +19,37 @@ from src.clients.kalshi_client import KalshiClient
 from src.clients.model_router import ModelRouter
 
 
-def _extract_fair_probability(debate_result: Dict) -> Optional[float]:
+# Base pooling weights for the decide-path debate. The forecaster is the
+# dedicated estimator so it carries the largest weight; bull and bear act
+# as adversarial correctors. Realized-skill multipliers scale these.
+_DEBATE_POOL_WEIGHTS = {
+    "forecaster": 0.5,
+    "bull_researcher": 0.25,
+    "bear_researcher": 0.25,
+}
+
+
+def _extract_fair_probability(
+    debate_result: Dict,
+    skill_weights: Optional[Dict[str, float]] = None,
+) -> Optional[float]:
     """
     Pool the debate agents' YES-probability estimates into one fair value.
 
-    The forecaster is the dedicated estimator so it carries the largest
-    weight; bull and bear act as adversarial correctors. Pooling uses
-    disagreement-aware extremization: agreeing agents earn the configured
-    extremize correction, disagreeing agents fall back to plain pooling.
-    Returns None when no agent produced a usable probability (legacy
-    single-model path).
+    Each role's base weight is scaled by its realized-skill multiplier
+    (``skill_weights``, from settled-trade Brier scores per category;
+    missing roles get 1.0, so this fails open to the static weights).
+    Pooling uses disagreement-aware extremization: agreeing agents earn the
+    configured extremize correction, disagreeing agents fall back to plain
+    pooling. Returns None when no agent produced a usable probability
+    (legacy single-model path).
     """
     from src.utils.probability_engine import pool_probabilities_adaptive
 
+    multipliers = skill_weights or {}
     step_results = debate_result.get("step_results") or {}
-    weights = {"forecaster": 0.5, "bull_researcher": 0.25, "bear_researcher": 0.25}
     estimates = []
-    for role, weight in weights.items():
+    for role, base_weight in _DEBATE_POOL_WEIGHTS.items():
         result = step_results.get(role) or {}
         if "error" in result:
             continue
@@ -44,12 +60,157 @@ def _extract_fair_probability(debate_result: Dict) -> Optional[float]:
             value = float(probability)
         except (TypeError, ValueError):
             continue
-        if 0.0 < value < 1.0:
+        weight = base_weight * float(multipliers.get(role, 1.0))
+        if 0.0 < value < 1.0 and weight > 0:
             estimates.append((value, weight))
 
     extremize = float(getattr(settings.ensemble, "extremize_factor", 1.2) or 1.2)
     pooled = pool_probabilities_adaptive(estimates, extremize=extremize)
     return pooled.probability if pooled else None
+
+
+def _debate_member_probabilities(
+    debate_result: Dict,
+    skill_weights: Optional[Dict[str, float]] = None,
+) -> list[Dict[str, Any]]:
+    """
+    Every debate role's YES-probability claim, for settlement-time scoring.
+
+    Pooled roles (forecaster/bull/bear) carry their effective pooling
+    weight; roles that emitted a probability without being pooled (news
+    analyst tilt, risk manager) are recorded as ``pooled: False`` observers
+    with weight 0 so they accrue per-category skill history without moving
+    this decision. The trader never emits a probability (confidence is
+    certainty about the action, not a forecast) and is never scored.
+    """
+    from src.agents.ensemble import extract_role_probability
+
+    multipliers = skill_weights or {}
+    role_models = settings.ensemble.get_role_model_map()
+    step_results = debate_result.get("step_results") or {}
+    members: list[Dict[str, Any]] = []
+    for role, result in step_results.items():
+        role_name = str(role)
+        probability = extract_role_probability(
+            role_name, result if isinstance(result, dict) else {}
+        )
+        if probability is None or not (0.0 < probability < 1.0):
+            continue
+        base_weight = _DEBATE_POOL_WEIGHTS.get(role_name, 0.0)
+        weight = base_weight * float(multipliers.get(role_name, 1.0))
+        members.append(
+            {
+                "role": role_name,
+                "probability": probability,
+                "weight": weight,
+                "model": role_models.get(role_name),
+                "pooled": bool(weight > 0),
+            }
+        )
+    return members
+
+
+# Per-category skill multipliers, cached 30 minutes per market type. Mirrors
+# the live-trade loop's cache; module-level because decide jobs construct no
+# long-lived loop object.
+_SKILL_WEIGHTS_CACHE: Dict[str, tuple[Dict[str, float], float]] = {}
+
+
+async def _get_decision_skill_weights(
+    db_manager: DatabaseManager, market_type: Any
+) -> Dict[str, float]:
+    """
+    Role -> pooling multiplier from realized per-category Brier scores.
+
+    Category evidence refines each role's global multiplier through
+    hierarchical shrinkage; missing roles get no entry, so pooling fails
+    open to the static `_DEBATE_POOL_WEIGHTS`.
+    """
+    if not bool(getattr(settings.trading, "model_skill_weighting_enabled", True)):
+        return {}
+
+    from src.utils.database import normalize_market_type
+    from src.utils.probability_engine import (
+        category_skill_weight_multipliers,
+        skill_weight_multipliers,
+    )
+
+    cache_key = normalize_market_type(market_type)
+    now = time.time()
+    cached = _SKILL_WEIGHTS_CACHE.get(cache_key)
+    if cached is not None and cached[1] > now:
+        return cached[0]
+
+    weights: Dict[str, float] = {}
+    try:
+        global_summary = await db_manager.get_model_skill_summary()
+        if cache_key != "unknown":
+            category_summary = await db_manager.get_model_skill_summary(
+                market_type=cache_key
+            )
+            weights = category_skill_weight_multipliers(
+                global_summary, category_summary
+            )
+        else:
+            weights = skill_weight_multipliers(global_summary)
+    except Exception as exc:
+        get_trading_logger("decision_engine").debug(
+            "Model skill weight lookup failed", error=str(exc)
+        )
+
+    _SKILL_WEIGHTS_CACHE[cache_key] = (weights, now + 1800.0)
+    return weights
+
+
+async def _persist_ensemble_decision_intent(
+    db_manager: DatabaseManager,
+    market: Market,
+    decision: Any,
+    debate_result: Dict,
+    skill_weights: Optional[Dict[str, float]],
+) -> None:
+    """
+    Record a BUY intent row so settlement scoring can see each debate
+    member's probability claim.
+
+    The settlement-calibration rebuild joins trade_logs to the latest
+    matching decision row by (market, strategy, side) and harvests
+    ``member_probabilities`` from the payload — exactly how live-trade
+    members accrue skill history. Without this row the decide-path agents
+    (forecaster, news analyst, risk manager) would never be scored.
+    Telemetry only: failures are swallowed so persistence can never block
+    a trade decision.
+    """
+    from src.utils.database import LiveTradeDecision, normalize_market_type
+
+    try:
+        members = _debate_member_probabilities(debate_result, skill_weights=skill_weights)
+        payload = {
+            "fair_yes_probability": getattr(decision, "fair_yes_probability", None),
+            "member_probabilities": members,
+        }
+        await db_manager.add_live_trade_decision(
+            LiveTradeDecision(
+                created_at=datetime.now(timezone.utc),
+                run_id=f"decide-{uuid4().hex[:12]}",
+                step="decision",
+                strategy="directional_trading",
+                status="completed",
+                market_ticker=market.market_id,
+                title=market.title,
+                focus_type=normalize_market_type(market.category),
+                action="buy",
+                side=str(getattr(decision, "side", "YES") or "YES").upper(),
+                confidence=float(getattr(decision, "confidence", 0.0) or 0.0),
+                summary="Ensemble debate BUY intent",
+                rationale=str(getattr(decision, "reasoning", "") or "")[:2000],
+                payload_json=json.dumps(payload, default=str),
+            )
+        )
+    except Exception as exc:
+        get_trading_logger("decision_engine").debug(
+            "Failed to persist ensemble decision intent", error=str(exc)
+        )
 
 
 def _calculate_kelly_quantity(
@@ -380,10 +541,61 @@ async def make_decision_for_market(
 
                 if decision.side == "YES" and decision.confidence >= settings.trading.high_confidence_threshold:
                     logger.info(f"High-confidence YES opportunity found for {market.market_id}.")
-                    
+
+                    # Deterministic EV gate. This legacy path's only
+                    # probability-like signal is the LLM's confidence; using
+                    # it as the fair probability is acceptable *here* because
+                    # the gate then calibration-shrinks it, blends it with
+                    # the (prior-adjusted) market price, and demands net edge
+                    # after taker fees — high-priced favorites near expiry
+                    # are exactly where fees eat naive "confidence edges".
+                    from src.utils.market_prior import adjusted_market_yes_probability
+                    from src.utils.probability_engine import (
+                        calibration_shrink_slope,
+                        evaluate_trade_intent,
+                    )
+
+                    market_yes_prior = market.yes_price
+                    if bool(getattr(settings.trading, "market_prior_calibration_enabled", True)):
+                        try:
+                            market_yes_prior, _segment = await adjusted_market_yes_probability(
+                                db_manager, market.yes_price, hours_to_expiry
+                            )
+                        except Exception:
+                            market_yes_prior = market.yes_price
+                    try:
+                        gate_slope = calibration_shrink_slope(
+                            await db_manager.get_calibration_samples(limit=500)
+                        )
+                    except Exception:
+                        gate_slope = 1.0
+                    gate = evaluate_trade_intent(
+                        fair_yes_probability=decision.confidence,
+                        side="YES",
+                        entry_price=market.yes_price,
+                        market_yes_probability=market_yes_prior,
+                        calibration_slope=gate_slope,
+                        maker=False,
+                        min_net_edge=float(
+                            getattr(settings.trading, "live_trade_min_net_edge", 0.02) or 0.0
+                        ),
+                    )
+                    if not gate["approved"]:
+                        logger.info(
+                            f"High-confidence EV gate blocked {market.market_id}: {gate['reason']}"
+                        )
+                        await db_manager.record_market_analysis(
+                            market.market_id,
+                            "SKIP",
+                            decision.confidence,
+                            total_analysis_cost,
+                            f"high_confidence EV gate: {gate['reason']}",
+                        )
+                        return None
+
                     decision_action = "BUY"
                     confidence = decision.confidence
-                    
+
                     # Record analysis before creating position
                     await db_manager.record_market_analysis(
                         market.market_id, decision_action, confidence, total_analysis_cost, "high_confidence"
@@ -547,7 +759,22 @@ async def make_decision_for_market(
                 decision.reasoning = ensemble_result.get("reasoning", "Multi-agent ensemble decision")
                 # Attach the pooled fair YES probability so the edge filter
                 # compares probability-vs-price instead of confidence-vs-price.
-                decision.fair_yes_probability = _extract_fair_probability(ensemble_result)
+                # Pooling weights adapt to each role's realized per-category
+                # accuracy (fails open to the static weights).
+                skill_weights = await _get_decision_skill_weights(
+                    db_manager, market.category
+                )
+                decision.fair_yes_probability = _extract_fair_probability(
+                    ensemble_result, skill_weights=skill_weights
+                )
+                if str(decision.action).upper() == "BUY":
+                    await _persist_ensemble_decision_intent(
+                        db_manager,
+                        market,
+                        decision,
+                        ensemble_result,
+                        skill_weights,
+                    )
                 estimated_decision_cost = 0.10  # Ensemble uses multiple models
                 total_analysis_cost += estimated_decision_cost
             else:
