@@ -870,8 +870,10 @@ def test_decide_fair_probability_applies_skill_weights():
         debate_result,
         skill_weights={"bear_researcher": 2.0, "bull_researcher": 0.5},
     )
+    # Returns a PooledProbability (probability + member disagreement) so the
+    # caller can attach disagreement to the decision; compare probabilities.
     assert base is not None and bear_heavy is not None
-    assert bear_heavy < base
+    assert bear_heavy.probability < base.probability
 
 
 def test_decide_member_probabilities_cover_all_probability_emitting_roles():
