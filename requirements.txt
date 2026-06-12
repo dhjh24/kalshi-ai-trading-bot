@@ -18,6 +18,9 @@ anthropic
 pandas>=2.0.0
 numpy>=1.24.0
 scipy>=1.12.0       # For portfolio optimization (Python 3.13 compatible)
+scikit-learn>=1.4.0 # Random-forest upgrade for the ML outcome meta-model
+                    # (src/ml/outcome_model.py falls back to numpy logistic
+                    # regression when scikit-learn is unavailable)
 
 # Environment variables
 python-dotenv==1.0.0

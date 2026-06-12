@@ -469,6 +469,7 @@ class UnifiedAdvancedTradingSystem:
                 maker_entry_reprice_seconds=settings.trading.quick_flip_maker_entry_reprice_seconds,
                 dynamic_exit_reprice_seconds=settings.trading.quick_flip_dynamic_exit_reprice_seconds,
                 stop_loss_pct=settings.trading.quick_flip_stop_loss_pct,
+                min_bid_ask_size_ratio=settings.trading.quick_flip_min_bid_ask_size_ratio,
             )
             results = await run_quick_flip_strategy(
                 db_manager=self.db_manager,

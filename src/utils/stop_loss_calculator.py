@@ -6,9 +6,19 @@ Provides consistent stop-loss calculation across all trading strategies.
 
 Key Features:
 - 5-10% stop-loss based on entry price and confidence
-- Adaptive stop-loss based on market volatility  
+- Adaptive stop-loss based on market volatility
 - Take-profit targets to lock in gains
 - Time-based exit strategies
+
+Price-space convention
+----------------------
+All prices here are in the *held side's* price space: a NO position's entry
+price is the NO contract price, and "current price" is the NO mid. In that
+space profit always means the price went UP, regardless of side, because you
+bought the side at its own price. Therefore stop-losses sit BELOW entry and
+take-profits ABOVE entry for both YES and NO positions. (A previous version
+inverted the levels for NO positions — which exited NO winners as "stop
+losses" and booked NO losers as "take profit".)
 """
 
 from typing import Dict, Optional
@@ -87,16 +97,12 @@ class StopLossCalculator:
         else:
             take_profit_pct = cls.MIN_TAKE_PROFIT_PCT  # 15% for low confidence
             
-        # Calculate actual price levels based on side
-        if side.upper() == "YES":
-            # For YES positions, stop-loss is below entry, take-profit is above
-            stop_loss_price = entry_price * (1 - adjusted_stop_loss_pct)
-            take_profit_price = entry_price * (1 + take_profit_pct)
-        else:
-            # For NO positions, stop-loss is above entry, take-profit is below  
-            stop_loss_price = entry_price * (1 + adjusted_stop_loss_pct)
-            take_profit_price = entry_price * (1 - take_profit_pct)
-            
+        # Levels are side-symmetric: entry/current prices are quoted in the
+        # held side's own price space, where profit is always price-up.
+        stop_loss_price = entry_price * (1 - adjusted_stop_loss_pct)
+        take_profit_price = entry_price * (1 + take_profit_pct)
+
+
         # Ensure prices are within valid bounds (1¢ to 99¢)
         stop_loss_price = max(0.01, min(0.99, stop_loss_price))
         take_profit_price = max(0.01, min(0.99, take_profit_price))
@@ -133,11 +139,7 @@ class StopLossCalculator:
         Returns:
             Stop-loss price
         """
-        if side.upper() == "YES":
-            stop_loss_price = entry_price * (1 - stop_loss_pct)
-        else:
-            stop_loss_price = entry_price * (1 + stop_loss_pct)
-            
+        stop_loss_price = entry_price * (1 - stop_loss_pct)
         return max(0.01, min(0.99, round(stop_loss_price, 2)))
     
     @classmethod
@@ -160,12 +162,9 @@ class StopLossCalculator:
         Returns:
             True if stop-loss should be triggered
         """
-        if position_side.upper() == "YES":
-            # For YES positions, trigger if price drops below stop-loss
-            return current_price <= stop_loss_price
-        else:
-            # For NO positions, trigger if price rises above stop-loss
-            return current_price >= stop_loss_price
+        # Side-symmetric: current_price is in the held side's price space, so
+        # a loss is always the price dropping below the stop level.
+        return current_price <= stop_loss_price
     
     @classmethod
     def calculate_pnl_at_stop_loss(
@@ -181,12 +180,32 @@ class StopLossCalculator:
         Returns:
             Expected P&L (negative for loss)
         """
-        if side.upper() == "YES":
-            pnl_per_share = stop_loss_price - entry_price
-        else:
-            pnl_per_share = entry_price - stop_loss_price
-            
-        return pnl_per_share * quantity
+        return (stop_loss_price - entry_price) * quantity
+
+    @classmethod
+    def normalize_exit_levels(
+        cls,
+        entry_price: float,
+        stop_loss_price: Optional[float],
+        take_profit_price: Optional[float],
+    ) -> tuple[Optional[float], Optional[float]]:
+        """
+        Repair exit levels persisted by the old inverted NO-side logic.
+
+        Legacy NO positions stored their stop ABOVE entry and take-profit
+        BELOW entry. In side-price space those are mirrored around the entry
+        price, so reflect them back: same distance, correct direction.
+
+        Returns:
+            (stop_loss_price, take_profit_price), corrected when inverted.
+        """
+        fixed_stop = stop_loss_price
+        fixed_tp = take_profit_price
+        if stop_loss_price is not None and stop_loss_price > entry_price:
+            fixed_stop = max(0.01, min(0.99, entry_price - (stop_loss_price - entry_price)))
+        if take_profit_price is not None and take_profit_price < entry_price:
+            fixed_tp = max(0.01, min(0.99, entry_price + (entry_price - take_profit_price)))
+        return fixed_stop, fixed_tp
 
 
 # Convenience function for backward compatibility

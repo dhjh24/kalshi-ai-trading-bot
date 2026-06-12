@@ -279,6 +279,7 @@ def _build_quick_flip_config(*, hold_minutes: int) -> QuickFlipConfig:
         maker_entry_reprice_seconds=settings.trading.quick_flip_maker_entry_reprice_seconds,
         dynamic_exit_reprice_seconds=settings.trading.quick_flip_dynamic_exit_reprice_seconds,
         stop_loss_pct=settings.trading.quick_flip_stop_loss_pct,
+        min_bid_ask_size_ratio=settings.trading.quick_flip_min_bid_ask_size_ratio,
     )
 
 

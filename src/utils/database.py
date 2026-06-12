@@ -4137,6 +4137,52 @@ class DatabaseManager(TradingLoggerMixin):
                 continue
         return samples
 
+    async def get_calibration_feature_rows(
+        self,
+        *,
+        limit: int = 2000,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return recent settlement-calibration rows with their payload parsed,
+        newest first. Used to train the ML outcome meta-model
+        (src/ml/outcome_model.py) on realized results.
+        """
+        query = (
+            "SELECT predicted_probability, outcome, category, market_type, "
+            "strategy, payload_json FROM settlement_calibration "
+            "WHERE predicted_probability IS NOT NULL AND outcome IS NOT NULL "
+            "ORDER BY settled_at DESC, id DESC LIMIT ?"
+        )
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute(query, (max(1, int(limit)),))
+                rows = await cursor.fetchall()
+        except aiosqlite.Error as exc:
+            self.logger.warning(f"Failed to load calibration feature rows: {exc}")
+            return []
+
+        records: List[Dict[str, Any]] = []
+        for predicted, outcome, category, market_type, strategy, payload_json in rows:
+            payload: Dict[str, Any] = {}
+            if payload_json:
+                try:
+                    parsed = json.loads(payload_json)
+                    if isinstance(parsed, dict):
+                        payload = parsed
+                except (ValueError, TypeError):
+                    pass
+            records.append(
+                {
+                    "predicted_probability": predicted,
+                    "outcome": outcome,
+                    "category": category,
+                    "market_type": market_type,
+                    "strategy": strategy,
+                    "payload": payload,
+                }
+            )
+        return records
+
     async def get_performance_by_strategy(self) -> Dict[str, Dict]:
         """
         Get performance metrics broken down by strategy.

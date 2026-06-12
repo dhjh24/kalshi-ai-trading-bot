@@ -17,7 +17,7 @@ from src.clients.kalshi_client import KalshiClient
 from src.clients.model_router import ModelRouter
 
 
-def _extract_fair_probability(debate_result: Dict) -> Optional[float]:
+def _extract_fair_probability(debate_result: Dict):
     """
     Pool the debate agents' YES-probability estimates into one fair value.
 
@@ -25,8 +25,8 @@ def _extract_fair_probability(debate_result: Dict) -> Optional[float]:
     weight; bull and bear act as adversarial correctors. Pooling uses
     disagreement-aware extremization: agreeing agents earn the configured
     extremize correction, disagreeing agents fall back to plain pooling.
-    Returns None when no agent produced a usable probability (legacy
-    single-model path).
+    Returns a PooledProbability (probability + member disagreement) or None
+    when no agent produced a usable probability (legacy single-model path).
     """
     from src.utils.probability_engine import pool_probabilities_adaptive
 
@@ -48,16 +48,145 @@ def _extract_fair_probability(debate_result: Dict) -> Optional[float]:
             estimates.append((value, weight))
 
     extremize = float(getattr(settings.ensemble, "extremize_factor", 1.2) or 1.2)
-    pooled = pool_probabilities_adaptive(estimates, extremize=extremize)
-    return pooled.probability if pooled else None
+    return pool_probabilities_adaptive(estimates, extremize=extremize)
+
+
+# Calibration slope cache for the standard decision path: (slope, expires_at).
+# The live-trade loop maintains its own; this closes the same feedback loop
+# for trades created through make_decision_for_market.
+_CALIBRATION_SLOPE_CACHE: Dict[str, Any] = {"slope": 1.0, "expires_at": 0.0}
+_CALIBRATION_SLOPE_TTL_SECONDS = 1800.0
+
+
+async def _get_decision_calibration_slope(db_manager: DatabaseManager) -> float:
+    """
+    Reliability slope from realized settlements, cached for 30 minutes.
+    1.0 = no shrink; lower values shrink model probabilities toward 0.5
+    before the edge gate so a persistently overconfident ensemble
+    automatically trades less until its calibration recovers.
+    """
+    if not bool(getattr(settings.trading, "calibration_shrink_enabled", True)):
+        return 1.0
+    now = time.time()
+    if _CALIBRATION_SLOPE_CACHE["expires_at"] > now:
+        return float(_CALIBRATION_SLOPE_CACHE["slope"])
+
+    from src.utils.probability_engine import calibration_shrink_slope
+
+    slope = 1.0
+    try:
+        samples = await db_manager.get_calibration_samples(limit=500)
+        slope = calibration_shrink_slope(samples)
+    except Exception as exc:
+        get_trading_logger("decision_engine").debug(
+            "Calibration slope lookup failed", error=str(exc)
+        )
+    _CALIBRATION_SLOPE_CACHE["slope"] = slope
+    _CALIBRATION_SLOPE_CACHE["expires_at"] = now + _CALIBRATION_SLOPE_TTL_SECONDS
+    return slope
+
+
+async def _get_category_assessment(
+    db_manager: DatabaseManager, market: Market
+) -> Dict[str, Any]:
+    """
+    Best-effort category statistics for this market from the CategoryScorer.
+
+    Returns {category, score, allocation_pct, blocked}. Failures degrade to
+    a neutral assessment — statistics reinforce decisions, never break them.
+    """
+    assessment: Dict[str, Any] = {
+        "category": None,
+        "score": None,
+        "allocation_pct": None,
+        "blocked": False,
+    }
+    try:
+        from src.strategies.category_scorer import (
+            CategoryScorer,
+            get_allocation_pct,
+            infer_category,
+        )
+
+        category = infer_category(market.market_id, market.title or "")
+        assessment["category"] = category
+        db_path = getattr(db_manager, "db_path", None)
+        scorer = CategoryScorer(db_path) if db_path else CategoryScorer()
+        await scorer.initialize()
+        score = await scorer.get_score(category)
+        if score is not None:
+            assessment["score"] = float(score)
+            assessment["allocation_pct"] = get_allocation_pct(float(score))
+            assessment["blocked"] = await scorer.is_blocked(category)
+    except Exception as exc:
+        get_trading_logger("decision_engine").debug(
+            "Category assessment unavailable", error=str(exc)
+        )
+    return assessment
+
+
+async def _apply_ml_meta_model(
+    db_manager: DatabaseManager,
+    *,
+    side_win_probability: float,
+    entry_price: float,
+    side: str,
+    confidence: float,
+) -> float:
+    """
+    Blend the settlement-trained outcome meta-model into the side-win
+    probability (log-odds space). No-op until the model has enough settled
+    samples AND beats the raw LLM probabilities under cross-validation.
+    """
+    if not bool(getattr(settings.trading, "ml_meta_model_enabled", True)):
+        return side_win_probability
+    try:
+        from src.ml.outcome_model import get_outcome_model
+
+        model = await get_outcome_model(
+            db_manager,
+            max_blend_weight=float(
+                getattr(settings.trading, "ml_meta_model_max_blend_weight", 0.35) or 0.35
+            ),
+        )
+        if model is None:
+            return side_win_probability
+        blended = model.blend(
+            side_win_probability,
+            entry_price=entry_price,
+            side=side,
+            confidence=confidence,
+        )
+        if abs(blended - side_win_probability) > 1e-6:
+            get_trading_logger("decision_engine").info(
+                "ML meta-model adjusted win probability",
+                llm_probability=round(side_win_probability, 4),
+                blended_probability=round(blended, 4),
+                algorithm=model.algorithm,
+                training_samples=model.n_samples,
+                blend_weight=round(model.blend_weight(), 3),
+            )
+        return blended
+    except Exception as exc:
+        get_trading_logger("decision_engine").debug(
+            "ML meta-model blend skipped", error=str(exc)
+        )
+        return side_win_probability
 
 
 def _calculate_kelly_quantity(
     balance: float,
     entry_price: float,
     win_probability: float,
+    size_multiplier: float = 1.0,
 ) -> int:
-    """Fractional-Kelly contract count for a binary market entry."""
+    """
+    Fractional-Kelly contract count for a binary market entry.
+
+    ``size_multiplier`` scales the Kelly fraction down for statistically
+    weak categories (marginal category-scorer tiers) without touching the
+    probability estimate itself.
+    """
     from src.utils.probability_engine import kelly_fraction
 
     if entry_price <= 0 or balance <= 0:
@@ -68,6 +197,7 @@ def _calculate_kelly_quantity(
         multiplier=float(getattr(settings.trading, "kelly_fraction", 0.25) or 0.25),
         cap=float(getattr(settings.trading, "max_single_position", 0.03) or 0.03),
     )
+    fraction *= max(0.0, min(1.0, float(size_multiplier)))
     investment = balance * fraction
     quantity = int(investment // entry_price)
     get_trading_logger("decision_engine").info(
@@ -342,6 +472,27 @@ async def make_decision_for_market(
             logger.info(f"Market {market.market_id} in excluded category '{market.category}'. Skipping.")
             return None
 
+        # CHECK 6: Category statistics gate (before any LLM spend). A
+        # category with a statistically poor realized record is skipped
+        # outright — no analysis cost, no trade. The score also reinforces
+        # the edge filter and position sizing downstream.
+        category_assessment = await _get_category_assessment(db_manager, market)
+        if category_assessment.get("blocked"):
+            logger.info(
+                f"Market {market.market_id} blocked by category statistics "
+                f"({category_assessment.get('category')}: "
+                f"score={category_assessment.get('score')}). Skipping."
+            )
+            await db_manager.record_market_analysis(
+                market.market_id,
+                "CATEGORY_BLOCKED",
+                0.0,
+                0.0,
+                f"category {category_assessment.get('category')} score "
+                f"{category_assessment.get('score')}",
+            )
+            return None
+
         # Get real-time portfolio balance
         balance_response = await kalshi_client.get_balance()
         available_balance = get_balance_dollars(balance_response)
@@ -547,7 +698,15 @@ async def make_decision_for_market(
                 decision.reasoning = ensemble_result.get("reasoning", "Multi-agent ensemble decision")
                 # Attach the pooled fair YES probability so the edge filter
                 # compares probability-vs-price instead of confidence-vs-price.
-                decision.fair_yes_probability = _extract_fair_probability(ensemble_result)
+                # Disagreement (member std dev) travels alongside so contested
+                # forecasts must clear extra edge.
+                pooled_fair = _extract_fair_probability(ensemble_result)
+                decision.fair_yes_probability = (
+                    pooled_fair.probability if pooled_fair else None
+                )
+                decision.ensemble_disagreement = (
+                    pooled_fair.disagreement if pooled_fair else None
+                )
                 estimated_decision_cost = 0.10  # Ensemble uses multiple models
                 total_analysis_cost += estimated_decision_cost
             else:
@@ -590,6 +749,8 @@ async def make_decision_for_market(
             from src.utils.edge_filter import EdgeFilter
             from src.utils.probability_engine import (
                 blend_with_market,
+                disagreement_edge_padding,
+                shrink_toward_half,
                 side_win_probability,
             )
 
@@ -599,10 +760,32 @@ async def make_decision_for_market(
             # decision's *confidence* is certainty about the trade, not the
             # probability the side wins — conflating them fabricated edge.
             fair_yes = getattr(decision, "fair_yes_probability", None)
+            ensemble_disagreement = getattr(decision, "ensemble_disagreement", None)
             if fair_yes is not None:
+                # Close the feedback loop: shrink toward 0.5 by the realized
+                # reliability slope (settlement_calibration), exactly as the
+                # live-trade loop already does.
+                calibration_slope = await _get_decision_calibration_slope(db_manager)
+                shrunk_yes = shrink_toward_half(fair_yes, calibration_slope)
+
+                # Statistical reinforcement: blend the settlement-trained
+                # meta-model into the side-win probability before anchoring
+                # to the market price.
+                side_prob = side_win_probability(shrunk_yes, decision.side)
+                side_prob = await _apply_ml_meta_model(
+                    db_manager,
+                    side_win_probability=side_prob,
+                    entry_price=price,
+                    side=decision.side,
+                    confidence=decision.confidence,
+                )
+                adjusted_yes = (
+                    side_prob if decision.side == "YES" else 1.0 - side_prob
+                )
+
                 market_yes_prob = max(0.01, min(0.99, float(market.yes_price)))
                 blended_yes = blend_with_market(
-                    fair_yes,
+                    adjusted_yes,
                     market_yes_prob,
                     model_weight=float(
                         getattr(settings.ensemble, "market_blend_model_weight", 0.65) or 0.65
@@ -621,7 +804,9 @@ async def make_decision_for_market(
                     "anchoring to market price (zero edge, fails closed)"
                 )
 
-            # Check edge filter
+            # Check edge filter. Category statistics and ensemble
+            # disagreement raise the bar: contested forecasts and weak or
+            # coin-flip-priced markets must show more edge.
             should_trade, trade_reason, edge_result = EdgeFilter.should_trade_market(
                 ai_probability=ai_prob,
                 market_probability=market_prob,
@@ -631,7 +816,9 @@ async def make_decision_for_market(
                     'min_volume': settings.trading.min_volume,
                     'time_to_expiry_days': get_time_to_expiry_days(market),
                     'max_time_to_expiry': settings.trading.max_time_to_expiry_days
-                }
+                },
+                category_score=category_assessment.get("score"),
+                extra_required_edge=disagreement_edge_padding(ensemble_disagreement),
             )
             
             # The filter measures |edge|; the decision side must also be the
@@ -658,8 +845,18 @@ async def make_decision_for_market(
 
             # Calculate initial position size: true fractional Kelly when a
             # fair probability is available, legacy confidence scaling otherwise.
+            # Marginal categories (allocation tier below 5%) get a scaled-down
+            # Kelly fraction so unproven or weak areas stay small.
+            allocation_pct = category_assessment.get("allocation_pct")
+            category_size_multiplier = (
+                min(1.0, float(allocation_pct) / 0.05)
+                if allocation_pct is not None and allocation_pct > 0
+                else 1.0
+            )
             if fair_yes is not None and getattr(settings.trading, "use_kelly_criterion", True):
-                initial_quantity = _calculate_kelly_quantity(available_balance, price, ai_prob)
+                initial_quantity = _calculate_kelly_quantity(
+                    available_balance, price, ai_prob, category_size_multiplier
+                )
             else:
                 confidence_delta = decision.confidence - price
                 initial_quantity = _calculate_dynamic_quantity(available_balance, price, confidence_delta)
