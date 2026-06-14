@@ -133,6 +133,11 @@ def _specialist_payload(
             "action": "TRADE",
             "market_ticker": market_ticker,
             "side": "YES",
+            # Explicit fair probability, members in agreement: these parity
+            # fixtures model a clean approved trade. (Contested members now
+            # genuinely raise the EV bar via disagreement padding — that
+            # behavior has its own tests in test_probability_engine_*.)
+            "fair_yes_probability": 0.74,
             "confidence": 0.78,
             "edge_pct": 0.07,
             "position_size_pct": 2.0,
@@ -159,8 +164,8 @@ def _debate_responses(*, limit_cents: int = 41):
         ),
         json.dumps(
             {
-                "probability": 0.46,
-                "probability_ceiling": 0.58,
+                "probability": 0.68,
+                "probability_ceiling": 0.74,
                 "confidence": 0.63,
                 "key_arguments": ["variance risk"],
                 "risk_factors": ["late swing"],

@@ -279,6 +279,9 @@ def _build_quick_flip_config(*, hold_minutes: int) -> QuickFlipConfig:
         maker_entry_reprice_seconds=settings.trading.quick_flip_maker_entry_reprice_seconds,
         dynamic_exit_reprice_seconds=settings.trading.quick_flip_dynamic_exit_reprice_seconds,
         stop_loss_pct=settings.trading.quick_flip_stop_loss_pct,
+        ev_gate_enabled=settings.trading.quick_flip_ev_gate_enabled,
+        ev_confidence_margin=settings.trading.quick_flip_ev_confidence_margin,
+        max_last_trade_age_seconds=settings.trading.quick_flip_max_last_trade_age_seconds,
         min_bid_ask_size_ratio=settings.trading.quick_flip_min_bid_ask_size_ratio,
     )
 
@@ -601,7 +604,17 @@ def _normalize_final_payload(
     }
     if action != "BUY":
         normalized["execution_style"] = "NONE"
-    for extra_key in ("debate_transcript", "step_results", "elapsed_seconds", "selected_candidate"):
+    # fair_yes_disagreement and member_probabilities must survive
+    # normalization: the EV gate demands extra edge on contested calls, and
+    # settlement scoring needs each member's probability claim.
+    for extra_key in (
+        "debate_transcript",
+        "step_results",
+        "elapsed_seconds",
+        "selected_candidate",
+        "fair_yes_disagreement",
+        "member_probabilities",
+    ):
         if extra_key in payload:
             normalized[extra_key] = payload[extra_key]
     return normalized
@@ -675,25 +688,60 @@ def _candidate_market_data(candidate: Dict[str, Any]) -> Dict[str, Any]:
 def _pooled_fair_yes_probability(
     debate_result: Dict[str, Any],
     candidate: Dict[str, Any],
-) -> tuple[float, Optional[float]]:
+    *,
+    skill_weights: Optional[Dict[str, float]] = None,
+) -> tuple[float, Optional[float], List[Dict[str, Any]]]:
     """
     Pool the specialist's fair YES probability with the debate researchers'
     probability estimates in log-odds space. The specialist saw the full
     research payload, so it carries the largest weight; bull/bear act as
     adversarial correctors.
 
+    Each member's base weight is scaled by its realized-skill multiplier
+    (``skill_weights``, from settled-trade Brier scores; missing roles get
+    1.0), so members that have demonstrated accuracy gradually earn more
+    influence and persistently wrong ones lose it.
+
     Pooling uses disagreement-aware extremization (agreeing members earn the
     configured extremize correction; disagreeing members fall back to plain
-    pooling). Returns ``(probability, disagreement)`` where disagreement is
-    the member std dev (None when only one usable estimate existed) so the
-    EV gate can demand extra edge on contested calls.
+    pooling). Returns ``(probability, disagreement, members)`` where
+    disagreement is the member std dev (None when only one usable estimate
+    existed) and ``members`` records every pooled estimate for settlement
+    scoring.
+
+    Non-pooled debate roles that still emitted a probability (e.g. the risk
+    manager) are appended as ``pooled: False`` observers with weight 0: they
+    never move this trade's pooled probability, but settlement scoring sees
+    their claims, so they accrue the per-category skill history that future
+    weighting draws on. The trader never emits a probability (confidence is
+    certainty about the action, not a forecast) and is never scored here.
     """
+    from src.agents.ensemble import extract_role_probability
     from src.utils.probability_engine import pool_probabilities_adaptive
 
+    multipliers = skill_weights or {}
+    role_models = settings.ensemble.get_role_model_map()
     estimates: List[tuple[float, float]] = []
+    members: List[Dict[str, Any]] = []
+
+    def _add_member(role: str, probability: float, base_weight: float) -> None:
+        weight = base_weight * float(multipliers.get(role, 1.0))
+        if weight <= 0:
+            return
+        estimates.append((probability, weight))
+        members.append(
+            {
+                "role": role,
+                "probability": probability,
+                "weight": weight,
+                "model": role_models.get(role),
+                "pooled": True,
+            }
+        )
+
     specialist_fair = _safe_float(candidate.get("fair_yes_probability"), 0.0)
     if 0.0 < specialist_fair < 1.0:
-        estimates.append((specialist_fair, 0.5))
+        _add_member("specialist", specialist_fair, 0.5)
 
     step_results = debate_result.get("step_results") or {}
     for role, weight in (("bull_researcher", 0.25), ("bear_researcher", 0.25)):
@@ -702,15 +750,35 @@ def _pooled_fair_yes_probability(
             continue
         probability = _safe_float(result.get("probability"), -1.0)
         if 0.0 < probability < 1.0:
-            estimates.append((probability, weight))
+            _add_member(role, probability, weight)
+
+    pooled_roles = {member["role"] for member in members}
+    for role, result in step_results.items():
+        role_name = str(role)
+        if role_name in pooled_roles:
+            continue
+        observed = extract_role_probability(
+            role_name, result if isinstance(result, dict) else {}
+        )
+        if observed is None or not (0.0 < observed < 1.0):
+            continue
+        members.append(
+            {
+                "role": role_name,
+                "probability": observed,
+                "weight": 0.0,
+                "model": role_models.get(role_name),
+                "pooled": False,
+            }
+        )
 
     extremize = float(getattr(settings.ensemble, "extremize_factor", 1.2) or 1.2)
     pooled = pool_probabilities_adaptive(estimates, extremize=extremize)
     if pooled is None:
         fallback = _clamp(specialist_fair if specialist_fair > 0 else 0.5, lo=0.01, hi=0.99)
-        return fallback, None
+        return fallback, None, members
     disagreement = pooled.disagreement if pooled.num_members >= 2 else None
-    return pooled.probability, disagreement
+    return pooled.probability, disagreement, members
 
 
 def _top_of_book_bid_size(orderbook: Dict[str, Any], side: str) -> float:
@@ -745,6 +813,7 @@ def _debate_final_payload(
     debate_result: Dict[str, Any],
     *,
     candidate: Dict[str, Any],
+    skill_weights: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     raw_action = str(debate_result.get("action") or "SKIP").upper()
     action = "BUY" if raw_action in {"BUY", "SELL"} else "SKIP"
@@ -760,8 +829,10 @@ def _debate_final_payload(
         execution_style = "NONE"
 
     step_results = debate_result.get("step_results") or {}
-    fair_yes_probability, fair_yes_disagreement = _pooled_fair_yes_probability(
-        debate_result, candidate
+    fair_yes_probability, fair_yes_disagreement, member_probabilities = (
+        _pooled_fair_yes_probability(
+            debate_result, candidate, skill_weights=skill_weights
+        )
     )
     selected_candidate = {
         "event_ticker": candidate.get("event_ticker"),
@@ -783,6 +854,7 @@ def _debate_final_payload(
         "side": side,
         "fair_yes_probability": fair_yes_probability,
         "fair_yes_disagreement": fair_yes_disagreement,
+        "member_probabilities": member_probabilities,
         "confidence": _clamp(_safe_float(debate_result.get("confidence"), candidate.get("confidence")), lo=0.0, hi=1.0),
         "edge_pct": _safe_float(candidate.get("edge_pct"), 0.0),
         "position_size_pct": _clamp(
@@ -955,6 +1027,8 @@ class LiveTradeDecisionLoop:
         # Cached settlement-calibration reliability slopes keyed by market
         # type ("" = global): key -> (slope, expires_at).
         self._calibration_slope_cache: Dict[str, tuple[float, float]] = {}
+        # Cached per-role skill-weight multipliers: (weights, expires_at).
+        self._model_skill_cache: Dict[str, tuple[Dict[str, float], float]] = {}
         # Deterministic weather-model probabilities harvested from the
         # specialist research payloads: market_ticker -> probability entry
         # (+ "cached_at" epoch seconds). Consumed by the EV gate.
@@ -1019,6 +1093,62 @@ class LiveTradeDecisionLoop:
 
         self._calibration_slope_cache[cache_key] = (slope, now + 1800.0)
         return slope
+
+    async def _get_model_skill_weights(
+        self, market_type: Optional[str] = None
+    ) -> Dict[str, float]:
+        """
+        Per-role pooling-weight multipliers from realized Brier scores,
+        cached for 30 minutes per category. Category-level evidence (the
+        candidate's focus type, normalized like settlement calibration)
+        refines each role's global multiplier via hierarchical shrinkage,
+        so "sharp on weather, dull on sports" shows up in the weights
+        instead of averaging away. Roles without enough settled
+        observations (or when skill weighting is disabled) get no entry —
+        pooling treats a missing role as multiplier 1.0, so this fails
+        open to the configured base weights.
+        """
+        if not bool(getattr(settings.trading, "model_skill_weighting_enabled", True)):
+            return {}
+
+        from src.utils.database import normalize_market_type
+
+        cache_key = normalize_market_type(market_type)
+        now = datetime.now(timezone.utc).timestamp()
+        cached = self._model_skill_cache.get(cache_key)
+        if cached is not None:
+            weights, expires_at = cached
+            if expires_at > now:
+                return weights
+
+        from src.utils.probability_engine import (
+            category_skill_weight_multipliers,
+            skill_weight_multipliers,
+        )
+
+        weights: Dict[str, float] = {}
+        try:
+            global_summary = await self.db_manager.get_model_skill_summary()
+            if cache_key != "unknown":
+                category_summary = await self.db_manager.get_model_skill_summary(
+                    market_type=cache_key
+                )
+                weights = category_skill_weight_multipliers(
+                    global_summary, category_summary
+                )
+            else:
+                weights = skill_weight_multipliers(global_summary)
+            if weights:
+                self.logger.info(
+                    "Applying realized-skill pooling weights",
+                    market_type=cache_key,
+                    weights=weights,
+                )
+        except Exception as exc:
+            self.logger.debug("Model skill weight lookup failed", error=str(exc))
+
+        self._model_skill_cache[cache_key] = (weights, now + 1800.0)
+        return weights
 
     def _harvest_weather_model_probabilities(self, payload: Dict[str, Any]) -> None:
         """
@@ -1657,7 +1787,13 @@ class LiveTradeDecisionLoop:
                 "specialist_candidates": list(candidates),
             },
         )
-        debate_payload = _debate_final_payload(debate_result, candidate=selected_candidate)
+        debate_payload = _debate_final_payload(
+            debate_result,
+            candidate=selected_candidate,
+            skill_weights=await self._get_model_skill_weights(
+                selected_candidate.get("focus_type")
+            ),
+        )
         final = _normalize_final_payload(debate_payload, candidates=candidates)
         metadata = _extract_router_metadata(self.model_router) if debate_result else {"provider": "heuristic", "model": None}
         await self.db_manager.add_live_trade_decision(
@@ -2072,11 +2208,36 @@ class LiveTradeDecisionLoop:
         except (TypeError, ValueError):
             intent_disagreement = None
 
+        # Market-prior calibration: when validated models exist (fit from
+        # settled snapshot history), the gate's market anchor uses the
+        # calibrated settlement probability instead of the raw mid —
+        # correcting systematic price biases such as favorite-longshot.
+        # Fails closed to the raw mid (identity) when no model is active.
+        market_yes_prior = market_yes_mid
+        market_prior_segment: Optional[str] = None
+        if bool(getattr(settings.trading, "market_prior_calibration_enabled", True)):
+            try:
+                from src.utils.market_prior import adjusted_market_yes_probability
+
+                market_yes_prior, market_prior_segment = (
+                    await adjusted_market_yes_probability(
+                        self.db_manager,
+                        market_yes_mid,
+                        _safe_float(selected_event.get("hours_to_expiry"), 6.0),
+                    )
+                )
+            except Exception as exc:
+                self.logger.debug(
+                    "Market-prior adjustment unavailable", error=str(exc)
+                )
+                market_yes_prior = market_yes_mid
+                market_prior_segment = None
+
         gate = evaluate_trade_intent(
             fair_yes_probability=fair_yes_for_gate,
             side=intent_side,
             entry_price=limit_price,
-            market_yes_probability=market_yes_mid,
+            market_yes_probability=market_yes_prior,
             model_blend_weight=float(
                 getattr(settings.ensemble, "market_blend_model_weight", 0.65) or 0.65
             ),
@@ -2093,6 +2254,8 @@ class LiveTradeDecisionLoop:
         gate_snapshot = {
             "fair_yes_probability": gate["fair_yes_probability"],
             "market_yes_midpoint": market_yes_mid,
+            "market_yes_prior": market_yes_prior,
+            "market_prior_segment": market_prior_segment,
             "shrunk_yes_probability": gate["shrunk_yes_probability"],
             "blended_yes_probability": gate["blended_yes_probability"],
             "win_probability": gate["win_probability"],
@@ -2106,6 +2269,7 @@ class LiveTradeDecisionLoop:
             "disagreement": intent_disagreement,
             "disagreement_edge_padding": gate["disagreement_edge_padding"],
             "weather_model": weather_pooled_from,
+            "member_probabilities": final_intent.get("member_probabilities") or [],
         }
         if not gate["approved"]:
             await self._record_execution_status(
@@ -2130,6 +2294,55 @@ class LiveTradeDecisionLoop:
             blended_yes_probability=gate["blended_yes_probability"],
             net_edge=gate["ev"].net_edge,
         )
+
+        # Kelly sizing cap. The LLM's position_size_pct is a request, not an
+        # entitlement: the funded size can never exceed the fractional-Kelly
+        # bankroll fraction implied by the gate's blended win probability at
+        # this entry price. Mode-blind (paper/live parity).
+        if bool(getattr(settings.trading, "live_trade_kelly_sizing_enabled", True)):
+            from src.utils.probability_engine import kelly_fraction
+
+            max_pct_cap = float(
+                getattr(settings.trading, "max_position_size_pct", 3.0) or 3.0
+            )
+            kelly_pct = kelly_fraction(
+                win_probability=float(gate["win_probability"]),
+                entry_price=limit_price,
+                multiplier=float(
+                    getattr(settings.trading, "live_trade_kelly_multiplier", 0.25)
+                    or 0.25
+                ),
+                cap=max_pct_cap / 100.0,
+            )
+            kelly_budget = max(portfolio_value, 0.0) * kelly_pct
+            kelly_quantity = int(math.floor(kelly_budget / max(limit_price, 0.01)))
+            gate_snapshot["kelly_fraction"] = kelly_pct
+            gate_snapshot["kelly_max_quantity"] = kelly_quantity
+            if kelly_quantity < quantity:
+                self.logger.info(
+                    "Kelly cap reduced live-trade position size",
+                    market_ticker=market_ticker,
+                    requested_quantity=quantity,
+                    kelly_quantity=kelly_quantity,
+                    kelly_fraction=kelly_pct,
+                )
+                gate_snapshot["kelly_capped"] = True
+                quantity = kelly_quantity
+            if quantity <= 0:
+                await self._record_execution_status(
+                    run_id=run_id,
+                    final_intent=final_intent,
+                    status="blocked",
+                    summary=(
+                        "Kelly sizing allows less than one contract at the "
+                        "gate's blended win probability — the measured edge "
+                        "does not support a position."
+                    ),
+                    error="kelly_zero_size",
+                    quantity=quantity,
+                    payload={"gate_snapshot": gate_snapshot},
+                )
+                return False
 
         guardrail_strategy = "quick_flip" if is_short_quick_flip else "live_trade"
         allowed, reason = await self._passes_guardrails(

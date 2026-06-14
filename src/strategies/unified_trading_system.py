@@ -469,6 +469,9 @@ class UnifiedAdvancedTradingSystem:
                 maker_entry_reprice_seconds=settings.trading.quick_flip_maker_entry_reprice_seconds,
                 dynamic_exit_reprice_seconds=settings.trading.quick_flip_dynamic_exit_reprice_seconds,
                 stop_loss_pct=settings.trading.quick_flip_stop_loss_pct,
+                ev_gate_enabled=settings.trading.quick_flip_ev_gate_enabled,
+                ev_confidence_margin=settings.trading.quick_flip_ev_confidence_margin,
+                max_last_trade_age_seconds=settings.trading.quick_flip_max_last_trade_age_seconds,
                 min_bid_ask_size_ratio=settings.trading.quick_flip_min_bid_ask_size_ratio,
             )
             results = await run_quick_flip_strategy(

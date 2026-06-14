@@ -109,6 +109,15 @@ class QuickFlipConfig:
     maker_entry_reprice_seconds: int = 30
     dynamic_exit_reprice_seconds: int = 60
     stop_loss_pct: float = 0.08
+    # Statistical gates (see settings.py for the matching env knobs).
+    # ev_gate: candidate's movement confidence must clear the break-even win
+    # probability implied by its reward (net profit at target) vs. risk
+    # (stop-loss distance + fees), plus the margin.
+    ev_gate_enabled: bool = True
+    ev_confidence_margin: float = 0.0
+    # Reject candidates whose latest public trade is older than this — the
+    # momentum heuristics are meaningless on a stale tape. 0 disables.
+    max_last_trade_age_seconds: int = 900
     # Momentum confirmation from book imbalance: resting depth supporting the
     # entry side must be at least this fraction of the opposing side's depth
     # (on Kalshi the opposing side's bids ARE the asks above us). 0 disables.
@@ -406,6 +415,35 @@ class QuickFlipScalpingStrategy:
             "exit_fee": exit_fee,
         }
 
+    def _required_win_probability(
+        self,
+        *,
+        entry_price: float,
+        quantity: float,
+        net_profit_at_target: float,
+    ) -> Optional[float]:
+        """
+        Break-even win probability for this scalp's reward/risk profile.
+
+        A trade is positive expected value only when
+        ``p * reward - (1 - p) * risk > 0``, i.e. ``p > risk / (risk +
+        reward)``. Reward is the fee-inclusive net profit at the target
+        exit; risk is the stop-loss scenario — full stop distance plus the
+        taker entry fee plus a *taker* exit fee (stop exits cross the
+        spread, they do not rest). Returns None when the inputs are
+        degenerate (callers should already have rejected those).
+        """
+        stop_price = max(0.01, entry_price * (1.0 - self.config.stop_loss_pct))
+        entry_fee = self._estimate_kalshi_fee(entry_price, quantity, maker=False)
+        stop_exit_fee = self._estimate_kalshi_fee(stop_price, quantity, maker=False)
+        risk = (entry_price - stop_price) * quantity + entry_fee + stop_exit_fee
+        reward = float(net_profit_at_target)
+        if reward <= 0:
+            return None
+        if risk <= 0:
+            return 0.0
+        return risk / (risk + reward)
+
     @staticmethod
     def _normalize_fill_price(price: float) -> float:
         """Normalize either cent-style or dollar-style prices to dollars."""
@@ -586,9 +624,32 @@ class QuickFlipScalpingStrategy:
             "status": "timeout",
         }
 
+    @staticmethod
+    def _trade_timestamp_epoch(trade: Dict[str, Any]) -> Optional[float]:
+        """Best-effort epoch seconds for one public trade record."""
+        raw_ts = trade.get("ts")
+        if raw_ts is not None:
+            try:
+                numeric = float(raw_ts)
+                if numeric > 1e12:  # milliseconds
+                    numeric /= 1000.0
+                if numeric > 0:
+                    return numeric
+            except (TypeError, ValueError):
+                pass
+        created = trade.get("created_time") or trade.get("created_ts")
+        if isinstance(created, str) and created.strip():
+            try:
+                normalized = created.strip().replace("Z", "+00:00")
+                return datetime.fromisoformat(normalized).timestamp()
+            except ValueError:
+                return None
+        return None
+
     async def _get_recent_trade_stats(self, market_id: str, side: str) -> Dict[str, float]:
         """Summarize recent public trades for the requested side."""
-        min_ts = int(datetime.now(timezone.utc).timestamp()) - self.config.recent_trade_window_seconds
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        min_ts = now_ts - self.config.recent_trade_window_seconds
         trades_response = await self.kalshi_client.get_market_trades(
             market_id,
             limit=100,
@@ -616,13 +677,22 @@ class QuickFlipScalpingStrategy:
                 "recent_last_price": 0.0,
             }
 
-        return {
+        stats: Dict[str, float] = {
             "trade_count": float(len(prices)),
             "recent_max_price": max(prices),
             "recent_min_price": min(prices),
             "recent_last_price": prices[0],
             "recent_range": max(prices) - min(prices),
         }
+        # Tape freshness: trades arrive newest-first, so the first record's
+        # timestamp dates the most recent print. Left absent when the API
+        # payload carries no usable timestamp (the freshness guard then
+        # skips, mirroring the depth-guard telemetry-failure convention).
+        if trades:
+            newest_ts = self._trade_timestamp_epoch(trades[0])
+            if newest_ts is not None:
+                stats["last_trade_age_seconds"] = max(0.0, now_ts - newest_ts)
+        return stats
 
     async def _calculate_dynamic_exit_price(
         self,
@@ -1330,6 +1400,25 @@ class QuickFlipScalpingStrategy:
                 "recent_range": 0.0,
             }
 
+        # Tape freshness guard: the momentum heuristics and the movement
+        # LLM both extrapolate from recent prints; a tape whose newest trade
+        # is half an hour old describes a market that has gone quiet, not
+        # one that is moving. Checked before the movement analysis so stale
+        # candidates never spend AI budget. Skipped when the API supplied
+        # no usable trade timestamp.
+        max_trade_age = int(self.config.max_last_trade_age_seconds or 0)
+        last_trade_age = recent_trade_stats.get("last_trade_age_seconds")
+        if (
+            max_trade_age > 0
+            and last_trade_age is not None
+            and float(last_trade_age) > max_trade_age
+        ):
+            self.logger.debug(
+                f"Quick flip rejected {market.market_id} {side}: last trade "
+                f"{float(last_trade_age):.0f}s old (max {max_trade_age}s)"
+            )
+            return None
+
         movement_analysis = await self._analyze_market_movement(
             market,
             side,
@@ -1363,6 +1452,32 @@ class QuickFlipScalpingStrategy:
             or profit_estimate["net_roi"] < self.config.min_net_roi
         ):
             return None
+
+        # Expected-value gate: a confidence threshold alone admits trades
+        # whose stop-loss risk dwarfs their target reward (e.g. 60% to win
+        # $0.40 against 40% to lose $1.50 clears a 0.6 threshold while
+        # bleeding money). Require the movement confidence to exceed the
+        # break-even win probability of this exact reward/risk profile.
+        if self.config.ev_gate_enabled:
+            required_win_probability = self._required_win_probability(
+                entry_price=current_ask,
+                quantity=quantity,
+                net_profit_at_target=profit_estimate["net_profit"],
+            )
+            if required_win_probability is not None:
+                required_win_probability = min(
+                    0.99,
+                    required_win_probability
+                    + max(0.0, float(self.config.ev_confidence_margin)),
+                )
+                if movement_analysis["confidence"] < required_win_probability:
+                    self.logger.debug(
+                        f"Quick flip rejected {market.market_id} {side}: confidence "
+                        f"{movement_analysis['confidence']:.2f} below break-even win "
+                        f"probability {required_win_probability:.2f} "
+                        f"(reward ${profit_estimate['net_profit']:.2f} vs stop risk)"
+                    )
+                    return None
 
         if recent_trade_stats.get("trade_count", 0.0) < self.config.min_recent_trade_count:
             return None
