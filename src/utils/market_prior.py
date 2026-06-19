@@ -45,6 +45,7 @@ small cached loader at the bottom which reads fitted coefficients through a
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import time
 from dataclasses import dataclass
@@ -79,13 +80,38 @@ INTERCEPT_CLAMP = 2.0            # |a| <= 2 (≈ ±0.38 shift at mid prices)
 SLOPE_CLAMP = (0.25, 4.0)        # b in [0.25, 4]
 MAX_ADJUSTMENT = 0.08            # adjusted prior within ±8c of the raw mid
 
+# Isotonic model-selection. A monotone isotonic regression can fit the true
+# favorite-longshot reliability curve more flexibly than a 2-parameter Platt
+# sigmoid. To avoid overfitting the activation gate, the choice between Platt
+# and isotonic is made on a SEPARATE "select" fold carved out of the training
+# tickers (hash bucket in [HOLDOUT_FRACTION, SELECT_FRACTION_END)); the final
+# model is then refit on the full training set and judged against identity on
+# the untouched activation holdout. Isotonic only wins if it beats Platt on
+# the select fold by ISOTONIC_SELECT_EPS, so on truly-sigmoidal data Platt
+# (the simpler model) is kept and behavior is unchanged.
+SELECT_FRACTION_END = 0.32       # select fold = bucket in [0.20, 0.32)
+MAX_ISOTONIC_KNOTS = 6           # piecewise-linear breakpoints persisted
+# Isotonic must beat Platt on the select fold by a MEANINGFUL Brier margin,
+# not just any amount: on genuinely sigmoidal data the more-flexible isotonic
+# can win by select-fold noise (empirically up to ~0.004), so a small epsilon
+# would overfit and adopt isotonic spuriously. 0.008 (0.8% Brier) sits above
+# that noise band — isotonic is adopted only when clearly better (e.g. a
+# non-sigmoidal reliability curve), and Platt (the simpler model) wins ties.
+ISOTONIC_SELECT_EPS = 0.008
+
 # Loader cache TTL (seconds).
 _CACHE_TTL_SECONDS = 1800.0
 
 
 @dataclass(frozen=True)
 class MarketPriorModel:
-    """Fitted Platt coefficients for one time-to-expiry segment."""
+    """Fitted calibration model for one time-to-expiry segment.
+
+    Holds a Platt fit (intercept/slope) always; when ``model_form`` is
+    ``"isotonic"`` the monotone ``knots`` (ascending ``(logit_mid, prob)``
+    breakpoints) are applied instead, with the Platt coefficients retained as a
+    serializable fallback.
+    """
 
     segment: str
     intercept: float
@@ -97,9 +123,81 @@ class MarketPriorModel:
     holdout_brier_model: float
     holdout_brier_identity: float
     active: bool
+    model_form: str = "platt"
+    knots: Tuple[Tuple[float, float], ...] = ()
 
     def apply(self, mid: float) -> float:
+        if self.model_form == "isotonic" and len(self.knots) >= 2:
+            return clamp_probability(_isotonic_apply(self.knots, mid))
         return clamp_probability(inv_logit(self.intercept + self.slope * logit(mid)))
+
+
+def _isotonic_apply(knots: Sequence[Tuple[float, float]], mid: float) -> float:
+    """
+    Evaluate a monotone piecewise-linear isotonic model at ``mid``.
+
+    ``knots`` are ascending ``(logit_mid, probability)`` breakpoints. The query
+    is clamped to the fitted logit range (out-of-bounds clip), then linearly
+    interpolated. Degenerate knot sets fall back to the raw mid.
+    """
+    if not knots or len(knots) < 2:
+        return clamp_probability(mid)
+    x = logit(clamp_probability(mid))
+    xs = [float(k[0]) for k in knots]
+    ys = [float(k[1]) for k in knots]
+    if x <= xs[0]:
+        return clamp_probability(ys[0])
+    if x >= xs[-1]:
+        return clamp_probability(ys[-1])
+    for i in range(1, len(xs)):
+        if x <= xs[i]:
+            x0, x1 = xs[i - 1], xs[i]
+            y0, y1 = ys[i - 1], ys[i]
+            if x1 - x0 <= 1e-12:
+                return clamp_probability(y1)
+            t = (x - x0) / (x1 - x0)
+            return clamp_probability(y0 + t * (y1 - y0))
+    return clamp_probability(ys[-1])
+
+
+def fit_isotonic(
+    mids: Sequence[float],
+    outcomes: Sequence[float],
+    *,
+    max_knots: int = MAX_ISOTONIC_KNOTS,
+) -> Tuple[Tuple[float, float], ...]:
+    """
+    Fit a monotone isotonic regression of outcome on ``logit(mid)`` and return
+    it as ascending ``(logit_mid, probability)`` knots (empty on failure).
+
+    scikit-learn is an optional dependency: if it (or the data) is unusable the
+    function returns ``()`` and callers fall back to Platt — fail-closed.
+    """
+    try:
+        import numpy as np
+        from sklearn.isotonic import IsotonicRegression
+    except Exception:
+        return ()
+
+    x = np.array([logit(clamp_probability(m)) for m in mids], dtype=float)
+    y = np.array([1.0 if float(o) >= 0.5 else 0.0 for o in outcomes], dtype=float)
+    if x.size < 2 or float(x.max() - x.min()) <= 1e-9 or len(np.unique(y)) < 2:
+        return ()
+    order = np.argsort(x)
+    x, y = x[order], y[order]
+    try:
+        iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+        iso.fit(x, y)
+        grid = np.linspace(float(x.min()), float(x.max()), max(2, int(max_knots)))
+        preds = iso.predict(grid)
+    except Exception:
+        return ()
+    knots = tuple(
+        (float(gx), float(clamp_probability(float(gp))))
+        for gx, gp in zip(grid, preds)
+        if not (math.isnan(gx) or math.isnan(gp))
+    )
+    return knots if len(knots) >= 2 else ()
 
 
 def segment_for_hours(hours_to_expiry: Optional[float]) -> str:
@@ -119,6 +217,12 @@ def segment_for_hours(hours_to_expiry: Optional[float]) -> str:
     return TTE_SEGMENTS[-1][0]
 
 
+def _ticker_bucket(ticker: str) -> float:
+    """Stable [0, 1) hash bucket for a ticker (reproducible across fits)."""
+    digest = hashlib.md5(str(ticker).encode("utf-8")).digest()
+    return int.from_bytes(digest[:4], "big") / 0xFFFFFFFF
+
+
 def ticker_in_holdout(ticker: str, holdout_fraction: float = HOLDOUT_FRACTION) -> bool:
     """
     Stable ticker-level holdout assignment.
@@ -127,9 +231,7 @@ def ticker_in_holdout(ticker: str, holdout_fraction: float = HOLDOUT_FRACTION) -
     snapshot of a market lands on the same side (no leakage between
     correlated rows).
     """
-    digest = hashlib.md5(str(ticker).encode("utf-8")).digest()
-    bucket = int.from_bytes(digest[:4], "big") / 0xFFFFFFFF
-    return bucket < max(0.0, min(1.0, holdout_fraction))
+    return _ticker_bucket(ticker) < max(0.0, min(1.0, holdout_fraction))
 
 
 def brier_score(probabilities: Sequence[float], outcomes: Sequence[float]) -> float:
@@ -203,9 +305,16 @@ def fit_market_prior_models(
 
     Returns one :class:`MarketPriorModel` per segment that had any data
     (including the pooled ``global`` segment). ``active`` is True only when
-    the segment cleared the sample-size floors *and* beat the identity
-    baseline on the ticker-level holdout.
+    the segment cleared the sample-size floors *and* the chosen model beat the
+    identity baseline on the ticker-level holdout.
+
+    Platt vs isotonic is decided on a separate "select" fold carved from the
+    training tickers; the final model is refit on the full training set. On
+    truly-sigmoidal data Platt wins (simpler), so the Platt path — its
+    coefficients, ``n_train``, and holdout evaluation — is unchanged.
     """
+    # Per segment: train_full rows, the select sub-fold, the train_core
+    # (train_full minus select), and the activation holdout.
     by_segment: Dict[str, Dict[str, List[Tuple[float, float]]]] = {}
     holdout_tickers_by_segment: Dict[str, set] = {}
     for ticker, mid, hours, outcome in samples:
@@ -214,24 +323,74 @@ def fit_market_prior_models(
             # Extreme-priced rows carry almost no calibration information and
             # are dominated by tick-size artifacts.
             continue
-        in_holdout = ticker_in_holdout(ticker, holdout_fraction)
-        split = "holdout" if in_holdout else "train"
+        bucket_val = _ticker_bucket(str(ticker))
+        in_holdout = bucket_val < max(0.0, min(1.0, holdout_fraction))
+        in_select = (not in_holdout) and bucket_val < SELECT_FRACTION_END
+        outcome01 = 1.0 if float(outcome) >= 0.5 else 0.0
         for segment in (segment_for_hours(hours), GLOBAL_SEGMENT):
-            bucket = by_segment.setdefault(segment, {"train": [], "holdout": []})
-            bucket[split].append((mid_f, 1.0 if float(outcome) >= 0.5 else 0.0))
+            bucket = by_segment.setdefault(
+                segment, {"train_full": [], "train_core": [], "select": [], "holdout": []}
+            )
             if in_holdout:
+                bucket["holdout"].append((mid_f, outcome01))
                 holdout_tickers_by_segment.setdefault(segment, set()).add(str(ticker))
+            else:
+                bucket["train_full"].append((mid_f, outcome01))
+                if in_select:
+                    bucket["select"].append((mid_f, outcome01))
+                else:
+                    bucket["train_core"].append((mid_f, outcome01))
 
     fitted: List[MarketPriorModel] = []
     for segment, bucket in by_segment.items():
-        train = bucket["train"]
+        train = bucket["train_full"]
+        train_core = bucket["train_core"]
+        select = bucket["select"]
         holdout = bucket["holdout"]
         if not train:
             continue
+        # Platt is always fit on the FULL training set (unchanged behavior).
         intercept, slope = fit_platt([m for m, _ in train], [o for _, o in train])
 
-        def _model_probability(mid: float) -> float:
+        def _platt_probability(mid: float) -> float:
             return clamp_probability(inv_logit(intercept + slope * logit(mid)))
+
+        # Nested model selection on the held-out "select" fold: only adopt
+        # isotonic when it beats a Platt fit (trained on the same train_core)
+        # on data neither fit saw. Refit the winner on the full train set.
+        model_form = "platt"
+        knots: Tuple[Tuple[float, float], ...] = ()
+        if select and train_core:
+            core_intercept, core_slope = fit_platt(
+                [m for m, _ in train_core], [o for _, o in train_core]
+            )
+            core_knots = fit_isotonic(
+                [m for m, _ in train_core], [o for _, o in train_core]
+            )
+            if core_knots:
+                sel_out = [o for _, o in select]
+                platt_sel = brier_score(
+                    [clamp_probability(inv_logit(core_intercept + core_slope * logit(m)))
+                     for m, _ in select],
+                    sel_out,
+                )
+                iso_sel = brier_score(
+                    [_isotonic_apply(core_knots, m) for m, _ in select], sel_out
+                )
+                if (
+                    not math.isnan(iso_sel)
+                    and not math.isnan(platt_sel)
+                    and iso_sel < platt_sel - ISOTONIC_SELECT_EPS
+                ):
+                    refit = fit_isotonic([m for m, _ in train], [o for _, o in train])
+                    if refit:
+                        model_form = "isotonic"
+                        knots = refit
+
+        def _model_probability(mid: float) -> float:
+            if model_form == "isotonic" and len(knots) >= 2:
+                return _isotonic_apply(knots, mid)
+            return _platt_probability(mid)
 
         train_brier_model = brier_score([_model_probability(m) for m, _ in train], [o for _, o in train])
         train_brier_identity = brier_score([m for m, _ in train], [o for _, o in train])
@@ -264,6 +423,8 @@ def fit_market_prior_models(
                 holdout_brier_model=holdout_brier_model,
                 holdout_brier_identity=holdout_brier_identity,
                 active=active,
+                model_form=model_form,
+                knots=knots,
             )
         )
     return fitted
@@ -309,6 +470,30 @@ def invalidate_market_prior_cache() -> None:
     _models_cache.clear()
 
 
+def knots_to_json(knots: Sequence[Tuple[float, float]]) -> Optional[str]:
+    """Serialize isotonic knots for DB persistence (None when empty)."""
+    if not knots:
+        return None
+    return json.dumps([[float(x), float(y)] for x, y in knots])
+
+
+def _parse_knots_json(value) -> Tuple[Tuple[float, float], ...]:
+    """Parse persisted knots JSON back to a tuple of (logit_mid, prob) pairs."""
+    if not value:
+        return ()
+    try:
+        data = json.loads(value) if isinstance(value, str) else value
+    except (TypeError, ValueError):
+        return ()
+    knots: List[Tuple[float, float]] = []
+    for pair in (data or []):
+        try:
+            knots.append((float(pair[0]), float(pair[1])))
+        except (TypeError, ValueError, IndexError):
+            return ()
+    return tuple(knots)
+
+
 async def load_market_prior_models(db_manager) -> Dict[str, MarketPriorModel]:
     """
     Load active fitted models keyed by segment, cached for 30 minutes.
@@ -327,6 +512,16 @@ async def load_market_prior_models(db_manager) -> Dict[str, MarketPriorModel]:
         rows = await db_manager.get_market_prior_models()
         for row in rows:
             try:
+                model_form = str(row.get("model_form") or "platt")
+                knots = (
+                    _parse_knots_json(row.get("knots_json"))
+                    if model_form == "isotonic"
+                    else ()
+                )
+                # Corrupt/empty isotonic knots fall back to the Platt twin.
+                if model_form == "isotonic" and len(knots) < 2:
+                    model_form = "platt"
+                    knots = ()
                 model = MarketPriorModel(
                     segment=str(row["segment"]),
                     intercept=float(row["intercept"]),
@@ -338,6 +533,8 @@ async def load_market_prior_models(db_manager) -> Dict[str, MarketPriorModel]:
                     holdout_brier_model=float(row["holdout_brier_model"]),
                     holdout_brier_identity=float(row["holdout_brier_identity"]),
                     active=bool(row["active"]),
+                    model_form=model_form,
+                    knots=knots,
                 )
             except (KeyError, TypeError, ValueError):
                 continue

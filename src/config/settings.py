@@ -371,6 +371,14 @@ class SentimentConfig:
     cache_ttl_minutes: int = 30
     max_articles_per_source: int = 10
     relevance_threshold: float = 0.3
+    # Exponential recency half-life (hours) applied to news relevance ranking.
+    # Live-trade markets resolve in hours, so a 3-day-old keyword match should
+    # not outrank breaking news of equal overlap. A very large value disables
+    # the decay (legacy overlap-only ordering). Dateless articles get a neutral
+    # factor — never dropped — and the hard relevance gate stays on raw overlap.
+    news_half_life_hours: float = field(
+        default_factory=lambda: float(os.getenv("NEWS_HALF_LIFE_HOURS", "36.0"))
+    )
 
 
 @dataclass
@@ -511,6 +519,47 @@ class WeatherConfig:
     )
 
 
+@dataclass
+class SportsConfig:
+    """
+    Sportsbook-odds gate anchor configuration.
+
+    ``src/data/sports_adapter.py`` already converts ESPN moneylines into
+    de-vigged implied win probabilities — the single sharpest public prior for
+    game-winner markets, and game-winner sports (NCAAB) is the bot's only
+    proven-profitable niche. This config controls pooling that prior into the
+    live-trade EV gate (``fair_yes_for_gate``) exactly the way the weather
+    deterministic forecast is pooled, so the consensus anchors every sports
+    trade deterministically rather than only reaching the LLM as prose.
+
+    Ships default-on but at a deliberately conservative pool weight (Kalshi
+    title->team mapping is fuzzier than the per-ticker weather mapping) with a
+    kill switch. In-game pooling is disabled by default: ESPN's scoreboard
+    odds block is a pre-game line that goes stale once the game tips off.
+    """
+
+    enabled: bool = field(
+        default_factory=lambda: _get_bool_env("SPORTS_ODDS_GATE_ENABLED", True)
+    )
+    # Weight on the de-vigged sportsbook probability when pooled with the LLM
+    # fair probability in log-odds space. Effective weight is scaled by the
+    # estimate's quality. Conservative default vs weather's 0.75.
+    model_pool_weight: float = field(
+        default_factory=lambda: float(os.getenv("SPORTS_MODEL_POOL_WEIGHT", "0.55"))
+    )
+    # Minimum quality (0-1) before the sportsbook prior is pooled at all.
+    min_quality_to_pool: float = field(
+        default_factory=lambda: float(os.getenv("SPORTS_MIN_QUALITY_TO_POOL", "0.5"))
+    )
+    # Quality ceiling for in-game events. ESPN scoreboard moneylines are the
+    # pre-game consensus and do not track the live score, so by default an
+    # in-game market caps quality at 0 (never pooled). Raise only if a live
+    # odds feed is wired in.
+    in_game_max_quality: float = field(
+        default_factory=lambda: float(os.getenv("SPORTS_IN_GAME_MAX_QUALITY", "0.0"))
+    )
+
+
 # Trading strategy configuration — DISCIPLINED DEFAULTS (sane risk management)
 # Beast mode is still available via --beast flag, but NOT the default.
 # Discipline defaults based on live prediction market trading experience.
@@ -537,10 +586,76 @@ class TradingConfig:
     # Category-specific confidence adjustments (applied as multipliers to base threshold)
     category_confidence_adjustments: Dict[str, float] = field(default_factory=lambda: {
         "sports": 0.90,      # Sports showed best performance (NCAAB 74% WR), lower threshold
-        "economics": 1.15,   # Economics showed -70% ROI, higher threshold required  
+        "economics": 1.15,   # Economics showed -70% ROI, higher threshold required
         "politics": 1.05,    # Slight increase for political volatility
         "default": 1.0       # Base multiplier for other categories
     })
+
+    # Category-specific multipliers on the live-trade NET-EDGE floor. Multiplies
+    # ``live_trade_min_net_edge`` per category before the EV gate, so proven-weak
+    # buckets must clear a higher edge bar and capital concentrates in proven
+    # ones. Defaults are >= 1.0 by design: a sub-1.0 value LOWERS the floor and
+    # could approve trades the flat floor blocks, so any loosening is an explicit
+    # operator opt-in. Unlisted categories fall back to "default" (1.0 = no-op).
+    category_min_net_edge_multipliers: Dict[str, float] = field(default_factory=lambda: {
+        "economics": 1.5,    # -70% ROI historically: demand much more edge
+        "politics": 1.25,    # higher variance, weaker realized record
+        "default": 1.0,      # no change for everything else (incl. sports)
+    })
+
+    # Event-level concentration cap (fraction of portfolio). The per-category
+    # sector cap buckets every same-day NCAAB NO position into one "sports"
+    # bucket; this caps exposure sharing a single Kalshi event/series root so an
+    # upset-heavy slate cannot cluster correlated losses through one event. 1.0
+    # disables the extra check (sector cap still applies).
+    max_event_concentration_pct: float = field(
+        default_factory=lambda: float(os.getenv("MAX_EVENT_CONCENTRATION_PCT", "0.12"))
+    )
+
+    # Total-portfolio usage cap (dry-powder floor) for the live/weather paths.
+    # 1.0 = disabled (full deployment allowed). Set e.g. 0.90 to keep ~10% cash
+    # free for the next high-edge opportunity. Enforced in PortfolioEnforcer.
+    max_portfolio_usage_pct: float = field(
+        default_factory=lambda: float(os.getenv("MAX_PORTFOLIO_USAGE_PCT", "1.0"))
+    )
+
+    # Route decide.py's main BUY path through the canonical evaluate_trade_intent
+    # gate (the same one the live-trade loop and decide's high-confidence path
+    # use) instead of the legacy EdgeFilter gate. OPT-IN (default off): it is a
+    # decision-core behavior change — shadow/backtest before enabling live. When
+    # on, it folds in the market-prior-calibrated anchor, category-aware
+    # calibration slope, the settlement meta-model, the category net-edge
+    # multiplier, and the coin-flip/weak-category surcharge.
+    decide_use_canonical_gate: bool = field(
+        default_factory=lambda: _get_bool_env("DECIDE_USE_CANONICAL_GATE", False)
+    )
+
+    # Cross-market (Polymarket) price pooled into the live-trade EV gate as a
+    # second external prior. OPT-IN (default off): the LLM already sees the
+    # Polymarket price as prose (partial double-count), the text-similarity
+    # ticker mapping can be imprecise, and Polymarket's liquid coverage skews
+    # to politics/crypto (weak overlap with the proven NCAAB niche). When on,
+    # a fresh, liquid, high-confidence match is log-odds-pooled at a small
+    # confidence-scaled weight; agreement shrinks claimed edge, divergence
+    # pulls fair toward consensus. Fails closed on low confidence/volume/stale.
+    cross_market_pool_enabled: bool = field(
+        default_factory=lambda: _get_bool_env("CROSS_MARKET_POOL_ENABLED", False)
+    )
+    cross_market_min_mapping_confidence: float = field(
+        default_factory=lambda: float(os.getenv("CROSS_MARKET_MIN_MAPPING_CONFIDENCE", "0.65"))
+    )
+    cross_market_min_volume_usd: float = field(
+        default_factory=lambda: float(os.getenv("CROSS_MARKET_MIN_VOLUME_USD", "2000"))
+    )
+    cross_market_pool_weight_base: float = field(
+        default_factory=lambda: float(os.getenv("CROSS_MARKET_POOL_WEIGHT_BASE", "0.20"))
+    )
+    cross_market_pool_weight_cap: float = field(
+        default_factory=lambda: float(os.getenv("CROSS_MARKET_POOL_WEIGHT_CAP", "0.25"))
+    )
+    cross_market_max_age_seconds: float = field(
+        default_factory=lambda: float(os.getenv("CROSS_MARKET_MAX_AGE_SECONDS", "900"))
+    )
     
     scan_interval_seconds: int = 60      # SANE: 60-second scan interval (was 30)
     
@@ -986,6 +1101,7 @@ class Settings:
     ensemble: EnsembleConfig = field(default_factory=EnsembleConfig)
     sentiment: SentimentConfig = field(default_factory=SentimentConfig)
     weather: WeatherConfig = field(default_factory=WeatherConfig)
+    sports: SportsConfig = field(default_factory=SportsConfig)
 
     def validate(self) -> bool:
         """Validate configuration settings."""
@@ -1133,6 +1249,15 @@ class Settings:
 
         if not (0.0 <= self.weather.nws_blend_weight <= 1.0):
             raise ValueError("WEATHER_NWS_BLEND_WEIGHT must be between 0 and 1")
+
+        if not (0.0 <= self.sports.model_pool_weight <= 1.0):
+            raise ValueError("SPORTS_MODEL_POOL_WEIGHT must be between 0 and 1")
+
+        if not (0.0 <= self.sports.min_quality_to_pool <= 1.0):
+            raise ValueError("SPORTS_MIN_QUALITY_TO_POOL must be between 0 and 1")
+
+        if not (0.0 <= self.sports.in_game_max_quality <= 1.0):
+            raise ValueError("SPORTS_IN_GAME_MAX_QUALITY must be between 0 and 1")
 
         for sigma_name in (
             "sigma_floor_f",

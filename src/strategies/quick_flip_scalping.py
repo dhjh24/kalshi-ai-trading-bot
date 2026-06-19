@@ -397,8 +397,14 @@ class QuickFlipScalpingStrategy:
         exit_price: float,
         quantity: float,
     ) -> Dict[str, float]:
-        """Estimate gross/net PnL including taker entry and maker exit fees."""
-        entry_fee = self._estimate_kalshi_fee(entry_price, quantity, maker=False)
+        """Estimate gross/net PnL including maker entry and maker exit fees.
+
+        Quick-flip entries are submitted post-only (maker) — see
+        ``_execute_live_maker_entry`` — so the identification gate must price the
+        maker entry fee (1.75%), not the 4x-larger taker fee, or it inflates the
+        minimum profitable exit and rejects genuinely positive-EV scalps.
+        """
+        entry_fee = self._estimate_kalshi_fee(entry_price, quantity, maker=True)
         exit_fee = self._estimate_kalshi_fee(exit_price, quantity, maker=True)
         gross_profit = (exit_price - entry_price) * quantity
         fees_paid = entry_fee + exit_fee
@@ -421,6 +427,7 @@ class QuickFlipScalpingStrategy:
         entry_price: float,
         quantity: float,
         net_profit_at_target: float,
+        tick_size: float = 0.01,
     ) -> Optional[float]:
         """
         Break-even win probability for this scalp's reward/risk profile.
@@ -429,12 +436,18 @@ class QuickFlipScalpingStrategy:
         ``p * reward - (1 - p) * risk > 0``, i.e. ``p > risk / (risk +
         reward)``. Reward is the fee-inclusive net profit at the target
         exit; risk is the stop-loss scenario — full stop distance plus the
-        taker entry fee plus a *taker* exit fee (stop exits cross the
-        spread, they do not rest). Returns None when the inputs are
-        degenerate (callers should already have rejected those).
+        *maker* entry fee (entries are post-only) plus a *taker* exit fee
+        (stop exits cross the spread, they do not rest). The stop distance is
+        priced over the SAME tick-floored stop the executor actually places
+        (``_calculate_stop_loss_price``); pricing risk over the un-floored
+        stop understates true risk at low entry prices and admitted
+        negative-EV scalps. Returns None when the inputs are degenerate
+        (callers should already have rejected those).
         """
-        stop_price = max(0.01, entry_price * (1.0 - self.config.stop_loss_pct))
-        entry_fee = self._estimate_kalshi_fee(entry_price, quantity, maker=False)
+        stop_price = self._calculate_stop_loss_price(
+            entry_price=entry_price, tick_size=tick_size
+        )
+        entry_fee = self._estimate_kalshi_fee(entry_price, quantity, maker=True)
         stop_exit_fee = self._estimate_kalshi_fee(stop_price, quantity, maker=False)
         risk = (entry_price - stop_price) * quantity + entry_fee + stop_exit_fee
         reward = float(net_profit_at_target)
@@ -1463,6 +1476,7 @@ class QuickFlipScalpingStrategy:
                 entry_price=current_ask,
                 quantity=quantity,
                 net_profit_at_target=profit_estimate["net_profit"],
+                tick_size=tick_size,
             )
             if required_win_probability is not None:
                 required_win_probability = min(

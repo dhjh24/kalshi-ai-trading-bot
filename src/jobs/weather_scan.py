@@ -387,6 +387,12 @@ async def _execute_candidate(
         enforcer = PortfolioEnforcer(
             getattr(db_manager, "db_path", "trading_system.db"),
             portfolio_value=balance,
+            max_event_pct=float(
+                getattr(settings.trading, "max_event_concentration_pct", 1.0) or 1.0
+            ),
+            max_portfolio_usage_pct=float(
+                getattr(settings.trading, "max_portfolio_usage_pct", 1.0) or 1.0
+            ),
         )
         await enforcer.initialize()
         allowed, reason = await enforcer.check_trade(

@@ -781,6 +781,63 @@ def _pooled_fair_yes_probability(
     return pooled.probability, disagreement, members
 
 
+def _normalize_sports_label(value: Any) -> str:
+    """Lowercase and collapse non-alphanumerics for fuzzy team matching."""
+    lowered = str(value or "").lower()
+    cleaned = "".join(ch if ch.isalnum() else " " for ch in lowered)
+    return " ".join(cleaned.split())
+
+
+def _looks_like_spread_or_total(label: str) -> bool:
+    """
+    True when a normalized market label looks like a spread/total/score market
+    rather than a plain game-winner — those must not receive a moneyline win
+    probability. Conservative (any numeric token or wagering keyword skips).
+    """
+    tokens = label.split()
+    if any(tok.isdigit() for tok in tokens):
+        return True
+    keywords = {
+        "by", "margin", "points", "point", "spread", "total", "over", "under",
+        "combined", "handicap", "plus", "minus", "odd", "even", "ot", "overtime",
+    }
+    return any(tok in keywords for tok in tokens)
+
+
+def _team_matches_label(team: Any, label: str) -> bool:
+    """
+    True when ``label`` (already normalized) unambiguously names this team via
+    its full display name, its distinctive nickname token, or its abbreviation.
+    """
+    if not isinstance(team, dict):
+        return False
+    label_tokens = label.split()
+    display = _normalize_sports_label(team.get("display_name") or "")
+    if display and display in label:
+        return True
+    if display:
+        nickname = display.split()[-1] if display.split() else ""
+        if len(nickname) >= 4 and nickname in label_tokens:
+            return True
+    abbr = _normalize_sports_label(team.get("abbreviation") or "")
+    if abbr and len(abbr) >= 3 and abbr in label_tokens:
+        return True
+    return False
+
+
+def _polymarket_trade_age_seconds(value: Any) -> Optional[float]:
+    """Age in seconds of a Polymarket last-trade ISO timestamp; None if absent."""
+    if not value:
+        return None
+    try:
+        observed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - observed).total_seconds())
+
+
 def _top_of_book_bid_size(orderbook: Dict[str, Any], side: str) -> float:
     """
     Total quantity resting at the best bid for one orderbook side.
@@ -1033,6 +1090,14 @@ class LiveTradeDecisionLoop:
         # specialist research payloads: market_ticker -> probability entry
         # (+ "cached_at" epoch seconds). Consumed by the EV gate.
         self._weather_model_probs: Dict[str, Dict[str, Any]] = {}
+        # De-vigged sportsbook implied win probabilities harvested from the
+        # research payloads: market_ticker -> probability entry (+ "cached_at").
+        # Consumed by the EV gate the same way as weather.
+        self._sports_model_probs: Dict[str, Dict[str, Any]] = {}
+        # Cross-market (Polymarket) YES prices harvested from the research
+        # payloads: market_ticker -> entry (+ "cached_at"). Pooled into the EV
+        # gate as a second external prior when CROSS_MARKET_POOL_ENABLED.
+        self._cross_market_probs: Dict[str, Dict[str, Any]] = {}
 
     async def _get_calibration_slope(self, market_type: Optional[str] = None) -> float:
         """
@@ -1178,6 +1243,152 @@ class LiveTradeDecisionLoop:
     ) -> Optional[Dict[str, Any]]:
         """Fresh deterministic weather estimate for a ticker, if we have one."""
         entry = self._weather_model_probs.get(str(market_ticker or ""))
+        if not entry:
+            return None
+        cached_at = _safe_float(entry.get("cached_at"), 0.0)
+        if datetime.now(timezone.utc).timestamp() - cached_at > max_age_seconds:
+            return None
+        return entry
+
+    def _harvest_sports_model_probabilities(self, payload: Dict[str, Any]) -> None:
+        """
+        Bind de-vigged sportsbook win probabilities to the per-team game-winner
+        market tickers so the EV gate can pool the sharpest public prior with
+        the LLM estimate (same mechanism as weather).
+
+        Fails closed: needs both de-vigged moneyline legs and an unambiguous
+        team->ticker match (exactly one of the two teams named in the market's
+        YES label, and no spread/total wording). In-game events are skipped by
+        default because ESPN's scoreboard odds block is a stale pre-game line.
+        """
+        try:
+            if not bool(getattr(settings.sports, "enabled", True)):
+                return
+            sports_context = payload.get("sports_context") or {}
+            signals = sports_context.get("signals") or {}
+            odds = signals.get("odds") or {}
+            if not isinstance(odds, dict):
+                return
+            home_prob = _safe_float(odds.get("home_implied_win_probability"), -1.0)
+            away_prob = _safe_float(odds.get("away_implied_win_probability"), -1.0)
+            if not (0.0 < home_prob < 1.0) or not (0.0 < away_prob < 1.0):
+                return  # need both de-vigged legs
+
+            quality = 0.85  # title->team mapping is fuzzier than weather's per-ticker map
+            if bool(signals.get("is_live")):
+                quality = min(
+                    quality,
+                    float(getattr(settings.sports, "in_game_max_quality", 0.0) or 0.0),
+                )
+            if quality <= 0.0:
+                return  # in-game / floored -> pre-game line is stale, do not pool
+
+            teams = (
+                ("home", odds.get("home_team") or {}, home_prob),
+                ("away", odds.get("away_team") or {}, away_prob),
+            )
+            now = datetime.now(timezone.utc).timestamp()
+            event = payload.get("event") or {}
+            for market in (event.get("markets") or []):
+                ticker = str(market.get("ticker") or "").strip()
+                if not ticker:
+                    continue
+                label = _normalize_sports_label(
+                    f"{market.get('yes_sub_title') or ''} {market.get('title') or ''}"
+                )
+                if not label or _looks_like_spread_or_total(label):
+                    continue
+                matched = [
+                    (side_name, prob)
+                    for side_name, team, prob in teams
+                    if _team_matches_label(team, label)
+                ]
+                if len(matched) != 1:
+                    continue  # 0 or 2 matches -> ambiguous, skip (fail-closed)
+                side_name, model_prob = matched[0]
+                self._sports_model_probs[ticker] = {
+                    "model_yes_probability": _clamp(model_prob, lo=0.01, hi=0.99),
+                    "quality": quality,
+                    "source": odds.get("provider") or "espn_odds",
+                    "matched_side": side_name,
+                    "cached_at": now,
+                }
+        except Exception as exc:  # telemetry only — never break the loop
+            self.logger.debug("Sports probability harvest failed", error=str(exc))
+
+    def _sports_model_entry(
+        self, market_ticker: str, *, max_age_seconds: float = 1800.0
+    ) -> Optional[Dict[str, Any]]:
+        """Fresh de-vigged sportsbook estimate for a ticker, if we have one."""
+        entry = self._sports_model_probs.get(str(market_ticker or ""))
+        if not entry:
+            return None
+        cached_at = _safe_float(entry.get("cached_at"), 0.0)
+        if datetime.now(timezone.utc).timestamp() - cached_at > max_age_seconds:
+            return None
+        return entry
+
+    def _harvest_cross_market_probabilities(self, payload: Dict[str, Any]) -> None:
+        """
+        Harvest matched Polymarket YES prices from the research payload so the
+        EV gate can pool an independent market's price as a second prior. Only
+        fresh, liquid, high-confidence matches are kept; everything else is
+        skipped (fail-closed). Gated by ``cross_market_pool_enabled``.
+        """
+        try:
+            if not bool(getattr(settings.trading, "cross_market_pool_enabled", False)):
+                return
+            context = payload.get("cross_market_context") or {}
+            matches = context.get("matches") or []
+            if not isinstance(matches, list):
+                return
+            min_conf = float(
+                getattr(settings.trading, "cross_market_min_mapping_confidence", 0.65) or 0.65
+            )
+            min_volume = float(
+                getattr(settings.trading, "cross_market_min_volume_usd", 2000.0) or 0.0
+            )
+            max_age = float(
+                getattr(settings.trading, "cross_market_max_age_seconds", 900.0) or 0.0
+            )
+            now = datetime.now(timezone.utc).timestamp()
+            for match in matches:
+                if not isinstance(match, dict):
+                    continue
+                ticker = str(match.get("kalshi_ticker") or "").strip()
+                if not ticker:
+                    continue
+                yes_price = _safe_float(match.get("polymarket_yes_price"), -1.0)
+                if not (0.0 < yes_price < 1.0):
+                    continue
+                confidence = _safe_float(match.get("mapping_confidence"), 0.0)
+                if confidence < min_conf:
+                    continue
+                volume = _safe_float(match.get("polymarket_volume_usd"), 0.0)
+                if min_volume > 0 and volume < min_volume:
+                    continue
+                # Staleness guard when a last-trade timestamp is available; a
+                # missing timestamp falls back to the 5-min snapshot cache +
+                # volume floor (parity convention: missing telemetry skips the
+                # check rather than failing the harvest).
+                if max_age > 0:
+                    age = _polymarket_trade_age_seconds(match.get("polymarket_last_trade_at"))
+                    if age is not None and age > max_age:
+                        continue
+                self._cross_market_probs[ticker] = {
+                    "polymarket_yes_probability": _clamp(yes_price, lo=0.01, hi=0.99),
+                    "mapping_confidence": confidence,
+                    "volume_usd": volume,
+                    "cached_at": now,
+                }
+        except Exception as exc:  # telemetry only — never break the loop
+            self.logger.debug("Cross-market probability harvest failed", error=str(exc))
+
+    def _cross_market_entry(
+        self, market_ticker: str, *, max_age_seconds: float = 1800.0
+    ) -> Optional[Dict[str, Any]]:
+        """Fresh matched Polymarket price for a ticker, if we have one."""
+        entry = self._cross_market_probs.get(str(market_ticker or ""))
         if not entry:
             return None
         cached_at = _safe_float(entry.get("cached_at"), 0.0)
@@ -1614,6 +1825,8 @@ class LiveTradeDecisionLoop:
             )
 
         self._harvest_weather_model_probabilities(payload)
+        self._harvest_sports_model_probabilities(payload)
+        self._harvest_cross_market_probabilities(payload)
 
         focus_type = str(event.get("focus_type") or "general").lower()
         specialist_label = {
@@ -1631,6 +1844,15 @@ class LiveTradeDecisionLoop:
                 "forecast. Anchor your fair_yes_probability on them — deviate only "
                 "with concrete evidence the model missed (e.g. a frontal timing shift "
                 "in the latest discussion), and say why.\n"
+            )
+        if focus_type == "sports":
+            weather_prompt_line += (
+                "The sports_context.signals.odds block carries DE-VIGGED sportsbook "
+                "implied win probabilities (home_implied_win_probability / "
+                "away_implied_win_probability) — the sharpest public consensus for "
+                "game-winner markets. Treat them as the prior and anchor "
+                "fair_yes_probability to the matching team's number; stray only with "
+                "concrete in-game evidence the book may lag, and say why.\n"
             )
         prompt = (
             f"You are the {specialist_label} for a short-dated prediction-market bot.\n"
@@ -2115,6 +2337,127 @@ class LiveTradeDecisionLoop:
                     )
 
         # ------------------------------------------------------------------
+        # Sportsbook override: de-vigged moneyline implied win probabilities
+        # are the sharpest public prior for game-winner markets — and sports
+        # (NCAAB) is the bot's only proven-profitable niche. When a fresh,
+        # unambiguous per-team odds estimate exists for this ticker it is
+        # pooled into the LLM estimate (log-odds, weight scaled by quality),
+        # exactly like the weather model. Mutually exclusive with weather (an
+        # event is one focus type); fails closed to the LLM estimate on any
+        # ambiguity, missing leg, in-game staleness, or low quality.
+        # ------------------------------------------------------------------
+        sports_pooled_from: Optional[Dict[str, Any]] = None
+        if weather_pooled_from is None and bool(getattr(settings.sports, "enabled", True)):
+            sports_entry = self._sports_model_entry(market_ticker)
+            if sports_entry is not None:
+                sports_model_prob = _clamp(
+                    _safe_float(sports_entry.get("model_yes_probability"), 0.5),
+                    lo=0.01,
+                    hi=0.99,
+                )
+                sports_quality = _clamp(
+                    _safe_float(sports_entry.get("quality"), 0.0), lo=0.0, hi=1.0
+                )
+                sports_min_quality = float(
+                    getattr(settings.sports, "min_quality_to_pool", 0.5) or 0.5
+                )
+                if sports_quality >= sports_min_quality:
+                    from src.utils.probability_engine import pool_probabilities
+
+                    sports_pool_weight = _clamp(
+                        float(getattr(settings.sports, "model_pool_weight", 0.55) or 0.55)
+                        * sports_quality,
+                        lo=0.0,
+                        hi=0.95,
+                    )
+                    sports_pooled = pool_probabilities(
+                        [
+                            (fair_yes_for_gate, 1.0 - sports_pool_weight),
+                            (sports_model_prob, sports_pool_weight),
+                        ],
+                        extremize=1.0,
+                    )
+                    if sports_pooled is not None:
+                        sports_pooled_from = {
+                            "llm_fair_yes_probability": fair_yes_for_gate,
+                            "sportsbook_yes_probability": sports_model_prob,
+                            "quality": sports_quality,
+                            "source": sports_entry.get("source"),
+                            "matched_side": sports_entry.get("matched_side"),
+                            "pool_weight": sports_pool_weight,
+                        }
+                        fair_yes_for_gate = sports_pooled.probability
+                        self.logger.info(
+                            "Pooled sportsbook probability into EV gate",
+                            market_ticker=market_ticker,
+                            llm_fair=sports_pooled_from["llm_fair_yes_probability"],
+                            sportsbook=sports_model_prob,
+                            pooled=fair_yes_for_gate,
+                            quality=sports_quality,
+                        )
+
+        # ------------------------------------------------------------------
+        # Cross-market (Polymarket) anchor: an independent market pricing the
+        # same question is a second external prior. OPT-IN and low-weight; only
+        # pools when neither a weather nor a sportsbook model already anchored
+        # this trade (a market is one focus type, but stay deterministic).
+        # Agreement shrinks claimed edge; divergence pulls fair toward the
+        # cross-market consensus. Fails closed on any miss.
+        # ------------------------------------------------------------------
+        cross_market_pooled_from: Optional[Dict[str, Any]] = None
+        if (
+            weather_pooled_from is None
+            and sports_pooled_from is None
+            and bool(getattr(settings.trading, "cross_market_pool_enabled", False))
+        ):
+            cross_entry = self._cross_market_entry(market_ticker)
+            if cross_entry is not None:
+                poly_prob = _clamp(
+                    _safe_float(cross_entry.get("polymarket_yes_probability"), 0.5),
+                    lo=0.01,
+                    hi=0.99,
+                )
+                mapping_confidence = _clamp(
+                    _safe_float(cross_entry.get("mapping_confidence"), 0.0), lo=0.0, hi=1.0
+                )
+                from src.utils.probability_engine import pool_probabilities
+
+                weight_base = float(
+                    getattr(settings.trading, "cross_market_pool_weight_base", 0.20) or 0.20
+                )
+                weight_cap = float(
+                    getattr(settings.trading, "cross_market_pool_weight_cap", 0.25) or 0.25
+                )
+                cross_pool_weight = _clamp(
+                    weight_base * mapping_confidence, lo=0.0, hi=max(0.0, weight_cap)
+                )
+                if cross_pool_weight > 0:
+                    cross_pooled = pool_probabilities(
+                        [
+                            (fair_yes_for_gate, 1.0 - cross_pool_weight),
+                            (poly_prob, cross_pool_weight),
+                        ],
+                        extremize=1.0,
+                    )
+                    if cross_pooled is not None:
+                        cross_market_pooled_from = {
+                            "llm_fair_yes_probability": fair_yes_for_gate,
+                            "polymarket_yes_probability": poly_prob,
+                            "mapping_confidence": mapping_confidence,
+                            "volume_usd": cross_entry.get("volume_usd"),
+                            "pool_weight": cross_pool_weight,
+                        }
+                        fair_yes_for_gate = cross_pooled.probability
+                        self.logger.info(
+                            "Pooled cross-market (Polymarket) probability into EV gate",
+                            market_ticker=market_ticker,
+                            llm_fair=cross_market_pooled_from["llm_fair_yes_probability"],
+                            polymarket=poly_prob,
+                            pooled=fair_yes_for_gate,
+                            mapping_confidence=mapping_confidence,
+                        )
+
+        # ------------------------------------------------------------------
         # Microstructure guard: refuse entries into wide or empty books.
         # A wide spread makes the midpoint blend unreliable (the "market
         # probability" is a guess between distant quotes), and a thin top
@@ -2233,8 +2576,55 @@ class LiveTradeDecisionLoop:
                 market_yes_prior = market_yes_mid
                 market_prior_segment = None
 
+        # Outcome meta-model: the settlement-trained corrector (the same one
+        # decide.py already profits from) refines the pooled fair probability
+        # in held-side space before the gate. No-op until it has enough settled
+        # samples AND beats the raw LLM Brier in CV (fail-closed). Mode-blind,
+        # so paper/live parity holds whether or not it is active. The PRE-meta
+        # value stays the recorded calibration label so the model never trains
+        # on its own corrected output.
+        pre_meta_fair_yes_for_gate = fair_yes_for_gate
+        gate_fair_yes = fair_yes_for_gate
+        if bool(getattr(settings.trading, "ml_meta_model_enabled", True)):
+            try:
+                from src.jobs.decide import _apply_ml_meta_model
+                from src.utils.probability_engine import side_win_probability
+
+                side_prob = side_win_probability(fair_yes_for_gate, intent_side)
+                adjusted_side = await _apply_ml_meta_model(
+                    self.db_manager,
+                    side_win_probability=side_prob,
+                    entry_price=limit_price,
+                    side=intent_side,
+                    confidence=intent_confidence,
+                )
+                gate_fair_yes = _clamp(
+                    adjusted_side if intent_side == "YES" else 1.0 - adjusted_side,
+                    lo=0.01,
+                    hi=0.99,
+                )
+            except Exception as exc:
+                self.logger.debug(
+                    "Outcome meta-model adjustment unavailable", error=str(exc)
+                )
+                gate_fair_yes = fair_yes_for_gate
+
+        # Category-tiered net-edge floor: proven-weak categories must clear a
+        # higher edge bar so capital concentrates in proven ones. Reuses the
+        # category_label already computed for the confidence multiplier.
+        base_min_net_edge = float(
+            getattr(settings.trading, "live_trade_min_net_edge", 0.02) or 0.0
+        )
+        edge_multipliers = dict(
+            getattr(settings.trading, "category_min_net_edge_multipliers", {}) or {}
+        )
+        min_net_edge_multiplier = float(
+            edge_multipliers.get(category_label, edge_multipliers.get("default", 1.0))
+        )
+        effective_min_net_edge = max(0.0, base_min_net_edge * min_net_edge_multiplier)
+
         gate = evaluate_trade_intent(
-            fair_yes_probability=fair_yes_for_gate,
+            fair_yes_probability=gate_fair_yes,
             side=intent_side,
             entry_price=limit_price,
             market_yes_probability=market_yes_prior,
@@ -2246,13 +2636,14 @@ class LiveTradeDecisionLoop:
             ),
             maker=expects_maker_entry,
             include_exit_fee=is_quick_flip_intent,
-            min_net_edge=float(
-                getattr(settings.trading, "live_trade_min_net_edge", 0.02) or 0.0
-            ),
+            min_net_edge=effective_min_net_edge,
             disagreement=intent_disagreement,
         )
         gate_snapshot = {
-            "fair_yes_probability": gate["fair_yes_probability"],
+            # Recorded as the calibration training label — deliberately the
+            # PRE-meta-model pooled value (see above).
+            "fair_yes_probability": pre_meta_fair_yes_for_gate,
+            "meta_adjusted_fair_yes_probability": gate_fair_yes,
             "market_yes_midpoint": market_yes_mid,
             "market_yes_prior": market_yes_prior,
             "market_prior_segment": market_prior_segment,
@@ -2268,7 +2659,11 @@ class LiveTradeDecisionLoop:
             "top_depth_contracts": top_depth_contracts,
             "disagreement": intent_disagreement,
             "disagreement_edge_padding": gate["disagreement_edge_padding"],
+            "min_net_edge_multiplier": min_net_edge_multiplier,
+            "effective_min_net_edge": effective_min_net_edge,
             "weather_model": weather_pooled_from,
+            "sports_model": sports_pooled_from,
+            "cross_market_model": cross_market_pooled_from,
             "member_probabilities": final_intent.get("member_probabilities") or [],
         }
         if not gate["approved"]:

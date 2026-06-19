@@ -756,6 +756,9 @@ class LiveTradeResearchService(TradingLoggerMixin):
                             "polymarket_yes_price": best.get("yes_price"),
                             "polymarket_no_price": best.get("no_price"),
                             "polymarket_volume_usd": best.get("volume_usd"),
+                            # Carried through so the EV-gate harvester can enforce
+                            # a staleness guard before pooling the price.
+                            "polymarket_last_trade_at": best.get("last_trade_at"),
                             "mapping_confidence": round(best_confidence, 3),
                         }
                     )

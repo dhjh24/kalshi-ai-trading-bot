@@ -501,8 +501,34 @@ class SportsAdapter(TradingLoggerMixin):
         # markets — sharper than any single-model estimate.
         odds = SportsAdapter._extract_odds(competition)
         if odds is not None:
+            # Bind home/away team identity onto the odds block so downstream
+            # consumers (the live-trade EV gate) can resolve which side of a
+            # per-team Kalshi market each de-vigged win probability belongs to
+            # without re-deriving the home/away mapping. The home/away->prob
+            # binding is computed here and would otherwise be discarded.
+            odds["home_team"] = SportsAdapter._competitor_team_identity(home)
+            odds["away_team"] = SportsAdapter._competitor_team_identity(away)
             signals["odds"] = odds
         return signals
+
+    @staticmethod
+    def _competitor_team_identity(
+        competitor: Optional[Mapping[str, Any]],
+    ) -> Optional[Dict[str, str]]:
+        """Pull {id, display_name, abbreviation} from an ESPN competitor block."""
+        if not isinstance(competitor, Mapping):
+            return None
+        team = competitor.get("team")
+        if not isinstance(team, Mapping):
+            return None
+        identity = {
+            "id": str(team.get("id") or ""),
+            "display_name": str(team.get("displayName") or ""),
+            "abbreviation": str(team.get("abbreviation") or ""),
+        }
+        if not any(identity.values()):
+            return None
+        return identity
 
 
 async def fetch_context(

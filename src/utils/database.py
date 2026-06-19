@@ -14,6 +14,16 @@ from src.utils.logging_setup import TradingLoggerMixin
 
 LLM_USAGE_RECENT_WINDOW_DAYS = 7
 
+# Half-life (days) for exponential recency weighting of role-skill Brier
+# scores. Model lineups and market regimes drift, so a dead regime should not
+# keep up-weighting a role forever; recent settlements count more. A very large
+# value approximates the legacy unweighted lifetime average. Rows with a
+# missing/unparseable settled_at are treated as "now" (weight 1.0) so legacy
+# backfill rows are never silently dropped.
+MODEL_SKILL_BRIER_HALFLIFE_DAYS = float(
+    os.getenv("MODEL_SKILL_BRIER_HALFLIFE_DAYS", "90")
+)
+
 
 def _safe_load_json(value: Any) -> Optional[Any]:
     """Best-effort JSON decode for TEXT columns, returning None on failure."""
@@ -1664,6 +1674,22 @@ class DatabaseManager(TradingLoggerMixin):
                 fitted_at TEXT NOT NULL
             )
         """)
+        # Isotonic-calibration columns (added later). model_form is 'platt' or
+        # 'isotonic'; knots_json holds the isotonic breakpoints. Idempotent
+        # ALTERs so legacy DBs upgrade in place (NULL -> Platt on load).
+        cursor = await db.execute("PRAGMA table_info(market_prior_models)")
+        mp_info = await cursor.fetchall()
+        mp_columns = {col[1] for col in mp_info}
+        if mp_info and "model_form" not in mp_columns:
+            await db.execute(
+                "ALTER TABLE market_prior_models ADD COLUMN model_form TEXT DEFAULT 'platt'"
+            )
+            self.logger.info("Added model_form column to market_prior_models table")
+        if mp_info and "knots_json" not in mp_columns:
+            await db.execute(
+                "ALTER TABLE market_prior_models ADD COLUMN knots_json TEXT"
+            )
+            self.logger.info("Added knots_json column to market_prior_models table")
 
         # Per-ensemble-member realized accuracy. Rebuilt alongside
         # settlement_calibration from executed decisions' member
@@ -4534,8 +4560,8 @@ class DatabaseManager(TradingLoggerMixin):
                         segment, intercept, slope, n_train, n_holdout,
                         train_brier_model, train_brier_identity,
                         holdout_brier_model, holdout_brier_identity,
-                        active, fitted_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        active, fitted_at, model_form, knots_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         str(row["segment"]),
@@ -4549,6 +4575,8 @@ class DatabaseManager(TradingLoggerMixin):
                         _nan_to_none(row.get("holdout_brier_identity")),
                         1 if row.get("active") else 0,
                         fitted_at,
+                        str(row.get("model_form") or "platt"),
+                        row.get("knots_json"),
                     ),
                 )
             await db.commit()
@@ -4574,29 +4602,68 @@ class DatabaseManager(TradingLoggerMixin):
         With ``market_type`` (normalized via :func:`normalize_market_type`),
         only observations from that category count — feeding the per-category
         skill multipliers. Without it, the global summary is returned.
+
+        The mean Brier is exponentially recency-weighted (half-life
+        :data:`MODEL_SKILL_BRIER_HALFLIFE_DAYS`) and the returned sample count
+        is the EFFECTIVE count (sum of weights), so a role whose accuracy is
+        stale carries less influence and shrinks harder toward the no-skill
+        prior. Rows with a missing/unparseable ``settled_at`` get weight 1.0
+        (treated as "now") so legacy backfill rows are never dropped.
         """
         query = (
-            "SELECT role, COUNT(*) AS n, AVG(brier_score) AS avg_brier "
-            "FROM model_skill_observations"
+            "SELECT role, brier_score, settled_at FROM model_skill_observations"
         )
         params: Tuple[Any, ...] = ()
         if market_type is not None:
             query += " WHERE market_type = ?"
             params = (_normalize_calibration_market_type(market_type),)
-        query += " GROUP BY role"
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 cursor = await db.execute(query, params)
                 rows = await cursor.fetchall()
         except aiosqlite.Error:
             return {}
-        summary: Dict[str, Tuple[int, float]] = {}
-        for role, n, avg_brier in rows:
+
+        now = datetime.now(timezone.utc)
+        half_life = max(1e-6, float(MODEL_SKILL_BRIER_HALFLIFE_DAYS))
+        # role -> [weighted_brier_sum, weight_sum]
+        accum: Dict[str, List[float]] = {}
+        for role, brier_score, settled_at in rows:
             try:
-                summary[str(role)] = (int(n), float(avg_brier))
+                brier = float(brier_score)
             except (TypeError, ValueError):
                 continue
+            weight = self._recency_weight(settled_at, now, half_life)
+            bucket = accum.setdefault(str(role), [0.0, 0.0])
+            bucket[0] += weight * brier
+            bucket[1] += weight
+
+        summary: Dict[str, Tuple[int, float]] = {}
+        for role, (weighted_sum, weight_total) in accum.items():
+            if weight_total <= 0:
+                continue
+            effective_n = int(round(weight_total))
+            if effective_n <= 0:
+                continue
+            summary[role] = (effective_n, weighted_sum / weight_total)
         return summary
+
+    @staticmethod
+    def _recency_weight(
+        settled_at: Any, now: datetime, half_life_days: float
+    ) -> float:
+        """Exponential recency weight in (0, 1]. Unparseable date -> 1.0 (now)."""
+        if not settled_at:
+            return 1.0
+        try:
+            observed = datetime.fromisoformat(str(settled_at).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return 1.0
+        if observed.tzinfo is None:
+            observed = observed.replace(tzinfo=timezone.utc)
+        age_days = (now - observed).total_seconds() / 86400.0
+        age_days = max(0.0, age_days)
+        return 0.5 ** (age_days / half_life_days)
 
     async def get_calibration_feature_rows(
         self,

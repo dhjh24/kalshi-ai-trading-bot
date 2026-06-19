@@ -243,7 +243,7 @@ async def refresh_market_prior_models(db_manager) -> int:
     Build the training set from labelled snapshots, fit per-segment Platt
     scalers, persist them, and return the number of *active* segments.
     """
-    from src.utils.market_prior import fit_market_prior_models
+    from src.utils.market_prior import fit_market_prior_models, knots_to_json
 
     samples = await db_manager.sample_settled_snapshot_rows()
     if not samples:
@@ -264,6 +264,8 @@ async def refresh_market_prior_models(db_manager) -> int:
             "holdout_brier_model": model.holdout_brier_model,
             "holdout_brier_identity": model.holdout_brier_identity,
             "active": model.active,
+            "model_form": model.model_form,
+            "knots_json": knots_to_json(model.knots),
         }
         for model in fitted
     ]

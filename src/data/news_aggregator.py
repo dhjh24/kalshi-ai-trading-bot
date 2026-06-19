@@ -119,6 +119,8 @@ class NewsAggregator(TradingLoggerMixin):
         self,
         market_title: str,
         max_articles: int = 5,
+        *,
+        now: Optional[datetime] = None,
     ) -> List[Tuple[NewsArticle, float]]:
         """
         Return articles from the cache scored by relevance to *market_title*.
@@ -127,22 +129,54 @@ class NewsAggregator(TradingLoggerMixin):
         title, then score each article by the fraction of those terms that
         appear in the article's title + summary.
 
+        The hard inclusion gate stays on the RAW overlap score (so a market
+        with only modestly-stale news still surfaces articles), but the
+        ordering is by overlap weighted by an exponential recency factor
+        (half-life ``settings.sentiment.news_half_life_hours``). Live-trade
+        markets resolve in hours, so breaking news of equal overlap should
+        outrank a three-day-old match in the ``max_articles`` cap. Dateless
+        articles get a neutral 0.5 factor — never dropped, never treated as
+        fresh.
+
         Returns:
-            List of (NewsArticle, relevance_score) tuples sorted by score desc.
-            Only articles meeting the configured relevance_threshold are included.
+            List of (NewsArticle, raw_relevance_score) tuples, ordered by the
+            recency-weighted score. The returned score is the raw overlap so
+            downstream sentiment weighting semantics are unchanged.
         """
         keywords = self._extract_keywords(market_title)
         if not keywords:
             return []
 
-        scored: List[Tuple[NewsArticle, float]] = []
+        reference = now or datetime.now(tz=timezone.utc)
+        half_life = max(1e-6, float(settings.sentiment.news_half_life_hours))
+
+        scored: List[Tuple[NewsArticle, float, float]] = []
         for article in self._cache:
             score = self._score_relevance(article, keywords)
             if score >= settings.sentiment.relevance_threshold:
-                scored.append((article, score))
+                recency = self._recency_factor(article.published, reference, half_life)
+                scored.append((article, score, score * recency))
 
-        scored.sort(key=lambda pair: pair[1], reverse=True)
-        return scored[:max_articles]
+        # Order by recency-weighted score; return the raw overlap relevance.
+        scored.sort(key=lambda triple: triple[2], reverse=True)
+        return [(article, score) for article, score, _ranked in scored[:max_articles]]
+
+    @staticmethod
+    def _recency_factor(
+        published: Optional[datetime],
+        reference: datetime,
+        half_life_hours: float,
+    ) -> float:
+        """Exponential recency weight in (0, 1]. Dateless -> neutral 0.5."""
+        if published is None:
+            return 0.5
+        published_utc = published
+        if published_utc.tzinfo is None:
+            published_utc = published_utc.replace(tzinfo=timezone.utc)
+        age_hours = (reference - published_utc).total_seconds() / 3600.0
+        # Clamp future-dated / clock-skewed articles to "now" (factor 1.0).
+        age_hours = max(0.0, age_hours)
+        return 0.5 ** (age_hours / half_life_hours)
 
     # ------------------------------------------------------------------
     # Internal helpers

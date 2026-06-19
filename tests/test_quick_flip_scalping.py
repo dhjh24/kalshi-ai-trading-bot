@@ -44,9 +44,14 @@ def test_estimate_trade_profit_includes_fees():
         quantity=25,
     )
 
+    # Quick-flip entries are post-only maker, so the identification gate prices
+    # a maker entry fee (not taker) — derived here to stay in lockstep with the
+    # fee schedule rather than hardcoding a magic number.
+    entry_fee = estimate_kalshi_fee(0.18, 25, maker=True)
+    exit_fee = estimate_kalshi_fee(0.23, 25, maker=True)
     assert estimate["gross_profit"] == pytest.approx(1.25)
-    assert estimate["fees_paid"] == pytest.approx(0.34)
-    assert estimate["net_profit"] == pytest.approx(0.91)
+    assert estimate["fees_paid"] == pytest.approx(entry_fee + exit_fee)
+    assert estimate["net_profit"] == pytest.approx(1.25 - (entry_fee + exit_fee))
     assert estimate["net_roi"] > 0
 
 
@@ -216,7 +221,9 @@ async def test_evaluate_price_opportunity_raises_target_to_fee_adjusted_exit():
     )
 
     assert opportunity is not None
-    assert opportunity.exit_price == pytest.approx(0.22)
+    # With the maker entry fee (entries are post-only), the lowest profitable
+    # exit clears one tick sooner than under the old taker-fee assumption.
+    assert opportunity.exit_price == pytest.approx(0.21)
     assert opportunity.expected_profit > 0
 
 

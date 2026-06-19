@@ -643,17 +643,19 @@ def _qf_market():
 def test_required_win_probability_matches_reward_risk_arithmetic():
     strategy = _quick_flip_strategy()
     required = strategy._required_win_probability(
-        entry_price=0.19, quantity=25, net_profit_at_target=0.40
+        entry_price=0.19, quantity=25, net_profit_at_target=0.40, tick_size=0.01
     )
-    stop_price = 0.19 * (1 - strategy.config.stop_loss_pct)
-    entry_fee = strategy._estimate_kalshi_fee(0.19, 25, maker=False)
+    # Risk is priced over the SAME tick-floored stop the executor places, with a
+    # maker entry fee (post-only entry) and a taker stop-exit fee (stops cross).
+    stop_price = strategy._calculate_stop_loss_price(entry_price=0.19, tick_size=0.01)
+    entry_fee = strategy._estimate_kalshi_fee(0.19, 25, maker=True)
     stop_fee = strategy._estimate_kalshi_fee(stop_price, 25, maker=False)
     risk = (0.19 - stop_price) * 25 + entry_fee + stop_fee
     assert required == pytest.approx(risk / (risk + 0.40))
     assert 0.5 < required < 0.9
 
     assert strategy._required_win_probability(
-        entry_price=0.19, quantity=25, net_profit_at_target=0.0
+        entry_price=0.19, quantity=25, net_profit_at_target=0.0, tick_size=0.01
     ) is None
 
 
@@ -661,7 +663,7 @@ def test_required_win_probability_matches_reward_risk_arithmetic():
 async def test_quick_flip_ev_gate_blocks_marginal_confidence():
     strategy = _quick_flip_strategy()
     strategy._analyze_market_movement = AsyncMock(
-        return_value={"target_price": 0.22, "confidence": 0.65, "reason": "bounce"}
+        return_value={"target_price": 0.21, "confidence": 0.65, "reason": "bounce"}
     )
     strategy._get_recent_trade_stats = AsyncMock(
         return_value={
@@ -679,8 +681,10 @@ async def test_quick_flip_ev_gate_blocks_marginal_confidence():
         hours_to_expiry=2.0,
         market_volume=5000,
     )
-    # 0.65 confidence clears the legacy 0.6 threshold but NOT the ~0.70
-    # break-even win probability of this reward/risk profile.
+    # The lowest profitable exit at this entry is 0.21 (net ~$0.35 over a
+    # ~$0.82 stop-loss risk), a ~0.70 break-even win probability. 0.65
+    # confidence clears the legacy 0.6 threshold but NOT that break-even, so
+    # the EV gate must still reject it.
     assert opportunity is None
 
 

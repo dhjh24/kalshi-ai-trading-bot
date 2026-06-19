@@ -7,7 +7,7 @@ import asyncio
 import json
 import time
 import numpy as np
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -72,35 +72,57 @@ def _extract_fair_probability(
 # Calibration slope cache for the standard decision path: (slope, expires_at).
 # The live-trade loop maintains its own; this closes the same feedback loop
 # for trades created through make_decision_for_market.
-_CALIBRATION_SLOPE_CACHE: Dict[str, Any] = {"slope": 1.0, "expires_at": 0.0}
+# Per-market-type ("" = global) cache: key -> (slope, expires_at).
+_CALIBRATION_SLOPE_CACHE: Dict[str, Any] = {}
 _CALIBRATION_SLOPE_TTL_SECONDS = 1800.0
 
 
-async def _get_decision_calibration_slope(db_manager: DatabaseManager) -> float:
+async def _get_decision_calibration_slope(
+    db_manager: DatabaseManager, market_type: Optional[str] = None
+) -> float:
     """
-    Reliability slope from realized settlements, cached for 30 minutes.
+    Reliability slope from realized settlements, cached 30 minutes per category.
     1.0 = no shrink; lower values shrink model probabilities toward 0.5
     before the edge gate so a persistently overconfident ensemble
     automatically trades less until its calibration recovers.
+
+    When ``market_type`` is provided and that category has accumulated enough
+    settled samples, its category-specific slope is used (overconfident
+    categories shrink harder), mirroring the live-trade loop; otherwise the
+    pooled global slope. ``market_type=None`` preserves the original
+    global-only behavior.
     """
     if not bool(getattr(settings.trading, "calibration_shrink_enabled", True)):
         return 1.0
-    now = time.time()
-    if _CALIBRATION_SLOPE_CACHE["expires_at"] > now:
-        return float(_CALIBRATION_SLOPE_CACHE["slope"])
 
-    from src.utils.probability_engine import calibration_shrink_slope
+    from src.utils.probability_engine import (
+        MIN_CALIBRATION_SAMPLES,
+        calibration_shrink_slope,
+    )
+
+    cache_key = (market_type or "").strip().lower()
+    now = time.time()
+    cached = _CALIBRATION_SLOPE_CACHE.get(cache_key)
+    if cached is not None and cached[1] > now:
+        return float(cached[0])
 
     slope = 1.0
     try:
-        samples = await db_manager.get_calibration_samples(limit=500)
+        samples: list = []
+        if cache_key:
+            samples = await db_manager.get_calibration_samples(
+                market_type=cache_key, limit=500
+            )
+            if len(samples) < MIN_CALIBRATION_SAMPLES:
+                samples = await db_manager.get_calibration_samples(limit=500)
+        else:
+            samples = await db_manager.get_calibration_samples(limit=500)
         slope = calibration_shrink_slope(samples)
     except Exception as exc:
         get_trading_logger("decision_engine").debug(
             "Calibration slope lookup failed", error=str(exc)
         )
-    _CALIBRATION_SLOPE_CACHE["slope"] = slope
-    _CALIBRATION_SLOPE_CACHE["expires_at"] = now + _CALIBRATION_SLOPE_TTL_SECONDS
+    _CALIBRATION_SLOPE_CACHE[cache_key] = (slope, now + _CALIBRATION_SLOPE_TTL_SECONDS)
     return slope
 
 
@@ -190,6 +212,142 @@ async def _apply_ml_meta_model(
             "ML meta-model blend skipped", error=str(exc)
         )
         return side_win_probability
+
+
+def _decide_category_edge_surcharge(
+    market_probability: float, category_score: Optional[float]
+) -> float:
+    """
+    Extra required net edge ($/contract) ported from EdgeFilter's statistical
+    surcharges so the canonical gate keeps the same protections: near-50c
+    markets (max randomness + max fees) demand more edge unless the category is
+    statistically strong, and weak categories demand more still. A probability
+    edge of ``x`` maps ~1:1 to ``$x`` of net edge per contract (a contract pays
+    $1), and the surcharge can only ever RAISE the bar.
+    """
+    from src.utils.edge_filter import EdgeFilter
+
+    surcharge = 0.0
+    in_zone = (
+        EdgeFilter.COIN_FLIP_ZONE_LOW
+        <= market_probability
+        <= EdgeFilter.COIN_FLIP_ZONE_HIGH
+    )
+    strong = (
+        category_score is not None and category_score >= EdgeFilter.STRONG_CATEGORY_SCORE
+    )
+    if in_zone and not strong:
+        surcharge += EdgeFilter.COIN_FLIP_ZONE_PENALTY
+    if category_score is not None and category_score < EdgeFilter.WEAK_CATEGORY_SCORE:
+        surcharge += EdgeFilter.WEAK_CATEGORY_PENALTY
+    return surcharge
+
+
+async def _evaluate_decide_canonical_gate(
+    *,
+    db_manager: DatabaseManager,
+    market: Market,
+    decision: Any,
+    fair_yes: Optional[float],
+    ensemble_disagreement: Optional[float],
+    price: float,
+    market_prob: float,
+    category_assessment: Dict[str, Any],
+) -> Tuple[bool, str, float]:
+    """
+    Canonical EV gate for the standard decision path (opt-in via
+    ``DECIDE_USE_CANONICAL_GATE``). Routes the trade through the SAME
+    ``evaluate_trade_intent`` used by the live-trade loop and decide's
+    high-confidence path, so the three gates stop deciding the same trade
+    differently. Returns ``(should_trade, reason, ai_prob)`` where ``ai_prob``
+    is the gate's blended side-win probability (used downstream for Kelly
+    sizing).
+
+    Parity with the live loop: calibration-shrink + market-prior-calibrated
+    anchor are done INSIDE the gate; the settlement meta-model is pre-applied
+    to the held-side probability beforehand (feature-consistent with its
+    pre-shrink training label); EdgeFilter's coin-flip/weak-category surcharge
+    and category net-edge multiplier are folded into ``min_net_edge``;
+    disagreement padding is applied by the gate. Fails closed (reject) when no
+    fair probability is available.
+    """
+    from src.utils.probability_engine import (
+        clamp_probability,
+        evaluate_trade_intent,
+        side_win_probability,
+    )
+
+    side = str(decision.side or "YES").upper()
+    if fair_yes is None:
+        # No fair probability ⇒ no basis for edge. Reject instead of
+        # fabricating edge from the model's self-reported confidence.
+        return (
+            False,
+            "No fair probability available; canonical gate fails closed (zero edge)",
+            market_prob,
+        )
+
+    # Settlement meta-model on the held-side win probability (pre-shrink, as the
+    # model was trained); the gate then shrinks + blends.
+    side_prob = side_win_probability(clamp_probability(fair_yes), side)
+    side_prob = await _apply_ml_meta_model(
+        db_manager,
+        side_win_probability=side_prob,
+        entry_price=price,
+        side=side,
+        confidence=float(decision.confidence),
+    )
+    gate_fair_yes = clamp_probability(side_prob if side == "YES" else 1.0 - side_prob)
+
+    # Market anchor: Platt-calibrated mid, fail-closed to the raw mid.
+    market_yes_prior = max(0.01, min(0.99, float(market.yes_price)))
+    if bool(getattr(settings.trading, "market_prior_calibration_enabled", True)):
+        try:
+            from src.utils.market_prior import adjusted_market_yes_probability
+
+            market_yes_prior, _segment = await adjusted_market_yes_probability(
+                db_manager, market_yes_prior, get_time_to_expiry_days(market) * 24.0
+            )
+            market_yes_prior = max(0.01, min(0.99, float(market_yes_prior)))
+        except Exception:
+            market_yes_prior = max(0.01, min(0.99, float(market.yes_price)))
+
+    slope = await _get_decision_calibration_slope(
+        db_manager, market_type=category_assessment.get("category")
+    )
+
+    # Net-edge floor: category multiplier (batch with the live loop) + the
+    # ported coin-flip/weak-category surcharge.
+    category_label = str(category_assessment.get("category") or "default").lower()
+    edge_multipliers = dict(
+        getattr(settings.trading, "category_min_net_edge_multipliers", {}) or {}
+    )
+    edge_multiplier = float(
+        edge_multipliers.get(category_label, edge_multipliers.get("default", 1.0))
+    )
+    base_min_edge = float(
+        getattr(settings.trading, "live_trade_min_net_edge", 0.02) or 0.0
+    )
+    surcharge = _decide_category_edge_surcharge(
+        market_yes_prior, category_assessment.get("score")
+    )
+    effective_min_edge = max(0.0, base_min_edge * edge_multiplier) + surcharge
+
+    gate = evaluate_trade_intent(
+        fair_yes_probability=gate_fair_yes,
+        side=side,
+        entry_price=price,
+        market_yes_probability=market_yes_prior,
+        model_blend_weight=float(
+            getattr(settings.ensemble, "market_blend_model_weight", 0.65) or 0.65
+        ),
+        calibration_slope=slope,
+        maker=False,
+        min_net_edge=effective_min_edge,
+        disagreement=ensemble_disagreement,
+    )
+    ai_prob = float(gate["win_probability"])
+    return bool(gate["approved"]), f"canonical EV gate: {gate['reason']}", ai_prob
 
 
 def _debate_member_probabilities(
@@ -487,6 +645,12 @@ async def _passes_live_trade_guardrails(
         enforcer = PortfolioEnforcer(
             db_path=str(db_path),
             portfolio_value=max(float(portfolio_value or 0.0), 0.0),
+            max_event_pct=float(
+                getattr(settings.trading, "max_event_concentration_pct", 1.0) or 1.0
+            ),
+            max_portfolio_usage_pct=float(
+                getattr(settings.trading, "max_portfolio_usage_pct", 1.0) or 1.0
+            ),
         )
         await enforcer.initialize()
         current_positions = await _get_current_position_exposures(db_manager)
@@ -1012,6 +1176,24 @@ async def make_decision_for_market(
                 )
 
                 market_yes_prob = max(0.01, min(0.99, float(market.yes_price)))
+                # Anchor the blend to the CALIBRATED market mid (Platt
+                # market-prior), matching the live-trade loop and decide's
+                # high-confidence path instead of the raw mid. Fails closed to
+                # the raw mid when no validated segment model is active.
+                if bool(getattr(settings.trading, "market_prior_calibration_enabled", True)):
+                    try:
+                        from src.utils.market_prior import adjusted_market_yes_probability
+
+                        adjusted_mid, _mp_segment = await adjusted_market_yes_probability(
+                            db_manager,
+                            market_yes_prob,
+                            get_time_to_expiry_days(market) * 24.0,
+                        )
+                        market_yes_prob = max(0.01, min(0.99, float(adjusted_mid)))
+                    except Exception as exc:
+                        logger.debug(
+                            f"Market-prior adjustment unavailable for {market.market_id}: {exc}"
+                        )
                 blended_yes = blend_with_market(
                     adjusted_yes,
                     market_yes_prob,
@@ -1057,6 +1239,23 @@ async def make_decision_for_market(
                 trade_reason = (
                     f"Estimated win probability {ai_prob:.2f} does not exceed the "
                     f"{decision.side} price {market_prob:.2f} — no positive edge"
+                )
+
+            # Canonical-gate override (opt-in, A/B-able in shadow): route the
+            # same trade through the live-trade loop's evaluate_trade_intent so
+            # the two gates in this file stop diverging. Replaces the EdgeFilter
+            # verdict and the Kelly-sizing win probability when enabled; the
+            # EdgeFilter pass above is pure math (no extra I/O of note).
+            if bool(getattr(settings.trading, "decide_use_canonical_gate", False)):
+                should_trade, trade_reason, ai_prob = await _evaluate_decide_canonical_gate(
+                    db_manager=db_manager,
+                    market=market,
+                    decision=decision,
+                    fair_yes=fair_yes,
+                    ensemble_disagreement=ensemble_disagreement,
+                    price=price,
+                    market_prob=market_prob,
+                    category_assessment=category_assessment,
                 )
 
             if not should_trade:

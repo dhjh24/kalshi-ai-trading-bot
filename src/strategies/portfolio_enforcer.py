@@ -39,6 +39,21 @@ from src.strategies.category_scorer import CategoryScorer, infer_category, BLOCK
 logger = logging.getLogger(__name__)
 
 
+def _event_root(market_id: str) -> Optional[str]:
+    """
+    Conservative Kalshi event/series root from a market ticker.
+
+    Kalshi tickers are ``EVENT_TICKER-MARKET_SUFFIX`` (e.g.
+    ``KXNCAAB-25JAN20DUKE-DUKE``). Stripping the final ``-suffix`` groups the
+    per-team / per-strike legs of one event together. Returns None when there
+    is no hyphen to split on, so callers fall back to the category-only check.
+    """
+    text = str(market_id or "").strip()
+    if "-" not in text:
+        return None
+    return text.rsplit("-", 1)[0]
+
+
 # --- Strategy tags -----------------------------------------------------------
 
 STRATEGY_QUICK_FLIP = "quick_flip"
@@ -162,6 +177,8 @@ class PortfolioEnforcer:
         max_drawdown_pct: float = 0.15,
         max_position_pct: float = 0.03,
         max_sector_pct: float = 0.30,
+        max_event_pct: float = 1.0,
+        max_portfolio_usage_pct: float = 1.0,
         strategy_limits: Optional[Dict[str, StrategyLimits]] = None,
     ):
         self.db_path = db_path
@@ -169,6 +186,17 @@ class PortfolioEnforcer:
         self.max_drawdown_pct = max_drawdown_pct
         self.max_position_pct = max_position_pct
         self.max_sector_pct = max_sector_pct
+        # Per-event concentration cap. Defaults to 1.0 (disabled) so existing
+        # callers are unchanged; the live paths pass the configured value. Caps
+        # exposure sharing a single Kalshi event/series root, catching correlated
+        # same-day batches (e.g. many NCAAB NO legs) that the broad category
+        # sector cap pools into one bucket.
+        self.max_event_pct = max_event_pct
+        # Total-portfolio usage cap (dry-powder floor). Defaults to 1.0
+        # (disabled). When set below 1.0, blocks trades that would push total
+        # open exposure past this fraction, reserving cash to take the next
+        # high-edge opportunity mid-cycle instead of being fully deployed.
+        self.max_portfolio_usage_pct = max_portfolio_usage_pct
         self.scorer = CategoryScorer(db_path)
         self._blocked_count = 0
         self._allowed_count = 0
@@ -706,6 +734,51 @@ class PortfolioEnforcer:
                 reason = (
                     f"Adding ${amount:.2f} to '{cat}' would exceed sector limit "
                     f"{self.max_sector_pct*100:.0f}% (current: ${sector_exposure:.2f})"
+                )
+                await self._log_blocked(ticker, cat, side, amount, reason, score)
+                self._blocked_count += 1
+                return False, reason
+
+        # --- Rule 4b: Per-event correlation cap ---
+        # Many simultaneous legs of one event (e.g. a heavy NCAAB slate of NO
+        # positions, or multiple strikes of one market) are highly correlated
+        # but collapse into a single category bucket above. Cap exposure sharing
+        # one event/series root so an upset-heavy day cannot cluster losses.
+        if (
+            current_positions
+            and self.portfolio_value > 0
+            and self.max_event_pct < 1.0
+        ):
+            root = _event_root(ticker)
+            if root is not None:
+                event_exposure = sum(
+                    v for k, v in current_positions.items()
+                    if _event_root(k) == root
+                )
+                if (event_exposure + amount) / self.portfolio_value > self.max_event_pct:
+                    reason = (
+                        f"Adding ${amount:.2f} to event '{root}' would exceed the "
+                        f"per-event cap {self.max_event_pct*100:.0f}% "
+                        f"(current: ${event_exposure:.2f})"
+                    )
+                    await self._log_blocked(ticker, cat, side, amount, reason, score)
+                    self._blocked_count += 1
+                    return False, reason
+
+        # --- Rule 4c: Total-portfolio usage cap (dry-powder floor) ---
+        # Reserve cash so the bot can still take the next high-edge trade
+        # mid-cycle instead of being ~100% deployed. Disabled at 1.0.
+        if (
+            current_positions
+            and self.portfolio_value > 0
+            and self.max_portfolio_usage_pct < 1.0
+        ):
+            total_exposure = sum(current_positions.values())
+            if (total_exposure + amount) / self.portfolio_value > self.max_portfolio_usage_pct:
+                reason = (
+                    f"Adding ${amount:.2f} would exceed the portfolio-usage cap "
+                    f"{self.max_portfolio_usage_pct*100:.0f}% "
+                    f"(current deployed: ${total_exposure:.2f} of ${self.portfolio_value:.2f})"
                 )
                 await self._log_blocked(ticker, cat, side, amount, reason, score)
                 self._blocked_count += 1
