@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useMutation } from "@tanstack/react-query";
-import { API_BASE_URL } from "../lib/api";
+import { getApiBaseUrl } from "../lib/api";
 import { LlmTokenBadge } from "./ui";
 
 const ANALYSIS_LIMIT_OPTIONS = [4, 8, 12, 24, 36];
@@ -26,7 +26,7 @@ export function LiveTradeBatchControls({
       const targets = eventTickers.slice(0, Math.min(analysisLimit, eventTickers.length));
       const results = await Promise.allSettled(
         targets.map(async (eventTicker) => {
-          const response = await fetch(`${API_BASE_URL}/api/analysis/events/${eventTicker}`, {
+          const response = await fetch(`${getApiBaseUrl()}/api/analysis/events/${eventTicker}`, {
             method: "POST",
             headers: {
               "content-type": "application/json"

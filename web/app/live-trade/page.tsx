@@ -622,9 +622,9 @@ export default async function LiveTradePage({
                   <p className="max-w-3xl text-slate-600">{event.sub_title}</p>
                 ) : null}
                 <div className="flex flex-wrap gap-4 text-sm text-slate-500">
-                  <span>24h volume {event.volume_24h.toLocaleString()}</span>
+                  <span>24h volume {event.volume_24h.toLocaleString("en-US")}</span>
                   <span>
-                    Total volume {event.volume_total.toLocaleString()}
+                    Total volume {event.volume_total.toLocaleString("en-US")}
                   </span>
                   <span>
                     Avg YES spread{" "}
@@ -695,7 +695,7 @@ export default async function LiveTradePage({
                         {formatProbability(market.yes_ask)}
                       </td>
                       <td className="px-4 py-3 text-sm text-slate-600">
-                        {market.volume_24h.toLocaleString()}
+                        {market.volume_24h.toLocaleString("en-US")}
                       </td>
                       <td className="px-4 py-3 text-sm text-slate-600">
                         {formatMoney(market.liquidity_dollars)}

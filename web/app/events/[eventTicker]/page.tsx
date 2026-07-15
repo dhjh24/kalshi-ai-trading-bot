@@ -125,7 +125,7 @@ export default async function EventDetailPage({
                 </div>
                 <div className="text-right">
                   <p className="font-semibold text-steel">{Math.round(market.yesMidpoint * 100)}¢</p>
-                  <p className="text-sm text-slate-500">{market.volume24h.toLocaleString()} 24h</p>
+                  <p className="text-sm text-slate-500">{market.volume24h.toLocaleString("en-US")} 24h</p>
                 </div>
               </div>
             ))}

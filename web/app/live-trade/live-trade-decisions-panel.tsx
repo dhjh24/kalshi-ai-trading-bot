@@ -9,7 +9,7 @@ import {
 } from "react";
 import { useMutation } from "@tanstack/react-query";
 import {
-  API_BASE_URL,
+  getApiBaseUrl,
   getLiveTradeDecisionFeed
 } from "../../lib/api";
 import { formatMoney, formatTimestamp } from "../../lib/format";
@@ -377,7 +377,7 @@ async function submitDecisionFeedback(
   updatedAt: string | null;
 }> {
   const response = await fetch(
-    `${API_BASE_URL}/api/live-trade/decisions/${encodeURIComponent(record.id)}/feedback`,
+    `${getApiBaseUrl()}/api/live-trade/decisions/${encodeURIComponent(record.id)}/feedback`,
     {
       method: "POST",
       headers: {

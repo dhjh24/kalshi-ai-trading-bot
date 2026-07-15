@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { formatDateShort } from "../lib/format";
+import { formatDateShort, formatNumber } from "../lib/format";
 import type { MarketRow } from "../lib/types";
 import { EmptyState } from "./ui";
 
@@ -166,7 +166,7 @@ export function MarketTable({
         <h3 className="text-lg font-semibold text-steel">{title}</h3>
         {filters ? (
           <div className="flex items-center gap-2 text-xs font-semibold text-slate-500">
-            <span>{items.length.toLocaleString()} shown</span>
+            <span>{formatNumber(items.length)} shown</span>
             <Link href="/markets" className="rounded-full border border-slate-200 bg-white px-3 py-2 transition hover:border-signal hover:text-signal">
               Reset
             </Link>
@@ -297,7 +297,7 @@ export function MarketTable({
                   </td>
                   <td className="px-4 py-3 text-sm text-slate-600">{market.category}</td>
                   <td className="px-4 py-3 text-sm text-slate-600">
-                    {market.volume.toLocaleString()}
+                    {formatNumber(market.volume)}
                   </td>
                   <td className="px-4 py-3 text-sm text-slate-600">
                     {formatDateShort(new Date(market.expiration_ts * 1000).toISOString())}

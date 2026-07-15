@@ -69,12 +69,12 @@ export default async function MarketDetailPage({
         </Panel>
         <Panel title="24h volume">
           <p className="text-3xl font-semibold text-steel">
-            {detail.market.live?.volume24h.toLocaleString() || "0"}
+            {detail.market.live?.volume24h.toLocaleString("en-US") || "0"}
           </p>
         </Panel>
         <Panel title="Open interest">
           <p className="text-3xl font-semibold text-steel">
-            {detail.market.live?.openInterest.toLocaleString() || "0"}
+            {detail.market.live?.openInterest.toLocaleString("en-US") || "0"}
           </p>
         </Panel>
         <Panel title="Liquidity">
@@ -197,13 +197,13 @@ export default async function MarketDetailPage({
                 <div>
                   <p className="text-sm text-slate-500">Taker YES volume</p>
                   <p className="mt-2 text-2xl font-semibold text-steel">
-                    {detail.trades.takerYesVolume.toLocaleString()}
+                    {detail.trades.takerYesVolume.toLocaleString("en-US")}
                   </p>
                 </div>
                 <div>
                   <p className="text-sm text-slate-500">Taker NO volume</p>
                   <p className="mt-2 text-2xl font-semibold text-steel">
-                    {detail.trades.takerNoVolume.toLocaleString()}
+                    {detail.trades.takerNoVolume.toLocaleString("en-US")}
                   </p>
                 </div>
               </div>
@@ -248,7 +248,7 @@ export default async function MarketDetailPage({
                 </div>
                 <div className="text-right">
                   <p className="font-semibold text-steel">{Math.round(market.yesMidpoint * 100)}¢</p>
-                  <p className="text-sm text-slate-500">{market.volume24h.toLocaleString()} 24h</p>
+                  <p className="text-sm text-slate-500">{market.volume24h.toLocaleString("en-US")} 24h</p>
                 </div>
               </div>
             ))}

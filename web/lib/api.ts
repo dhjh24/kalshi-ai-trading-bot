@@ -54,13 +54,6 @@ export function getApiBaseUrl(): string {
   return `${window.location.protocol}//${pageHost}:${getConfiguredApiPort()}`;
 }
 
-/** Resolves at use-time so LAN hostnames track the page origin. */
-export const API_BASE_URL = {
-  toString: () => getApiBaseUrl(),
-  valueOf: () => getApiBaseUrl(),
-  [Symbol.toPrimitive]: () => getApiBaseUrl()
-} as unknown as string;
-
 const MAX_ERROR_BODY_LENGTH = 500;
 const GLOBAL_API_REVALIDATE_SECONDS = Number.parseInt(
   process.env.NEXT_PUBLIC_DASHBOARD_API_REVALIDATE_SECONDS || "8",

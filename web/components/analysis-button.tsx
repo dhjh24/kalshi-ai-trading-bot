@@ -2,7 +2,7 @@
 
 import { useId, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
-import { API_BASE_URL } from "../lib/api";
+import { getApiBaseUrl } from "../lib/api";
 import type { AnalysisRecord, AnalysisTargetType } from "../lib/types";
 import { useTopicStream } from "../lib/use-topic-stream";
 import { LlmTokenBadge } from "./ui";
@@ -44,7 +44,7 @@ export function AnalysisButton({
   const mutation = useMutation({
     mutationFn: async () => {
       const response = await fetch(
-        `${API_BASE_URL}/api/analysis/${targetType === "market" ? "markets" : "events"}/${targetId}`,
+        `${getApiBaseUrl()}/api/analysis/${targetType === "market" ? "markets" : "events"}/${targetId}`,
         {
           method: "POST",
           headers: {

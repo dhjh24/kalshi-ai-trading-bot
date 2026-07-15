@@ -25,7 +25,9 @@ export function LineChart({
         grid: { left: 36, right: 20, top: 48, bottom: 36 },
         xAxis: {
           type: "category",
-          data: data.map((point) => new Date(point.timestamp).toLocaleTimeString()),
+          data: data.map((point) =>
+            new Date(point.timestamp).toLocaleTimeString("en-US", { timeZone: "UTC" })
+          ),
           boundaryGap: false,
           axisLine: { lineStyle: { color: "#cbd5e1" } }
         },
@@ -67,7 +69,9 @@ export function CandlestickChart({
         grid: { left: 36, right: 20, top: 48, bottom: 36 },
         xAxis: {
           type: "category",
-          data: candles.map((entry) => new Date(entry[0]).toLocaleTimeString()),
+          data: candles.map((entry) =>
+            new Date(entry[0]).toLocaleTimeString("en-US", { timeZone: "UTC" })
+          ),
           boundaryGap: true,
           axisLine: { lineStyle: { color: "#cbd5e1" } }
         },
