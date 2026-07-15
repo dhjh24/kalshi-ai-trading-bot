@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { buildDashboardOrigins } from "../src/corsOrigins";
+import {
+  buildDashboardOrigins,
+  isAllowedDashboardOrigin
+} from "../src/corsOrigins";
 
 describe("dashboard API CORS", () => {
   it("allows fallback dashboard web ports selected by the launcher", () => {
@@ -27,5 +30,12 @@ describe("dashboard API CORS", () => {
 
     expect(origins.has("http://192.168.1.20:3000")).toBe(true);
     expect(origins.has("http://dev.local:3002")).toBe(true);
+  });
+
+  it("allows private LAN origins on dashboard web ports", () => {
+    expect(isAllowedDashboardOrigin("http://10.10.10.29:3000")).toBe(true);
+    expect(isAllowedDashboardOrigin("http://192.168.1.20:3001")).toBe(true);
+    expect(isAllowedDashboardOrigin("http://8.8.8.8:3000")).toBe(false);
+    expect(isAllowedDashboardOrigin("http://10.10.10.29:9999")).toBe(false);
   });
 });

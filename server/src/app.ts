@@ -24,10 +24,9 @@ import {
 } from "./services/dashboardService.js";
 import { queueAnalysisRequest } from "./services/analysisService.js";
 import { liveStreamHub } from "./services/liveStreamHub.js";
-import { buildDashboardOrigins } from "./corsOrigins.js";
+import { isAllowedDashboardOrigin } from "./corsOrigins.js";
 
 const streamTopicSchema = z.enum(["markets", "btc", "scores", "analysis", "live-trade-decisions"]);
-const dashboardOrigins = buildDashboardOrigins();
 
 function tokenDigest(value: string): Buffer {
   return createHash("sha256").update(value, "utf8").digest();
@@ -115,7 +114,13 @@ export async function buildServer() {
   });
 
   await app.register(cors, {
-    origin: Array.from(dashboardOrigins)
+    origin: (origin, callback) => {
+      if (!origin || isAllowedDashboardOrigin(origin)) {
+        callback(null, true);
+        return;
+      }
+      callback(null, false);
+    }
   });
 
   app.get("/health", async () => ({
@@ -411,7 +416,7 @@ export async function buildServer() {
     reply.raw.setHeader("Content-Type", "text/event-stream");
     reply.raw.setHeader("Cache-Control", "no-cache, no-transform");
     reply.raw.setHeader("Connection", "keep-alive");
-    if (origin && dashboardOrigins.has(origin)) {
+    if (origin && isAllowedDashboardOrigin(origin)) {
       reply.raw.setHeader("Access-Control-Allow-Origin", origin);
       reply.raw.setHeader("Vary", "Origin");
     }

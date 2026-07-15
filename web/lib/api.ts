@@ -15,8 +15,51 @@ import type {
   SafetyPayload
 } from "./types";
 
-export const API_BASE_URL =
-  process.env.NEXT_PUBLIC_DASHBOARD_API_URL || "http://127.0.0.1:4000";
+function getConfiguredApiPort(): string {
+  const configured = process.env.NEXT_PUBLIC_DASHBOARD_API_URL;
+  if (configured) {
+    try {
+      const port = new URL(configured).port;
+      if (port) {
+        return port;
+      }
+    } catch {
+      // fall through
+    }
+  }
+
+  return process.env.NEXT_PUBLIC_DASHBOARD_API_PORT || "4000";
+}
+
+export function getApiBaseUrl(): string {
+  // During Docker build/SSR, reach the API by service name.
+  if (typeof window === "undefined") {
+    return (
+      process.env.DASHBOARD_API_INTERNAL_URL ||
+      process.env.DASHBOARD_API_URL ||
+      process.env.NEXT_PUBLIC_DASHBOARD_API_URL ||
+      "http://127.0.0.1:4000"
+    );
+  }
+
+  const pageHost = window.location.hostname;
+  const configured = process.env.NEXT_PUBLIC_DASHBOARD_API_URL;
+
+  // Loopback page → prefer configured localhost API URL
+  if (pageHost === "localhost" || pageHost === "127.0.0.1") {
+    return configured || `http://${pageHost}:${getConfiguredApiPort()}`;
+  }
+
+  // LAN / hostname page → same host, API port (avoids CORS + wrong 127.0.0.1)
+  return `${window.location.protocol}//${pageHost}:${getConfiguredApiPort()}`;
+}
+
+/** Resolves at use-time so LAN hostnames track the page origin. */
+export const API_BASE_URL = {
+  toString: () => getApiBaseUrl(),
+  valueOf: () => getApiBaseUrl(),
+  [Symbol.toPrimitive]: () => getApiBaseUrl()
+} as unknown as string;
 
 const MAX_ERROR_BODY_LENGTH = 500;
 const GLOBAL_API_REVALIDATE_SECONDS = Number.parseInt(
@@ -152,7 +195,7 @@ function requestDefaultsForGet(path: string): RequestInit & {
 }
 
 async function requestApi<T>(path: string, init?: RequestApiOptions): Promise<T> {
-  const url = `${API_BASE_URL}${path}`;
+  const url = `${getApiBaseUrl()}${path}`;
   const method = (init?.method || "GET").toUpperCase();
   const isGet = method === "GET";
   const requestInit: RequestInit & { next?: { revalidate?: number } } = {
@@ -224,7 +267,7 @@ export async function putApi<T>(path: string, body?: unknown): Promise<T> {
 }
 
 export function createStreamUrl(topic: string): string {
-  return `${API_BASE_URL}/api/stream/${topic}`;
+  return `${getApiBaseUrl()}/api/stream/${topic}`;
 }
 
 export async function getOverview() {
