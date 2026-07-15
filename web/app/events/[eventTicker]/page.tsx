@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { AnalysisButton } from "../../../components/analysis-button";
-import { AnalysisResultCard } from "../../../components/analysis-result-card";
+import { LiveAnalysisResult } from "../../../components/live-analysis-result";
 import { CandlestickChart, LineChart } from "../../../components/charts";
 import { NewsList } from "../../../components/news-list";
 import { Badge, Panel } from "../../../components/ui";
@@ -50,7 +50,14 @@ export default async function EventDetailPage({
 
       <section id="analysis">
         <Panel title="Latest event analysis">
-          <AnalysisResultCard title="Event analysis" analysis={detail.latestAnalysis} />
+          <QueryProvider>
+            <LiveAnalysisResult
+              title="Event analysis"
+              targetType="event"
+              targetId={eventTicker}
+              initialRecord={detail.latestAnalysis}
+            />
+          </QueryProvider>
         </Panel>
       </section>
 

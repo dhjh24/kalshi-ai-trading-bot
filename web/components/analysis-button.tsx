@@ -2,24 +2,14 @@
 
 import { useId, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
+import {
+  mapQueuedAnalysisResponse,
+  selectLatestAnalysisRecord
+} from "../lib/analysis-stream";
 import { getDashboardMutationHeaders, getMutationApiBaseUrl } from "../lib/api";
 import type { AnalysisRecord, AnalysisTargetType } from "../lib/types";
 import { useTopicStream } from "../lib/use-topic-stream";
 import { LlmTokenBadge } from "./ui";
-
-function selectLatest(
-  payload: unknown,
-  targetType: AnalysisTargetType,
-  targetId: string,
-  previous: AnalysisRecord | null
-) {
-  const items = Array.isArray(payload) ? (payload as AnalysisRecord[]) : [];
-  const next = items.find(
-    (item) => item.targetType === targetType && item.targetId === targetId
-  );
-
-  return next || previous;
-}
 
 export function AnalysisButton({
   targetType,
@@ -30,11 +20,16 @@ export function AnalysisButton({
   targetId: string;
   initialRecord: AnalysisRecord | null;
 }) {
-  const liveRecord = useTopicStream<AnalysisRecord | null>(
+  const [optimisticRecord, setOptimisticRecord] = useState<AnalysisRecord | null>(
+    null
+  );
+  const streamedRecord = useTopicStream<AnalysisRecord | null>(
     "analysis",
     initialRecord,
-    (payload, previous) => selectLatest(payload, targetType, targetId, previous)
+    (payload, previous) =>
+      selectLatestAnalysisRecord(payload, targetType, targetId, previous)
   );
+  const liveRecord = streamedRecord ?? optimisticRecord ?? initialRecord;
   const inputId = useId();
   const [useWebResearch, setUseWebResearch] = useState<boolean>(() => {
     const value = initialRecord?.context?.useWebResearch;
@@ -54,11 +49,27 @@ export function AnalysisButton({
         }
       );
 
+      const payload = await response.json().catch(() => null);
       if (!response.ok) {
-        throw new Error("Failed to queue analysis");
+        const detail =
+          payload &&
+          typeof payload === "object" &&
+          typeof (payload as { message?: unknown }).message === "string"
+            ? (payload as { message: string }).message
+            : payload &&
+                typeof payload === "object" &&
+                typeof (payload as { error?: unknown }).error === "string"
+              ? (payload as { error: string }).error
+              : `Failed to queue analysis (${response.status})`;
+        throw new Error(detail);
       }
 
-      return (await response.json()) as AnalysisRecord;
+      return mapQueuedAnalysisResponse(payload);
+    },
+    onSuccess: (record) => {
+      if (record) {
+        setOptimisticRecord(record);
+      }
     }
   });
 
@@ -102,6 +113,13 @@ export function AnalysisButton({
       >
         {status}
       </button>
+      {mutation.isError ? (
+        <p className="max-w-xs text-right text-xs text-rose-600">
+          {mutation.error instanceof Error
+            ? mutation.error.message
+            : "Failed to queue analysis"}
+        </p>
+      ) : null}
       {liveRecord ? (
         <p className="max-w-xs text-right text-xs text-slate-400">
           {liveRecord.status === "pending"
@@ -110,7 +128,11 @@ export function AnalysisButton({
               ? `Last request asked for ${requestedWebResearch ? "web research" : "no web research"}.`
               : `Last run ${usedWebResearch ? "used web research" : "ran without web research"}.`}
         </p>
-      ) : null}
+      ) : (
+        <p className="max-w-xs text-right text-xs text-slate-400">
+          Results appear below when the bridge finishes.
+        </p>
+      )}
     </div>
   );
 }

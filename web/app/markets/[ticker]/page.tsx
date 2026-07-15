@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { AnalysisButton } from "../../../components/analysis-button";
-import { AnalysisResultCard } from "../../../components/analysis-result-card";
+import { LiveAnalysisResult } from "../../../components/live-analysis-result";
 import { CandlestickChart, LineChart } from "../../../components/charts";
 import { NewsList } from "../../../components/news-list";
 import { Badge, Panel } from "../../../components/ui";
@@ -151,7 +151,14 @@ export default async function MarketDetailPage({
 
       <section id="analysis" className="grid gap-6 xl:grid-cols-[1.15fr_0.85fr]">
         <Panel title="Latest analysis">
-          <AnalysisResultCard title="Market analysis" analysis={latestAnalysis} />
+          <QueryProvider>
+            <LiveAnalysisResult
+              title="Market analysis"
+              targetType="market"
+              targetId={ticker}
+              initialRecord={latestAnalysis}
+            />
+          </QueryProvider>
         </Panel>
         <Panel title="Related event">
           {detail.event ? (
