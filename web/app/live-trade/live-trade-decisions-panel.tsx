@@ -9,8 +9,9 @@ import {
 } from "react";
 import { useMutation } from "@tanstack/react-query";
 import {
-  getApiBaseUrl,
-  getLiveTradeDecisionFeed
+  getDashboardMutationHeaders,
+  getLiveTradeDecisionFeed,
+  getMutationApiBaseUrl
 } from "../../lib/api";
 import { formatMoney, formatTimestamp } from "../../lib/format";
 import {
@@ -377,12 +378,10 @@ async function submitDecisionFeedback(
   updatedAt: string | null;
 }> {
   const response = await fetch(
-    `${getApiBaseUrl()}/api/live-trade/decisions/${encodeURIComponent(record.id)}/feedback`,
+    `${getMutationApiBaseUrl()}/api/live-trade/decisions/${encodeURIComponent(record.id)}/feedback`,
     {
       method: "POST",
-      headers: {
-        "content-type": "application/json"
-      },
+      headers: getDashboardMutationHeaders(),
       body: JSON.stringify({
         feedback,
         runId: record.runId,

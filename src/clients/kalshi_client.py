@@ -296,6 +296,26 @@ class KalshiClient(TradingLoggerMixin):
             "GET", f"/trade-api/v2/markets/{ticker}", require_auth=False
         )
 
+    async def get_event(
+        self,
+        event_ticker: str,
+        *,
+        with_nested_markets: bool = True,
+    ) -> Dict[str, Any]:
+        """Get one event by ticker (list filters are unreliable for exact lookup)."""
+        normalized = str(event_ticker or "").strip()
+        if not normalized:
+            return {}
+        params: Dict[str, Any] = {}
+        if with_nested_markets:
+            params["with_nested_markets"] = "true"
+        return await self._make_authenticated_request(
+            "GET",
+            f"/trade-api/v2/events/{normalized}",
+            params=params,
+            require_auth=False,
+        )
+
     async def get_series(
         self,
         series_ticker: str,

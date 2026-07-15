@@ -54,6 +54,38 @@ export function getApiBaseUrl(): string {
   return `${window.location.protocol}//${pageHost}:${getConfiguredApiPort()}`;
 }
 
+/** Browser mutations go through Next `/api/proxy` so the token stays server-side. */
+export function getMutationApiBaseUrl(): string {
+  if (typeof window !== "undefined") {
+    return "/api/proxy";
+  }
+  return getApiBaseUrl();
+}
+
+export function getDashboardMutationHeaders(
+  extra?: HeadersInit
+): Record<string, string> {
+  const headers: Record<string, string> = {
+    "content-type": "application/json"
+  };
+
+  if (extra) {
+    new Headers(extra).forEach((value, key) => {
+      headers[key] = value;
+    });
+  }
+
+  // SSR / proxy-less server calls to Fastify need the token when not loopback
+  if (typeof window === "undefined") {
+    const token = (process.env.DASHBOARD_API_TOKEN || "").trim();
+    if (token) {
+      headers["x-dashboard-token"] = token;
+    }
+  }
+
+  return headers;
+}
+
 const MAX_ERROR_BODY_LENGTH = 500;
 const GLOBAL_API_REVALIDATE_SECONDS = Number.parseInt(
   process.env.NEXT_PUBLIC_DASHBOARD_API_REVALIDATE_SECONDS || "8",
@@ -239,22 +271,53 @@ export async function fetchApi<T>(path: string): Promise<T> {
   return requestApi<T>(path);
 }
 
+async function requestMutationApi<T>(
+  path: string,
+  init: RequestApiOptions
+): Promise<T> {
+  const url = `${getMutationApiBaseUrl()}${path}`;
+  let response: Response;
+
+  try {
+    response = await fetch(url, {
+      ...init,
+      headers: getDashboardMutationHeaders(init.headers)
+    });
+  } catch (error) {
+    if (isNextDynamicServerUsageError(error)) {
+      throw error;
+    }
+
+    throw new DashboardApiError({
+      path,
+      url,
+      cause: error
+    });
+  }
+
+  if (!response.ok) {
+    throw new DashboardApiError({
+      path,
+      url,
+      status: response.status,
+      statusText: response.statusText,
+      body: await readErrorBody(response)
+    });
+  }
+
+  return (await response.json()) as T;
+}
+
 export async function postApi<T>(path: string, body?: unknown): Promise<T> {
-  return requestApi<T>(path, {
+  return requestMutationApi<T>(path, {
     method: "POST",
-    headers: {
-      "content-type": "application/json"
-    },
     body: body === undefined ? undefined : JSON.stringify(body)
   });
 }
 
 export async function putApi<T>(path: string, body?: unknown): Promise<T> {
-  return requestApi<T>(path, {
+  return requestMutationApi<T>(path, {
     method: "PUT",
-    headers: {
-      "content-type": "application/json"
-    },
     body: body === undefined ? undefined : JSON.stringify(body)
   });
 }

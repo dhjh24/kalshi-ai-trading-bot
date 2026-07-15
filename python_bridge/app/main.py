@@ -193,19 +193,52 @@ async def _event_snapshot_from_event_ticker(
 ) -> Dict[str, Any]:
     """Build a dashboard-style event snapshot from a Kalshi event ticker."""
     now = datetime.now(timezone.utc)
+    requested = str(event_ticker or "").strip()
 
+    def _snapshot_from_raw_event(raw_event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        got_ticker = str(raw_event.get("event_ticker") or "").strip()
+        # List endpoints sometimes ignore event_ticker and return an unrelated row.
+        if got_ticker and got_ticker != requested:
+            return None
+        return state.research_service._build_event_snapshot(
+            raw_event,
+            now=now,
+            normalized_filters=set(),
+            max_hours_to_expiry=24 * 365,
+            # Manual analysis must work for settled/finalized events too.
+            require_tradeable=False,
+        )
+
+    # Exact event lookup (preferred). List filters are not reliable for one ticker.
+    try:
+        event_response = await state.kalshi_client.get_event(
+            requested,
+            with_nested_markets=True,
+        )
+        raw_event = event_response.get("event") or event_response
+        if isinstance(raw_event, dict) and raw_event.get("event_ticker"):
+            snapshot = _snapshot_from_raw_event(raw_event)
+            if snapshot is not None:
+                return snapshot
+    except KalshiAPIError as exc:
+        if "HTTP 404" not in str(exc):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Kalshi event lookup failed for {requested}: {exc}",
+            ) from exc
+
+    # Markets for this event (include settled; do not force status=open).
     markets_response = await state.kalshi_client.get_markets(
-        event_ticker=event_ticker,
-        status="open",
+        event_ticker=requested,
         limit=200,
     )
     raw_markets = markets_response.get("markets") or []
     if raw_markets:
         sample_market = raw_markets[0]
         synthetic_event = {
-            "event_ticker": event_ticker,
+            "event_ticker": requested,
             "series_ticker": str(sample_market.get("series_ticker") or ""),
-            "title": str(sample_market.get("title") or event_ticker),
+            "title": str(sample_market.get("title") or requested),
             "sub_title": str(
                 sample_market.get("subtitle")
                 or sample_market.get("yes_sub_title")
@@ -214,37 +247,25 @@ async def _event_snapshot_from_event_ticker(
             "category": sample_market.get("category"),
             "markets": raw_markets,
         }
-        snapshot = state.research_service._build_event_snapshot(
-            synthetic_event,
-            now=now,
-            normalized_filters=set(),
-            max_hours_to_expiry=24 * 365,
-        )
+        snapshot = _snapshot_from_raw_event(synthetic_event)
         if snapshot is not None:
             return snapshot
 
     response = await state.kalshi_client.get_events(
-        event_ticker=event_ticker,
+        event_ticker=requested,
         with_nested_markets=True,
         limit=1,
-        status="open",
     )
     raw_event = (response.get("events") or [None])[0]
-    if raw_event is None:
-        raise HTTPException(status_code=404, detail=f"Event {event_ticker} not found")
+    if isinstance(raw_event, dict):
+        snapshot = _snapshot_from_raw_event(raw_event)
+        if snapshot is not None:
+            return snapshot
 
-    snapshot = state.research_service._build_event_snapshot(
-        raw_event,
-        now=now,
-        normalized_filters=set(),
-        max_hours_to_expiry=24 * 365,
+    raise HTTPException(
+        status_code=404,
+        detail=f"Event {requested} could not be normalized for analysis",
     )
-    if snapshot is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Event {event_ticker} could not be normalized for analysis",
-        )
-    return snapshot
 
 
 async def _event_snapshot_from_market_ticker(
@@ -279,6 +300,7 @@ async def _event_snapshot_from_market_ticker(
         raw_markets=[market],
         now=datetime.now(timezone.utc),
         max_hours_to_expiry=24 * 365,
+        require_tradeable=False,
     )
     if snapshot is None:
         raise HTTPException(

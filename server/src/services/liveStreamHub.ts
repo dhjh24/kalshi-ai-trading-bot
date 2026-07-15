@@ -117,6 +117,11 @@ class LiveStreamHub {
     }
   }
 
+  /** Publish camelCase analysis rows matching the web `AnalysisRecord` shape. */
+  refreshAnalysis(limit = 20): void {
+    this.publish("analysis", listAnalysisRequests(limit).map(mapAnalysisRequest));
+  }
+
   subscribe(topic: Topic, listener: (payload: unknown) => void) {
     this.emitter.on(topic, listener);
     return () => this.emitter.off(topic, listener);
@@ -160,14 +165,10 @@ class LiveStreamHub {
       this.publish("scores", payload);
     };
 
-    const refreshAnalysis = () => {
-      this.publish("analysis", listAnalysisRequests(20).map(mapAnalysisRequest));
-    };
-
     this.runRefresh(refreshMarkets);
     this.runRefresh(refreshBtc);
     this.runRefresh(refreshScores);
-    this.runRefresh(refreshAnalysis);
+    this.runRefresh(() => this.refreshAnalysis());
     this.runRefresh(() => this.refreshLiveTradeDecisions());
 
     const startInterval = (callback: () => void | Promise<void>, intervalMs: number) => {
@@ -178,7 +179,7 @@ class LiveStreamHub {
     startInterval(refreshMarkets, serverConfig.dataRefreshMs);
     startInterval(refreshBtc, serverConfig.cryptoRefreshMs);
     startInterval(refreshScores, serverConfig.sportsRefreshMs);
-    startInterval(refreshAnalysis, serverConfig.dataRefreshMs);
+    startInterval(() => this.refreshAnalysis(), serverConfig.dataRefreshMs);
     startInterval(
       () => this.refreshLiveTradeDecisionsOnCursorChange(),
       LIVE_TRADE_DECISION_CURSOR_POLL_MS

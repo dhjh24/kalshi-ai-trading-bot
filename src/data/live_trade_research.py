@@ -903,18 +903,24 @@ class LiveTradeResearchService(TradingLoggerMixin):
         now: datetime,
         normalized_filters: set[str],
         max_hours_to_expiry: int,
+        require_tradeable: bool = True,
     ) -> Optional[Dict[str, Any]]:
         """Normalize one Kalshi event into a dashboard-friendly snapshot."""
         category = normalize_market_category(raw_event.get("category"), title=raw_event.get("title", ""))
         if normalized_filters and category.casefold() not in normalized_filters:
             return None
 
-        markets = [
-            self._build_market_snapshot(market, now=now)
-            for market in raw_event.get("markets", [])
-            if is_active_market_status(get_market_status(market)) and is_tradeable_market(market)
-        ]
-        markets = [market for market in markets if market is not None]
+        markets = []
+        for market in raw_event.get("markets", []):
+            status = get_market_status(market)
+            if require_tradeable:
+                if not is_active_market_status(status) or not is_tradeable_market(market):
+                    continue
+            elif not str(market.get("ticker") or "").strip():
+                continue
+            snapshot_market = self._build_market_snapshot(market, now=now)
+            if snapshot_market is not None:
+                markets.append(snapshot_market)
         if not markets:
             return None
 
@@ -1002,14 +1008,20 @@ class LiveTradeResearchService(TradingLoggerMixin):
         *,
         now: datetime,
         max_hours_to_expiry: int,
+        require_tradeable: bool = True,
     ) -> Optional[Dict[str, Any]]:
         """Build a synthetic event snapshot from a market-level crypto group."""
-        markets = [
-            self._build_market_snapshot(raw_market, now=now)
-            for raw_market in raw_markets
-            if is_active_market_status(get_market_status(raw_market)) and is_tradeable_market(raw_market)
-        ]
-        markets = [market for market in markets if market is not None]
+        markets = []
+        for raw_market in raw_markets:
+            status = get_market_status(raw_market)
+            if require_tradeable:
+                if not is_active_market_status(status) or not is_tradeable_market(raw_market):
+                    continue
+            elif not str(raw_market.get("ticker") or "").strip():
+                continue
+            snapshot_market = self._build_market_snapshot(raw_market, now=now)
+            if snapshot_market is not None:
+                markets.append(snapshot_market)
         if not markets:
             return None
 

@@ -11,7 +11,7 @@ const dashboardServerHost =
 const dashboardServerPort = process.env.DASHBOARD_SERVER_PORT || "4000";
 
 const nextConfig: NextConfig = {
-  allowedDevOrigins: ["127.0.0.1"],
+  allowedDevOrigins: ["127.0.0.1", "10.10.10.29"],
   distDir: process.env.NEXT_DIST_DIR || ".next",
   output: "standalone",
   outputFileTracingRoot: path.join(process.cwd(), ".."),

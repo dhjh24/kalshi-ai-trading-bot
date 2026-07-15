@@ -2,8 +2,7 @@ import { serverConfig } from "../config.js";
 import {
   completeAnalysisRequest,
   createAnalysisRequest,
-  failAnalysisRequest,
-  listAnalysisRequests
+  failAnalysisRequest
 } from "../repositories/dashboardRepository.js";
 import type { AnalysisTargetType } from "../types.js";
 import { createRequestId } from "../utils/helpers.js";
@@ -121,7 +120,7 @@ async function processAnalysisRequest(
       error instanceof Error ? error.message : "Unknown analysis failure"
     );
   } finally {
-    liveStreamHub.publish("analysis", listAnalysisRequests(20));
+    liveStreamHub.refreshAnalysis();
   }
 }
 
@@ -132,7 +131,7 @@ export function queueAnalysisRequest(
 ) {
   const requestId = createRequestId(targetType);
   const request = createAnalysisRequest(requestId, targetType, targetId, body || {});
-  liveStreamHub.publish("analysis", listAnalysisRequests(20));
+  liveStreamHub.refreshAnalysis();
   void processAnalysisRequest(requestId, targetType, targetId, body);
   return request;
 }

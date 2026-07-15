@@ -45,7 +45,7 @@ Cursor project rules live in [`.cursor/rules/`](.cursor/rules/). `project-overvi
 ## Non-negotiables
 
 - Prefer `--paper` / `--shadow` before `--live`
-- Agents never place Kalshi orders; `execute.py` does
+- Agents never place Kalshi orders; prefer `execute.py` (MM / quick-flip / safe-compounder have direct order paths)
 - Do not resurrect `paper_trader.py` or `xai_client.py`
 - Node 24+ for the dashboard; Python 3.12+
 - Never commit `.env` or private key PEMs

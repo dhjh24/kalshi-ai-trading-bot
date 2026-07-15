@@ -11,7 +11,7 @@ cryptography==42.0.0
 pycryptodome==3.20.0
 
 # OpenRouter/OpenAI client
-openai==1.51.2
+openai>=1.68.0
 anthropic
 
 # Data handling and analysis - updated for Python 3.13 compatibility
